@@ -479,7 +479,6 @@ pub fn esc_hint(tickets: &[i64]) -> String {
     }
 }
 
-/// `#1, #2, #3`, or `#1, #2, #3 +2 more` past three (it has to fit the spinner line).
 /// How loud a launched worker's end is in the transcript (AMP #2861).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndLevel {
@@ -505,6 +504,67 @@ fn launch_end_notice(end: &amp_core::supervisor::LaunchEnd) -> (EndLevel, String
     (level, format!("worker ended: {}", end.line()))
 }
 
+/// A launch that ended with no worker session behind it (AMP #2862): what its
+/// [`amp_core::supervisor::LaunchEnd`] said.
+#[derive(Debug, Clone)]
+struct EndedLaunch {
+    agent_id: String,
+    /// The launch end's `Err` text: [`amp_core::supervisor::LAUNCH_CRASHED`] and what happened
+    /// to the ticket, or why it was never dispatched.
+    why: String,
+    at: std::time::SystemTime,
+}
+
+/// The live workers in `sessions` with their phases, by ticket: what the roster compares to
+/// decide whether it is out of date (AMP #2862).
+fn live_phases(
+    sessions: &[amp_core::supervisor::WorkerSessionInfo],
+) -> Vec<(i64, amp_core::supervisor::WorkerPhase)> {
+    let mut live: Vec<_> = sessions
+        .iter()
+        .filter_map(|s| s.phase.map(|p| (s.task_id, p)))
+        .collect();
+    live.sort_by_key(|(id, _)| *id);
+    live
+}
+
+/// The roster row of a launch that ended with no session (AMP #2862): a finished worker of this
+/// chat whose outcome says `crashed` or `not_dispatched`, and, for a crash, whether its ticket
+/// went back to ready (the `/workers` panel shows that as for any returned worker).
+fn ended_launch_entry(task_id: i64, end: &EndedLaunch) -> WorkerEntry {
+    use amp_core::supervisor::LAUNCH_CRASHED;
+    let crashed = end.why.starts_with(LAUNCH_CRASHED);
+    let returned_to = format!("#{task_id} was returned to ready");
+    let not_returned = format!("#{task_id} could not be returned to ready: ");
+    let still_open = format!("#{task_id} is still in progress in AMP");
+    let returned = if !crashed {
+        None
+    } else if end.why.contains(&returned_to) {
+        Some(Ok(()))
+    } else if let Some(at) = end.why.find(&not_returned) {
+        Some(Err(end.why[at + not_returned.len()..].trim().to_owned()))
+    } else if end.why.contains(&still_open) {
+        Some(Err("still in progress in AMP".to_owned()))
+    } else {
+        None
+    };
+    WorkerEntry {
+        task_id,
+        agent_id: end.agent_id.clone(),
+        phase: Phase::Finished,
+        state: format!(
+            "{} {}",
+            if crashed { "crashed" } else { "not dispatched" },
+            crate::roster::ago(end.at, std::time::SystemTime::now())
+        ),
+        outcome: Some(if crashed { "crashed" } else { "not_dispatched" }.to_owned()),
+        returned,
+        local: true,
+        ..WorkerEntry::default()
+    }
+}
+
+/// `#1, #2, #3`, or `#1, #2, #3 +2 more` past three (it has to fit the spinner line).
 fn ticket_list(tickets: &[i64]) -> String {
     let shown = tickets
         .iter()
@@ -741,6 +801,16 @@ pub struct Shell {
     /// Copies of the supervisor's launched ends as they land (AMP #2861), shown as notices on the
     /// tick. Display only: the queue itself is drained at the next turn's start (#2857).
     launch_watch: Option<tokio::sync::broadcast::Receiver<amp_core::supervisor::LaunchEnd>>,
+    /// The supervisor's live workers and their phases as the roster last showed them (AMP
+    /// #2862): an agent event refreshes the roster when they changed, whatever tool ended.
+    roster_live: Vec<(i64, amp_core::supervisor::WorkerPhase)>,
+    /// Launches that ended with no session behind them (AMP #2862): the worker task crashed
+    /// (#2885), or the launch was never dispatched. The supervisor keeps no finished session for
+    /// these, so the roster keeps them from their launch end.
+    ended_launches: std::collections::BTreeMap<i64, EndedLaunch>,
+    /// Tests: the worker sessions the roster reads, in place of a supervisor's.
+    #[cfg(test)]
+    test_sessions: Option<Vec<amp_core::supervisor::WorkerSessionInfo>>,
     /// Tickets with a live worker when the running reply started (AMP #2858): not this reply's
     /// launches, so stopping it leaves them alone.
     turn_live: Vec<i64>,
@@ -873,6 +943,10 @@ impl Shell {
                 cleared_done: None,
                 supervisor: None,
                 launch_watch: None,
+                roster_live: Vec::new(),
+                ended_launches: Default::default(),
+                #[cfg(test)]
+                test_sessions: None,
                 turn_live: Vec::new(),
                 connect: None,
                 secret: None,
@@ -1658,6 +1732,16 @@ impl Shell {
         loop {
             match watch.try_recv() {
                 Ok(end) => {
+                    if let Err(why) = &end.result {
+                        self.ended_launches.insert(
+                            end.task_id,
+                            EndedLaunch {
+                                agent_id: end.agent_id.clone(),
+                                why: why.clone(),
+                                at: std::time::SystemTime::now(),
+                            },
+                        );
+                    }
                     let (level, text) = launch_end_notice(&end);
                     match level {
                         EndLevel::Info => self.view.add_notice(&text),
@@ -1678,6 +1762,11 @@ impl Shell {
                     break;
                 }
             }
+        }
+        // AMP #2862: an end is news for the roster too (the worker is finished, crashed or never
+        // dispatched), not only when a dispatch tool call returns.
+        if shown {
+            self.build_roster();
         }
         shown
     }
@@ -2321,12 +2410,13 @@ impl Shell {
         }
         self.view.apply(event);
         self.follow_streaming(event);
-        // #2355: a worker's run has ended (the supervisor recorded it) by the time its
-        // `amp_run_ticket` returns: the strip stops saying running, and its finished notice lands
-        // now, before the manager's reply, not on the next tick.
-        if let AgentEvent::ToolExecutionEnd { tool_name, .. } = event
-            && tool_name == amp_core::policy::DISPATCH_TOOL
-        {
+        // AMP #2862: the roster follows the supervisor's live status, not the dispatch tool call.
+        // In Launch mode `amp_run_ticket` returns at once, while its worker is still queued or
+        // running; in Await mode (#2355) the worker has ended by then, so the strip stops
+        // saying running and its finished notice lands now, above the manager's reply. Either
+        // way, a change in who is live is what refreshes it. Streaming deltas are skipped: the
+        // tick catches anything they would.
+        if !matches!(event, AgentEvent::MessageUpdate { .. }) && self.live_changed() {
             self.build_roster();
         }
         if let AgentEvent::ToolExecutionStart {
@@ -4283,11 +4373,8 @@ impl Shell {
     fn build_roster(&mut self) -> bool {
         let now = std::time::SystemTime::now();
         let snap = self.meta.as_ref().map(|m| m.snapshot());
-        let sessions = self
-            .supervisor
-            .as_ref()
-            .map(|s| s.sessions())
-            .unwrap_or_default();
+        let sessions = self.worker_sessions();
+        self.roster_live = live_phases(&sessions);
         let mut entries: std::collections::BTreeMap<i64, WorkerEntry> = Default::default();
         for i in &sessions {
             let model = i.model.clone().unwrap_or_default();
@@ -4319,6 +4406,13 @@ impl Shell {
                     ..WorkerEntry::default()
                 },
             );
+        }
+        // AMP #2862: launches that ended with no session (crashed, or never dispatched) stay
+        // identifiable as this chat's finished workers until the ticket runs again.
+        for (id, end) in &self.ended_launches {
+            entries
+                .entry(*id)
+                .or_insert_with(|| ended_launch_entry(*id, end));
         }
         // Sessions read from disk (an earlier chat's workers).
         for (id, s) in &self.sessions {
@@ -4416,6 +4510,13 @@ impl Shell {
             }
             self.noticed.insert(i.task_id, live);
         }
+        // A live worker that left the supervisor with no session (its task crashed, AMP #2885)
+        // is not live any more; its launch end's notice already said how it ended (#2862).
+        for (id, live) in self.noticed.iter_mut() {
+            if *live && !sessions.iter().any(|i| i.task_id == *id) {
+                *live = false;
+            }
+        }
         // A worker that just started running was just dispatched: AMP's ready count changed.
         let mut dispatched = false;
         for i in &sessions {
@@ -4432,6 +4533,31 @@ impl Shell {
             self.view.strip().blur();
         }
         self.view.roster().set(entries)
+    }
+
+    /// This chat's worker sessions, live and finished, from the supervisor.
+    fn worker_sessions(&self) -> Vec<amp_core::supervisor::WorkerSessionInfo> {
+        #[cfg(test)]
+        if let Some(sessions) = &self.test_sessions {
+            return sessions.clone();
+        }
+        self.supervisor
+            .as_ref()
+            .map(|s| s.sessions())
+            .unwrap_or_default()
+    }
+
+    /// Whether the supervisor's live workers (tickets and phases) differ from what the roster
+    /// last showed (AMP #2862).
+    fn live_changed(&self) -> bool {
+        #[cfg(test)]
+        let has_source = self.supervisor.is_some() || self.test_sessions.is_some();
+        #[cfg(not(test))]
+        let has_source = self.supervisor.is_some();
+        if !has_source {
+            return false;
+        }
+        live_phases(&self.worker_sessions()) != self.roster_live
     }
 
     /// The context window of `model` (`provider/model`) from the chat's model list; 0 unknown.
@@ -4793,6 +4919,7 @@ fn count(n: u64, one: &str, many: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{clean_answer, parse_id, short_role, worker_summaries};
+    use crate::roster::{Phase, WorkerEntry};
     use std::sync::Arc;
 
     /// #2857: a turn opens with the ends the manager has not seen, once. The block is `None` with
@@ -5248,5 +5375,196 @@ mod tests {
         assert!(!shell.show_launch_ends());
         let screen = shell.view().render_plain(120, 40).join("\n");
         assert_eq!(screen.matches("worker ended: #2854").count(), 1, "{screen}");
+    }
+
+    /// A worker session for the #2862 roster tests: live in `phase`, or finished with `outcome`.
+    fn session(
+        task_id: i64,
+        phase: Option<amp_core::supervisor::WorkerPhase>,
+        outcome: Option<amp_core::supervisor::WorkerOutcome>,
+        returned: Option<Result<(), String>>,
+    ) -> amp_core::supervisor::WorkerSessionInfo {
+        let now = std::time::SystemTime::now();
+        amp_core::supervisor::WorkerSessionInfo {
+            task_id,
+            agent_id: "amp:amp-worker-backend".into(),
+            phase,
+            model: Some("wf/wf-1".into()),
+            cwd: None,
+            since: now,
+            ended: phase.is_none().then_some(now),
+            totals: amp_core::events::Totals::default(),
+            outcome,
+            error: None,
+            stopped_by: None,
+            returned,
+            session_file: None,
+            branch: None,
+            context_window: None,
+        }
+    }
+
+    /// A tool call ending in the manager's run.
+    fn tool_end(tool_name: &str) -> rpi_agent::AgentEvent {
+        rpi_agent::AgentEvent::ToolExecutionEnd {
+            tool_call_id: format!("call-{tool_name}"),
+            tool_name: tool_name.into(),
+            result: rpi_agent::AgentToolResult::text("ok"),
+            is_error: false,
+        }
+    }
+
+    fn roster_entry(shell: &super::Shell, task_id: i64) -> Option<WorkerEntry> {
+        shell
+            .view()
+            .roster()
+            .all()
+            .into_iter()
+            .find(|e| e.task_id == task_id)
+    }
+
+    /// AMP #2862: in Launch mode `amp_run_ticket` returns while its worker is queued, so the
+    /// tool call's end says nothing about the worker. The roster follows the supervisor: the
+    /// launch shows at once, the running worker stays running after the dispatch tool ended, and
+    /// the finish shows from the launch end, with no tool event at all.
+    #[tokio::test]
+    async fn the_roster_follows_a_launched_worker_from_start_to_finish() {
+        use amp_core::supervisor::{LaunchEnds, WorkerOutcome as O, WorkerPhase as P};
+
+        let ends = LaunchEnds::default();
+        let (mut shell, _feed) = watching_shell(&ends).await;
+        shell.test_sessions = Some(Vec::new());
+        shell.build_roster();
+        assert!(roster_entry(&shell, 2901).is_none());
+
+        // Background start: the launch is queued when the dispatch tool returns its ack.
+        shell.test_sessions = Some(vec![session(2901, Some(P::Queued), None, None)]);
+        shell.handle_event(&tool_end(amp_core::policy::DISPATCH_TOOL));
+        let e = roster_entry(&shell, 2901).expect("the launch shows at once");
+        assert_eq!(e.phase, Phase::Queued);
+        assert!(e.local);
+
+        // It gets a slot while the manager does something else.
+        shell.test_sessions = Some(vec![session(2901, Some(P::Running), None, None)]);
+        shell.handle_event(&tool_end("amp_get_task"));
+        assert_eq!(roster_entry(&shell, 2901).unwrap().phase, Phase::Running);
+        assert_eq!(shell.view().strip().shown().len(), 1, "the strip shows it");
+
+        // A later dispatch tool end with no change in who is live leaves it running.
+        shell.handle_event(&tool_end(amp_core::policy::DISPATCH_TOOL));
+        assert_eq!(roster_entry(&shell, 2901).unwrap().phase, Phase::Running);
+
+        // The finish: only the supervisor's state and its launch end, no tool call.
+        shell.test_sessions = Some(vec![session(2901, None, Some(O::Completed), None)]);
+        ends.push(ended(2901, O::Completed, None));
+        assert!(shell.show_launch_ends());
+        let e = roster_entry(&shell, 2901).expect("a finished worker stays listed");
+        assert_eq!(e.phase, Phase::Finished);
+        assert_eq!(e.outcome.as_deref(), Some("completed"));
+        assert!(shell.view().strip().shown().is_empty(), "nothing is live");
+    }
+
+    /// AMP #2862: Await mode keeps #2355's timing. The worker has ended by the time its tool
+    /// call returns, and the roster sees that from the supervisor at that event, so the finished
+    /// notice comes before the manager's reply. The tool's name plays no part.
+    #[tokio::test]
+    async fn await_mode_refreshes_when_the_worker_ends_inside_the_tool_call() {
+        use amp_core::supervisor::{LaunchEnds, WorkerOutcome as O, WorkerPhase as P};
+
+        let ends = LaunchEnds::default();
+        let (mut shell, _feed) = watching_shell(&ends).await;
+        shell.test_sessions = Some(vec![session(2902, Some(P::Running), None, None)]);
+        shell.handle_event(&tool_end("bash"));
+        assert_eq!(roster_entry(&shell, 2902).unwrap().phase, Phase::Running);
+
+        shell.test_sessions = Some(vec![session(2902, None, Some(O::Completed), None)]);
+        shell.handle_event(&tool_end(amp_core::policy::DISPATCH_TOOL));
+        let e = roster_entry(&shell, 2902).unwrap();
+        assert_eq!(
+            e.phase,
+            Phase::Finished,
+            "refreshed at the event, not the next tick"
+        );
+        assert!(!shell.live_changed());
+    }
+
+    /// AMP #2862: workers that ended badly stay identifiable in the roster after they finish:
+    /// an error whose ticket was returned, a stop whose return failed, a crashed worker task
+    /// (no session behind it, #2885) with either hand-back result, and a launch never
+    /// dispatched. They survive later rebuilds, and the panel says where each ticket went.
+    #[tokio::test]
+    async fn returned_failed_and_crashed_workers_stay_in_the_roster() {
+        use amp_core::supervisor::{LAUNCH_CRASHED, LaunchEnd, LaunchEnds, WorkerOutcome as O};
+
+        let ends = LaunchEnds::default();
+        let (mut shell, _feed) = watching_shell(&ends).await;
+        shell.test_sessions = Some(vec![
+            session(2911, None, Some(O::Error), Some(Ok(()))),
+            session(2912, None, Some(O::Cancelled), Some(Err("503".into()))),
+            session(2913, None, Some(O::Completed), None),
+        ]);
+        let crash = |id: i64, tail: &str| LaunchEnd {
+            task_id: id,
+            agent_id: "amp:amp-worker-frontend".into(),
+            result: Err(format!("{LAUNCH_CRASHED}: boom; #{id} {tail}")),
+        };
+        ends.push(crash(2914, "was returned to ready"));
+        ends.push(crash(
+            2915,
+            "could not be returned to ready: 502 Bad Gateway",
+        ));
+        ends.push(LaunchEnd {
+            task_id: 2916,
+            agent_id: "amp:amp-worker-backend".into(),
+            result: Err("AMP refused the dispatch".into()),
+        });
+        assert!(shell.show_launch_ends());
+        // Later ticks rebuild the roster; nothing ended is lost.
+        shell.build_roster();
+        shell.poll();
+
+        let get = |id| roster_entry(&shell, id).unwrap_or_else(|| panic!("#{id} is listed"));
+        let e = get(2911);
+        assert_eq!(
+            (e.phase, e.outcome.as_deref()),
+            (Phase::Finished, Some("error"))
+        );
+        assert_eq!(e.returned, Some(Ok(())));
+        let e = get(2912);
+        assert_eq!(e.outcome.as_deref(), Some("cancelled"));
+        assert_eq!(e.returned, Some(Err("503".into())));
+        assert_eq!(get(2913).outcome.as_deref(), Some("completed"));
+        let e = get(2914);
+        assert_eq!(
+            (e.phase, e.outcome.as_deref()),
+            (Phase::Finished, Some("crashed"))
+        );
+        assert_eq!(e.agent_id, "amp:amp-worker-frontend");
+        assert!(e.state.starts_with("crashed"), "{}", e.state);
+        assert_eq!(e.returned, Some(Ok(())));
+        let e = get(2915);
+        assert_eq!(e.outcome.as_deref(), Some("crashed"));
+        assert_eq!(e.returned, Some(Err("502 Bad Gateway".into())));
+        let e = get(2916);
+        assert_eq!(e.outcome.as_deref(), Some("not_dispatched"));
+        assert_eq!(e.returned, None);
+        assert!(
+            shell.view().roster().local().len() == 6,
+            "all six are this chat's workers"
+        );
+
+        // A crashed ticket that runs again shows its new session, not the crash.
+        shell.test_sessions.as_mut().unwrap().push(session(
+            2914,
+            Some(amp_core::supervisor::WorkerPhase::Running),
+            None,
+            None,
+        ));
+        shell.handle_event(&tool_end(amp_core::policy::DISPATCH_TOOL));
+        assert_eq!(get_phase(&shell, 2914), Phase::Running);
+    }
+
+    fn get_phase(shell: &super::Shell, task_id: i64) -> Phase {
+        roster_entry(shell, task_id).expect("listed").phase
     }
 }
