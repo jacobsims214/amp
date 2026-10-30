@@ -1422,7 +1422,7 @@ sequenceDiagram
   participant H as Harness
   B->>R: POST commands {op: stop, body: {}}
   R->>H: event: command
-  H->>H: verify, harness.abort() (manager + workers), clear the queue
+  H->>H: verify, abort the manager reply (launched workers keep running, AMP #2858), clear the queue
   H->>R: events [ack done, chat_event queue{items: []}, notice "Stopped.", run_end aborted, status busy=false]
   R-->>B: event: envelope ...
   Note over B,H: A local Esc / /abort sends the same events, so every viewer sees the stop.
