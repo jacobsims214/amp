@@ -340,7 +340,8 @@ async fn the_chat_follows_an_amp_json_the_manager_writes() {
     );
     // The header names the project (the poller fetched it), and so does the banner.
     let top: String = screen[..4].join("\n");
-    assert!(top.contains("· AMP v2 #2"), "{}", shown(&screen));
+    // (#2882: the project leads the Conversation box's top edge, after the brand bands.)
+    assert!(top.contains("▀▀ AMP v2 #2"), "{}", shown(&screen));
     assert!(
         top.contains("project #2 AMP v2 · http://"),
         "{}",

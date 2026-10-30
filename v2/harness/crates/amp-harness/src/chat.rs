@@ -199,6 +199,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     let mouse = load_mouse(&args)?;
     let padding = load_padding(&args)?;
     amp_tui::density::set(load_density(&args)?);
+    amp_tui::frame::set_ascii(load_ascii(&args)?);
 
     // First run (D12): ask for whatever is missing before connecting for real. In --snapshot only
     // with scripted answers (AMP_HARNESS_PROMPTS=stdin), so render checks never stop on a question.
@@ -709,6 +710,14 @@ fn load_wake_on_worker_end(args: &ChatArgs) -> Result<bool, CliError> {
     let env = |k: &str| std::env::var(k).ok();
     amp_core::approval_wait::resolve_wake_on_worker_end(&env, config_text(args).as_deref())
         .map_err(CliError::usage)
+}
+
+/// Box glyphs in ASCII (#2882): `AMP_HARNESS_ASCII`, then config.toml `[tui] ascii`, else by
+/// the terminal (`TERM=dumb`, a locale that isn't UTF-8).
+fn load_ascii(args: &ChatArgs) -> Result<bool, CliError> {
+    let env = |k: &str| std::env::var(k).ok();
+    amp_tui::theme::select::resolve_ascii(&env, config_text(args).as_deref())
+        .map_err(|e| CliError::usage(e.to_string()))
 }
 
 /// How tightly the chat is laid out (#2346): `AMP_HARNESS_DENSITY`, then config.toml `[tui]

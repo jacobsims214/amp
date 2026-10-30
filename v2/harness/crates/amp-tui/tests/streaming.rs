@@ -90,7 +90,12 @@ async fn a_streaming_create_tasks_shows_what_it_writes_and_how_many() {
             seen.push(message.clone());
         }
         if started {
-            assert_eq!(message, "Working…", "back to Working… once the call runs");
+            // (#2882: the Message box's title says who is replying instead of "Working…".)
+            assert_eq!(
+                message,
+                amp_tui::view::REPLYING,
+                "back to the plain reply once the call runs"
+            );
             break;
         }
     }

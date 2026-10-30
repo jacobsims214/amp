@@ -215,7 +215,13 @@ async fn remote_prompt_text_is_sanitized_on_screen_only() {
         .drive_until_idle(&mut events, &mut done, WAIT)
         .await
         .expect("idle");
-    let frame = shell.view().render_frame(100, 30).join("\n");
+    // #2882: rpi-tui's compositor closes any hyperlink (an empty OSC 8, `ESC ] 8 ; ; BEL`) where
+    // it joins a box placed beside another (the Conversation box's edges); that one is ours.
+    let frame = shell
+        .view()
+        .render_frame(100, 30)
+        .join("\n")
+        .replace("\u{1b}]8;;\u{7}", "");
     // (The editor's cursor marker is an APC ending in BEL, so BEL itself is not checked.)
     for bad in [
         "\u{1b}]", "\u{202E}", "\u{200B}", "\u{2060}", "\u{FEFF}", "\u{2028}",

@@ -240,22 +240,44 @@ async fn chat(dir: &Path, amp: Option<&str>, inputs: &[&str], env: &[(&str, &str
     out
 }
 
+/// The screen's words on one line, without the boxes' side edges (#2882).
 fn flat(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    s.split_whitespace()
+        .filter(|w| *w != "│")
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-/// The open panel as drawn (title rule to key hint), without the chat's padding.
+/// The open panel as drawn (#2882: its box, title in the top edge to the key hint in the bottom
+/// one), without the box's margin. Rows end without the right edge, so a row's last words read
+/// as its end.
 fn panel(out: &Output) -> Vec<String> {
-    let rows = common::unpad(out.stdout.lines().map(str::to_owned).collect(), 110);
-    let Some(start) = rows.iter().position(|l| l.starts_with("── ")) else {
+    let rows: Vec<String> = out.stdout.lines().map(str::to_owned).collect();
+    // The box after the Conversation box's bottom edge.
+    let Some(start) = rows
+        .iter()
+        .enumerate()
+        .skip_while(|(_, l)| !l.trim_start().starts_with('└'))
+        .find(|(_, l)| l.trim_start().starts_with("┌─ "))
+        .map(|(i, _)| i)
+    else {
         panic!("no panel open:\n{}", out.stdout);
     };
-    rows[start..]
-        .iter()
-        .take_while(|l| !l.contains("/ for commands"))
-        .map(|l| l.trim_end().to_owned())
-        .take_while(|l| !l.chars().all(|c| c == '─') || l.is_empty())
-        .collect()
+    let margin = rows[start].len() - rows[start].trim_start().len();
+    let mut out = Vec::new();
+    for l in &rows[start..] {
+        let l = l.get(margin..).unwrap_or("").trim_end();
+        let l = match l.strip_prefix('│') {
+            Some(_) => l.strip_suffix('│').unwrap_or(l).trim_end().to_owned(),
+            None => l.to_owned(),
+        };
+        let last = l.starts_with('└');
+        out.push(l);
+        if last {
+            break;
+        }
+    }
+    out
 }
 
 fn snapshot(name: &str, rows: &[String]) {
@@ -280,7 +302,7 @@ fn snapshot(name: &str, rows: &[String]) {
 fn row<'a>(rows: &'a [String], start: &str) -> &'a str {
     rows.iter()
         .map(String::as_str)
-        .find(|r| r.trim_start_matches(['›', ' ']).starts_with(start))
+        .find(|r| r.trim_start_matches(['│', '›', ' ']).starts_with(start))
         .unwrap_or_else(|| panic!("no row {start:?}:\n{}", rows.join("\n")))
 }
 
@@ -535,7 +557,7 @@ async fn mcp_add_details_test_and_restart() {
     assert!(web.contains(&http.url), "{config}");
 
     let rows = panel(&out);
-    assert!(rows[0].starts_with("── MCP · web"), "{rows:#?}");
+    assert!(rows[0].starts_with("┌─ MCP · web"), "{rows:#?}");
     assert!(row(&rows, "● web").contains("ready · 2 tools"), "{rows:#?}");
     assert!(row(&rows, "type").contains("http"), "{rows:#?}");
     assert!(row(&rows, "url").contains(&http.url), "{rows:#?}");
@@ -548,7 +570,11 @@ async fn mcp_add_details_test_and_restart() {
         row(&rows, "process").contains("server panels-http 1.0.0"),
         "{rows:#?}"
     );
-    assert!(rows.iter().any(|r| r.trim() == "echo, ping"), "{rows:#?}");
+    assert!(
+        rows.iter()
+            .any(|r| r.trim_start_matches('│').trim() == "echo, ping"),
+        "{rows:#?}"
+    );
 }
 
 /// `/model roles` lists every role's model and source; `/model <role> <p/m>` sets it for this
@@ -685,13 +711,13 @@ async fn agents_and_skills() {
 
     let out = chat(&dir, None, &["/agents", "key:down"], &[]).await;
     assert!(
-        panel(&out).iter().any(|r| r.starts_with("›")),
+        panel(&out).iter().any(|r| r.starts_with("│ ›")),
         "selection moves"
     );
     let out = chat(&dir, None, &["/agents worker-backend"], &[]).await;
     let rows = panel(&out);
     assert!(
-        rows[0].starts_with("── agent · worker-backend"),
+        rows[0].starts_with("┌─ agent · worker-backend"),
         "{rows:#?}"
     );
     assert!(row(&rows, "mode").contains("subagent"), "{rows:#?}");
@@ -723,7 +749,7 @@ async fn agents_and_skills() {
     );
     let out = chat(&dir, None, &["/skills amp-execution"], &[]).await;
     let rows = panel(&out);
-    assert!(rows[0].starts_with("── skill · amp-execution"), "{rows:#?}");
+    assert!(rows[0].starts_with("┌─ skill · amp-execution"), "{rows:#?}");
     assert!(
         row(&rows, "preloaded").contains("worker-backend"),
         "{rows:#?}"

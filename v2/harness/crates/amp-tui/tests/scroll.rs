@@ -93,7 +93,15 @@ impl Rig {
     fn shown(&self) -> Vec<usize> {
         self.screen()
             .lines()
-            .filter_map(|l| l.trim().strip_prefix("line ")?.parse().ok())
+            // (#2882: inside the Conversation box's side edges.)
+            .filter_map(|l| {
+                l.trim()
+                    .trim_matches('│')
+                    .trim()
+                    .strip_prefix("line ")?
+                    .parse()
+                    .ok()
+            })
             .collect()
     }
 
@@ -254,7 +262,7 @@ async fn the_new_output_pill_shows_only_while_scrolled_up_with_output_below() {
         .unwrap();
     let editor_top = screen
         .lines()
-        .position(|l| l.trim_start().starts_with('─'))
+        .position(|l| l.trim_start().starts_with("┌─ Message"))
         .unwrap();
     assert!(row < editor_top, "{screen}");
     let styled = r.shell.view().render_frame(W, H);

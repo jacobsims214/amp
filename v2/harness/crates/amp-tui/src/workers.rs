@@ -90,7 +90,8 @@ impl Component for SessionBar {
     }
 }
 
-/// The editor's place while a session is shown: a rule, the keys (or the stop question), a rule.
+/// The editor's place while a session is shown: the keys (or the stop question), in the Message
+/// box (#2882; its edges replaced the rules above and below).
 #[derive(Debug, Default)]
 pub struct KeysBar {
     text: Mutex<(String, bool)>,
@@ -115,14 +116,11 @@ impl Component for KeysBar {
     fn render(&self, width: usize) -> Vec<String> {
         let (text, warning) = self.text.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let c = theme().colors;
-        let rule = c.border_muted.fg(&"─".repeat(width));
         let color = if warning { c.warning } else { c.dim };
-        let mut lines = vec![rule.clone()];
-        for row in crate::wrap::wrap(&text, width.max(1)) {
-            lines.push(color.fg(&row));
-        }
-        lines.push(rule);
-        lines
+        crate::wrap::wrap(&text, width.max(1))
+            .iter()
+            .map(|row| color.fg(row))
+            .collect()
     }
 
     fn invalidate(&self) {}

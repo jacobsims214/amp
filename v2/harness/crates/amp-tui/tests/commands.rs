@@ -238,8 +238,14 @@ async fn ticket_shows_and_switches_the_current_ticket() {
         .lines()
         .find(|l| l.contains("AMP      state in_progress"))
         .unwrap_or_else(|| panic!("AMP row\n{screen}"));
+    // (#2882: the row is inside the panel's box.)
     assert!(
-        amp_row.contains("· dispatched ") && amp_row.trim_end().ends_with(" ago"),
+        amp_row.contains("· dispatched ")
+            && amp_row
+                .trim_end()
+                .trim_end_matches('│')
+                .trim_end()
+                .ends_with(" ago"),
         "{amp_row}"
     );
     assert!(!amp_row.contains("2026-10-22T"), "{amp_row}");
@@ -349,51 +355,60 @@ async fn workers_lists_local_and_remote_workers() {
     let mut rig = rig(vec![], true).await;
     rig.say("/workers").await;
     let screen = rig.screen();
-    assert!(screen.contains("AMP · workers"), "{screen}");
-    // Every row leads with the palette state mark (the web word), then #id name, the
-    // assignee exactly as AMP stores it, and where it runs.
+    // #2882 (artifact #26): one box titled with the counts, one row per worker (its state mark
+    // and its chip: #id name · agent · state), and the workers elsewhere under one dim label.
     assert!(
-        screen.contains(
-            "› ■ In progress running #2105 M3-5 Inline ticket chips · amp:amp-worker-backend · local"
+        screen.contains("┌─ Workers · 1 running · 1 queued · 2 elsewhere ─"),
+        "{screen}"
+    );
+    let row = |needle: &str| -> String {
+        screen
+            .lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no row with {needle}\n{screen}"))
+            .to_owned()
+    };
+    let local = row("#2105");
+    assert!(
+        local.contains(
+            "│ › ▸ #2105 M3-5 Inline ticket chips · worker-backend (claude-opus-5-5) · running "
         ),
         "{screen}"
     );
     assert!(
-        screen.contains("    claude-opus-5-5 · "),
-        "the run's detail below it\n{screen}"
-    );
-    assert!(
-        screen.contains("□ Ready queued #2111 · amp:amp-worker-backend · local"),
+        row("#2111").contains("│   □ #2111 · worker-backend (claude-opus-5-5) · queued "),
         "{screen}"
     );
+    let label = screen
+        .lines()
+        .position(|l| l.trim_start().starts_with("│   elsewhere "))
+        .expect(&screen);
+    let lines: Vec<&str> = screen.lines().collect();
     assert!(
-        screen.contains(
-            "■ In progress #2104 M3-2 AMP metadata poller · amp:amp-worker-backend · elsewhere"
-        ),
+        lines[label + 1]
+            .contains("│   ■ #2104 M3-2 AMP metadata poller · worker-backend · in progress"),
         "{screen}"
     );
-    assert!(screen.contains("■ In progress #2106"), "{screen}");
+    assert!(lines[label + 2].contains("■ #2106"), "{screen}");
     assert!(
         screen.lines().filter(|l| l.contains("#2105")).count() == 1,
         "a local worker is not listed twice\n{screen}"
     );
     assert!(
-        !screen.contains(" worker-backend"),
-        "assignee unmodified\n{screen}"
+        !screen.contains("· local") && !screen.contains("· elsewhere"),
+        "where it runs is the label, not a word on every row\n{screen}"
     );
-    // The location is dim; the assignee is not.
+    assert!(
+        screen.contains(
+            "└─ ↑↓ select · Enter watch · Ctrl+X stop · Ctrl+G open in AMP · Esc close ─"
+        ),
+        "the key hint is the box's bottom edge\n{screen}"
+    );
+    // The label is dim; the agent is muted.
     let c = rpi_tui::theme().colors;
     let frame = rig.shell.view().render_frame(W, H).join("\n");
-    let local_row = frame
-        .lines()
-        .find(|l| l.contains("#2105"))
-        .unwrap_or_default();
-    assert!(local_row.contains(&c.dim.fg("· local")), "{local_row:?}");
-    assert!(frame.contains(&c.dim.fg("· elsewhere")), "{frame:?}");
-    assert!(
-        frame.contains(&c.muted.fg("amp:amp-worker-backend")),
-        "{frame:?}"
-    );
+    assert!(frame.contains(&c.dim.fg("elsewhere")), "{frame:?}");
+    assert!(frame.contains(&c.muted.fg("worker-backend")), "{frame:?}");
     // #2395: printable keys belong to the editor while /workers is open, even an empty one.
     for c in ['x', 'o', 'X', 'O', 'y', ' '] {
         assert!(
@@ -688,7 +703,7 @@ async fn amp_tool_calls_are_titled_with_their_ticket() {
         rows[at + 1..]
             .iter()
             .take(6)
-            .any(|r| r.starts_with("   ✗ read README.md")),
+            .any(|r| r.starts_with(" │ ✗ read README.md")),
         "{screen}"
     );
     assert!(
@@ -727,7 +742,7 @@ async fn a_refusal_shows_waiting_for_your_approval_with_the_link() {
     let rows: Vec<&str> = screen.lines().collect();
     let call = rows
         .iter()
-        .position(|r| r.starts_with("   ✗ dispatch_task"))
+        .position(|r| r.starts_with(" │ ✗ dispatch_task"))
         .expect(&screen);
     let notice = rows
         .iter()

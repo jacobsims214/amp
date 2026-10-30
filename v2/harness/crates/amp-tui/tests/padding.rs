@@ -143,7 +143,10 @@ impl Rig {
     }
 }
 
-/// Every row leaves `pad` blank columns on the left and right of a `width`-column screen.
+/// Every row leaves `pad` blank columns on the left and right of a `width`-column screen. A
+/// box's row (#2882) leaves one column less: its edge takes the padding's inner column, so the
+/// text inside it (after the edge and one column of padding) starts a column further in than
+/// the padding alone put it.
 fn assert_padded(rows: &[String], width: usize, pad: usize) {
     for row in rows {
         let cells = visible_width(row);
@@ -152,12 +155,20 @@ fn assert_padded(rows: &[String], width: usize, pad: usize) {
             continue;
         }
         let lead = row.len() - row.trim_start_matches(' ').len();
-        assert!(lead >= pad, "touches the left edge: {row:?}");
+        let boxed = row.trim_start().starts_with(['┌', '│', '└']);
+        let side = if boxed { pad.saturating_sub(1) } else { pad };
+        assert!(lead >= side, "touches the left edge: {row:?}");
         let used = visible_width(row.trim_end());
         assert!(
-            used <= width - pad,
+            used <= width - side,
             "touches the right edge ({used}): {row:?}"
         );
+        if boxed {
+            assert_eq!(
+                lead, side,
+                "a box sits one column inside the padding: {row:?}"
+            );
+        }
     }
 }
 
@@ -271,8 +282,8 @@ async fn every_area_is_padded_at_80_and_127_columns() {
     }
 }
 
-/// #2344: padding on all four sides at 120x40 and 80x24: 2 columns left and right at 120, 1 at
-/// 80, and a blank row at the top and the bottom of both.
+/// #2344: padding on the sides at 120x40 and 80x24: 2 columns left and right at 120, 1 at 80,
+/// and a blank row at the top of both (#2882: none at the bottom; the boxes separate the screen).
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_side_is_padded_at_120x40_and_80x24() {
@@ -283,18 +294,14 @@ async fn every_side_is_padded_at_120x40_and_80x24() {
         let rows = rig.rows_at(width, height);
         assert_eq!(rig.shell.view().vertical_padding(), VERTICAL);
         assert_eq!(rows[0].trim(), "", "a blank top row at {width}x{height}");
-        assert_eq!(
-            rows[height - 1].trim(),
-            "",
-            "a blank bottom row at {width}x{height}"
-        );
-        // The header is right under the top row, the footer right over the bottom one.
+        // The header (the Conversation box's top edge, #2882) is right under the top row, the
+        // footer is the last row.
         assert!(rows[1].contains("ada@example.com"), "{rows:#?}");
-        assert!(rows[height - 2].contains("thinking off"), "{rows:#?}");
+        assert!(rows[height - 1].contains("thinking off"), "{rows:#?}");
         assert_padded(&rows, width, side);
         let left = |row: &str| row.len() - row.trim_start_matches(' ').len();
-        assert_eq!(left(&rows[1]), side, "{rows:#?}");
-        assert_eq!(left(&rows[height - 2]), side, "{rows:#?}");
+        assert_eq!(left(&rows[1]), side - 1, "{rows:#?}");
+        assert_eq!(left(&rows[height - 1]), side, "{rows:#?}");
         check_snapshot(
             &format!("padding-{width}x{height}"),
             &full_snapshot_text(&rows, width),
@@ -344,8 +351,9 @@ async fn the_padding_setting_moves_every_area() {
                 .map(|r| r.len() - r.trim_start_matches(' ').len())
                 .unwrap_or_else(|| panic!("{needle}: {rows:#?}"))
         };
-        // The header and the footer start right at the padding.
-        assert_eq!(left("ada@example.com"), pad, "{rows:#?}");
+        // The footer starts right at the padding; the header is the Conversation box's top edge,
+        // one column further out (#2882).
+        assert_eq!(left("ada@example.com"), pad.saturating_sub(1), "{rows:#?}");
         assert_eq!(left("/work/amp"), pad, "{rows:#?}");
     }
 }

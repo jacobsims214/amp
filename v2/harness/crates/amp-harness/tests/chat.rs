@@ -88,7 +88,8 @@ async fn the_chat_talks_to_the_manager() {
     assert!(screen.contains("faux/faux-1 • thinking"), "{screen}");
     // #2186: the banner names the session by its short id, on a row of its own; /usage names
     // the file, and the context the footer's `ctx N%` stands for.
-    assert!(screen.contains("\n   session "), "{screen}");
+    // (#2882: inside the Conversation box.)
+    assert!(screen.contains("\n │ session "), "{screen}");
     assert!(screen.contains(" (/usage for path)"), "{screen}");
     assert!(
         screen.contains("session: ~/.local/state/amp-harness/sessions/"),
@@ -117,10 +118,10 @@ async fn the_chat_talks_to_the_manager() {
     assert_eq!(amp.mock.calls_to("amp_whoami"), vec![json!({})]);
 
     // The footer, one row at 220 columns (compact, #2346): cwd • role … `ctx N%` · model •
-    // thinking; then the blank bottom row (#2344).
-    assert!(lines[58].contains("• manager"), "{}", lines[58]);
-    assert!(lines[58].contains("faux-1 • "), "{}", lines[58]);
-    assert_eq!(lines[59].trim(), "", "{screen}");
+    // thinking; the last row (#2882: no blank bottom row since the boxes).
+    assert!(lines[59].contains("• manager"), "{}", lines[59]);
+    assert!(lines[59].contains("faux-1 • "), "{}", lines[59]);
+    assert!(lines[58].trim_start().starts_with('└'), "{screen}");
 
     // The session was written to the JSONL state dir, like run -p.
     let sessions = dir.join("home/.local/state/amp-harness/sessions/amp-manager");
@@ -162,12 +163,12 @@ async fn model_switches_and_quit_in_the_chat() {
     );
     let screen = &out.stdout;
     // #2188: /model is a picker; ↓ Enter picks faux-2, and the panel closes.
-    assert!(!screen.contains("── model"), "{screen}");
+    assert!(!screen.contains("┌─ model"), "{screen}");
     assert!(screen.contains("model: faux/faux-2"), "{screen}");
     assert!(screen.contains("session in memory"), "{screen}");
     assert!(!screen.contains("never sent"), "{screen}");
-    // The footer's last row is above the blank bottom row (#2344).
-    let last = screen.lines().rev().nth(1).unwrap();
+    // The footer's row is the last (#2882: no blank bottom row since the boxes).
+    let last = screen.lines().next_back().unwrap();
     assert!(last.contains("faux-2 • "), "{last}");
 }
 
@@ -296,9 +297,11 @@ async fn amp_commands_with_the_metadata_poller() {
         // /open names the ticket's board drawer (no browser from a snapshot).
         "/open http://127.0.0.1:",
         "/project/2/board?task=2085: --snapshot does not open a browser",
-        // /workers: the board's in-progress ticket, run elsewhere.
-        "AMP · workers",
-        "■ In progress #2085 M1-4 CLI · amp:amp-worker-backend · elsewhere",
+        // /workers (#2882): one box, the board's in-progress ticket under "elsewhere", one row.
+        "┌─ Workers · 1 elsewhere ─",
+        "│   elsewhere ",
+        "■ #2085 M1-4 CLI · AMP Harness › M1 CLI · worker-backend · in progress",
+        "└─ ↑↓ select · Enter watch",
     ] {
         assert!(screen.contains(want), "missing {want:?} in\n{screen}");
     }
@@ -354,7 +357,8 @@ async fn open_uses_the_web_url_setting() {
         "missing {want:?} in\n{}",
         out.stdout
     );
-    assert!(out.stdout.contains("localhost:5173 · "), "{}", out.stdout);
+    // (#2882: the host is the last of the header's left side, in the Conversation box's edge.)
+    assert!(out.stdout.contains("· localhost:5173 ─"), "{}", out.stdout);
 
     // A web URL that is not http(s) is a settings error, before anything connects.
     let out = run(

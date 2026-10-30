@@ -359,21 +359,25 @@ fn no_ticket_hides_line_two_and_no_source_hides_everything() {
             .any(|l| l.contains('▀') || l.contains("workers"))
     );
 
-    // With one, the header is on top and the status line sits between the editor and the
-    // footer (#2186: with no cwd, model or usage set, the footer has no rows).
+    // With one, the header is on top (the Conversation box's top edge, #2882, with the
+    // ticket's line inside it) and the status line sits between the Message box and the footer
+    // (#2186: with no cwd, model or usage set, the footer has no rows). The boxed chat's status
+    // line has no `workers 0`: the Workers box shows them while they run.
     view.chrome().set_snapshot(sample::meta(true));
     let screen = view.render_plain(160, 20);
     assert!(
         screen[0]
             .trim_start()
-            .starts_with("▀▀▀▀▀▀▀▀ amp.simstech.cloud")
+            .starts_with("┌─ ▀▀▀▀▀▀▀▀ AMP #2 · simstech · ada@example.com · amp.simstech.cloud"),
+        "{screen:#?}"
     );
-    assert!(screen[1].trim_start().starts_with("■ In progress #2106"));
-    assert!(screen[18].trim_start().starts_with("────"), "{screen:#?}");
+    assert!(screen[1].trim_start().starts_with("│ ■ In progress #2106"));
+    assert!(screen[18].trim_start().starts_with("└────"), "{screen:#?}");
     assert!(
         screen[19]
             .trim_start()
-            .starts_with("■  2 QUESTIONS  │ workers 0 │"),
+            .starts_with("■  2 QUESTIONS  │ plan:")
+            && !screen[19].contains("workers"),
         "{screen:#?}"
     );
 }

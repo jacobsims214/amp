@@ -616,7 +616,10 @@ impl TicketMarker {
 }
 
 impl Component for TicketMarker {
-    fn render(&self, width: usize) -> Vec<String> {
+    fn render(&self, full: usize) -> Vec<String> {
+        // One column clear on each side, as the transcript's text has (#2882: the rule would
+        // otherwise run into the Conversation box's edges).
+        let width = full.saturating_sub(2);
         let c = rpi_tui::theme().colors;
         let p = palette();
         let rule = rpi_tui::theme().border_style.chars().horizontal;
@@ -659,7 +662,7 @@ impl Component for TicketMarker {
             line.push(' ');
             line.push_str(&c.border_muted.fg(&rule.repeat(width - used - 1)));
         }
-        vec![String::new(), line]
+        vec![String::new(), format!(" {line}")]
     }
 
     fn invalidate(&self) {}

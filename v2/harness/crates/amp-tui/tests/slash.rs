@@ -256,6 +256,13 @@ async fn the_empty_editor_shows_the_placeholder() {
     assert!(editor_row(&rig).is_some(), "{}", rig.screen());
 }
 
+/// `rows` with the boxes' side edges as blanks (#2882).
+fn unboxed(rows: &[String]) -> Vec<String> {
+    rows.iter()
+        .map(|l| l.replace('│', " ").trim_end().to_owned())
+        .collect()
+}
+
 /// The theme is process-global; /help's render test takes it alone.
 static LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -264,8 +271,9 @@ async fn help_is_grouped_with_descriptions_and_fits_80_columns() {
     let _lock = LOCK.lock().await;
     let mut rig = rig().await;
     rig.shell.submit("/help").await;
-    // Tall enough for the whole list.
-    let screen = rig.shell.view().render_plain(W, 80).join("\n");
+    // Tall enough for the whole list; the Conversation box's side edges (#2882) as blanks, so
+    // the rows read as they did inside the padding alone.
+    let screen = unboxed(&rig.shell.view().render_plain(W, 80)).join("\n");
     for heading in ["AMP", "Config", "Chat", "Keys"] {
         assert!(
             screen.lines().any(|l| l.trim() == heading),
@@ -369,7 +377,7 @@ async fn help_keys_follow_mouse_capture() {
     let mut rig = rig().await;
     rig.shell.set_mouse_capture(false);
     rig.shell.submit("/help").await;
-    let screen = rig.shell.view().render_plain(W, 80);
+    let screen = unboxed(&rig.shell.view().render_plain(W, 80));
     assert!(
         screen.iter().any(|l| {
             let l = l.trim();

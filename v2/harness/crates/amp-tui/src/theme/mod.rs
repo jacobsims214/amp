@@ -185,6 +185,8 @@ pub struct AmpPalette {
     pub epic: Vec<Color>,
     /// The four brand bands (header only; they never mean a state).
     pub bands: Vec<Color>,
+    /// No colour (`NO_COLOR`, #2882): the question chip is drawn in reverse video.
+    pub mono: bool,
 }
 
 impl AmpPalette {
@@ -213,6 +215,11 @@ impl AmpPalette {
     pub fn state_mark(&self, status: Status) -> String {
         let s = self.state(status);
         match s.chip {
+            Some(_) if self.mono => format!(
+                "{} {}",
+                s.glyph,
+                reverse(&format!(" {} ", s.label.to_uppercase()))
+            ),
             Some((fg, bg)) => format!(
                 "{} {}",
                 s.mark.fg(&s.glyph),
@@ -331,6 +338,7 @@ impl AmpTheme {
             done: plain(Status::Done.label(), "done")?,
             epic: list("amp.epic", &amp.epic, &amp.epic256, depth)?,
             bands: list("amp.bands", &amp.bands, &amp.bands256, depth)?,
+            mono: depth == ColorDepth::NoColor,
         };
 
         Ok(Self {
@@ -425,6 +433,7 @@ fn resolve(depth: ColorDepth, hex: &str, v256: Option<&Value256>) -> Result<Colo
         }
     };
     Ok(match (depth, rgb) {
+        (ColorDepth::NoColor, _) => Color::Default,
         (ColorDepth::TrueColor, Some((r, g, b))) => Color::Rgb(r, g, b),
         (ColorDepth::TrueColor, None) => Color::Default,
         (ColorDepth::Ansi256, rgb) => fallback.unwrap_or_else(|| match rgb {
@@ -453,6 +462,11 @@ pub fn install(theme: &AmpTheme) {
     if let Ok(mut c) = current.write() {
         *c = Some((theme.name.clone(), theme.depth));
     }
+}
+
+/// `text` in reverse video (the question chip without colour, #2882).
+pub fn reverse(text: &str) -> String {
+    format!("\x1b[7m{text}\x1b[27m")
 }
 
 /// The current AMP palette: the installed theme's, else `amp-dark` in 256 colours (safe in any

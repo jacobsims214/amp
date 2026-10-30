@@ -61,6 +61,7 @@ pub mod chrome;
 pub mod clipboard;
 pub mod density;
 pub mod footer;
+pub mod frame;
 pub mod history;
 pub mod inset;
 pub mod newline;
