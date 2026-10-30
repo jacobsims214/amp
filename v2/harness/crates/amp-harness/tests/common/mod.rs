@@ -571,6 +571,27 @@ pub fn flat(screen: &str) -> String {
         .join(" ")
 }
 
+/// A command that runs the amp-harness binary with the pty on its stdin as its controlling
+/// terminal (#2906). Give it the pty slave as stdin before spawning. Without this the child
+/// keeps the test runner's controlling terminal, and amp-harness reads that terminal for its
+/// size (crossterm `window_size()` opens `/dev/tty`) and for the OSC 11 background query
+/// (amp-tui `theme/select.rs`). Under `script -q /dev/null` (a 0x0 tty) it draws nothing to the
+/// test's pty. A new session plus `TIOCSCTTY` on stdin make `/dev/tty` the test's pty. This
+/// crate forbids `unsafe` (`Command::pre_exec`), so python3 does that and then execs the binary,
+/// keeping the same pid, like `setup_ctrl_c.rs`. Add the binary's arguments with `.args`.
+pub fn pty_command() -> std::process::Command {
+    let mut cmd = std::process::Command::new("python3");
+    cmd.args([
+        "-c",
+        "import fcntl, os, sys, termios\n\
+         os.setsid()\n\
+         fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n\
+         os.execv(sys.argv[1], sys.argv[1:])",
+        env!("CARGO_BIN_EXE_amp-harness"),
+    ]);
+    cmd
+}
+
 /// Runs the binary in `dir/project` with HOME in `dir/home`, the file credential store,
 /// `AMP_MCP_URL=url` and no other AMP_* settings. `env` adds variables.
 pub async fn run(dir: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
