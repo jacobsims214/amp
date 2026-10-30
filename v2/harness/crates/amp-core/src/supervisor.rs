@@ -564,9 +564,10 @@ impl LaunchAck {
         queued: bool,
     ) -> Self {
         let message = format!(
-            "Launched {agent_id} on #{task_id}: it is running in the background{}. You can carry on \
-             in this chat; its result arrives as a notice when it ends. Up to {limit} workers run \
-             at once; stop it from the /workers panel.",
+            "Launched #{task_id} ({agent_id}) in the background{}; end your turn: you'll get its \
+             result in a later turn, as a [worker summaries] entry once it ends. Don't poll \
+             amp_list_tasks to wait for it; the person can keep chatting meanwhile. Up to {limit} \
+             workers run at once; stop one from the /workers panel.",
             if queued {
                 " (every worker slot was taken, so it waits its turn)"
             } else {
@@ -1379,9 +1380,10 @@ impl Supervisor {
             // AMP #2834: the chat. The call returns at once and the worker runs on, so the
             // manager can keep talking while up to `max_parallel` workers run.
             DispatchMode::Launch => (
-                "Start a specialist agent on one AMP ticket in the background: it runs while you \
-                 carry on with other work in this chat, and its result arrives as a notice when it \
-                 ends. Don't wait for it, and don't run the same ticket twice.",
+                "Start a specialist agent on one AMP ticket in the background. After launching a \
+                 wave, end your turn: each worker's result reaches you in a later turn, as a \
+                 [worker summaries] entry once it ends. Don't poll or wait for it, and don't run the \
+                 same ticket twice.",
                 "returns an acknowledgement at once; the worker's last message and outcome arrive \
                  when it ends",
             ),
@@ -2952,6 +2954,38 @@ mod tests {
         assert!(c.apply_toml("[workers]\nmaxparallel = 3\n").is_err());
         let bad = |k: &str| (k == ENV_MAX_WORKERS).then(|| "four".to_owned());
         assert!(c.apply_env(&bad).unwrap_err().contains(ENV_MAX_WORKERS));
+    }
+
+    /// AMP #2892: the ack tells the manager to end its turn and where the result comes back,
+    /// the same thing the manager prompt's dispatch loop says.
+    #[test]
+    fn a_launch_ack_says_to_end_the_turn_and_where_the_result_arrives() {
+        let ack = |queued| {
+            LaunchAck::new(
+                3010,
+                "amp:amp-worker-backend".into(),
+                "amp-worker-backend".into(),
+                String::new(),
+                None,
+                4,
+                queued,
+            )
+            .message
+        };
+        let m = ack(false);
+        assert!(
+            m.starts_with("Launched #3010 (amp:amp-worker-backend) in the background; end your turn: you'll get its result in a later turn, as a [worker summaries] entry once it ends."),
+            "{m}"
+        );
+        assert!(m.contains("Don't poll amp_list_tasks"), "{m}");
+        assert!(!m.contains("arrives as a notice"), "{m}");
+        let q = ack(true);
+        assert!(
+            q.contains(
+                "in the background (every worker slot was taken, so it waits its turn); end your turn"
+            ),
+            "{q}"
+        );
     }
 
     /// AMP #2834: launched dispatch is opt-in. The default is the foreground, so `run -p` and

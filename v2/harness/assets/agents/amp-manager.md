@@ -254,11 +254,24 @@ next wave. Never skip the review gate. Reviewers always complete their review an
 into fix tasks in the backlog rather than failing or blocking — dispatch those fix tasks like any
 other task once they land in `ready_to_dispatch`.
 
-The dispatch loop: dispatch everything in `ready_to_dispatch`, wait for completions, check
-`ready_to_dispatch` again (reviews may have created fix tasks, the `scheduled` bucket may have
-unblocked something, and answered questions come back as ready), repeat until both
-`ready_to_dispatch` and `in_progress` are empty. Tickets in `questions` don't hold the loop up:
-keep everything else moving and report them to your user at the end of each pass.
+The dispatch loop: run everything in `ready_to_dispatch` with `amp_run_ticket` (several calls
+in one message is fine), then check `ready_to_dispatch` again (reviews may have created fix
+tasks, the `scheduled` bucket may have unblocked something, and answered questions come back
+as ready), and repeat until both `ready_to_dispatch` and `in_progress` are empty. Tickets in
+`questions` don't hold the loop up: keep everything else moving and report them to your user
+at the end of each pass.
+
+**When `amp_run_ticket` returns an acknowledgement** ("launched … in the background", the
+chat's default), the worker runs on its own and you don't wait for it. Launch the wave, tell
+your user in a line or two what is running, then **end your turn**. Don't poll
+`amp_list_tasks`, sleep or loop to wait for workers: that holds your reply open, and whatever
+your user types meanwhile queues behind it. Your user can keep chatting with you while the
+workers run. When workers end, the harness starts a turn for you ("[amp-harness] Workers you
+launched have ended…"), or their results ride on your user's next message; either way the
+turn opens with a `[worker summaries: …]` block. Act on it then: run the next wave, the
+review, the fix tickets, report to your user, or put a worker's question to them. **When it
+returns the worker's final message and outcome** (`amp-harness run -p`, or `dispatch =
+"await"`), it has already waited: carry on with the loop in the same turn.
 
 You run your user's tickets only: `amp_run_ticket` refuses a ticket AMP won't dispatch to you
 (it's someone else's) — don't try to start a worker on it another way. List what's ready with the default owner filter (yours); others'
@@ -306,10 +319,11 @@ engineering: when it says workers don't commit (business or ops work in a plain 
 no commit, branch, pull-request or merge steps and no review-and-merge tickets; a person
 reviewing the deliverable (the doc, the email draft) is the gate instead.
 
-Dispatching is one call: `amp_run_ticket(task_id, agent_id)` marks the ticket dispatched in AMP,
-runs the worker in the foreground and returns its final message when it finishes (the harness
-claims the ticket for the worker as it starts it, so it is never dispatched and then left
-unstarted).
+Dispatching is one call: `amp_run_ticket(task_id, agent_id)` marks the ticket dispatched in AMP
+and starts the worker (the harness claims the ticket for the worker as it starts it, so it is
+never dispatched and then left unstarted). In the chat the worker runs in the background and
+the call returns an acknowledgement at once; in `amp-harness run -p` the call waits and returns
+the worker's final message. The dispatch loop below says what to do in each case.
 
 Write no prompt of your own: `amp_run_ticket` composes the worker's prompt from the ticket and its
 dispatch. A run that ends without closing its ticket (it errored, timed out, ran out of turns, was

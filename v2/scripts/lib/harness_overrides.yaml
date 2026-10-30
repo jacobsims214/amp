@@ -111,10 +111,34 @@ files:
           reviewing the deliverable (the doc, the email draft) is the gate instead.
       - paragraph: "Dispatching is two steps in the same turn"
         with: |
-          Dispatching is one call: `amp_run_ticket(task_id, agent_id)` marks the ticket dispatched in AMP,
-          runs the worker in the foreground and returns its final message when it finishes (the harness
-          claims the ticket for the worker as it starts it, so it is never dispatched and then left
-          unstarted).
+          Dispatching is one call: `amp_run_ticket(task_id, agent_id)` marks the ticket dispatched in AMP
+          and starts the worker (the harness claims the ticket for the worker as it starts it, so it is
+          never dispatched and then left unstarted). In the chat the worker runs in the background and
+          the call returns an acknowledgement at once; in `amp-harness run -p` the call waits and returns
+          the worker's final message. The dispatch loop below says what to do in each case.
+      # #2892: the chat launches workers in the background (#2837) and wakes the manager when they
+      # end (#2891), so "wait for completions" would have the model poll amp_list_tasks with its
+      # reply held open. Phrased by what amp_run_ticket returns, so run -p (Force(Await)) stays right.
+      - paragraph: "The dispatch loop: dispatch everything in `ready_to_dispatch`, wait for completions"
+        with: |
+          The dispatch loop: run everything in `ready_to_dispatch` with `amp_run_ticket` (several calls
+          in one message is fine), then check `ready_to_dispatch` again (reviews may have created fix
+          tasks, the `scheduled` bucket may have unblocked something, and answered questions come back
+          as ready), and repeat until both `ready_to_dispatch` and `in_progress` are empty. Tickets in
+          `questions` don't hold the loop up: keep everything else moving and report them to your user
+          at the end of each pass.
+
+          **When `amp_run_ticket` returns an acknowledgement** ("launched … in the background", the
+          chat's default), the worker runs on its own and you don't wait for it. Launch the wave, tell
+          your user in a line or two what is running, then **end your turn**. Don't poll
+          `amp_list_tasks`, sleep or loop to wait for workers: that holds your reply open, and whatever
+          your user types meanwhile queues behind it. Your user can keep chatting with you while the
+          workers run. When workers end, the harness starts a turn for you ("[amp-harness] Workers you
+          launched have ended…"), or their results ride on your user's next message; either way the
+          turn opens with a `[worker summaries: …]` block. Act on it then: run the next wave, the
+          review, the fix tickets, report to your user, or put a worker's question to them. **When it
+          returns the worker's final message and outcome** (`amp-harness run -p`, or `dispatch =
+          "await"`), it has already waited: carry on with the loop in the same turn.
       # The dispatch result's `next` is quoted verbatim in the source (it is the server's wording,
       # frozen in internal/mcp/next.go). The harness has one launch tool, so it names only that.
       - find: "(the launch tool of your harness: Agent/Task\n> in Claude Code, the task tool in opencode, amp_run_ticket in the AMP harness)"
@@ -243,12 +267,12 @@ files:
           amp_run_ticket(task_id=ID, agent_id=<task's assigned_to>)
           ```
       - find: "**Step 2 — launch each worker in the same message, with its returned `worker_prompt`,** as the prompt (so they run in parallel):\n```\ntask(prompt=<the worker_prompt from dispatch>, subagent_type=<task's assigned_to>)\ntask(prompt=<the worker_prompt from dispatch>, subagent_type=<task's assigned_to>)\n```"
-        replace: "`amp_run_ticket` does both steps in one call: it dispatches the ticket in AMP and starts the worker, then returns when the worker finishes."
+        replace: "`amp_run_ticket` does both steps in one call: it dispatches the ticket in AMP and starts the worker. In the chat it returns an acknowledgement at once and the worker runs in the background: end your turn, and its result opens a later turn as a `[worker summaries]` entry. In `amp-harness run -p` it returns when the worker finishes."
       - find: "The `worker_prompt` already carries the ticket ID, project ID and `dispatch_id`, and tells the\nworker to call `amp_claim_task(task_id, dispatch_id)` first and complete or block the ticket\nitself. Don't retype a prompt of your own:"
         replace: "The harness handles the claim for its worker (the ticket is started when the worker process\nstarts, not before), and the worker completes or blocks the ticket itself. Don't write a prompt of\nyour own:"
       - paragraph: "Step 1 must happen before step 2, and step 2 must happen before your turn ends."
         with: |
-          `amp_run_ticket` marks each ticket dispatched in AMP before it starts the worker (this is what shows live progress on the board), and returns when the worker finishes. A dispatch the harness doesn't follow with a worker is returned to ready by AMP's watchdog (flagged at 10 minutes, returned at 30), and the harness releases the tickets it dispatched whose worker didn't run when it starts.
+          `amp_run_ticket` marks each ticket dispatched in AMP before it starts the worker (this is what shows live progress on the board). In the chat it returns at once and the worker's result arrives in a later turn; in `amp-harness run -p` it returns when the worker finishes. A dispatch the harness doesn't follow with a worker is returned to ready by AMP's watchdog (flagged at 10 minutes, returned at 30), and the harness releases the tickets it dispatched whose worker didn't run when it starts.
       - find: "- `not_started` — dispatched, nobody claimed it yet; launch its worker now (its `worker_prompt` is\n  in `amp_get_task`'s `dispatch_id`/`next`) or undo the dispatch at once."
         replace: "- `not_started` — dispatched, its worker never settled into the run; run it now with\n  `amp_run_ticket`, or undo the dispatch at once."
       - find: "| `not_started` in `amp_list_tasks` (dispatched, no worker claimed it) | nobody ever launched the worker, or it died before its first call | launch the worker now with its `worker_prompt`; if you won't, `amp_set_task_state(task_id, state=\"backlog\", reason=\"not started\")` |"

@@ -247,6 +247,17 @@ sets the timeout to `0` (`amp_update_project_settings(project_id, not_started_fl
 not_started_return_minutes=…)`), and then a silent dispatch stays in progress until someone acts,
 as before.
 
+**In the AMP harness this half is automatic.** `amp_run_ticket` starts the ticket for its worker
+(`amp_claim_task` with the dispatch result's `dispatch_id`), and when a worker ends without
+closing its ticket — it errored, timed out, used up its turn budget, stopped, or you stopped it —
+the harness reports the abandoned run and hands the ticket back itself, then says so in that
+call's result (its `returned` field and a note naming the ticket, the agent and the next step). So a
+ticket that comes back under `returned` while you are working is one whose worker did not finish:
+read `returned_reason`, and re-dispatch it (saying so to your user) or ask them. On startup the chat
+also releases tickets a previous, dead harness process left in progress, and tells the person at the
+chat. You never need to `amp_set_task_state(backlog)` a ticket your own `amp_run_ticket` just failed
+on.
+
 Run at most 4 workers at once, and start the next as one finishes. Wide fan-outs (10+ workers in
 one turn) are where sessions hang, and when they do every ticket in flight is orphaned at once.
 In a shared checkout, give each parallel worker its own `git worktree` so their branches don't
