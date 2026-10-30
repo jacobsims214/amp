@@ -95,6 +95,7 @@ pass_to_bash = []         # provider keys and AMP_TOKEN are hidden from agents' 
 
 [manager]
 auto_resume_on_approval = true   # resume the manager once a person approves its plan in AMP (AMP_HARNESS_AUTO_RESUME); harness/running-work.md
+wake_on_worker_end = true        # start the manager's next turn when a launched worker ends while the chat is idle (AMP_HARNESS_WAKE_ON_WORKER_END); harness/running-work.md
 
 [tui]
 theme = "auto"            # auto | dark | light | a theme .json file (--theme, AMP_HARNESS_THEME)

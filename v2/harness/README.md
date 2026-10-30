@@ -1368,6 +1368,20 @@ Esc or `/stop` (which also stops a running reply) stops waiting, and so does typ
 Turn it off with `[manager] auto_resume_on_approval = false` (or `AMP_HARNESS_AUTO_RESUME=false`);
 the chat then waits for your reply. Code: `amp-core/src/approval_wait.rs`.
 
+**The manager carries on when its workers end (#2891).** The chat launches workers in the
+background, so the manager's turn ends once they are running. When a worker ends and the chat is
+idle (no reply running, no prompt queued here or on a paired device, no `/server` switch, not
+quitting), the chat starts the manager's next turn itself, marked `↻ … ended while the chat was
+idle: the manager carries on by itself (an automatic turn, not a prompt from you; …)`. The prompt is
+`amp_tui::WAKE_PROMPT`, and the worker summaries are prepended as for any turn, so each end still
+reaches exactly one turn. Ends within `WAKE_SETTLE` (0.5 s) of each other give one turn. The loop
+guard allows at most `WAKE_LIMIT` (5) automatic turns within `WAKE_WINDOW` (10 minutes) with no
+prompt from the person. The next one trips it: a warning, and no more automatic turns until the
+person's next prompt, which carries the waiting ends and resets the guard. Turn it off with
+`[manager] wake_on_worker_end = false` (or `AMP_HARNESS_WAKE_ON_WORKER_END=false`). Await dispatch
+has no launched ends, so the setting changes nothing there. Code: `Shell::wake_on_worker_end` in
+`amp-tui/src/shell.rs`.
+
 The manager's tool policy adds (all roles for the first two):
 
 - `amp_approve_plan` is always denied, with a visible error pointing at `amp_check_plan`'s

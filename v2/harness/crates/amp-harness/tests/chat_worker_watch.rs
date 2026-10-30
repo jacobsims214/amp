@@ -808,8 +808,9 @@ async fn typing_with_the_workers_panel_open_goes_to_the_editor() {
 /// AMP #2837 end to end, on a real pty with the chat's default settings (no `[workers] dispatch`):
 /// the manager dispatches a ticket and its turn ends at once with the worker still running; the
 /// editor takes a new prompt, which the manager answers while the worker runs; the worker's end
-/// shows as a notice; and the turn after it receives the worker's summary at its top (the faux
-/// manager echoes what that turn was sent).
+/// shows as a notice; and, with nobody typing, the chat starts the manager's next turn by itself
+/// (AMP #2891), which receives the worker's summary at its top (the faux manager echoes what that
+/// turn was sent). The person's next prompt then goes without it: each end reaches one turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_chat_launches_workers_and_takes_prompts_while_they_run() {
     let amp = spawn(MockAmp::new(), None).await;
@@ -828,7 +829,8 @@ async fn the_chat_launches_workers_and_takes_prompts_while_they_run() {
             {"tool_calls": [run]},
             {"text": "Dispatched #2085; it runs in the background."},
             {"text": "Still here while the worker runs."},
-            {"text": "Next turn saw: {{last_user_message}}"}
+            {"text": "Next turn saw: {{last_user_message}}"},
+            {"text": "Then saw: {{last_user_message}}"}
         ],
         "wf": [nap, complete, {"text": "done"}]
     });
@@ -873,22 +875,41 @@ async fn the_chat_launches_workers_and_takes_prompts_while_they_run() {
         .await;
     dump("worker ended", &s);
 
-    // 4. The next turn receives the end at its top.
-    chat.send(b"what happened?\r");
+    // 4. With nobody typing, the chat starts the next turn (AMP #2891), marked as automatic,
+    //    and it receives the end at its top.
     let s = chat
-        .wait("the next turn's echo", |s| {
+        .wait("the automatic turn's echo", |s| {
             s.text().contains("Next turn saw: [worker summaries")
         })
         .await;
-    dump("next turn saw the worker's end", &s);
+    dump("the automatic turn saw the worker's end", &s);
     let t = s.text();
+    assert!(
+        t.contains("a worker you launched ended while the chat was idle"),
+        "the transcript says what started the turn: {t}"
+    );
     let echo = t.find("Next turn saw:").unwrap();
     assert!(
         t[echo..].contains(&format!("#{KNOWN} completed")),
         "the summary names the ticket: {t}"
     );
-    assert!(t[echo..].contains("what happened?"), "{t}");
+    assert!(
+        t[echo..].contains("[amp-harness] Workers you launched"),
+        "{t}"
+    );
     assert_eq!(amp.mock.calls_to("amp_complete_task").len(), 1);
+
+    // 5. The person's next prompt goes as typed: the end was delivered once.
+    chat.send(b"what happened?\r");
+    let s = chat
+        .wait("the person's turn's echo", |s| {
+            s.text().contains("Then saw: ")
+        })
+        .await;
+    let t = s.text();
+    let echo = t.find("Then saw: ").unwrap();
+    assert!(t[echo..].contains("what happened?"), "{t}");
+    assert!(!t[echo..].contains("[worker summaries"), "{t}");
 
     for _ in 0..3 {
         chat.send(b"\x03");
@@ -919,7 +940,9 @@ async fn esc_in_launch_mode_stops_the_reply_and_leaves_the_worker_running() {
         "boss": [
             {"tool_calls": [run]},
             {"text": "Dispatched."},
-            {"text": long}
+            {"text": long},
+            // AMP #2891: the automatic turn once the worker ends.
+            {"text": "Carried on."}
         ],
         "wf": [nap, complete, {"text": "done"}]
     });

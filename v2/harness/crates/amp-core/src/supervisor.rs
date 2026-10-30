@@ -650,6 +650,15 @@ impl LaunchEnds {
         self.watchers.subscribe()
     }
 
+    /// How many ends are queued, without taking any (AMP #2891: the chat starts a manager turn
+    /// for them when it is idle, and that turn's [`LaunchEnds::drain`] is what delivers them).
+    pub fn pending(&self) -> usize {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
     /// Every queued end, oldest first, leaving the queue empty.
     pub fn drain(&self) -> Vec<LaunchEnd> {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1689,6 +1698,12 @@ impl Supervisor {
     /// the queue it reads.
     pub fn take_launch_ends(&self) -> Vec<LaunchEnd> {
         self.launch_ends.drain()
+    }
+
+    /// How many launched ends wait for [`Supervisor::take_launch_ends`] (AMP #2891). Looking
+    /// never consumes them: the turn that drains them is still the one place they are delivered.
+    pub fn pending_launch_ends(&self) -> usize {
+        self.launch_ends.pending()
     }
 
     /// Every launched end from now on, as it lands, without consuming it (AMP #2861): what the

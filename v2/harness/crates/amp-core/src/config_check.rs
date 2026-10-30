@@ -555,7 +555,7 @@ fn check_workers(inputs: &Inputs) -> Vec<Problem> {
     }
 }
 
-/// `[manager]` (#2425): `auto_resume_on_approval`, a boolean.
+/// `[manager]` (#2425, #2891): `auto_resume_on_approval` and `wake_on_worker_end`, booleans.
 fn check_manager(inputs: &Inputs) -> Vec<Problem> {
     let Some(text) = &inputs.user_text else {
         return Vec::new();
@@ -563,7 +563,9 @@ fn check_manager(inputs: &Inputs) -> Vec<Problem> {
     let Ok(doc) = toml::from_str::<toml::Table>(text) else {
         return Vec::new();
     };
-    match crate::approval_wait::manager_auto_resume(&doc) {
+    match crate::approval_wait::manager_auto_resume(&doc)
+        .and_then(|_| crate::approval_wait::manager_wake_on_worker_end(&doc))
+    {
         Ok(_) => Vec::new(),
         Err(e) => vec![
             Problem::error("manager", Layer::User, clean(&e))
