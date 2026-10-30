@@ -18,12 +18,12 @@ use std::{
     fs::File,
     io::{Read, Write},
     path::Path,
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use common::{MockAmp, spawn, workdir};
+use common::{MockAmp, pty_command, spawn, workdir};
 use nix::{pty::Winsize, pty::openpty};
 use serde_json::{Value, json};
 
@@ -180,7 +180,7 @@ impl Chat {
         };
         let pty = openpty(Some(&size), None).expect("openpty");
         let stdio = || Stdio::from(pty.slave.try_clone().unwrap());
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_amp-harness"));
+        let mut cmd = pty_command();
         cmd.args(["--no-session", "--no-setup"])
             .current_dir(dir.join("project"))
             .env("HOME", dir.join("home"))
