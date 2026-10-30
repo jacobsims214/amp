@@ -701,6 +701,63 @@ impl LaunchEnd {
             ),
         }
     }
+
+    /// What the manager's next turn is told about this end (AMP #2883): [`LaunchEnd::line`],
+    /// then each of the report's notes (among them run reporting's #2802 hand-back notice,
+    /// `#N was returned: ...` or `... could not be returned: ...`), then the worker's final
+    /// message (a blocked worker's question, a completed worker's summary) trimmed to
+    /// [`LAUNCH_SUMMARY_MAX_CHARS`]. In Await mode the tool result carried all of this; a launched
+    /// run has only this summary to carry it. Continuation lines are indented, so the entry stays
+    /// one `- ` item in the manager's block. The chat's display notice stays on `line()`.
+    pub fn summary(&self) -> String {
+        let mut out = self.line();
+        let Ok(report) = &self.result else {
+            return out;
+        };
+        for note in report
+            .notes
+            .iter()
+            .map(|n| n.trim())
+            .filter(|n| !n.is_empty())
+        {
+            out.push_str("\n    note: ");
+            push_indented(&mut out, note);
+        }
+        let message = report.final_message.trim();
+        if !message.is_empty() {
+            out.push_str("\n    final message: ");
+            push_indented(&mut out, &trim_chars(message, LAUNCH_SUMMARY_MAX_CHARS));
+        }
+        out
+    }
+}
+
+/// How much of a launched worker's final message the manager's next turn gets (AMP #2883): enough
+/// for a blocked worker's question or a short completion summary, not a whole report.
+pub const LAUNCH_SUMMARY_MAX_CHARS: usize = 600;
+
+/// `text` cut to `max` characters (never inside one), marked when it was cut.
+fn trim_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        None => text.to_owned(),
+        Some((at, _)) => format!(
+            "{}... [trimmed; the full message is in the worker's session]",
+            text[..at].trim_end()
+        ),
+    }
+}
+
+/// Appends `text`, indenting every line after the first so it reads as part of one list item.
+fn push_indented(out: &mut String, text: &str) {
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+            if !line.trim().is_empty() {
+                out.push_str("      ");
+            }
+        }
+        out.push_str(line.trim_end());
+    }
 }
 
 /// The supervisor's extension points; run reporting ([`crate::run_report::RunReporter`], M2-6)
@@ -2867,6 +2924,113 @@ mod tests {
         assert_eq!(
             refused.line(),
             "#12 was not dispatched to amp:amp-worker-backend: cancelled before the worker started"
+        );
+    }
+
+    /// AMP #2883: the manager's summary of a launched end carries what the foreground tool
+    /// result did: the #2802 hand-back notice (returned, or could not be), and the worker's final
+    /// message, trimmed, with every continuation line indented under its one `- ` item.
+    #[test]
+    fn a_launched_end_summary_carries_the_hand_back_and_final_message() {
+        let report = |outcome, notes: &[&str], final_message: &str| WorkerReport {
+            task_id: 12,
+            agent_id: "amp:amp-worker-backend".into(),
+            role: "amp-worker-backend".into(),
+            outcome,
+            dispatch_id: String::new(),
+            started: true,
+            returned: None,
+            final_message: final_message.into(),
+            error: None,
+            model: "wf/wf-1".into(),
+            cwd: PathBuf::from("/r"),
+            worktree: None,
+            branch: None,
+            workspace: Placement::Shared,
+            session_file: None,
+            turns: 0,
+            tool_calls: 0,
+            tool_errors: 0,
+            usage: crate::events::UsageJson::default(),
+            duration_ms: 0,
+            notes: notes.iter().map(|n| (*n).to_owned()).collect(),
+            totals: Totals::default(),
+        };
+        let end = |r| LaunchEnd {
+            task_id: 12,
+            agent_id: "amp:amp-worker-backend".into(),
+            result: Ok(r),
+        };
+
+        let returned = end(report(
+            WorkerOutcome::Stopped,
+            &[
+                "abandoned: stopped",
+                "#12 was returned: worker amp:amp-worker-backend stopped without finishing. \
+                 It's back in ready; re-dispatch it or ask your user.",
+            ],
+            "",
+        ));
+        assert_eq!(
+            returned.summary(),
+            "#12 stopped by amp:amp-worker-backend\n    note: abandoned: stopped\n    note: #12 \
+             was returned: worker amp:amp-worker-backend stopped without finishing. It's back in \
+             ready; re-dispatch it or ask your user."
+        );
+
+        let stuck = end(report(
+            WorkerOutcome::Error,
+            &["could not return #12 to ready in AMP: 503"],
+            "",
+        ));
+        assert!(
+            stuck
+                .summary()
+                .contains("\n    note: could not return #12 to ready in AMP: 503"),
+            "{}",
+            stuck.summary()
+        );
+
+        let question = end(report(
+            WorkerOutcome::Blocked,
+            &[],
+            "  Should the cache be per user?\n\n- yes: simpler\n- no: cheaper  \n",
+        ));
+        assert_eq!(
+            question.summary(),
+            "#12 blocked by amp:amp-worker-backend\n    final message: Should the cache be per \
+             user?\n\n      - yes: simpler\n      - no: cheaper"
+        );
+        assert!(
+            !question
+                .summary()
+                .lines()
+                .skip(1)
+                .any(|l| l.starts_with("- ")),
+            "continuations never read as a new item"
+        );
+
+        let long = "é".repeat(LAUNCH_SUMMARY_MAX_CHARS + 50);
+        let done = end(report(WorkerOutcome::Completed, &[], &long));
+        let summary = done.summary();
+        let kept = "é".repeat(LAUNCH_SUMMARY_MAX_CHARS);
+        assert!(
+            summary.ends_with(&format!(
+                "final message: {kept}... [trimmed; the full message is in the worker's session]"
+            )),
+            "{summary}"
+        );
+        assert!(!summary.contains(&"é".repeat(LAUNCH_SUMMARY_MAX_CHARS + 1)));
+
+        let refused = LaunchEnd {
+            task_id: 12,
+            agent_id: "amp:amp-worker-backend".into(),
+            result: Err("AMP refused the dispatch".into()),
+        };
+        assert_eq!(
+            refused.summary(),
+            refused.line(),
+            "nothing ran, nothing more to say"
         );
     }
 

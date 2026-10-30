@@ -362,19 +362,24 @@ pub trait ReloadControl: Send + Sync {
 }
 
 /// The block a manager turn opens with when workers ended since the last one (AMP #2857): one
-/// line per end, from [`amp_core::supervisor::LaunchEnd::line`]. `None` when nothing ended, so a
-/// turn with nothing to report is the prompt as typed.
+/// item per end, from [`amp_core::supervisor::LaunchEnd::summary`] (its line, then its notes —
+/// the #2802 hand-back notice among them — and the worker's trimmed final message, AMP #2883).
+/// `None` when nothing ended, so a turn with nothing to report is the prompt as typed. The header
+/// makes no claim about AMP of its own: a hand-back can fail, so each entry says where its
+/// ticket stands.
 fn worker_summaries(ends: &[amp_core::supervisor::LaunchEnd]) -> Option<String> {
     if ends.is_empty() {
         return None;
     }
     let mut block = String::from(
-        "[worker summaries: runs you launched that have ended since your last turn. Their ",
+        "[worker summaries: runs you launched that have ended since your last turn. Each entry \
+         says where its ticket stands: a worker that completed or blocked closed its own ticket, \
+         and the notes say whether any other ticket was returned to ready or could not be. Act \
+         on those notes and on any question in a final message.]",
     );
-    block.push_str("tickets are already updated in AMP; carry on from here.]");
     for end in ends {
         block.push_str("\n- ");
-        block.push_str(&end.line());
+        block.push_str(&end.summary());
     }
     Some(block)
 }
@@ -4684,6 +4689,15 @@ mod tests {
             notes: Vec::new(),
             totals: amp_core::events::Totals::default(),
         };
+        let mut failed = report(WorkerOutcome::Error, Some("the model failed"));
+        failed.returned = Some(Err("503".into()));
+        failed.notes = vec![
+            "#2855: worker amp:amp-worker-frontend failed: the model failed, and it could not be \
+             returned: 503. It may still be in progress; check the ticket."
+                .into(),
+        ];
+        let mut asked = report(WorkerOutcome::Blocked, None);
+        asked.final_message = format!("Per-user cache or shared?\n{}", "x".repeat(900));
         let ends = vec![
             LaunchEnd {
                 task_id: 2854,
@@ -4693,7 +4707,12 @@ mod tests {
             LaunchEnd {
                 task_id: 2855,
                 agent_id: "amp:amp-worker-frontend".into(),
-                result: Ok(report(WorkerOutcome::Error, Some("the model failed"))),
+                result: Ok(failed),
+            },
+            LaunchEnd {
+                task_id: 2856,
+                agent_id: "amp:amp-worker-backend".into(),
+                result: Ok(asked),
             },
         ];
 
@@ -4706,10 +4725,30 @@ mod tests {
             block.contains("#2855 error by amp:amp-worker-frontend: the model failed"),
             "{block}"
         );
-        // One line per end, under one header: the model reads where each run got to.
+        // #2883: the failed hand-back reaches the model, and the header no longer claims every
+        // ticket is already updated.
+        assert!(
+            block.contains(
+                "    note: #2855: worker amp:amp-worker-frontend failed: the model \
+                 failed, and it could not be returned: 503"
+            ),
+            "{block}"
+        );
+        assert!(!block.contains("already updated in AMP"), "{block}");
+        // A blocked worker's question arrives, trimmed.
+        assert!(
+            block.contains(
+                "#2856 blocked by amp:amp-worker-backend\n    final message: \
+                 Per-user cache or shared?"
+            ),
+            "{block}"
+        );
+        assert!(block.contains("[trimmed;"), "{block}");
+        assert!(!block.contains(&"x".repeat(700)), "{block}");
+        // One item per end, under one header: the model reads where each run got to.
         assert_eq!(
             block.lines().filter(|l| l.starts_with("- ")).count(),
-            2,
+            3,
             "{block}"
         );
     }
