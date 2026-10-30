@@ -37,9 +37,15 @@ Terminal.app over ssh, send Shift+Enter as a plain Enter, so it **sends** the me
 Up in an empty (or one-line) editor recalls the prompts you sent earlier in this chat, newest first; Down goes forward again, and Down past the
 newest gives back what you had typed. In a multi-line draft Up and Down move the cursor, and in
 the `/` menu and the panels they move the selection. Workers' prompts are not in this history.
-Esc stops the reply, and with it any worker this chat started (the transcript names them). Esc that
-closes a panel, the `/` menu or a worker's session doesn't: for 2 s the spinner line says `Esc again to
-stop the reply` (naming the live workers, e.g. `… and the worker on #222`), and only the next Esc stops it.
+Esc stops the manager's reply only. Workers it launched keep running, and the transcript says so
+(`stopping the reply; the worker on #222 keeps running (/workers to stop it)`); `/workers` or quitting
+stops them. A launch from this reply that is still waiting for a slot is cancelled instead, and never
+dispatched. With `[workers] dispatch = "await"` the workers run inside the reply, so Esc stops them too.
+Esc that closes a panel, the `/` menu or a worker's session doesn't stop the reply: for 2 s the spinner
+line says `Esc again to stop the reply`, and only the next Esc stops it. The hint names only the
+launches that Esc would cancel (e.g. `… and the worker on #222`), or in Await mode the live workers.
+A prompt you send while a reply runs is queued (`queued #1 · runs after this reply: …`, up to 5) and
+runs on its own after the reply; stopping the reply drops the queue (↑ recalls it).
 The model's thinking shows as one `▸ Thought for 12s` line: click it, or
 press Ctrl+T, to open it (Ctrl+T opens the lowest one on screen), and `/config thinking` switches
 between collapsed, full and hidden (see [configuration](configuration.md)). Ctrl+O shows tool
