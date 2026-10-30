@@ -70,7 +70,7 @@ use std::{
 use amp_core::events::{RunEvent, Totals};
 use amp_core::meta::{MetaHandle, Topics};
 use amp_core::models::thinking_name;
-use amp_core::supervisor::Supervisor;
+use amp_core::supervisor::{DispatchMode, Supervisor};
 use amp_core::tickets::Status;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rpi_agent::AgentEvent;
@@ -569,6 +569,92 @@ pub fn worker_stop_notice(tickets: &[i64]) -> String {
     }
 }
 
+/// What stopping the reply does to this chat's live workers (AMP #2858), for
+/// [`reply_stop_notice`] and the Esc hint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplyStop {
+    /// Every live worker of this chat.
+    pub live: Vec<i64>,
+    /// Launched during the reply being stopped and still waiting for a slot (not dispatched):
+    /// the reply's tool-call signal still cancels these. Launch mode only.
+    pub cancelled: Vec<i64>,
+    /// Live, not cancelled, and still waiting for a slot: they stay queued. Launch mode only.
+    pub queued: Vec<i64>,
+}
+
+/// The note when Esc, `/abort`, `/stop` or a remote Stop stops the reply (AMP #2858), or `None`
+/// when no worker of this chat is live.
+///
+/// - [`DispatchMode::Await`]: the workers run inside the reply's `amp_run_ticket` calls, so
+///   stopping the reply stops them: [`worker_stop_notice`], as before.
+/// - [`DispatchMode::Launch`]: a dispatched worker is the supervisor's and keeps running (only
+///   `/workers` or quitting stops it); a launch from this very reply that is still waiting for a
+///   slot is cancelled before AMP ever hears of it.
+pub fn reply_stop_notice(mode: DispatchMode, stop: &ReplyStop) -> Option<String> {
+    if stop.live.is_empty() {
+        return None;
+    }
+    if mode == DispatchMode::Await {
+        return Some(worker_stop_notice(&stop.live));
+    }
+    let mut parts = vec!["stopping the reply".to_owned()];
+    match stop.cancelled.as_slice() {
+        [] => {}
+        [one] => parts.push(format!(
+            "#{one} was still waiting for a slot, so its launch is cancelled and it is not \
+             dispatched"
+        )),
+        many => parts.push(format!(
+            "{} were still waiting for a slot, so their launches are cancelled and they are not \
+             dispatched",
+            hash_ids(many)
+        )),
+    }
+    let kept: Vec<i64> = stop
+        .live
+        .iter()
+        .copied()
+        .filter(|id| !stop.cancelled.contains(id))
+        .collect();
+    match kept.as_slice() {
+        [] => {}
+        [one] => {
+            let what = if stop.queued.contains(one) {
+                "stays queued for a slot"
+            } else {
+                "keeps running"
+            };
+            parts.push(format!("the worker on #{one} {what} (/workers to stop it)"));
+        }
+        many => {
+            let waiting: Vec<i64> = many
+                .iter()
+                .copied()
+                .filter(|id| stop.queued.contains(id))
+                .collect();
+            let mut line = format!(
+                "{} workers keep running on {} (/workers to stop one)",
+                many.len(),
+                hash_ids(many)
+            );
+            match waiting.as_slice() {
+                [] => {}
+                [one] => line.push_str(&format!("; #{one} is still queued for a slot")),
+                w => line.push_str(&format!("; {} are still queued for a slot", hash_ids(w))),
+            }
+            parts.push(line);
+        }
+    }
+    Some(parts.join("; "))
+}
+
+fn hash_ids(ids: &[i64]) -> String {
+    ids.iter()
+        .map(|id| format!("#{id}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// After Ctrl+D scrolled the transcript (or was held at its end), Ctrl+D on the empty editor
 /// doesn't quit until it has been left alone this long, so scrolling down with it (or holding
 /// it) stops at the latest output instead of quitting (#2185).
@@ -655,6 +741,9 @@ pub struct Shell {
     /// Copies of the supervisor's launched ends as they land (AMP #2861), shown as notices on the
     /// tick. Display only: the queue itself is drained at the next turn's start (#2857).
     launch_watch: Option<tokio::sync::broadcast::Receiver<amp_core::supervisor::LaunchEnd>>,
+    /// Tickets with a live worker when the running reply started (AMP #2858): not this reply's
+    /// launches, so stopping it leaves them alone.
+    turn_live: Vec<i64>,
     /// `/connect`'s harness side, if the caller gave one.
     connect: Option<Arc<dyn ProviderConnect>>,
     /// A key being typed for `/connect`.
@@ -784,6 +873,7 @@ impl Shell {
                 cleared_done: None,
                 supervisor: None,
                 launch_watch: None,
+                turn_live: Vec::new(),
                 connect: None,
                 secret: None,
                 server: None,
@@ -932,12 +1022,10 @@ impl Shell {
                 let _ = reply.send(started);
             }
             crate::remote::RemoteCall::Stop { reply } => {
-                // As Esc / `/abort`: the reply stops, and with it the manager's workers.
+                // As Esc / `/abort`: the reply stops; what that does to the workers depends on
+                // the dispatch mode (AMP #2858).
                 if self.running {
-                    let live = self.live_tickets();
-                    if !live.is_empty() {
-                        self.view.add_warning(&worker_stop_notice(&live));
-                    }
+                    self.warn_reply_stop();
                     self.view.set_stopping(true);
                     self.clear_esc_hint();
                     let harness = Arc::clone(&self.harness);
@@ -1877,6 +1965,52 @@ impl Shell {
         });
     }
 
+    /// The supervisor's dispatch mode ([`DispatchMode::Await`] without one).
+    pub fn dispatch_mode(&self) -> DispatchMode {
+        self.supervisor
+            .as_ref()
+            .map_or(DispatchMode::Await, |s| s.config().dispatch)
+    }
+
+    /// What stopping the running reply would do to this chat's workers now (AMP #2858). In
+    /// Launch mode a worker is cancelled only when this reply launched it (it wasn't live when
+    /// the turn started, so its tool-call signal is this reply's) and it is still waiting for a
+    /// slot (queued, and AMP has no dispatch for it).
+    pub fn reply_stop(&self) -> ReplyStop {
+        let Some(sup) = self.supervisor.as_ref() else {
+            return ReplyStop::default();
+        };
+        let workers = sup.workers();
+        let live = workers.iter().map(|w| w.task_id).collect();
+        if sup.config().dispatch == DispatchMode::Await {
+            return ReplyStop {
+                live,
+                ..ReplyStop::default()
+            };
+        }
+        let dispatched = sup.unfinished();
+        let waiting = |w: &&amp_core::supervisor::WorkerStatus| {
+            w.phase == amp_core::supervisor::WorkerPhase::Queued && !dispatched.contains(&w.task_id)
+        };
+        let (cancelled, queued) = workers
+            .iter()
+            .filter(waiting)
+            .map(|w| w.task_id)
+            .partition(|id| !self.turn_live.contains(id));
+        ReplyStop {
+            live,
+            cancelled,
+            queued,
+        }
+    }
+
+    /// Warns what stopping the reply does to this chat's workers, if any are live (AMP #2858).
+    fn warn_reply_stop(&mut self) {
+        if let Some(note) = reply_stop_notice(self.dispatch_mode(), &self.reply_stop()) {
+            self.view.add_warning(&note);
+        }
+    }
+
     /// Tickets with a live (queued, running or reporting) worker.
     pub fn live_tickets(&self) -> Vec<i64> {
         self.supervisor
@@ -2435,6 +2569,9 @@ impl Shell {
         self.turn_plan = false;
         self.turn_refusals.clear();
         self.running = true;
+        // AMP #2858: workers already live now were not launched by this reply, so stopping it
+        // can't cancel them.
+        self.turn_live = self.live_tickets();
         self.prompts += 1;
         // R-M16: the model sees where a remote turn came from; the feed shows the plain text.
         let model_text = match &origin {
@@ -2494,13 +2631,14 @@ impl Shell {
 
     /// Asks the running prompt to stop; it then finishes as aborted, and the transcript says
     /// "Stopped." once, below whatever the reply had streamed ([`Shell::finish_run`]).
+    ///
+    /// It stops only the reply: it never calls [`Supervisor::cancel_all`] (AMP #2858). In Await
+    /// mode the reply's `amp_run_ticket` calls end, and their workers with them; in Launch mode
+    /// dispatched workers keep running and only this reply's still-queued launches end
+    /// ([`reply_stop_notice`] says which). `/workers` stops one worker; quitting stops them all.
     pub async fn abort(&mut self) {
         if self.running {
-            let live = self.live_tickets();
-            if !live.is_empty() {
-                // Stopping the reply cancels the manager's amp_run_ticket, and so its workers.
-                self.view.add_warning(&worker_stop_notice(&live));
-            }
+            self.warn_reply_stop();
         }
         self.abort_quietly().await;
     }
@@ -2759,8 +2897,13 @@ impl Shell {
 
     fn show_esc_hint(&mut self) {
         self.esc_hint_until = Some(Instant::now() + ESC_HINT_FOR);
-        self.view
-            .set_working_message(&esc_hint(&self.live_tickets()));
+        // AMP #2858: name only the workers the next Esc would stop (in Launch mode, this
+        // reply's launches still waiting for a slot).
+        let stopped = match self.dispatch_mode() {
+            DispatchMode::Await => self.live_tickets(),
+            DispatchMode::Launch => self.reply_stop().cancelled,
+        };
+        self.view.set_working_message(&esc_hint(&stopped));
     }
 
     fn clear_esc_hint(&mut self) {
@@ -4839,6 +4982,98 @@ mod tests {
         assert_eq!(short_role("amp-manager"), "manager");
         assert_eq!(short_role("amp:amp-worker-backend"), "worker-backend");
         assert_eq!(short_role("reviewer"), "reviewer");
+    }
+
+    fn stop(live: &[i64], cancelled: &[i64], queued: &[i64]) -> super::ReplyStop {
+        super::ReplyStop {
+            live: live.to_vec(),
+            cancelled: cancelled.to_vec(),
+            queued: queued.to_vec(),
+        }
+    }
+
+    /// AMP #2858: in Await mode stopping the reply stops its workers, and says so as before.
+    #[test]
+    fn await_mode_keeps_the_old_stop_notice() {
+        use super::{DispatchMode::Await, reply_stop_notice, worker_stop_notice};
+        assert_eq!(reply_stop_notice(Await, &stop(&[], &[], &[])), None);
+        assert_eq!(
+            reply_stop_notice(Await, &stop(&[7], &[], &[])).as_deref(),
+            Some("stopping the worker on #7 too; its ticket goes back to ready")
+        );
+        assert_eq!(
+            reply_stop_notice(Await, &stop(&[7, 8], &[], &[])),
+            Some(worker_stop_notice(&[7, 8]))
+        );
+    }
+
+    /// AMP #2858: in Launch mode stopping the reply leaves dispatched workers running, and the
+    /// notice never says they stop or that their tickets go back to ready.
+    #[test]
+    fn launch_mode_says_the_workers_keep_running() {
+        use super::{DispatchMode::Launch, reply_stop_notice};
+        assert_eq!(reply_stop_notice(Launch, &stop(&[], &[], &[])), None);
+        let one = reply_stop_notice(Launch, &stop(&[7], &[], &[])).unwrap();
+        assert_eq!(
+            one,
+            "stopping the reply; the worker on #7 keeps running (/workers to stop it)"
+        );
+        let two = reply_stop_notice(Launch, &stop(&[7, 8], &[], &[])).unwrap();
+        assert_eq!(
+            two,
+            "stopping the reply; 2 workers keep running on #7, #8 (/workers to stop one)"
+        );
+        for note in [&one, &two] {
+            assert!(!note.contains("too"), "{note}");
+            assert!(!note.contains("back to ready"), "{note}");
+        }
+    }
+
+    /// AMP #2858: a launch from the stopped reply that still waits for a slot is cancelled and
+    /// never dispatched; one queued by an earlier reply stays queued; both are named apart from
+    /// the workers that keep running.
+    #[test]
+    fn launch_mode_names_cancelled_and_still_queued_launches() {
+        use super::{DispatchMode::Launch, reply_stop_notice};
+        assert_eq!(
+            reply_stop_notice(Launch, &stop(&[9], &[9], &[])).as_deref(),
+            Some(
+                "stopping the reply; #9 was still waiting for a slot, so its launch is \
+                 cancelled and it is not dispatched"
+            )
+        );
+        assert_eq!(
+            reply_stop_notice(Launch, &stop(&[7, 9, 10], &[9, 10], &[])).as_deref(),
+            Some(
+                "stopping the reply; #9, #10 were still waiting for a slot, so their launches \
+                 are cancelled and they are not dispatched; the worker on #7 keeps running \
+                 (/workers to stop it)"
+            )
+        );
+        assert_eq!(
+            reply_stop_notice(Launch, &stop(&[11], &[], &[11])).as_deref(),
+            Some(
+                "stopping the reply; the worker on #11 stays queued for a slot (/workers to stop it)"
+            )
+        );
+        assert_eq!(
+            reply_stop_notice(Launch, &stop(&[7, 8, 9, 11], &[9], &[11])).as_deref(),
+            Some(
+                "stopping the reply; #9 was still waiting for a slot, so its launch is \
+                 cancelled and it is not dispatched; 3 workers keep running on #7, #8, #11 \
+                 (/workers to stop one); #11 is still queued for a slot"
+            )
+        );
+    }
+
+    /// AMP #2858: with no supervisor (a worker role's chat) nothing is live, the mode is Await,
+    /// and stopping the reply has nothing to say about workers.
+    #[tokio::test]
+    async fn no_supervisor_means_await_and_no_worker_note() {
+        let ends = amp_core::supervisor::LaunchEnds::default();
+        let (shell, _feed) = watching_shell(&ends).await;
+        assert_eq!(shell.dispatch_mode(), super::DispatchMode::Await);
+        assert_eq!(shell.reply_stop(), super::ReplyStop::default());
     }
 
     /// A worker report for the #2861 tests: `task_id` ended with `outcome`.
