@@ -749,3 +749,115 @@ fn rpi_tui_text(result: &rpi_agent::AgentToolResult) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Launches two workers that each answer in one turn and end on their own, then waits for both
+/// background tasks to finish without consuming a single end, so the test starts from "both are
+/// done, nobody has read anything" every time.
+async fn two_workers_end_unread(f: &Fixture, sup: &Arc<Supervisor>, ids: [i64; 2]) {
+    f.script(vec![
+        step("Nothing to do.", json!([])),
+        step("Nothing to do.", json!([])),
+    ]);
+    for id in ids {
+        sup.launch(req(id, "worker-backend"), CancellationToken::new())
+            .await
+            .expect("launched");
+    }
+    // `join_launched` waits on the background tasks themselves, and each task records its end
+    // before it returns: once both have joined, both ends are queued and nothing has read them.
+    assert_eq!(
+        sup.join_launched(Duration::from_secs(30)).await,
+        2,
+        "both launched workers ended"
+    );
+    assert_eq!(sup.launched_running(), 0);
+    assert!(live_tickets(sup).is_empty());
+}
+
+fn sorted_ids(ends: &[amp_core::supervisor::LaunchEnd]) -> Vec<i64> {
+    let mut ids: Vec<i64> = ends.iter().map(|e| e.task_id).collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// 9. AMP #2865: a busy manager turn does not lose worker results. Two background workers end
+/// before anything consumes the queue; both ends are retained, one drain (the manager's next turn,
+/// `Shell::take_worker_summaries` → `take_launch_ends`, #2857) returns both, and a second drain —
+/// or a wait for the next end — gets nothing: no duplicate summaries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_ends_before_any_consumption_are_kept_and_drained_exactly_once() {
+    let f = fixture("retained-two").await;
+    let hooks = Arc::new(Recorder::default());
+    let sup = f.supervisor(launch_config(4), Some(Arc::clone(&hooks)));
+
+    two_workers_end_unread(&f, &sup, [3081, 3082]).await;
+    // Both really finished — reported through on_finish — before anything was consumed.
+    assert_eq!(hooks.reports().len(), 2, "{:?}", hooks.reports());
+
+    // The first drain returns both, each with its report.
+    let first = sup.take_launch_ends();
+    assert_eq!(sorted_ids(&first), [3081, 3082], "{first:?}");
+    for end in &first {
+        let report = end.result.as_ref().expect("a report");
+        assert_eq!(report.task_id, end.task_id);
+        assert_eq!(report.outcome, WorkerOutcome::Stopped, "{report:?}");
+        assert!(
+            end.line().contains(&format!("#{}", end.task_id)),
+            "{}",
+            end.line()
+        );
+    }
+
+    // A second drain is empty, and nothing is waiting to be handed out again.
+    assert!(sup.take_launch_ends().is_empty(), "a drained end came back");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), sup.next_launch_end())
+            .await
+            .is_err(),
+        "a drained end was handed out again"
+    );
+    assert!(sup.take_launch_ends().is_empty());
+}
+
+/// 10. AMP #2865 with the #2861 display broadcast in play: a watcher sees a copy of each end, and
+/// reading those copies (or never reading them) does not take anything out of the delivery queue.
+/// The queue still holds both, one drain returns both, a second drain is empty, and the watcher
+/// gets nothing new from the drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_display_broadcast_does_not_change_what_the_queue_retains() {
+    let f = fixture("retained-watched").await;
+    let sup = f.supervisor(launch_config(4), None);
+    // Two watchers, subscribed before the workers end: one reads everything (the chat's poll),
+    // one never reads at all.
+    let mut shown = sup.watch_launch_ends();
+    let _ignored = sup.watch_launch_ends();
+
+    two_workers_end_unread(&f, &sup, [3091, 3092]).await;
+
+    // The watcher got a copy of each end...
+    let mut copies = Vec::new();
+    while let Ok(end) = shown.try_recv() {
+        copies.push(end);
+    }
+    assert_eq!(sorted_ids(&copies), [3091, 3092], "{copies:?}");
+
+    // ...and the queue still delivers both, exactly once.
+    let first = sup.take_launch_ends();
+    assert_eq!(sorted_ids(&first), [3091, 3092], "{first:?}");
+    assert!(first.iter().all(|e| e.result.is_ok()), "{first:?}");
+    assert!(sup.take_launch_ends().is_empty(), "a drained end came back");
+
+    // Draining shows nothing new to the watcher, and a watcher subscribed late sees no history.
+    assert!(
+        matches!(
+            shown.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ),
+        "the drain re-broadcast an end"
+    );
+    let mut late = sup.watch_launch_ends();
+    assert!(matches!(
+        late.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+}
