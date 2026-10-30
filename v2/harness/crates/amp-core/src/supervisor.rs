@@ -586,6 +586,64 @@ pub struct LaunchEnd {
     pub result: Result<WorkerReport, String>,
 }
 
+/// The queue of launched ends (AMP #2834, #2835): one producer — [`Supervisor::record_launch_end`],
+/// fed by [`Supervisor::launch`] — and two ways to consume it. Draining is what makes a summary
+/// arrive exactly once: an end leaves the queue on the call that returns it, so a later drain or
+/// wait never sees it again, whether it was a success or a failure.
+#[derive(Debug, Default)]
+pub struct LaunchEnds {
+    queue: Mutex<VecDeque<LaunchEnd>>,
+    notify: tokio::sync::Notify,
+}
+
+impl LaunchEnds {
+    /// Queues one end and wakes whoever is waiting for it.
+    pub fn push(&self, end: LaunchEnd) {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(end);
+        self.notify.notify_waiters();
+    }
+
+    /// Every queued end, oldest first, leaving the queue empty.
+    pub fn drain(&self) -> Vec<LaunchEnd> {
+        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        queue.drain(..).collect()
+    }
+
+    /// The oldest end, or waits for the next one. Returns at once when one is already queued.
+    pub async fn next(&self) -> LaunchEnd {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Subscribe before looking, so an end recorded in between is not missed.
+            notified.as_mut().enable();
+            if let Some(end) = self
+                .queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()
+            {
+                return end;
+            }
+            notified.await;
+        }
+    }
+
+    /// How many ends are waiting; what a caller checks instead of draining to look.
+    pub fn len(&self) -> usize {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 impl LaunchEnd {
     /// Whether this end is one the person has to hear about: a run that closed its ticket says
     /// nothing new, one that ended any other way carries its own notes.
@@ -815,8 +873,7 @@ pub struct Supervisor {
     /// [`Supervisor::join_launched`] can wait for them at shutdown.
     launched: Mutex<Vec<JoinHandle<()>>>,
     /// The ends of those launches, for completion delivery to drain.
-    launch_ends: Mutex<VecDeque<LaunchEnd>>,
-    launch_end_notify: tokio::sync::Notify,
+    launch_ends: LaunchEnds,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -868,8 +925,7 @@ impl Supervisor {
             writer: Arc::new(tokio::sync::Mutex::new(())),
             ledger,
             launched: Mutex::new(Vec::new()),
-            launch_ends: Mutex::new(VecDeque::new()),
-            launch_end_notify: tokio::sync::Notify::new(),
+            launch_ends: LaunchEnds::default(),
         })
     }
 
@@ -1514,30 +1570,12 @@ impl Supervisor {
     /// run that never got as far as dispatching. Completion delivery is the chat's job; this is
     /// the queue it reads.
     pub fn take_launch_ends(&self) -> Vec<LaunchEnd> {
-        let mut ends = self
-            .launch_ends
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        ends.drain(..).collect()
+        self.launch_ends.drain()
     }
 
     /// Waits for the next launched end (AMP #2834). Returns at once when one is already queued.
     pub async fn next_launch_end(&self) -> LaunchEnd {
-        loop {
-            let notified = self.launch_end_notify.notified();
-            tokio::pin!(notified);
-            // Subscribe before looking, so an end recorded in between is not missed.
-            notified.as_mut().enable();
-            if let Some(end) = self
-                .launch_ends
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .pop_front()
-            {
-                return end;
-            }
-            notified.await;
-        }
+        self.launch_ends.next().await
     }
 
     /// How many launched workers are still on this supervisor's books.
@@ -1569,11 +1607,7 @@ impl Supervisor {
     }
 
     fn record_launch_end(&self, end: LaunchEnd) {
-        self.launch_ends
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push_back(end);
-        self.launch_end_notify.notify_waiters();
+        self.launch_ends.push(end);
     }
 
     fn stop_handle(&self, task_id: i64, signal: CancellationToken) -> StopHandle {
@@ -2802,6 +2836,68 @@ mod tests {
             refused.line(),
             "#12 was not dispatched to amp:amp-worker-backend: cancelled before the worker started"
         );
+    }
+
+    /// AMP #2835: the completion queue holds successes and failures alike, and consuming an end
+    /// takes it out of the queue for good — a second drain or wait never sees it again.
+    #[tokio::test]
+    async fn launch_ends_queue_successes_and_failures_once() {
+        let ends = LaunchEnds::default();
+        assert!(ends.is_empty());
+        let end = |task_id, result| LaunchEnd {
+            task_id,
+            agent_id: "amp:amp-worker-backend".into(),
+            result,
+        };
+        let ok = || {
+            Ok(WorkerReport {
+                task_id: 0,
+                agent_id: "amp:amp-worker-backend".into(),
+                role: "amp-worker-backend".into(),
+                outcome: WorkerOutcome::Completed,
+                dispatch_id: String::new(),
+                started: true,
+                returned: None,
+                final_message: String::new(),
+                error: None,
+                model: "wf/wf-1".into(),
+                cwd: PathBuf::from("/r"),
+                worktree: None,
+                branch: None,
+                workspace: Placement::Shared,
+                session_file: None,
+                turns: 0,
+                tool_calls: 0,
+                tool_errors: 0,
+                usage: crate::events::UsageJson::default(),
+                duration_ms: 0,
+                notes: Vec::new(),
+                totals: Totals::default(),
+            })
+        };
+
+        // One queue carries both a success and a failure, in the order they ended.
+        ends.push(end(1, ok()));
+        ends.push(end(2, Err("the slot was cancelled".into())));
+        assert_eq!(ends.len(), 2);
+
+        let drained = ends.drain();
+        assert_eq!(
+            drained.iter().map(|e| e.task_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(drained[0].result.is_ok(), "a completed run");
+        assert!(drained[1].result.is_err(), "a dispatch that never ran");
+
+        // Consumed exactly once: the queue is empty and stays that way.
+        assert!(ends.is_empty());
+        assert!(ends.drain().is_empty(), "a second drain sees nothing");
+
+        // A wait returns what is queued and removes it too, so the two ways of consuming cannot
+        // both hand out the same end.
+        ends.push(end(3, ok()));
+        assert_eq!(ends.next().await.task_id, 3);
+        assert!(ends.is_empty(), "the wait took it out of the queue");
     }
 
     #[test]
