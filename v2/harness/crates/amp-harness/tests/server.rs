@@ -467,13 +467,28 @@ async fn switching_away_from_the_markers_server_warns_once() {
         .url
         .trim_end_matches("/mcp")
         .replace("127.0.0.1", "localhost");
-    let warning = format!(
-        "warning: .amp.json at {} was made for {one_origin}; #71 on this server ({two_origin}) \
-         may be another project; `/project <id>` picks this server's",
-        dir.join("project/.amp.json").display()
+    // #2905: the warning wraps inside the Conversation box (#2882) wherever the path makes it
+    // long, so it is read without the box edges, and the path (one token, hard-broken when it
+    // is wider than a row) is compared without the breaks; the rest of the line is exact.
+    let flat = common::flat(screen);
+    let lead = "warning: .amp.json at ";
+    let message = format!(
+        " was made for {one_origin}; #71 on this server ({two_origin}) may be another project; \
+         `/project <id>` picks this server's"
     );
-    let flat: String = screen.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(flat.contains(&warning), "missing {warning:?} in\n{screen}");
+    let at = flat
+        .find(lead)
+        .unwrap_or_else(|| panic!("missing {lead:?} in\n{screen}"));
+    let rest = &flat[at + lead.len()..];
+    let end = rest
+        .find(&message)
+        .unwrap_or_else(|| panic!("missing {message:?} after {lead:?} in\n{screen}"));
+    let unbroken = |s: &str| s.split_whitespace().collect::<String>();
+    assert_eq!(
+        unbroken(&rest[..end]),
+        unbroken(&dir.join("project/.amp.json").display().to_string()),
+        "the warning's path in\n{screen}"
+    );
     assert_eq!(flat.matches("was made for").count(), 1, "{screen}");
     // Back on the marker's server: the plain line, no warning.
     assert!(
