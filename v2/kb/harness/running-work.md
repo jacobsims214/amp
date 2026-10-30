@@ -150,6 +150,40 @@ When the manager dispatches a ticket (its `amp_run_ticket` tool), the harness:
 Workers never wait on a prompt: their shell runs with no terminal input, and every command has a
 time limit.
 
+### The manager carries on when workers end
+
+In the chat, workers run in the background: the manager's turn ends once it has launched them,
+and you can keep talking to it. When a worker ends, the chat shows `worker ended: #N …`. If the
+chat is idle then (no reply running, nothing you typed waiting, no prompt from a paired device
+waiting), it **starts the manager's next turn by itself**, the way it resumes after a plan
+approval. The transcript marks that turn: `↻ a worker you launched ended while the chat was idle:
+the manager carries on by itself (an automatic turn, not a prompt from you; …)`, followed by the
+turn's prompt, `[amp-harness] Workers you launched have ended: …`. The turn opens with the
+summary of every worker that ended since the manager's last turn, so it can run the next wave,
+review, open fix tickets or report to you.
+
+- **One turn for ends close together.** The chat waits half a second after the newest end, so
+  workers that finish together give one turn with all their summaries. Each end reaches exactly
+  one turn.
+- **Busy?** While a reply runs or a prompt waits, nothing starts: the next turn (yours, or the
+  queued prompt's) carries the summaries. Nothing starts during a `/server` switch or while
+  quitting.
+- **Loop guard.** At most 5 automatic turns within 10 minutes with no prompt from you. One more
+  pauses this, and the chat warns: `⏸ The manager started 5 turns by itself in the last 10
+  minutes with no prompt from you, so it stops waking for worker ends. …`. The ended workers wait
+  for your next prompt, which carries their summaries and turns waking back on. Workers that take
+  minutes each never reach the limit; a manager stuck relaunching workers that fail at once does.
+- **Turn it off** in config.toml (or with `AMP_HARNESS_WAKE_ON_WORKER_END=false`). Ends then wait
+  for your next prompt:
+
+  ```toml
+  [manager]
+  wake_on_worker_end = false
+  ```
+
+  With `[workers] dispatch = "await"` the manager waits for each worker inside its own turn, so
+  this setting has nothing to do.
+
 ## Worker limits
 
 ```toml

@@ -241,6 +241,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     shell.set_padding(padding);
     // #2425: after asking for plan approval, wait for it in AMP and resume the manager.
     shell.set_auto_resume(load_auto_resume(&args)?);
+    // #2891: a launched worker that ends while the chat is idle starts the manager's next turn.
+    shell.set_wake_on_worker_end(load_wake_on_worker_end(&args)?);
     // A suggested first prompt (new project: seed the KB; new user: the AMP guide). Nothing is
     // sent until the person presses Enter.
     if let Some(text) = outcome.and_then(|o| o.prefill) {
@@ -698,6 +700,14 @@ fn load_padding(args: &ChatArgs) -> Result<usize, CliError> {
 fn load_auto_resume(args: &ChatArgs) -> Result<bool, CliError> {
     let env = |k: &str| std::env::var(k).ok();
     amp_core::approval_wait::resolve_auto_resume(&env, config_text(args).as_deref())
+        .map_err(CliError::usage)
+}
+
+/// `[manager] wake_on_worker_end` (#2891): `AMP_HARNESS_WAKE_ON_WORKER_END`, then config.toml,
+/// else on.
+fn load_wake_on_worker_end(args: &ChatArgs) -> Result<bool, CliError> {
+    let env = |k: &str| std::env::var(k).ok();
+    amp_core::approval_wait::resolve_wake_on_worker_end(&env, config_text(args).as_deref())
         .map_err(CliError::usage)
 }
 

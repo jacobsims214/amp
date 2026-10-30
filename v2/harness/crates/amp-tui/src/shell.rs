@@ -473,6 +473,104 @@ pub const ESC_HINT: &str = "Esc again to stop the reply";
 /// At most this many prompts wait for the running reply, here as on a paired device (AMP #2889).
 pub use amp_core::remote::link::QUEUE_MAX;
 
+/// The user turn the chat starts by itself when launched workers ended while it was idle (AMP
+/// #2891), as the plan-approval resume does (#2425). The worker summaries go above it, at the
+/// top of the turn ([`Shell::take_worker_summaries`]). No digits: every standalone number in a
+/// user message counts as a ticket the person named ([`amp_core::approval`]).
+pub const WAKE_PROMPT: &str = "[amp-harness] Workers you launched have ended: their summaries \
+     are above. Carry on with what they mean for the plan (the next wave, a review, fix tickets, \
+     or a report to the person).";
+
+/// How long the chat waits after the newest worker end it saw before it wakes the manager (AMP
+/// #2891): ends that land close together give one turn.
+pub const WAKE_SETTLE: Duration = Duration::from_millis(500);
+
+/// The loop guard on automatic turns (AMP #2891): at most [`WAKE_LIMIT`] of them within
+/// [`WAKE_WINDOW`] with no prompt from the person. One more pauses waking until the person sends
+/// a prompt; the ends wait for that prompt's turn, as when the switch is off.
+pub const WAKE_LIMIT: usize = 5;
+pub const WAKE_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// The transcript line above an automatic turn (AMP #2891): what started it, so it is not taken
+/// for something the person typed.
+pub fn wake_notice(ended: usize) -> String {
+    format!(
+        "↻ {} ended while the chat was idle: the manager carries on by itself (an automatic \
+         turn, not a prompt from you; [manager] wake_on_worker_end = false turns this off).",
+        if ended == 1 {
+            "a worker you launched".to_owned()
+        } else {
+            format!("{ended} workers you launched")
+        }
+    )
+}
+
+/// The warning when the loop guard stops waking the manager (AMP #2891).
+pub fn wake_paused_notice(ended: usize) -> String {
+    format!(
+        "⏸ The manager started {WAKE_LIMIT} turns by itself in the last {} minutes with no \
+         prompt from you, so it stops waking for worker ends. {} for your next prompt.",
+        WAKE_WINDOW.as_secs() / 60,
+        if ended == 1 {
+            "One ended worker waits".to_owned()
+        } else {
+            format!("{ended} ended workers wait")
+        }
+    )
+}
+
+/// The loop guard on the automatic turns worker ends start (AMP #2891). A prompt from the person
+/// resets it ([`WakeGuard::reset`]).
+#[derive(Debug, Default)]
+pub struct WakeGuard {
+    /// When the automatic turns since the person's last prompt started, within [`WAKE_WINDOW`].
+    times: std::collections::VecDeque<Instant>,
+    /// Tripped: no automatic turn until the person's next prompt.
+    paused: bool,
+}
+
+/// What [`WakeGuard::allow`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeVerdict {
+    /// Start the automatic turn (counted).
+    Wake,
+    /// The guard just tripped: say so once, start nothing.
+    Trip,
+    /// Already tripped: start nothing, say nothing.
+    Paused,
+}
+
+impl WakeGuard {
+    pub fn allow(&mut self, now: Instant) -> WakeVerdict {
+        if self.paused {
+            return WakeVerdict::Paused;
+        }
+        while self
+            .times
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= WAKE_WINDOW)
+        {
+            self.times.pop_front();
+        }
+        if self.times.len() >= WAKE_LIMIT {
+            self.paused = true;
+            return WakeVerdict::Trip;
+        }
+        self.times.push_back(now);
+        WakeVerdict::Wake
+    }
+
+    /// The person sent a prompt: automatic turns may start again, with a fresh count.
+    pub fn reset(&mut self) {
+        self.times.clear();
+        self.paused = false;
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+}
+
 /// The line a prompt typed during a reply leaves (AMP #2889): its place in the queue, that it
 /// runs on its own once the reply ends, and that Esc drops it (as a paired device's queue).
 pub fn queued_notice(position: usize, text: &str) -> String {
@@ -918,6 +1016,18 @@ pub struct Shell {
     turn_refusals: Vec<amp_core::approval::Refusal>,
     /// The wait for a person's plan approval (#2425), between turns.
     approval_wait: Option<amp_core::approval_wait::ApprovalWait>,
+    /// `[manager] wake_on_worker_end` (AMP #2891, default on): launched workers that end while
+    /// the chat is idle start the manager's next turn ([`Shell::wake_on_worker_end`]).
+    wake_on_end: bool,
+    /// The turn being started is an automatic one ([`WAKE_PROMPT`]), so it doesn't reset the
+    /// loop guard the way a prompt from the person does.
+    waking: bool,
+    /// The loop guard on automatic turns.
+    wake_guard: WakeGuard,
+    /// When the newest worker end was shown ([`WAKE_SETTLE`]).
+    end_seen_at: Option<Instant>,
+    /// [`Shell::quit`] has begun: nothing new starts.
+    quitting: bool,
 }
 
 /// A tool call whose arguments are still streaming (#2384).
@@ -1012,6 +1122,11 @@ impl Shell {
                 turn_plan: false,
                 turn_refusals: Vec::new(),
                 approval_wait: None,
+                wake_on_end: true,
+                waking: false,
+                wake_guard: WakeGuard::default(),
+                end_seen_at: None,
+                quitting: false,
             },
             done_rx,
         )
@@ -1794,6 +1909,7 @@ impl Shell {
         // AMP #2862: an end is news for the roster too (the worker is finished, crashed or never
         // dispatched), not only when a dispatch tool call returns.
         if shown {
+            self.end_seen_at = Some(Instant::now());
             self.build_roster();
         }
         shown
@@ -2164,7 +2280,8 @@ impl Shell {
         S: Future<Output = ()>,
         R: FnMut(&Self),
     {
-        // Quitting: nothing queued may start once the reply ends.
+        // Quitting: nothing queued may start once the reply ends, nor any automatic turn.
+        self.quitting = true;
         self.prompt_queue.clear();
         if self.settled() {
             return QuitOutcome::Idle;
@@ -2310,6 +2427,74 @@ impl Shell {
         self.auto_resume = on;
         if !on {
             self.stop_approval_wait(None);
+        }
+    }
+
+    /// `[manager] wake_on_worker_end` (AMP #2891, default on): a launched worker that ends while
+    /// the chat is idle starts the manager's next turn, which gets its summary. Off: the ends wait
+    /// for the person's next prompt, as before.
+    pub fn set_wake_on_worker_end(&mut self, on: bool) {
+        self.wake_on_end = on;
+    }
+
+    /// Whether the loop guard has stopped automatic turns until the person's next prompt.
+    pub fn wake_paused(&self) -> bool {
+        self.wake_guard.is_paused()
+    }
+
+    /// Starts one manager turn for the launched workers that ended (AMP #2891), the way the plan
+    /// approval resume does ([`Shell::watch_approval`]): a notice saying what started it, then
+    /// [`WAKE_PROMPT`] as the user turn. Only when the chat is idle: no reply running, no prompt
+    /// queued here or on a paired device (that prompt's turn carries the ends), no server switch,
+    /// no quit, and no worker end seen in the last [`WAKE_SETTLE`] (so ends close together give
+    /// one turn). It never takes the ends itself: [`Shell::start_run_as`] does, so each still
+    /// reaches exactly one turn, and ends that land during this turn wait for the next wake.
+    /// The [`WakeGuard`] caps how many such turns run with no prompt from the person.
+    fn wake_on_worker_end(&mut self, now: Instant) -> bool {
+        if !self.wake_on_end
+            || self.running
+            || self.switching
+            || self.quitting
+            || self.quit_confirm_until.is_some_and(|until| now < until)
+            || !self.prompt_queue.is_empty()
+            || self.remote_queue_len() > 0
+            || self
+                .end_seen_at
+                .is_some_and(|at| now.saturating_duration_since(at) < WAKE_SETTLE)
+        {
+            return false;
+        }
+        let pending = self
+            .supervisor
+            .as_ref()
+            .map_or(0, |s| s.pending_launch_ends());
+        if pending == 0 {
+            return false;
+        }
+        match self.wake_guard.allow(now) {
+            WakeVerdict::Paused => false,
+            WakeVerdict::Trip => {
+                self.view.add_warning(&wake_paused_notice(pending));
+                true
+            }
+            WakeVerdict::Wake => {
+                self.view.add_notice(&wake_notice(pending));
+                self.view.add_user(WAKE_PROMPT);
+                self.waking = true;
+                self.start_run(WAKE_PROMPT.to_owned());
+                true
+            }
+        }
+    }
+
+    /// Prompts from a paired device waiting in the remote link's queue (AMP #2891).
+    fn remote_queue_len(&self) -> usize {
+        let Some(Ok(link)) = self.remote.as_ref().map(|r| r.link.as_ref()) else {
+            return 0;
+        };
+        match link.current() {
+            amp_core::remote::RemoteState::On(on) => on.queue_len,
+            _ => 0,
         }
     }
 
@@ -2735,6 +2920,11 @@ impl Shell {
         self.stop_approval_wait(None);
         self.turn_plan = false;
         self.turn_refusals.clear();
+        // AMP #2891: a turn that isn't an automatic wake is the person's (typed, queued, remote,
+        // or their plan approval), so automatic turns may start again afterwards.
+        if !std::mem::take(&mut self.waking) {
+            self.wake_guard.reset();
+        }
         self.running = true;
         // AMP #2858: workers already live now were not launched by this reply, so stopping it
         // can't cancel them.
@@ -3815,7 +4005,10 @@ impl Shell {
         // The Done marker first (sync_meta), then let the finished ticket go.
         let synced = self.sync_meta();
         let watched = self.watch_approval();
-        changed | synced | watched | self.clear_done_ticket()
+        // AMP #2891: last, once everything that could start a turn (a queued prompt, a paired
+        // device's, the approval resume) has had its go.
+        let woke = self.wake_on_worker_end(Instant::now());
+        changed | synced | watched | woke | self.clear_done_ticket()
     }
 
     /// A current ticket stops being current once it is done (UX review #2175 finding 12,
@@ -5016,6 +5209,68 @@ fn count(n: u64, one: &str, many: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{clean_answer, parse_id, short_role, worker_summaries};
+
+    /// AMP #2891's loop guard: at most WAKE_LIMIT automatic turns within WAKE_WINDOW; the next
+    /// trips it once and it stays paused (silently) until the person's prompt resets it. Turns
+    /// older than the window stop counting.
+    #[test]
+    fn the_wake_guard_caps_automatic_turns_until_the_person_speaks() {
+        use super::{WAKE_LIMIT, WAKE_WINDOW, WakeGuard, WakeVerdict};
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let mut g = WakeGuard::default();
+        for i in 0..WAKE_LIMIT {
+            assert_eq!(
+                g.allow(t0 + Duration::from_secs(i as u64)),
+                WakeVerdict::Wake
+            );
+        }
+        assert_eq!(g.allow(t0 + Duration::from_secs(30)), WakeVerdict::Trip);
+        assert!(g.is_paused());
+        // Paused stays paused, even once the window has passed: only the person resumes it.
+        assert_eq!(g.allow(t0 + WAKE_WINDOW * 2), WakeVerdict::Paused);
+        g.reset();
+        assert!(!g.is_paused());
+        assert_eq!(g.allow(t0 + WAKE_WINDOW * 2), WakeVerdict::Wake);
+
+        // Spread out over more than the window, automatic turns go on: a long plan whose
+        // workers take minutes each never trips it.
+        let mut g = WakeGuard::default();
+        let every = WAKE_WINDOW / WAKE_LIMIT as u32 + Duration::from_secs(1);
+        for i in 0..(WAKE_LIMIT * 3) {
+            assert_eq!(
+                g.allow(t0 + every * i as u32),
+                WakeVerdict::Wake,
+                "turn {i}"
+            );
+        }
+    }
+
+    /// The automatic turn says what it is, and its prompt names no number (a number in a user
+    /// message counts as a ticket the person named).
+    #[test]
+    fn the_wake_turn_is_labelled_and_names_no_ticket() {
+        use super::{WAKE_PROMPT, wake_notice, wake_paused_notice};
+        assert!(
+            !WAKE_PROMPT.chars().any(|c| c.is_ascii_digit()),
+            "{WAKE_PROMPT}"
+        );
+        assert!(WAKE_PROMPT.starts_with("[amp-harness]"));
+        let one = wake_notice(1);
+        assert!(
+            one.contains("a worker you launched ended while the chat was idle"),
+            "{one}"
+        );
+        assert!(one.contains("not a prompt from you"), "{one}");
+        assert!(wake_notice(3).contains("3 workers you launched"));
+        let paused = wake_paused_notice(2);
+        assert!(paused.contains("stops waking"), "{paused}");
+        assert!(
+            paused.contains("2 ended workers wait for your next prompt"),
+            "{paused}"
+        );
+    }
     use crate::roster::{Phase, WorkerEntry};
     use std::sync::Arc;
 

@@ -1289,6 +1289,13 @@ impl Inner {
             "true",
         );
         line(&mut rows, "auto_resume_on_approval", v, src);
+        let (v, src) = setting(
+            "manager",
+            "wake_on_worker_end",
+            amp_core::approval_wait::ENV_WAKE_ON_WORKER_END,
+            "true",
+        );
+        line(&mut rows, "wake_on_worker_end", v, src);
 
         head(&mut rows, "tools, workers, secrets");
         let (bash, bash_src) = match (

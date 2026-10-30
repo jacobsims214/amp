@@ -40,6 +40,12 @@ use crate::meta::{AmpMeta, User};
 /// `[manager] auto_resume_on_approval` (default true): the env override.
 pub const ENV_AUTO_RESUME: &str = "AMP_HARNESS_AUTO_RESUME";
 
+/// `[manager] wake_on_worker_end` (default true, AMP #2891): the env override.
+pub const ENV_WAKE_ON_WORKER_END: &str = "AMP_HARNESS_WAKE_ON_WORKER_END";
+
+/// The settings `[manager]` takes.
+pub const MANAGER_KEYS: &[&str] = &["auto_resume_on_approval", "wake_on_worker_end"];
+
 /// The manager's tools whose call means the turn planned or looked at the plan.
 pub const PLAN_TOOLS: &[&str] = &[
     "amp_create_tasks",
@@ -322,39 +328,68 @@ pub fn resolve_auto_resume(
     env: &dyn Fn(&str) -> Option<String>,
     config: Option<&str>,
 ) -> Result<bool, String> {
-    if let Some(v) = env(ENV_AUTO_RESUME).filter(|v| !v.trim().is_empty()) {
-        return on_off(&v).map_err(|e| format!("{ENV_AUTO_RESUME}: {e}"));
+    resolve_manager_switch(env, config, ENV_AUTO_RESUME, "auto_resume_on_approval")
+}
+
+/// `[manager] wake_on_worker_end` (AMP #2891): [`ENV_WAKE_ON_WORKER_END`], then config.toml,
+/// else true. On, a chat that launched workers starts the manager's next turn by itself when one
+/// ends while the chat is idle; off, the ends wait for the person's next prompt.
+pub fn resolve_wake_on_worker_end(
+    env: &dyn Fn(&str) -> Option<String>,
+    config: Option<&str>,
+) -> Result<bool, String> {
+    resolve_manager_switch(env, config, ENV_WAKE_ON_WORKER_END, "wake_on_worker_end")
+}
+
+fn resolve_manager_switch(
+    env: &dyn Fn(&str) -> Option<String>,
+    config: Option<&str>,
+    env_key: &str,
+    key: &str,
+) -> Result<bool, String> {
+    if let Some(v) = env(env_key).filter(|v| !v.trim().is_empty()) {
+        return on_off(&v).map_err(|e| format!("{env_key}: {e}"));
     }
     let Some(text) = config else {
         return Ok(true);
     };
     let doc: toml::Table = toml::from_str(text).map_err(|e| format!("config.toml: {e}"))?;
-    manager_auto_resume(&doc)
+    manager_switch(&doc, key)
 }
 
-/// `[manager]` in a parsed config file: only `auto_resume_on_approval`, a boolean.
+/// `[manager]` in a parsed config file: `auto_resume_on_approval`, a boolean.
 pub fn manager_auto_resume(doc: &toml::Table) -> Result<bool, String> {
+    manager_switch(doc, "auto_resume_on_approval")
+}
+
+/// `[manager]` in a parsed config file: `wake_on_worker_end`, a boolean (AMP #2891).
+pub fn manager_wake_on_worker_end(doc: &toml::Table) -> Result<bool, String> {
+    manager_switch(doc, "wake_on_worker_end")
+}
+
+/// One of [`MANAGER_KEYS`] in `[manager]`, a boolean that defaults to true. Any other key in the
+/// table is refused.
+fn manager_switch(doc: &toml::Table, key: &str) -> Result<bool, String> {
     let Some(manager) = doc.get("manager") else {
         return Ok(true);
     };
     let Some(table) = manager.as_table() else {
         return Err("[manager] must be a table".to_owned());
     };
-    for key in table.keys() {
-        if key != "auto_resume_on_approval" {
+    for k in table.keys() {
+        if !MANAGER_KEYS.contains(&k.as_str()) {
             return Err(format!(
-                "[manager] {key}: unknown setting (the only one is auto_resume_on_approval)"
+                "[manager] {k}: unknown setting (use {})",
+                MANAGER_KEYS.join(" or ")
             ));
         }
     }
-    match table.get("auto_resume_on_approval") {
+    match table.get(key) {
         None => Ok(true),
         Some(toml::Value::Boolean(b)) => Ok(*b),
-        Some(toml::Value::String(s)) => {
-            on_off(s).map_err(|e| format!("[manager] auto_resume_on_approval: {e}"))
-        }
+        Some(toml::Value::String(s)) => on_off(s).map_err(|e| format!("[manager] {key}: {e}")),
         Some(other) => Err(format!(
-            "[manager] auto_resume_on_approval: unknown value `{other}`: use true or false"
+            "[manager] {key}: unknown value `{other}`: use true or false"
         )),
     }
 }
@@ -574,6 +609,29 @@ mod tests {
         let off = |k: &str| (k == ENV_AUTO_RESUME).then(|| "off".to_owned());
         assert_eq!(
             resolve_auto_resume(&off, Some("[manager]\nauto_resume_on_approval = true\n")),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn wake_on_worker_end_reads_env_then_config_and_shares_the_table() {
+        let none = |_: &str| None;
+        assert_eq!(resolve_wake_on_worker_end(&none, None), Ok(true));
+        let both = "[manager]\nauto_resume_on_approval = false\nwake_on_worker_end = \"off\"\n";
+        assert_eq!(resolve_wake_on_worker_end(&none, Some(both)), Ok(false));
+        // Each key is its own switch, and the other is no longer an unknown setting.
+        assert_eq!(resolve_auto_resume(&none, Some(both)), Ok(false));
+        assert_eq!(
+            resolve_auto_resume(&none, Some("[manager]\nwake_on_worker_end = false\n")),
+            Ok(true)
+        );
+        assert!(resolve_wake_on_worker_end(&none, Some("[manager]\nwake = false\n")).is_err());
+        assert!(
+            resolve_wake_on_worker_end(&none, Some("[manager]\nwake_on_worker_end = 2\n")).is_err()
+        );
+        let off = |k: &str| (k == ENV_WAKE_ON_WORKER_END).then(|| "false".to_owned());
+        assert_eq!(
+            resolve_wake_on_worker_end(&off, Some("[manager]\nwake_on_worker_end = true\n")),
             Ok(false)
         );
     }
