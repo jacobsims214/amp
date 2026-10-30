@@ -67,16 +67,28 @@ pub trait RemoteHost: Send + Sync {
     fn status(&self) -> HostStatus;
 }
 
+/// Whether the chat is busy for remote devices: a manager reply is running, by the host's word
+/// (`host.busy`) or as this link saw it start (`link_busy`, from `RunStart`/`RunEnd` and the
+/// prompts it started). Running workers don't count (#2838): `workers_running` is reported
+/// apart, and the queue starts the next prompt as soon as the reply ends.
+pub(crate) fn reply_busy(host: &HostStatus, link_busy: bool) -> bool {
+    host.busy || link_busy
+}
+
 /// The chat's status for `hello` and `status` (section 6.3).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostStatus {
     pub model: String,
+    /// A manager reply is running: a prompt's turn, an automatic wake turn (#2891) or an approval
+    /// resume. Never workers: launched workers run outside the reply (`workers_running`), and an
+    /// idle manager with workers running takes a prompt at once (#2838).
     pub busy: bool,
     pub context_pct: Option<i64>,
     pub cost_usd_micros: i64,
     pub project: Option<(i64, String)>,
     pub ticket_id: Option<i64>,
     pub branch: Option<String>,
+    /// Live workers, reported on their own; they never make the chat `busy` (#2838).
     pub workers_running: i64,
     // #2388: the rest of what the TUI's header, footer and status line show (section 6.3).
     /// The current ticket's name, board state (`in_progress`, …), epic and story.
@@ -987,6 +999,8 @@ struct Actor {
     prompts: Bucket,
     ops: Bucket,
     refused_at: std::collections::HashMap<String, i64>,
+    /// A manager reply is running, as this link saw it: set when it starts a prompt and on
+    /// `RunStart`, cleared on `RunEnd` (the shell's reply events; workers send none).
     busy: bool,
     feed_seen: u64,
     guard: DeltaGuard,
@@ -1161,7 +1175,7 @@ impl Actor {
             .collect();
         json!({
             "model": s.model,
-            "busy": s.busy || self.busy,
+            "busy": reply_busy(&s, self.busy),
             "context_pct": s.context_pct,
             "cost_usd_micros": s.cost_usd_micros,
             "project": s.project.map(|(id, name)| json!({"id": id, "name": name})),
@@ -1488,7 +1502,7 @@ impl Actor {
             self.publish_state();
         }
         // A queued prompt waiting for a run that ended without our noticing (a server switch).
-        if !self.queue.is_empty() && !self.busy && !self.deps().host.status().busy {
+        if !self.queue.is_empty() && !reply_busy(&self.deps().host.status(), self.busy) {
             self.start_next().await;
         }
         self.maybe_status(false);
@@ -2468,6 +2482,26 @@ impl Poster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2838: `busy` is a running manager reply (a wake turn is one), never running workers.
+    #[test]
+    fn busy_is_the_managers_reply_not_its_workers() {
+        let idle_with_workers = HostStatus {
+            busy: false,
+            workers_running: 4,
+            ..HostStatus::default()
+        };
+        assert!(!reply_busy(&idle_with_workers, false));
+        let replying = HostStatus {
+            busy: true,
+            ..idle_with_workers.clone()
+        };
+        assert!(reply_busy(&replying, false));
+        // The link saw the reply (or a wake turn) start before the host's status caught up.
+        assert!(reply_busy(&idle_with_workers, true));
+        assert!(reply_busy(&replying, true));
+        assert!(!reply_busy(&HostStatus::default(), false));
+    }
 
     /// #2455: every end reason has its own words; losing project access isn't a Revoke all.
     #[test]
