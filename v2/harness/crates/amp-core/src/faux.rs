@@ -19,6 +19,8 @@
 //!
 //! Placeholders in `text`, filled at call time from what the model was sent:
 //! - `{{last_tool_result}}`: the text of the newest tool result, without the clock stamp;
+//! - `{{last_user_message}}`: the text of the newest user message, without the clock stamp (AMP
+//!   #2837: what the turn was really sent, e.g. the worker summaries the chat puts on top);
 //! - `{{system_prompt}}`: the whole system prompt;
 //! - `{{current_time}}`: the newest clock stamp the request carried (#2250,
 //!   [`crate::request_time`]), or `none`;
@@ -176,6 +178,7 @@ impl StepSpec {
         let has_placeholder = spec.text.as_deref().is_some_and(|t| {
             [
                 "{{last_tool_result}}",
+                "{{last_user_message}}",
                 "{{system_prompt}}",
                 "{{current_time}}",
                 "{{context:",
@@ -232,6 +235,18 @@ fn fill(template: &str, ctx: &Context) -> String {
             _ => None,
         })
         .unwrap_or_default();
+    let last_user_message = ctx
+        .messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            Message::User(u) => Some(crate::request_time::strip(&match &u.content {
+                rpi_ai::types::UserContent::Text(t) => t.clone(),
+                rpi_ai::types::UserContent::Blocks(b) => texts(b),
+            })),
+            _ => None,
+        })
+        .unwrap_or_default();
     let current_time = ctx
         .messages
         .iter()
@@ -251,6 +266,7 @@ fn fill(template: &str, ctx: &Context) -> String {
     let system = ctx.system_prompt.as_deref().unwrap_or_default();
     let filled = template
         .replace("{{last_tool_result}}", &last_tool_result)
+        .replace("{{last_user_message}}", &last_user_message)
         .replace("{{current_time}}", &current_time);
     fill_context(&filled, system).replace("{{system_prompt}}", system)
 }

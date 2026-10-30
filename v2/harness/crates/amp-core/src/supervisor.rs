@@ -117,8 +117,9 @@ pub struct SupervisorConfig {
     /// Whether `amp_run_ticket` waits for its worker (`dispatch`, `AMP_HARNESS_WORKER_DISPATCH`,
     /// AMP #2834). Default `await`: the worker runs in the foreground of the tool call, which is
     /// what headless `run -p` and every existing test rely on. `launch` returns an ack at once and
-    /// runs the worker in a task the supervisor owns; the chat opts in (see
-    /// [`Supervisor::launch`] and [`Supervisor::take_launch_ends`]).
+    /// runs the worker in a task the supervisor owns (see [`Supervisor::launch`] and
+    /// [`Supervisor::take_launch_ends`]). The chat starts from `launch` instead (AMP #2837, via
+    /// [`SupervisorConfig::load_with`]); `run -p` is always `await` (AMP #2884).
     pub dispatch: DispatchMode,
 }
 
@@ -195,7 +196,19 @@ impl SupervisorConfig {
         env: &dyn Fn(&str) -> Option<String>,
         config_path: Option<PathBuf>,
     ) -> Result<Self, String> {
-        let mut cfg = Self::default();
+        Self::load_with(env, config_path, Self::default())
+    }
+
+    /// [`Self::load`] starting from `base` instead of the defaults: whatever config.toml or the
+    /// environment names wins over `base`, and the rest of `base` stays. The chat uses it to
+    /// default to [`DispatchMode::Launch`] while an explicit `dispatch = "await"` still wins (AMP
+    /// #2837).
+    pub fn load_with(
+        env: &dyn Fn(&str) -> Option<String>,
+        config_path: Option<PathBuf>,
+        base: Self,
+    ) -> Result<Self, String> {
+        let mut cfg = base;
         if let Some(path) = config_path.or_else(|| amp_mcp::default_config_path(env))
             && let Ok(text) = std::fs::read_to_string(&path)
         {
