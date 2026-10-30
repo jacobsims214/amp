@@ -590,20 +590,46 @@ pub struct LaunchEnd {
 /// fed by [`Supervisor::launch`] — and two ways to consume it. Draining is what makes a summary
 /// arrive exactly once: an end leaves the queue on the call that returns it, so a later drain or
 /// wait never sees it again, whether it was a success or a failure.
-#[derive(Debug, Default)]
+///
+/// Watching ([`LaunchEnds::watch`], AMP #2861) is separate from consuming: every pushed end is
+/// also broadcast to the watchers, so the chat can show it the moment it lands without taking it
+/// from the queue the next manager turn reads.
+#[derive(Debug)]
 pub struct LaunchEnds {
     queue: Mutex<VecDeque<LaunchEnd>>,
     notify: tokio::sync::Notify,
+    watchers: tokio::sync::broadcast::Sender<LaunchEnd>,
+}
+
+/// How many ends a watcher can fall behind before it misses some (it is told how many).
+const LAUNCH_END_WATCH_CAPACITY: usize = 64;
+
+impl Default for LaunchEnds {
+    fn default() -> Self {
+        Self {
+            queue: Mutex::default(),
+            notify: tokio::sync::Notify::new(),
+            watchers: tokio::sync::broadcast::channel(LAUNCH_END_WATCH_CAPACITY).0,
+        }
+    }
 }
 
 impl LaunchEnds {
-    /// Queues one end and wakes whoever is waiting for it.
+    /// Queues one end, wakes whoever is waiting for it, and shows it to the watchers.
     pub fn push(&self, end: LaunchEnd) {
+        // No watchers is fine: the queue is the delivery, the broadcast is only for display.
+        let _ = self.watchers.send(end.clone());
         self.queue
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push_back(end);
         self.notify.notify_waiters();
+    }
+
+    /// A copy of every end pushed from now on, for display (AMP #2861). Receiving from it never
+    /// touches the queue, so [`LaunchEnds::drain`] still returns each end exactly once.
+    pub fn watch(&self) -> tokio::sync::broadcast::Receiver<LaunchEnd> {
+        self.watchers.subscribe()
     }
 
     /// Every queued end, oldest first, leaving the queue empty.
@@ -1571,6 +1597,12 @@ impl Supervisor {
     /// the queue it reads.
     pub fn take_launch_ends(&self) -> Vec<LaunchEnd> {
         self.launch_ends.drain()
+    }
+
+    /// Every launched end from now on, as it lands, without consuming it (AMP #2861): what the
+    /// chat shows; [`Supervisor::take_launch_ends`] still delivers each one to the manager once.
+    pub fn watch_launch_ends(&self) -> tokio::sync::broadcast::Receiver<LaunchEnd> {
+        self.launch_ends.watch()
     }
 
     /// Waits for the next launched end (AMP #2834). Returns at once when one is already queued.

@@ -475,6 +475,31 @@ pub fn esc_hint(tickets: &[i64]) -> String {
 }
 
 /// `#1, #2, #3`, or `#1, #2, #3 +2 more` past three (it has to fit the spinner line).
+/// How loud a launched worker's end is in the transcript (AMP #2861).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// The notice for one launched worker's end (AMP #2861): a completed ticket is plain news, one
+/// the worker blocked or stopped on wants the person, and a failure (or a dispatch that never
+/// happened) is an error. The text is [`amp_core::supervisor::LaunchEnd::line`], as the manager
+/// reads it at its next turn.
+fn launch_end_notice(end: &amp_core::supervisor::LaunchEnd) -> (EndLevel, String) {
+    use amp_core::supervisor::WorkerOutcome as O;
+    let level = match &end.result {
+        Ok(report) => match report.outcome {
+            O::Completed => EndLevel::Info,
+            O::Blocked | O::Stopped | O::Cancelled => EndLevel::Warn,
+            O::Error | O::Timeout | O::TurnBudget => EndLevel::Error,
+        },
+        Err(_) => EndLevel::Error,
+    };
+    (level, format!("worker ended: {}", end.line()))
+}
+
 fn ticket_list(tickets: &[i64]) -> String {
     let shown = tickets
         .iter()
@@ -622,6 +647,9 @@ pub struct Shell {
     cleared_done: Option<i64>,
     /// The manager's worker supervisor, so quitting can cancel and wait for its workers.
     supervisor: Option<Arc<Supervisor>>,
+    /// Copies of the supervisor's launched ends as they land (AMP #2861), shown as notices on the
+    /// tick. Display only: the queue itself is drained at the next turn's start (#2857).
+    launch_watch: Option<tokio::sync::broadcast::Receiver<amp_core::supervisor::LaunchEnd>>,
     /// `/connect`'s harness side, if the caller gave one.
     connect: Option<Arc<dyn ProviderConnect>>,
     /// A key being typed for `/connect`.
@@ -750,6 +778,7 @@ impl Shell {
                 footer_ticket: None,
                 cleared_done: None,
                 supervisor: None,
+                launch_watch: None,
                 connect: None,
                 secret: None,
                 server: None,
@@ -1519,7 +1548,45 @@ impl Shell {
 
     /// Gives the shell the session's worker supervisor (the manager's; `None` for a worker role).
     pub fn set_supervisor(&mut self, supervisor: Option<Arc<Supervisor>>) {
+        self.launch_watch = supervisor.as_ref().map(|s| s.watch_launch_ends());
         self.supervisor = supervisor;
+    }
+
+    /// Shows every launched worker that ended since the last tick (AMP #2861), whether the
+    /// manager is idle or mid-reply: no dispatch tool result has to come back first. It reads
+    /// the supervisor's broadcast, never its queue, so the next turn still gets each end once
+    /// ([`Shell::take_worker_summaries`]). Returns whether anything was shown.
+    fn show_launch_ends(&mut self) -> bool {
+        use tokio::sync::broadcast::error::TryRecvError;
+        let Some(watch) = self.launch_watch.as_mut() else {
+            return false;
+        };
+        let mut shown = false;
+        loop {
+            match watch.try_recv() {
+                Ok(end) => {
+                    let (level, text) = launch_end_notice(&end);
+                    match level {
+                        EndLevel::Info => self.view.add_notice(&text),
+                        EndLevel::Warn => self.view.add_warning(&text),
+                        EndLevel::Error => self.view.add_error(&text),
+                    }
+                    shown = true;
+                }
+                Err(TryRecvError::Lagged(missed)) => {
+                    self.view.add_warning(&format!(
+                        "{missed} worker ends were not shown here; /workers lists them"
+                    ));
+                    shown = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Closed) => {
+                    self.launch_watch = None;
+                    break;
+                }
+            }
+        }
+        shown
     }
 
     /// Gives the shell `/connect` (amp-harness: keychain, provider checks, config).
@@ -3297,6 +3364,7 @@ impl Shell {
         let mut changed = self.expire_hints(Instant::now());
         changed |= self.poll_remote();
         changed |= self.build_roster();
+        changed |= self.show_launch_ends();
         changed |= self.pump_sessions();
         while let Ok(msg) = self.msgs_rx.try_recv() {
             changed = true;
@@ -4577,6 +4645,7 @@ fn count(n: u64, one: &str, many: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{clean_answer, parse_id, short_role, worker_summaries};
+    use std::sync::Arc;
 
     /// #2857: a turn opens with the ends the manager has not seen, once. The block is `None` with
     /// nothing queued (the prompt goes as typed), and a second look at the same drained ends has
@@ -4731,5 +4800,179 @@ mod tests {
         assert_eq!(short_role("amp-manager"), "manager");
         assert_eq!(short_role("amp:amp-worker-backend"), "worker-backend");
         assert_eq!(short_role("reviewer"), "reviewer");
+    }
+
+    /// A worker report for the #2861 tests: `task_id` ended with `outcome`.
+    fn ended(
+        task_id: i64,
+        outcome: amp_core::supervisor::WorkerOutcome,
+        error: Option<&str>,
+    ) -> amp_core::supervisor::LaunchEnd {
+        use amp_core::supervisor::{LaunchEnd, WorkerReport};
+        LaunchEnd {
+            task_id,
+            agent_id: "amp:amp-worker-backend".into(),
+            result: Ok(WorkerReport {
+                task_id,
+                agent_id: "amp:amp-worker-backend".into(),
+                role: "amp-worker-backend".into(),
+                outcome,
+                dispatch_id: String::new(),
+                started: true,
+                returned: None,
+                final_message: String::new(),
+                error: error.map(str::to_owned),
+                model: "wf/wf-1".into(),
+                cwd: std::path::PathBuf::from("/r"),
+                worktree: None,
+                branch: None,
+                workspace: amp_core::workspace::Placement::Shared,
+                session_file: None,
+                turns: 0,
+                tool_calls: 0,
+                tool_errors: 0,
+                usage: amp_core::events::UsageJson::default(),
+                duration_ms: 0,
+                notes: Vec::new(),
+                totals: amp_core::events::Totals::default(),
+            }),
+        }
+    }
+
+    /// A manager shell on a scripted model with a manager feed, watching `ends` the way
+    /// [`super::Shell::set_supervisor`] watches the supervisor's queue (#2861).
+    async fn watching_shell(
+        ends: &amp_core::supervisor::LaunchEnds,
+    ) -> (super::Shell, Arc<amp_core::manager_feed::ManagerFeed>) {
+        use rpi_ai::providers::faux::{FauxProvider, FauxScript};
+        use rpi_harness::{agent_harness::AgentHarness, types::AgentHarnessOptions};
+        let provider = FauxProvider::new(FauxScript::new());
+        let model = provider.default_model().clone();
+        let harness = AgentHarness::create(AgentHarnessOptions {
+            model: model.clone(),
+            session: amp_core::agent::memory_session(),
+            models: vec![provider],
+            ..Default::default()
+        })
+        .await
+        .expect("harness");
+        let info = super::ShellInfo {
+            role: "amp-manager".into(),
+            provider: model.provider.to_string(),
+            model_id: model.id.clone(),
+            thinking: rpi_ai::ThinkingLevel::Off,
+            requested_thinking: None,
+            context_window: 200_000,
+            cwd: "/work/amp".into(),
+            git_branch: None,
+            session_file: None,
+            banner: vec!["AMP harness · manager".into()],
+        };
+        let (mut shell, _done) = super::Shell::new(Arc::new(harness), info, vec![]);
+        let feed = amp_core::manager_feed::ManagerFeed::new();
+        shell.set_feed(Some(Arc::clone(&feed)));
+        shell.launch_watch = Some(ends.watch());
+        (shell, feed)
+    }
+
+    fn feed_notices(
+        feed: &amp_core::manager_feed::ManagerFeed,
+    ) -> Vec<(amp_core::chat_event::NoticeLevel, String)> {
+        use amp_core::chat_event::ChatEvent;
+        feed.since(0)
+            .expect("feed")
+            .into_iter()
+            .filter_map(|e| match e.event {
+                ChatEvent::Notice { level, text, .. } => Some((level, text)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #2861: a launched worker's end shows on the tick — with the manager idle and mid-reply —
+    /// as a transcript line and a feed notice, success as news and failure as an error. Nothing
+    /// here is a dispatch tool result: the shell only polls.
+    #[tokio::test]
+    async fn launched_ends_show_on_the_tick_idle_or_mid_reply() {
+        use amp_core::chat_event::NoticeLevel;
+        use amp_core::supervisor::{LaunchEnd, LaunchEnds, WorkerOutcome};
+
+        let ends = LaunchEnds::default();
+        let (mut shell, feed) = watching_shell(&ends).await;
+        assert!(!shell.show_launch_ends(), "nothing ended yet");
+
+        // Idle.
+        ends.push(ended(2854, WorkerOutcome::Completed, None));
+        assert!(!shell.is_running());
+        assert!(shell.poll(), "the tick shows the end");
+        let screen = shell.view().render_plain(120, 40).join("\n");
+        assert!(
+            screen.contains("worker ended: #2854 completed by amp:amp-worker-backend"),
+            "{screen}"
+        );
+
+        // Mid-reply: a run is going, and its tool calls have nothing to do with these workers.
+        shell.running = true;
+        ends.push(ended(2855, WorkerOutcome::Error, Some("the model failed")));
+        ends.push(LaunchEnd {
+            task_id: 2856,
+            agent_id: "amp:amp-worker-frontend".into(),
+            result: Err("AMP refused the dispatch".into()),
+        });
+        assert!(shell.show_launch_ends());
+        let screen = shell.view().render_plain(120, 40).join("\n");
+        assert!(
+            screen
+                .contains("worker ended: #2855 error by amp:amp-worker-backend: the model failed"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("#2856 was not dispatched to amp:amp-worker-frontend"),
+            "{screen}"
+        );
+        shell.running = false;
+
+        let notices = feed_notices(&feed);
+        let level_of = |needle: &str| {
+            notices
+                .iter()
+                .find(|(_, t)| t.contains(needle))
+                .map(|(l, _)| *l)
+                .unwrap_or_else(|| panic!("no notice for {needle}: {notices:?}"))
+        };
+        assert_eq!(level_of("#2854 completed"), NoticeLevel::Info);
+        assert_eq!(level_of("#2855 error"), NoticeLevel::Error);
+        assert_eq!(level_of("#2856 was not dispatched"), NoticeLevel::Error);
+        assert!(!shell.show_launch_ends(), "each end is shown once");
+    }
+
+    /// #2861: showing an end leaves it in the queue, so the next manager turn still gets every
+    /// end exactly once (#2857's drain), and the notices never repeat what the turn delivers.
+    #[tokio::test]
+    async fn showing_ends_leaves_the_next_turns_delivery_whole_and_once() {
+        use amp_core::supervisor::{LaunchEnds, WorkerOutcome};
+
+        let ends = LaunchEnds::default();
+        let (mut shell, _feed) = watching_shell(&ends).await;
+        ends.push(ended(2854, WorkerOutcome::Completed, None));
+        ends.push(ended(2855, WorkerOutcome::Error, Some("the model failed")));
+        assert!(shell.show_launch_ends());
+        assert_eq!(ends.len(), 2, "display does not consume the queue");
+
+        // What `Shell::take_worker_summaries` does at the next turn's start.
+        let block = worker_summaries(&ends.drain()).expect("both ends reach the turn");
+        assert_eq!(
+            block.lines().filter(|l| l.starts_with("- ")).count(),
+            2,
+            "{block}"
+        );
+        assert!(block.contains("#2854 completed"), "{block}");
+        assert!(block.contains("#2855 error"), "{block}");
+        assert_eq!(worker_summaries(&ends.drain()), None, "and only once");
+
+        // Draining sends nothing new to the watcher: the transcript does not show them again.
+        assert!(!shell.show_launch_ends());
+        let screen = shell.view().render_plain(120, 40).join("\n");
+        assert_eq!(screen.matches("worker ended: #2854").count(), 1, "{screen}");
     }
 }
