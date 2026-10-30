@@ -219,8 +219,9 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         wait_mcp: false,
         // #2241: ask about untrusted repo MCP servers (in the terminal, before the TUI opens).
         ask_trust: true,
-        // The chat keeps the configured `[workers] dispatch` (its own default is #2837's).
-        dispatch_override: None,
+        // AMP #2837: workers run in the background, so the person can keep talking to the manager
+        // while they work; an explicit `[workers] dispatch = "await"` (or the env var) still wins.
+        dispatch: session::CHAT_DISPATCH,
     })
     .await?;
     let settings = args.conn.settings()?;

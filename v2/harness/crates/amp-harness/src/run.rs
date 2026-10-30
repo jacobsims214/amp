@@ -318,7 +318,7 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         ask_trust: false,
         // AMP #2884: the process ends with the manager's reply, so `amp_run_ticket` must wait for
         // its worker here whatever `[workers] dispatch` or AMP_HARNESS_WORKER_DISPATCH says.
-        dispatch_override: Some(amp_core::supervisor::DispatchMode::Await),
+        dispatch: session::HEADLESS_DISPATCH,
     });
     let session = tokio::select! {
         s = build => s?,
