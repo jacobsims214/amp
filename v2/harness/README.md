@@ -1166,9 +1166,14 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   session's tokens and cost, `/help` (also `/?`), `/abort`, `/stop` (the reply, or the wait for
   plan approval), `/close` (the open panel), `/quit`
   (also `/exit`, `/q`). Typing `/` opens a completion menu (↑↓ choose, Tab complete, Enter run).
-- Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply (and the workers it
-  started; an Esc that closes a panel, the `/` menu or a worker's session doesn't, and for 2 s the
-  spinner line says `Esc again to stop the reply`). Up/Down in an empty or one-line editor recall
+- Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply (an Esc that closes a
+  panel, the `/` menu or a worker's session doesn't, and for 2 s the spinner line says `Esc again to
+  stop the reply`). Esc, `/abort` and `/stop` end the reply only (#2858): in the chat's default
+  Launch dispatch, launched workers keep running (stop one from `/workers`; quitting stops them all),
+  and only a launch from this reply that is still waiting for a worker slot is cancelled. With
+  `[workers] dispatch = "await"` the workers run inside the reply and stop with it. A prompt typed
+  while a reply runs is queued (#2889): up to 5, run in order after the reply, dropped if the reply
+  is stopped. Up/Down in an empty or one-line editor recall
   earlier prompts; Down past the newest restores the draft. A new line also comes
   from Ctrl+J (every terminal), Alt+Enter (`ESC CR`: Option as Esc+/Meta on a Mac) and `\` then
   Enter (#2349). Without the kitty keyboard protocol most terminals send Shift+Enter as a plain CR,
@@ -1435,8 +1440,18 @@ redirection to a file are denied too.
 ## Dispatching workers (M2-5)
 
 A primary role (the manager) gets the native tool `amp_run_ticket(task_id, agent_id, instructions?,
-worktree?, branch?, base?)`. It runs one specialist on one ticket in the foreground of the tool
-call and returns the worker's final message, outcome, usage and where its work is:
+worktree?, branch?, base?)`. It runs one specialist on one ticket, in one of two modes
+(`[workers] dispatch`, below):
+
+- **Launch** (the chat's default, #2837): the call returns an acknowledgement at once (`Launched
+  #<id> … in the background`, noting when every slot is taken and it waits its turn), and the worker
+  runs on in a task the supervisor owns. The manager ends its turn; the worker's final message,
+  outcome, usage and where its work is reach a later turn as a `[worker summaries]` entry (and wake
+  an idle chat, above).
+- **Await** (`run -p` always, #2884, or the chat with `dispatch = "await"`): the call returns when
+  the worker ends, with its final message, outcome, usage and where its work is.
+
+Either way:
 
 1. The agent must be in the roster and allowed by the manager's `task` policy; otherwise nothing
    happens in AMP.
@@ -1456,8 +1471,9 @@ call and returns the worker's final message, outcome, usage and where its work i
 5. **Before the worker's first turn, the harness starts the ticket for it** (#2802, below): the
    dispatch result carries a `dispatch_id`, and the harness calls `amp_claim_task(task_id,
    dispatch_id)` itself once the worker exists.
-6. It runs until it stops, hits the timeout or the turn budget, or is cancelled (the manager's run
-   was aborted). Ending a worker early aborts its in-flight tools. Every end that doesn't close the
+6. It runs until it stops, hits the timeout or the turn budget, or is cancelled. In Await mode
+   stopping the manager's reply cancels it; in Launch mode it survives that and ends early only on a
+   `/workers` stop or when the chat quits. Ending a worker early aborts its in-flight tools. Every end that doesn't close the
    ticket hands it back (#2802, below).
 
 Limits, in `~/.config/amp-harness/config.toml` or the environment (env wins):
@@ -1468,8 +1484,11 @@ max_parallel = 4          # AMP_HARNESS_MAX_WORKERS: workers at once; extra call
 timeout_minutes = 60      # AMP_HARNESS_WORKER_TIMEOUT_SECS (seconds): wall clock per worker
 max_turns = 400           # AMP_HARNESS_WORKER_MAX_TURNS: model turns per worker; 0 = no limit
 isolation = "auto"        # AMP_HARNESS_WORKER_ISOLATION: auto | worktree | folder | shared
+dispatch = "launch"       # AMP_HARNESS_WORKER_DISPATCH: launch | await (run -p always awaits)
 ```
 
+`dispatch` defaults to `launch` in the chat; an explicit `await` here or in the environment wins,
+as the way back to foreground dispatch. `run -p` ignores it and always awaits.
 Unknown keys and non-positive `max_parallel` or timeouts are errors. `[workers]` is read when the
 chat starts and only from your user config (a repo's `.amp/harness/config.toml` can't set it).
 
