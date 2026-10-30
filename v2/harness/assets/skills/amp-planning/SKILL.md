@@ -678,14 +678,14 @@ amp_run_ticket(task_id=ID, agent_id=<task's assigned_to>)
 It returns `dispatch_id`, `worker_prompt`, `next` and `start_by`. The ticket is in progress but
 **not started**: nothing has picked it up yet.
 
-`amp_run_ticket` does both steps in one call: it dispatches the ticket in AMP and starts the worker, then returns when the worker finishes.
+`amp_run_ticket` does both steps in one call: it dispatches the ticket in AMP and starts the worker. In the chat it returns an acknowledgement at once and the worker runs in the background: end your turn, and its result opens a later turn as a `[worker summaries]` entry. In `amp-harness run -p` it returns when the worker finishes.
 
 The harness handles the claim for its worker (the ticket is started when the worker process
 starts, not before), and the worker completes or blocks the ticket itself. Don't write a prompt of
 your own: yours would lose the `dispatch_id`, and the ticket
 would be flagged "not started" at 10 minutes and returned to ready at 30.
 
-`amp_run_ticket` marks each ticket dispatched in AMP before it starts the worker (this is what shows live progress on the board), and returns when the worker finishes. A dispatch the harness doesn't follow with a worker is returned to ready by AMP's watchdog (flagged at 10 minutes, returned at 30), and the harness releases the tickets it dispatched whose worker didn't run when it starts.
+`amp_run_ticket` marks each ticket dispatched in AMP before it starts the worker (this is what shows live progress on the board). In the chat it returns at once and the worker's result arrives in a later turn; in `amp-harness run -p` it returns when the worker finishes. A dispatch the harness doesn't follow with a worker is returned to ready by AMP's watchdog (flagged at 10 minutes, returned at 30), and the harness releases the tickets it dispatched whose worker didn't run when it starts.
 
 **Don't move ticket state yourself.** Workers claim their own ticket and complete or block it; a
 `amp_complete_task` without a worker's `dispatch_id` is a **closeout**, and it's only for a worker
