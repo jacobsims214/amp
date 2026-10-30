@@ -582,9 +582,14 @@ pub struct LaunchEnd {
     pub agent_id: String,
     /// `Ok`: the run ended and its [`WorkerHooks::on_finish`] ran (the ticket was closed, or
     /// returned). `Err`: nothing was dispatched — the slot was cancelled before it came up, or
-    /// AMP refused the dispatch — and nothing in AMP needs undoing.
+    /// AMP refused the dispatch — and nothing in AMP needs undoing; or, when it starts with
+    /// [`LAUNCH_CRASHED`], the worker task panicked (AMP #2885) and the message says whether its
+    /// ticket was handed back.
     pub result: Result<WorkerReport, String>,
 }
+
+/// How a launched end whose worker task panicked starts (AMP #2885).
+pub const LAUNCH_CRASHED: &str = "the worker task crashed";
 
 /// The queue of launched ends (AMP #2834, #2835): one producer — [`Supervisor::record_launch_end`],
 /// fed by [`Supervisor::launch`] — and two ways to consume it. Draining is what makes a summary
@@ -694,6 +699,9 @@ impl LaunchEnd {
                     line.push_str(&format!(": {err}"));
                 }
                 line
+            }
+            Err(why) if why.starts_with(LAUNCH_CRASHED) => {
+                format!("#{} by {}: {why}", self.task_id, self.agent_id)
             }
             Err(why) => format!(
                 "#{} was not dispatched to {}: {why}",
@@ -1475,6 +1483,7 @@ impl Supervisor {
             at: Where { repo, place, edits },
             stops,
             slot,
+            progress: Arc::default(),
         })
     }
 
@@ -1499,6 +1508,7 @@ impl Supervisor {
             at,
             stops,
             slot,
+            progress,
             ..
         } = prepared;
         // Held until this returns, however it returns: the ticket leaves the live map (so it can
@@ -1565,6 +1575,7 @@ impl Supervisor {
                 .into_owned(),
             }
         })?;
+        progress.dispatched.store(true, Ordering::SeqCst);
         if let Some(w) = self.live.lock().unwrap().get_mut(&req.task_id) {
             w.dispatched = true;
         }
@@ -1578,7 +1589,7 @@ impl Supervisor {
                     ..DispatchResult::default()
                 }
             });
-        let dispatch = Dispatch::new(&dispatched.dispatch_id);
+        let dispatch = Dispatch::new(&dispatched.dispatch_id, progress);
         // The ledger is what the next startup sweeps: this ticket is ours from here until its
         // worker closes it or it is handed back.
         if let Err(e) = self.ledger.record(
@@ -1632,12 +1643,23 @@ impl Supervisor {
         );
         let sup = Arc::clone(self);
         let (task_id, agent_id) = (ack.task_id, ack.agent_id.clone());
+        let progress = Arc::clone(&prepared.progress);
         let handle = tokio::spawn(async move {
-            let result = sup.run_prepared(prepared, true).await;
+            // AMP #2885: the run is its own task, so a panic in it (a poisoned lock, a hook) comes
+            // back here as a JoinError instead of taking the end and the ticket with it. Its live
+            // slot, worker permit and writer lock are dropped as it unwinds.
+            let run = tokio::spawn({
+                let sup = Arc::clone(&sup);
+                async move { sup.run_prepared(prepared, true).await }
+            });
+            let result = match run.await {
+                Ok(result) => result.map_err(|e| e.to_string()),
+                Err(crash) => Err(sup.launch_crashed(task_id, &progress, crash).await),
+            };
             sup.record_launch_end(LaunchEnd {
                 task_id,
                 agent_id,
-                result: result.map_err(|e| e.to_string()),
+                result,
             });
         });
         let mut launched = self.launched.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1693,6 +1715,51 @@ impl Supervisor {
             }
         }
         ended
+    }
+
+    /// A launched run's task died (AMP #2885): hands its ticket back when it was dispatched and
+    /// its `on_finish` never completed (#2802 — nobody else will: the live entry went with the
+    /// task, so quit's [`Supervisor::release_unfinished`] can't see it), and says so in the end's
+    /// message, which starts with [`LAUNCH_CRASHED`].
+    async fn launch_crashed(
+        &self,
+        task_id: i64,
+        progress: &LaunchProgress,
+        crash: tokio::task::JoinError,
+    ) -> String {
+        let what = if crash.is_panic() {
+            let payload = crash.into_panic();
+            payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "it panicked".to_owned())
+        } else {
+            "it was cancelled".to_owned()
+        };
+        tracing::error!(ticket = task_id, panic = %what, "a launched worker task crashed");
+        let mut why = format!("{LAUNCH_CRASHED}: {what}");
+        if !progress.dispatched.load(Ordering::SeqCst) {
+            why.push_str("; nothing was dispatched");
+        } else if progress.finished.load(Ordering::SeqCst) {
+            why.push_str(&format!("; #{task_id} had already been closed or returned"));
+        } else {
+            match &self.hooks {
+                Some(hooks) => match hooks
+                    .release(task_id, &format!("worker crashed: {what}"))
+                    .await
+                {
+                    Ok(()) => why.push_str(&format!("; #{task_id} was returned to ready")),
+                    Err(e) => {
+                        why.push_str(&format!("; #{task_id} could not be returned to ready: {e}"))
+                    }
+                },
+                None => why.push_str(&format!(
+                    "; #{task_id} is still in progress in AMP (no run reporting to return it)"
+                )),
+            }
+        }
+        why
     }
 
     fn record_launch_end(&self, end: LaunchEnd) {
@@ -2112,6 +2179,7 @@ impl Supervisor {
         if let Some(hooks) = &self.hooks {
             hooks.on_finish(info, &mut report).await;
         }
+        dispatch.progress.finished.store(true, Ordering::SeqCst);
         self.record_finished(&report);
         report
     }
@@ -2236,6 +2304,18 @@ struct Prepared {
     at: Where,
     stops: StopHandle,
     slot: LiveSlot,
+    /// How far the run got, readable after it panicked (AMP #2885).
+    progress: Arc<LaunchProgress>,
+}
+
+/// How far a prepared run got, kept outside it so [`Supervisor::launch`] can tell after a panic
+/// whether the ticket is still ours to hand back (AMP #2885).
+#[derive(Debug, Default)]
+struct LaunchProgress {
+    /// AMP accepted the dispatch.
+    dispatched: AtomicBool,
+    /// [`WorkerHooks::on_finish`] returned: the ticket was closed or handed back.
+    finished: AtomicBool,
 }
 
 /// What a dispatch gave this run (AMP #2801/#2802): the token its worker starts and closes the
@@ -2248,13 +2328,16 @@ struct Dispatch {
     /// Whether the ticket was started for this run: the harness's claim, or AMP's fallback on the
     /// worker's first write. Shared, because the worker's hooks see the same run.
     claimed: Arc<AtomicBool>,
+    /// The run's [`LaunchProgress`]; `finish` marks it finished once `on_finish` returns.
+    progress: Arc<LaunchProgress>,
 }
 
 impl Dispatch {
-    fn new(id: &str) -> Self {
+    fn new(id: &str, progress: Arc<LaunchProgress>) -> Self {
         Self {
             id: id.to_owned(),
             claimed: Arc::default(),
+            progress,
         }
     }
 

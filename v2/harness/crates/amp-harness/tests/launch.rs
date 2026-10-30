@@ -154,6 +154,15 @@ impl Fixture {
             }),
             None => reporter as Arc<dyn WorkerHooks>,
         };
+        self.supervisor_with(config, hooks)
+    }
+
+    /// A launched-mode supervisor with exactly these hooks.
+    fn supervisor_with(
+        &self,
+        config: SupervisorConfig,
+        hooks: Arc<dyn WorkerHooks>,
+    ) -> Arc<Supervisor> {
         Supervisor::with_hooks_and_ledger(
             Arc::clone(&self.rt),
             ManagerContext {
@@ -860,4 +869,108 @@ async fn the_display_broadcast_does_not_change_what_the_queue_retains() {
         late.try_recv(),
         Err(tokio::sync::broadcast::error::TryRecvError::Empty)
     ));
+}
+
+/// Hooks around the real run reporter whose `on_finish` panics before the reporter sees the run:
+/// a launched worker task that dies mid-finish, so nothing on the normal path ends it or returns
+/// its ticket (AMP #2885). Every `release` is kept for the test.
+struct PanicsInFinish {
+    reporter: Arc<RunReporter>,
+    released: Mutex<Vec<(i64, String)>>,
+}
+
+#[async_trait::async_trait]
+impl WorkerHooks for PanicsInFinish {
+    fn before_tool_call(&self, worker: &WorkerInfo) -> Option<rpi_agent::BeforeToolCall> {
+        self.reporter.before_tool_call(worker)
+    }
+
+    async fn on_finish(&self, _worker: &WorkerInfo, _report: &mut WorkerReport) {
+        panic!("boom in on_finish");
+    }
+
+    async fn release(&self, task_id: i64, why: &str) -> Result<(), String> {
+        self.released
+            .lock()
+            .unwrap()
+            .push((task_id, why.to_owned()));
+        self.reporter.release(task_id, why).await
+    }
+}
+
+/// 11. AMP #2885: a launched worker task that panics after its ticket was dispatched still ends
+/// exactly once — an `Err` end naming the crash, on the delivery queue and on the display
+/// broadcast — and its ticket is handed back through `WorkerHooks::release` (#2802), the live
+/// slot and the worker slot both let go. Before the fix the panic was swallowed: no end, the
+/// ticket left in progress, and quit's `release_unfinished` blind to it (its live entry gone).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launched_worker_that_panics_still_ends_once_and_returns_its_ticket() {
+    let f = fixture("panics").await;
+    let hooks = Arc::new(PanicsInFinish {
+        reporter: RunReporter::new(Arc::clone(&f.rt.mcp)).with_ledger(Arc::clone(&f.ledger)),
+        released: Mutex::default(),
+    });
+    let sup = f.supervisor_with(launch_config(1), Arc::clone(&hooks) as Arc<dyn WorkerHooks>);
+    let mut shown = sup.watch_launch_ends();
+    f.script(vec![step("Nothing to do.", json!([]))]);
+
+    sup.launch(req(3101, "worker-backend"), CancellationToken::new())
+        .await
+        .expect("launched");
+    assert_eq!(
+        sup.join_launched(Duration::from_secs(30)).await,
+        1,
+        "the launched task ended"
+    );
+
+    // Exactly one end, an error naming the crash and where the ticket went.
+    let ends = sup.take_launch_ends();
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    let end = &ends[0];
+    assert_eq!(end.task_id, 3101);
+    let why = end.result.as_ref().expect_err("a crash is an Err end");
+    assert!(why.contains("crashed"), "{why}");
+    assert!(
+        why.contains("boom in on_finish"),
+        "it names the panic: {why}"
+    );
+    assert!(why.contains("#3101 was returned"), "{why}");
+    let line = end.line();
+    assert!(line.contains("#3101") && line.contains("crashed"), "{line}");
+    assert!(
+        !line.contains("not dispatched"),
+        "it was dispatched: {line}"
+    );
+    assert_eq!(end.summary(), line);
+    assert!(sup.take_launch_ends().is_empty(), "delivered once");
+
+    // The display broadcast showed it too.
+    let copy = shown.try_recv().expect("the chat was shown the crash");
+    assert_eq!(copy.task_id, 3101);
+    assert!(copy.line().contains("crashed"), "{}", copy.line());
+
+    // #2802: handed back through the hooks, once, with the reason; the ledger let go of it.
+    let released = hooks.released.lock().unwrap().clone();
+    assert_eq!(released.len(), 1, "{released:?}");
+    assert_eq!(released[0].0, 3101);
+    assert!(released[0].1.contains("worker crashed"), "{released:?}");
+    let returns = f.calls("amp_return_task");
+    assert_eq!(returns.len(), 1, "{returns:?}");
+    assert_eq!(returns[0]["task_id"], 3101);
+    assert!(
+        f.ledger.records().iter().all(|r| r.task_id != 3101),
+        "{:?}",
+        f.ledger.records()
+    );
+
+    // The live entry and the worker slot are free: the ticket can run again.
+    assert!(live_tickets(&sup).is_empty());
+    assert!(sup.unfinished().is_empty());
+    assert_eq!(sup.launched_running(), 0);
+    f.script(vec![step("Nothing to do.", json!([]))]);
+    let again = Supervisor::launch(&sup, req(3102, "worker-backend"), CancellationToken::new())
+        .await
+        .expect("the single slot is free again");
+    assert!(!again.queued, "the crashed run's permit was released");
+    sup.join_launched(Duration::from_secs(30)).await;
 }
