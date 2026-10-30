@@ -27,10 +27,21 @@
 //! worker's usage [`Totals`] and where its work is. Run reporting ([`crate::run_report`], M2-6)
 //! reports it to AMP through [`WorkerHooks`]. Errors before step 3 are tool errors for the
 //! manager and touch nothing in AMP.
+//!
+//! **Launched (background) dispatch (AMP #2834).** With [`SupervisorConfig::dispatch`] set to
+//! [`DispatchMode::Launch`], `amp_run_ticket` doesn't wait for the worker: steps 1-3 happen, then
+//! the run is handed to a task the supervisor owns and the call returns a [`LaunchAck`]. The
+//! worker's end is queued ([`Supervisor::take_launch_ends`]) for whatever delivers it into the
+//! manager's conversation, and [`Supervisor::join_launched`] waits for them at shutdown. Nothing
+//! else changes: `begin`/`prepare` are the same code path, so the semaphore, duplicate
+//! prevention, AMP's dispatch, the worker's claim, the ledger and the return of every ticket that
+//! doesn't close still run — only *who awaits* the run differs. Foreground stays the default, for
+//! headless `run -p` and the tests.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -49,7 +60,7 @@ use rpi_harness::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::sync::Semaphore;
+use tokio::{sync::Semaphore, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -103,6 +114,43 @@ pub struct SupervisorConfig {
     /// Where workers that edit files work (`isolation`, `AMP_HARNESS_WORKER_ISOLATION`, #2364).
     /// Default `auto`: a git worktree in a usable repository, else a folder per ticket.
     pub isolation: Isolation,
+    /// Whether `amp_run_ticket` waits for its worker (`dispatch`, `AMP_HARNESS_WORKER_DISPATCH`,
+    /// AMP #2834). Default `await`: the worker runs in the foreground of the tool call, which is
+    /// what headless `run -p` and every existing test rely on. `launch` returns an ack at once and
+    /// runs the worker in a task the supervisor owns; the chat opts in (see
+    /// [`Supervisor::launch`] and [`Supervisor::take_launch_ends`]).
+    pub dispatch: DispatchMode,
+}
+
+/// Whether `amp_run_ticket` waits for its worker (AMP #2834).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DispatchMode {
+    /// The tool call awaits the worker and returns its [`WorkerReport`] (the default).
+    #[default]
+    Await,
+    /// The tool call returns a [`LaunchAck`] and the worker runs on, in a supervisor-owned task.
+    Launch,
+}
+
+impl DispatchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Await => "await",
+            Self::Launch => "launch",
+        }
+    }
+}
+
+impl FromStr for DispatchMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "await" | "foreground" | "wait" => Ok(Self::Await),
+            "launch" | "background" => Ok(Self::Launch),
+            other => Err(format!("expected `await` or `launch`, not `{other}`")),
+        }
+    }
 }
 
 impl Default for SupervisorConfig {
@@ -113,6 +161,7 @@ impl Default for SupervisorConfig {
             max_turns: 400,
             abort_grace: Duration::from_secs(10),
             isolation: Isolation::Auto,
+            dispatch: DispatchMode::Await,
         }
     }
 }
@@ -120,6 +169,8 @@ impl Default for SupervisorConfig {
 pub const ENV_MAX_WORKERS: &str = "AMP_HARNESS_MAX_WORKERS";
 pub const ENV_WORKER_TIMEOUT_SECS: &str = "AMP_HARNESS_WORKER_TIMEOUT_SECS";
 pub const ENV_WORKER_MAX_TURNS: &str = "AMP_HARNESS_WORKER_MAX_TURNS";
+/// `launch` runs `amp_run_ticket`'s worker in the background (AMP #2834).
+pub const ENV_WORKER_DISPATCH: &str = "AMP_HARNESS_WORKER_DISPATCH";
 
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -128,6 +179,7 @@ struct WorkersTable {
     timeout_minutes: Option<f64>,
     max_turns: Option<u32>,
     isolation: Option<String>,
+    dispatch: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -174,6 +226,9 @@ impl SupervisorConfig {
         if let Some(i) = w.isolation {
             self.isolation = i.parse()?;
         }
+        if let Some(d) = w.dispatch {
+            self.dispatch = d.parse().map_err(|e| format!("dispatch: {e}"))?;
+        }
         Ok(())
     }
 
@@ -197,6 +252,11 @@ impl SupervisorConfig {
         }
         if let Some(v) = get(ENV_ISOLATION) {
             self.isolation = v.parse().map_err(|e| format!("{ENV_ISOLATION}: {e}"))?;
+        }
+        if let Some(v) = get(ENV_WORKER_DISPATCH) {
+            self.dispatch = v
+                .parse()
+                .map_err(|e| format!("{ENV_WORKER_DISPATCH}: {e}"))?;
         }
         Ok(())
     }
@@ -452,6 +512,113 @@ pub struct WorkerReport {
     pub totals: Totals,
 }
 
+/// What a launched `amp_run_ticket` tells the manager at once (AMP #2834), in place of the
+/// [`WorkerReport`] a foreground call would have waited for: the ticket is AMP's, the worker is
+/// the supervisor's, and its end will come later through [`Supervisor::take_launch_ends`].
+///
+/// `Serialize`, because it is the tool result's `details`; the chat's tool row reads the same
+/// fields.
+#[derive(Debug, Clone, Serialize)]
+pub struct LaunchAck {
+    pub task_id: i64,
+    /// AMP's form: `amp:amp-worker-backend`.
+    pub agent_id: String,
+    /// The role id.
+    pub role: String,
+    /// `provider/model`, or empty when the role has no model configured (the worker then fails to
+    /// build and reports it, exactly as a foreground run does).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// Where it works when it starts (#2364): worktree, folder, or the person's own folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<Placement>,
+    /// Workers allowed at once ([`SupervisorConfig::max_parallel`]): what the manager may count on.
+    pub limit: usize,
+    /// Every slot was taken, so this worker waits its turn before it dispatches in AMP.
+    pub queued: bool,
+    /// What the manager is told, in one line.
+    pub message: String,
+}
+
+impl LaunchAck {
+    fn new(
+        task_id: i64,
+        agent_id: String,
+        role: String,
+        model: String,
+        workspace: Option<Placement>,
+        limit: usize,
+        queued: bool,
+    ) -> Self {
+        let message = format!(
+            "Launched {agent_id} on #{task_id}: it is running in the background{}. You can carry on \
+             in this chat; its result arrives as a notice when it ends. Up to {limit} workers run \
+             at once; stop it from the /workers panel.",
+            if queued {
+                " (every worker slot was taken, so it waits its turn)"
+            } else {
+                ""
+            }
+        );
+        Self {
+            task_id,
+            agent_id,
+            role,
+            model,
+            workspace,
+            limit,
+            queued,
+            message,
+        }
+    }
+}
+
+/// How a launched worker ended (AMP #2834): the run's report, or the reason it never got as far
+/// as a dispatch. Queued by [`Supervisor::launch`], read by [`Supervisor::take_launch_ends`] —
+/// the seam completion delivery sits on.
+#[derive(Debug, Clone)]
+pub struct LaunchEnd {
+    pub task_id: i64,
+    pub agent_id: String,
+    /// `Ok`: the run ended and its [`WorkerHooks::on_finish`] ran (the ticket was closed, or
+    /// returned). `Err`: nothing was dispatched — the slot was cancelled before it came up, or
+    /// AMP refused the dispatch — and nothing in AMP needs undoing.
+    pub result: Result<WorkerReport, String>,
+}
+
+impl LaunchEnd {
+    /// Whether this end is one the person has to hear about: a run that closed its ticket says
+    /// nothing new, one that ended any other way carries its own notes.
+    pub fn needs_attention(&self) -> bool {
+        match &self.result {
+            Ok(report) => !report.outcome.closed_ticket(),
+            Err(_) => false,
+        }
+    }
+
+    /// The one line completion delivery shows: `■ #123 completed by amp:amp-worker-backend`.
+    pub fn line(&self) -> String {
+        match &self.result {
+            Ok(report) => {
+                let mut line = format!(
+                    "#{} {} by {}",
+                    self.task_id,
+                    report.outcome.as_str(),
+                    self.agent_id
+                );
+                if let Some(err) = report.error.as_deref().filter(|e| !e.trim().is_empty()) {
+                    line.push_str(&format!(": {err}"));
+                }
+                line
+            }
+            Err(why) => format!(
+                "#{} was not dispatched to {}: {why}",
+                self.task_id, self.agent_id
+            ),
+        }
+    }
+}
+
 /// The supervisor's extension points; run reporting ([`crate::run_report::RunReporter`], M2-6)
 /// plugs in here.
 #[async_trait::async_trait]
@@ -644,6 +811,12 @@ pub struct Supervisor {
     /// The tickets this machine dispatched (AMP #2802): what the next startup hands back if this
     /// process dies with one in progress.
     ledger: Arc<Ledger>,
+    /// The tasks of the workers launched in the background (AMP #2834), kept so
+    /// [`Supervisor::join_launched`] can wait for them at shutdown.
+    launched: Mutex<Vec<JoinHandle<()>>>,
+    /// The ends of those launches, for completion delivery to drain.
+    launch_ends: Mutex<VecDeque<LaunchEnd>>,
+    launch_end_notify: tokio::sync::Notify,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -694,6 +867,9 @@ impl Supervisor {
             git_lock: tokio::sync::Mutex::new(()),
             writer: Arc::new(tokio::sync::Mutex::new(())),
             ledger,
+            launched: Mutex::new(Vec::new()),
+            launch_ends: Mutex::new(VecDeque::new()),
+            launch_end_notify: tokio::sync::Notify::new(),
         })
     }
 
@@ -1025,14 +1201,28 @@ impl Supervisor {
     /// `amp_run_ticket`'s description: what it does, plus every dispatchable role with its
     /// description.
     pub fn tool_description(&self) -> String {
+        let (opening, returns) = match self.config.dispatch {
+            // The default: the tool call waits for the worker (headless, and what `run -p` does).
+            DispatchMode::Await => (
+                "Run a specialist agent on one AMP ticket and wait for it to finish.",
+                "returns its final message and outcome",
+            ),
+            // AMP #2834: the chat. The call returns at once and the worker runs on, so the
+            // manager can keep talking while up to `max_parallel` workers run.
+            DispatchMode::Launch => (
+                "Start a specialist agent on one AMP ticket in the background: it runs while you \
+                 carry on with other work in this chat, and its result arrives as a notice when it \
+                 ends. Don't wait for it, and don't run the same ticket twice.",
+                "returns an acknowledgement at once; the worker's last message and outcome arrive \
+                 when it ends",
+            ),
+        };
         let mut text = format!(
-            "Run a specialist agent on one AMP ticket and wait for it to finish. Marks the ticket \
-             dispatched in AMP (amp_dispatch_task), gives a worker whose role edits files its own \
-             place to work ({}), runs it on its own model, and returns \
-             its final message and outcome (completed, blocked, stopped, error, timeout, cancelled \
-             or turn_budget) as JSON. Call it once per ticket in the same message to run tickets in \
-             parallel: at most {} run at once, extra calls wait for a free slot; each worker has \
-             {} of wall-clock time. agent_id is the ticket's assigned_to.\n\nAgents:",
+            "{opening} Marks the ticket dispatched in AMP (amp_dispatch_task), gives a worker whose \
+             role edits files its own place to work ({}), runs it on its own model, and {returns} \
+             (completed, blocked, stopped, error, timeout, cancelled or turn_budget) as JSON. At \
+             most {} run at once, and calls beyond that wait for a free slot; each worker has {} of \
+             wall-clock time. agent_id is the ticket's assigned_to.\n\nAgents:",
             self.place_description(),
             self.config.max_parallel,
             human_duration(self.config.timeout),
@@ -1085,11 +1275,28 @@ impl Supervisor {
 
     /// Runs one ticket. `Err` means nothing was dispatched; once AMP has the dispatch, every end
     /// is an `Ok(WorkerReport)` (and [`WorkerHooks::on_finish`] has run).
+    ///
+    /// This is the foreground half of [`Supervisor::launch`]'s pair: both call
+    /// [`Supervisor::prepare`] and [`Supervisor::run_prepared`], so a launched worker is the same
+    /// run, only awaited by the supervisor's task instead of by the tool call (AMP #2834).
     pub async fn run_ticket(
-        &self,
+        self: &Arc<Self>,
         req: RunRequest,
         signal: CancellationToken,
     ) -> Result<WorkerReport, RunTicketError> {
+        let prepared = self.prepare(req, signal).await?;
+        self.run_prepared(prepared, false).await
+    }
+
+    /// Validating everything that can refuse a run, and reserving its place, before it starts
+    /// (AMP #2834): the agent, the live-map slot (which is what turns a second call for the same
+    /// ticket into [`RunTicketError::AlreadyRunning`]) and where the worker will work. `Err` here
+    /// means nothing was dispatched and nothing is left in this supervisor's live map.
+    async fn prepare(
+        self: &Arc<Self>,
+        req: RunRequest,
+        signal: CancellationToken,
+    ) -> Result<Prepared, RunTicketError> {
         if req.task_id <= 0 {
             return Err(RunTicketError::BadArguments(format!(
                 "task_id must be a ticket id, not {}",
@@ -1098,8 +1305,12 @@ impl Supervisor {
         }
         let role = self.resolve_role(&req.agent_id)?;
         let agent_id = format!("amp:{}", role.id);
-        let _guard = self.claim(req.task_id, &agent_id)?;
-        let stops = self.stop_handle(req.task_id, signal.clone());
+        let slot = self.claim(req.task_id, &agent_id)?;
+        let stops = self.stop_handle(req.task_id, signal);
+        let model = role
+            .resolve_model(&self.rt.current_models())
+            .ok()
+            .map(|r| r.model_ref());
 
         // #2364: where it will work, decided before anything happens in AMP.
         let edits = role.tool_policy(&self.manager.cwd).exposes("edit");
@@ -1117,9 +1328,56 @@ impl Supervisor {
         } else {
             None
         };
+        Ok(Prepared {
+            req,
+            role,
+            agent_id,
+            model,
+            at: Where { repo, place, edits },
+            stops,
+            slot,
+        })
+    }
+
+    /// The run itself, on a [`Prepared`] ticket: waits its turn (the shared-folder writer lock,
+    /// then a worker slot), dispatches in AMP, records the ledger, runs the worker, and ends in a
+    /// report — or in `Err` when it never got to dispatch.
+    ///
+    /// `detached` is AMP #2834's launch rule: the manager's tool-call signal still cancels a
+    /// worker that has not been dispatched yet (nothing is left in AMP), but once AMP has the
+    /// dispatch the run is the supervisor's, and only [`Supervisor::stop_worker`] (the person, at
+    /// the chat) or [`Supervisor::cancel_all`] (quit) end it. An Esc in the chat stops the reply,
+    /// not the workers.
+    async fn run_prepared(
+        &self,
+        prepared: Prepared,
+        detached: bool,
+    ) -> Result<WorkerReport, RunTicketError> {
+        let Prepared {
+            req,
+            role,
+            agent_id,
+            at,
+            stops,
+            slot,
+            ..
+        } = prepared;
+        // Held until this returns, however it returns: the ticket leaves the live map (so it can
+        // be run again) only when its run is really over.
+        let _slot = slot;
+        let execution = if detached {
+            StopHandle {
+                signal: CancellationToken::new(),
+                ..stops.clone()
+            }
+        } else {
+            stops.clone()
+        };
+        let signal = stops.signal.clone();
+
         // Under `isolation = "shared"`, workers that edit files take turns in the manager's
         // folder. (An explicit `worktree: false` is the manager's own call and doesn't wait.)
-        let _writer = if edits && place == Some(Placement::Shared) {
+        let _writer = if at.edits && at.place == Some(Placement::Shared) {
             Some(tokio::select! {
                 biased;
                 _ = signal.cancelled() => return Err(RunTicketError::Cancelled),
@@ -1193,17 +1451,129 @@ impl Supervisor {
         }
 
         let report = self
-            .run_dispatched(
-                &req,
-                &role,
-                &agent_id,
-                &dispatch,
-                Where { repo, place, edits },
-                stops,
-            )
+            .run_dispatched(&req, &role, &agent_id, &dispatch, at, execution)
             .await;
         drop(permit);
         Ok(report)
+    }
+
+    /// Launches one ticket in the background (AMP #2834): everything that can refuse a run
+    /// happens here, and the caller gets a [`LaunchAck`] as soon as the worker is the
+    /// supervisor's — the worker itself runs on in a task of the supervisor's, its ticket
+    /// dispatched, claimed, in the ledger and returned exactly as a foreground run's would be.
+    ///
+    /// The manager's tool call is what calls this, so a chat is free for other work while up to
+    /// [`SupervisorConfig::max_parallel`] workers run; dispatches from separate turns overlap
+    /// instead of serialising (the cap is the same semaphore, held by the background task).
+    ///
+    /// **Cancellation.** `signal` (the tool call's) cancels a worker that has not been dispatched
+    /// yet: nothing is left in AMP and the end says so. Once AMP has the dispatch, only
+    /// [`Supervisor::stop_worker`] — the person at the chat — or [`Supervisor::cancel_all`] — quit
+    /// — end the run, because stopping the manager's reply must not silently kill work it
+    /// started (the KB's split from #2832).
+    ///
+    /// Every launched end lands in [`Supervisor::take_launch_ends`], for whoever delivers it into
+    /// the manager's conversation; [`Supervisor::join_launched`] waits for the tasks at shutdown.
+    pub async fn launch(
+        self: &Arc<Self>,
+        req: RunRequest,
+        signal: CancellationToken,
+    ) -> Result<LaunchAck, RunTicketError> {
+        let prepared = self.prepare(req, signal).await?;
+        // Best effort at the ack: with every slot taken this run waits its turn, which the
+        // manager is told instead of being made to wait for it.
+        let ack = LaunchAck::new(
+            prepared.req.task_id,
+            prepared.agent_id.clone(),
+            prepared.role.id.clone(),
+            prepared.model.clone().unwrap_or_default(),
+            prepared.at.place,
+            self.config.max_parallel,
+            self.slots.available_permits() == 0,
+        );
+        let sup = Arc::clone(self);
+        let (task_id, agent_id) = (ack.task_id, ack.agent_id.clone());
+        let handle = tokio::spawn(async move {
+            let result = sup.run_prepared(prepared, true).await;
+            sup.record_launch_end(LaunchEnd {
+                task_id,
+                agent_id,
+                result: result.map_err(|e| e.to_string()),
+            });
+        });
+        let mut launched = self.launched.lock().unwrap_or_else(PoisonError::into_inner);
+        // Finished tasks are already accounted for by their end: drop their handles so a long
+        // chat's launches don't pile up.
+        launched.retain(|h| !h.is_finished());
+        launched.push(handle);
+        drop(launched);
+        Ok(ack)
+    }
+
+    /// The launched workers' ends, oldest first, drained (AMP #2834): each is a finished run or a
+    /// run that never got as far as dispatching. Completion delivery is the chat's job; this is
+    /// the queue it reads.
+    pub fn take_launch_ends(&self) -> Vec<LaunchEnd> {
+        let mut ends = self
+            .launch_ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        ends.drain(..).collect()
+    }
+
+    /// Waits for the next launched end (AMP #2834). Returns at once when one is already queued.
+    pub async fn next_launch_end(&self) -> LaunchEnd {
+        loop {
+            let notified = self.launch_end_notify.notified();
+            tokio::pin!(notified);
+            // Subscribe before looking, so an end recorded in between is not missed.
+            notified.as_mut().enable();
+            if let Some(end) = self
+                .launch_ends
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()
+            {
+                return end;
+            }
+            notified.await;
+        }
+    }
+
+    /// How many launched workers are still on this supervisor's books.
+    pub fn launched_running(&self) -> usize {
+        self.launched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|h| !h.is_finished())
+            .count()
+    }
+
+    /// Waits up to `bound` for the launched workers to end (AMP #2834: `cancel_all` first, then
+    /// this, then [`Supervisor::release_unfinished`] for anything still open). Returns how many
+    /// ended within the bound; the ones that didn't are left running — a caller that means to
+    /// stop them cancels first rather than having them aborted mid-run here.
+    pub async fn join_launched(&self, bound: Duration) -> usize {
+        let handles: Vec<JoinHandle<()>> =
+            std::mem::take(&mut *self.launched.lock().unwrap_or_else(PoisonError::into_inner));
+        let deadline = Instant::now() + bound;
+        let mut ended = 0;
+        for handle in handles {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if tokio::time::timeout(left, handle).await.is_ok() {
+                ended += 1;
+            }
+        }
+        ended
+    }
+
+    fn record_launch_end(&self, end: LaunchEnd) {
+        self.launch_ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(end);
+        self.launch_end_notify.notify_waiters();
     }
 
     fn stop_handle(&self, task_id: i64, signal: CancellationToken) -> StopHandle {
@@ -1219,7 +1589,7 @@ impl Supervisor {
         }
     }
 
-    fn claim(&self, task_id: i64, agent_id: &str) -> Result<LiveGuard<'_>, RunTicketError> {
+    fn claim(self: &Arc<Self>, task_id: i64, agent_id: &str) -> Result<LiveSlot, RunTicketError> {
         let mut live = self.live.lock().unwrap();
         if live.contains_key(&task_id) {
             return Err(RunTicketError::AlreadyRunning(task_id));
@@ -1242,7 +1612,7 @@ impl Supervisor {
                 context_window: None,
             },
         );
-        Ok(LiveGuard { sup: self, task_id })
+        Ok(LiveSlot(Arc::clone(self), task_id))
     }
 
     async fn run_dispatched(
@@ -1729,6 +2099,22 @@ struct Where {
     edits: bool,
 }
 
+/// One ticket checked and reserved by [`Supervisor::prepare`], waiting for its run (AMP #2834):
+/// everything that can refuse a dispatch has been decided, and the ticket is in the live map so
+/// nothing else can start it. Dropping it without running releases the slot.
+struct Prepared {
+    req: RunRequest,
+    role: Role,
+    /// AMP's form: `amp:amp-worker-backend`.
+    agent_id: String,
+    /// `provider/model` when the role's model resolves (the ack says it before the worker is
+    /// built).
+    model: Option<String>,
+    at: Where,
+    stops: StopHandle,
+    slot: LiveSlot,
+}
+
 /// What a dispatch gave this run (AMP #2801/#2802): the token its worker starts and closes the
 /// ticket with. Empty on a server that doesn't issue tokens, which skips the claim and lets the
 /// worker's first write start the ticket (AMP's fallback).
@@ -1834,16 +2220,14 @@ fn outcome_text(outcome: &HarnessRunOutcome) -> Option<String> {
     }
 }
 
-/// Removes the ticket from the live map when the call ends, however it ends.
-struct LiveGuard<'a> {
-    sup: &'a Supervisor,
-    task_id: i64,
-}
+/// Keeps a ticket in the live map while its run exists, and takes it out when the run ends,
+/// however it ends (AMP #2834: owned rather than borrowed, so a launched run's task can hold it).
+struct LiveSlot(Arc<Supervisor>, i64);
 
-impl Drop for LiveGuard<'_> {
+impl Drop for LiveSlot {
     fn drop(&mut self) {
-        if let Ok(mut live) = self.sup.live.lock() {
-            live.remove(&self.task_id);
+        if let Ok(mut live) = self.0.live.lock() {
+            live.remove(&self.1);
         }
     }
 }
@@ -2266,18 +2650,40 @@ impl AgentTool for RunTicketTool {
         _on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
     ) -> Result<AgentToolResult, ToolError> {
         let req = parse_request(params).map_err(ToolError::Validation)?;
-        match self.sup.run_ticket(req, signal).await {
-            Ok(report) => {
-                let value = serde_json::to_value(&report).unwrap_or(Value::Null);
-                let mut out =
+        // AMP #2834: `[workers] dispatch = "launch"` (the chat) gets the ack; the default
+        // foreground run awaits its worker and returns the report, which is what `run -p` and
+        // every test rely on.
+        let out = match self.sup.config().dispatch {
+            DispatchMode::Await => self
+                .sup
+                .run_ticket(req, signal)
+                .await
+                .map(|r| Outcome::Report(Box::new(r))),
+            DispatchMode::Launch => self.sup.launch(req, signal).await.map(Outcome::Launched),
+        };
+        match out {
+            Ok(out) => {
+                let value = match &out {
+                    Outcome::Report(report) => serde_json::to_value(report),
+                    Outcome::Launched(ack) => serde_json::to_value(ack),
+                }
+                .unwrap_or(Value::Null);
+                let mut result =
                     AgentToolResult::text(serde_json::to_string_pretty(&value).unwrap_or_default());
-                out.details = value;
-                Ok(out)
+                result.details = value;
+                Ok(result)
             }
             Err(RunTicketError::Cancelled) => Err(ToolError::Abort),
             Err(e) => Err(ToolError::Tool(e.to_string())),
         }
     }
+}
+
+/// What `amp_run_ticket` returns: a foreground run's report, or a launched run's ack.
+enum Outcome {
+    /// Boxed: a report is much larger than an ack, and this enum is built once per call.
+    Report(Box<WorkerReport>),
+    Launched(LaunchAck),
 }
 
 /// Tickets with a worker in this process (for tests and diagnostics).
@@ -2312,6 +2718,90 @@ mod tests {
         assert!(c.apply_toml("[workers]\nmaxparallel = 3\n").is_err());
         let bad = |k: &str| (k == ENV_MAX_WORKERS).then(|| "four".to_owned());
         assert!(c.apply_env(&bad).unwrap_err().contains(ENV_MAX_WORKERS));
+    }
+
+    /// AMP #2834: launched dispatch is opt-in. The default is the foreground, so `run -p` and
+    /// every existing caller are unchanged; the chat asks for `launch` in config or the
+    /// environment, and a typo is refused by name rather than silently doing the other thing.
+    #[test]
+    fn launched_dispatch_is_opt_in_and_a_bad_value_is_refused() {
+        assert_eq!(SupervisorConfig::default().dispatch, DispatchMode::Await);
+        assert_eq!(DispatchMode::Await.as_str(), "await");
+        assert_eq!(DispatchMode::Launch.as_str(), "launch");
+
+        let mut c = SupervisorConfig::default();
+        c.apply_toml("[workers]\ndispatch = \"launch\"\n").unwrap();
+        assert_eq!(c.dispatch, DispatchMode::Launch);
+        // The environment wins over config.toml, as every other worker setting does.
+        let env = |k: &str| (k == ENV_WORKER_DISPATCH).then(|| "await".to_owned());
+        c.apply_env(&env).unwrap();
+        assert_eq!(c.dispatch, DispatchMode::Await);
+
+        let e = SupervisorConfig::default()
+            .apply_toml("[workers]\ndispatch = \"eventually\"\n")
+            .unwrap_err();
+        assert!(e.contains("expected `await` or `launch`"), "{e}");
+        let bad = |k: &str| (k == ENV_WORKER_DISPATCH).then(|| "later".to_owned());
+        let e = SupervisorConfig::default().apply_env(&bad).unwrap_err();
+        assert!(e.contains(ENV_WORKER_DISPATCH), "{e}");
+        assert!(e.contains("expected `await` or `launch`"), "{e}");
+    }
+
+    /// A launched end's one line, and whether it needs the person's attention: a closed ticket
+    /// doesn't, a run that ended any other way does, and a dispatch that never happened says so.
+    #[test]
+    fn a_launched_end_reads_as_one_line() {
+        let report = |outcome, error: Option<&str>| WorkerReport {
+            task_id: 12,
+            agent_id: "amp:amp-worker-backend".into(),
+            role: "amp-worker-backend".into(),
+            outcome,
+            dispatch_id: String::new(),
+            started: true,
+            returned: None,
+            final_message: String::new(),
+            error: error.map(str::to_owned),
+            model: "wf/wf-1".into(),
+            cwd: PathBuf::from("/r"),
+            worktree: None,
+            branch: None,
+            workspace: Placement::Shared,
+            session_file: None,
+            turns: 0,
+            tool_calls: 0,
+            tool_errors: 0,
+            usage: crate::events::UsageJson::default(),
+            duration_ms: 0,
+            notes: Vec::new(),
+            totals: Totals::default(),
+        };
+        let end = |outcome, error: Option<&str>| LaunchEnd {
+            task_id: 12,
+            agent_id: "amp:amp-worker-backend".into(),
+            result: Ok(report(outcome, error)),
+        };
+
+        let done = end(WorkerOutcome::Completed, None);
+        assert_eq!(done.line(), "#12 completed by amp:amp-worker-backend");
+        assert!(!done.needs_attention());
+        let blocked = end(WorkerOutcome::Blocked, None);
+        assert!(!blocked.needs_attention(), "a question is the worker's own");
+        let failed = end(WorkerOutcome::Error, Some("the model failed"));
+        assert!(failed.needs_attention());
+        assert_eq!(
+            failed.line(),
+            "#12 error by amp:amp-worker-backend: the model failed"
+        );
+        let refused = LaunchEnd {
+            task_id: 12,
+            agent_id: "amp:amp-worker-backend".into(),
+            result: Err("cancelled before the worker started".into()),
+        };
+        assert!(!refused.needs_attention(), "nothing was dispatched");
+        assert_eq!(
+            refused.line(),
+            "#12 was not dispatched to amp:amp-worker-backend: cancelled before the worker started"
+        );
     }
 
     #[test]
