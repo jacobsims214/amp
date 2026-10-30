@@ -23,7 +23,8 @@ pub enum RemoteCall {
         origin: PromptOrigin,
         reply: oneshot::Sender<bool>,
     },
-    /// Stop the running turn and its workers, as Esc / `/abort` do.
+    /// Stop the running reply, as Esc / `/abort` do: it drops the queued prompts, here and in the
+    /// link; what it does to workers depends on the dispatch mode (AMP #2858).
     Stop { reply: oneshot::Sender<()> },
 }
 

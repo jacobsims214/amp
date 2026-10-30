@@ -470,6 +470,29 @@ pub const STOPPED: &str = "Stopped.";
 /// ([`esc_hint`]).
 pub const ESC_HINT: &str = "Esc again to stop the reply";
 
+/// At most this many prompts wait for the running reply, here as on a paired device (AMP #2889).
+pub use amp_core::remote::link::QUEUE_MAX;
+
+/// The line a prompt typed during a reply leaves (AMP #2889): its place in the queue, that it
+/// runs on its own once the reply ends, and that Esc drops it (as a paired device's queue).
+pub fn queued_notice(position: usize, text: &str) -> String {
+    let preview: String = text.replace(['\n', '\t'], " ").chars().take(80).collect();
+    let more = if text.chars().count() > 80 { "…" } else { "" };
+    format!(
+        "queued #{position} · runs after this reply: \"{preview}{more}\" (Esc stops the reply \
+         and drops the queue)"
+    )
+}
+
+/// What a stopped reply says about the prompts it drops (AMP #2889).
+pub fn dropped_notice(n: usize) -> String {
+    if n == 1 {
+        "dropped the queued prompt (↑ recalls it)".to_owned()
+    } else {
+        format!("dropped {n} queued prompts (↑ recalls them)")
+    }
+}
+
 /// [`ESC_HINT`], naming this chat's live workers, which stopping the reply stops too (#2354).
 pub fn esc_hint(tickets: &[i64]) -> String {
     match tickets.len() {
@@ -872,6 +895,10 @@ pub struct Shell {
     history: PromptHistory,
     /// The running prompt's run id in the manager feed (#2370).
     run_id: Option<String>,
+    /// Prompts typed here while a reply runs (AMP #2889), oldest first: each runs as its own
+    /// turn when the reply before it ends, as the remote link's follow-up queue does
+    /// ([`amp_core::remote::link::QUEUE_MAX`] at most). A stopped reply drops them.
+    prompt_queue: std::collections::VecDeque<String>,
     /// The worker chips last sent to the manager feed (#2370).
     fed_workers: Option<amp_core::chat_event::ChatEvent>,
     /// The status the remote link reports (#2373), refreshed on every poll once it exists.
@@ -929,6 +956,7 @@ impl Shell {
                 prompts: 0,
                 pending_model: None,
                 running: false,
+                prompt_queue: std::collections::VecDeque::new(),
                 done_tx,
                 meta: None,
                 opener: Arc::new(|url: &str| amp_mcp::oauth::open_browser(url)),
@@ -2136,6 +2164,8 @@ impl Shell {
         S: Future<Output = ()>,
         R: FnMut(&Self),
     {
+        // Quitting: nothing queued may start once the reply ends.
+        self.prompt_queue.clear();
         if self.settled() {
             return QuitOutcome::Idle;
         }
@@ -2556,9 +2586,13 @@ impl Shell {
 
     /// The spinner's message when no hint is shown: what the model is writing, else "Working…".
     fn working_text(&self) -> String {
-        match &self.streaming {
+        let text = match &self.streaming {
             Some(call) => amp_render::streaming_line(&call.name, &call.json),
             None => WORKING.to_owned(),
+        };
+        match self.prompt_queue.len() {
+            0 => text,
+            n => format!("{text} · {n} queued"),
         }
     }
 
@@ -2614,8 +2648,7 @@ impl Shell {
         // #2161: a sent prompt hands the keys back to the editor; a docked panel stays.
         self.editor_clicked = self.view.panel().is_open();
         if self.running {
-            self.view
-                .add_notice("still working: wait for the reply, or press Esc to abort it");
+            self.queue_prompt(trimmed);
             return Submit::Continue;
         }
         if self.switching {
@@ -2626,6 +2659,50 @@ impl Shell {
         self.view.add_user(trimmed);
         self.start_run(trimmed.to_owned());
         Submit::Continue
+    }
+
+    /// A prompt typed while a reply runs (AMP #2889): it waits its turn instead of being refused,
+    /// and the transcript and the spinner line say so. At most [`QUEUE_MAX`] wait, as on a paired
+    /// device; a stopped reply drops them ([`Shell::finish_run`]).
+    fn queue_prompt(&mut self, text: &str) {
+        if self.prompt_queue.len() >= QUEUE_MAX {
+            self.view.add_notice(&format!(
+                "{QUEUE_MAX} prompts are already queued: send it once one has run (↑ recalls it)"
+            ));
+            return;
+        }
+        self.prompt_queue.push_back(text.to_owned());
+        self.view
+            .add_notice(&queued_notice(self.prompt_queue.len(), text));
+        if self.esc_hint_until.is_none() {
+            self.show_working();
+        }
+    }
+
+    /// The prompts typed here that wait for the running reply to end (AMP #2889), oldest first.
+    pub fn queued_prompts(&self) -> Vec<String> {
+        self.prompt_queue.iter().cloned().collect()
+    }
+
+    /// After a reply ended (AMP #2889): a stopped one drops the queue and says so; otherwise the
+    /// oldest queued prompt runs now, as its own turn. Prompts from a paired device wait in the
+    /// remote link's queue and run after these, one per reply ([`amp_core::remote::link`]).
+    fn after_run(&mut self, stopped: bool) {
+        if stopped {
+            let n = self.prompt_queue.len();
+            self.prompt_queue.clear();
+            if n > 0 {
+                self.view.add_notice(&dropped_notice(n));
+            }
+            return;
+        }
+        if self.switching {
+            return;
+        }
+        if let Some(next) = self.prompt_queue.pop_front() {
+            self.view.add_user(&next);
+            self.start_run(next);
+        }
     }
 
     /// While any ticket waits for approval, re-reads the plan now (#2209, #2230): before the manager's
@@ -2755,6 +2832,18 @@ impl Shell {
         self.view.set_stopping(false);
         // The reply's error line already says what went wrong: say it once (#2207).
         let error_shown = self.view.take_error_shown();
+        // AMP #2889: the run ended stopped exactly when its `run_end` says `aborted`, which is
+        // what makes the remote link drop its queue: the chat's queue goes with it, so the two
+        // never disagree. A reply that had already ended when Esc reached it ended `completed`
+        // (or `failed`), and both queues run on.
+        let stopped = match &result {
+            Ok(r) => match &r.outcome {
+                HarnessRunOutcome::Aborted { .. } => true,
+                HarnessRunOutcome::Failed { .. } => stopping,
+                HarnessRunOutcome::Completed { .. } | HarnessRunOutcome::Suspended { .. } => false,
+            },
+            Err(_) => stopping,
+        };
         if let Some(run_id) = self.run_id.take() {
             use amp_core::chat_event::{ChatEvent, RunOutcome};
             let (outcome, error) = match &result {
@@ -2818,6 +2907,7 @@ impl Shell {
                 amp_core::provider_error::summarize("", &e)
             )),
         }
+        self.after_run(stopped);
     }
 
     /// A key the editor doesn't get first: the `/` menu's keys ([`crate::slash::CommandMenu`]),
@@ -2993,7 +3083,14 @@ impl Shell {
             DispatchMode::Await => self.live_tickets(),
             DispatchMode::Launch => self.reply_stop().cancelled,
         };
-        self.view.set_working_message(&esc_hint(&stopped));
+        let mut hint = esc_hint(&stopped);
+        // AMP #2889: stopping the reply drops what was queued behind it.
+        match self.prompt_queue.len() {
+            0 => {}
+            1 => hint.push_str(" (drops the queued prompt)"),
+            n => hint.push_str(&format!(" (drops {n} queued prompts)")),
+        }
+        self.view.set_working_message(&hint);
     }
 
     fn clear_esc_hint(&mut self) {
@@ -5242,6 +5339,68 @@ mod tests {
 
     /// A manager shell on a scripted model with a manager feed, watching `ends` the way
     /// [`super::Shell::set_supervisor`] watches the supervisor's queue (#2861).
+    /// AMP #2889: a prompt sent during a reply is queued, not refused: the transcript says where
+    /// it is and that it runs after this reply, the spinner line counts the queue, a sixth is
+    /// refused as on a paired device, and a stopped reply drops them all and says so.
+    #[tokio::test]
+    async fn prompts_sent_during_a_reply_queue_up_to_five_and_a_stop_drops_them() {
+        let ends = amp_core::supervisor::LaunchEnds::default();
+        let (mut shell, _feed) = watching_shell(&ends).await;
+        shell.running = true;
+        shell.view.set_working(true);
+        for i in 1..=6 {
+            shell.submit(&format!("follow-up {i}")).await;
+        }
+        assert_eq!(
+            shell.queued_prompts(),
+            (1..=5)
+                .map(|i| format!("follow-up {i}"))
+                .collect::<Vec<_>>()
+        );
+        let screen = shell.view().render_plain(160, 60).join("\n");
+        assert!(
+            screen.contains(
+                "queued #1 · runs after this reply: \"follow-up 1\" (Esc stops the reply and \
+                 drops the queue)"
+            ),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("queued #5 · runs after this reply"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("5 prompts are already queued: send it once one has run"),
+            "{screen}"
+        );
+        assert!(!screen.contains("follow-up 6\""), "{screen}");
+        assert!(!screen.contains("still working"), "{screen}");
+        assert_eq!(shell.working_text(), "Working… · 5 queued");
+        shell.running = false;
+        shell.after_run(true);
+        assert!(shell.queued_prompts().is_empty());
+        let screen = shell.view().render_plain(160, 60).join("\n");
+        assert!(
+            screen.contains("dropped 5 queued prompts (↑ recalls them)"),
+            "{screen}"
+        );
+        assert_eq!(shell.working_text(), "Working…");
+        assert_eq!(
+            super::dropped_notice(1),
+            "dropped the queued prompt (↑ recalls it)"
+        );
+    }
+
+    /// AMP #2889: a long or multi-line prompt shows as one line of at most 80 characters.
+    #[test]
+    fn the_queued_line_is_one_short_line() {
+        let long = format!("line one\n{}", "x".repeat(200));
+        let line = super::queued_notice(2, &long);
+        assert!(line.starts_with("queued #2 · runs after this reply: \"line one xxx"));
+        assert!(line.contains("…\" (Esc stops the reply"));
+        assert!(!line.contains('\n'));
+    }
+
     async fn watching_shell(
         ends: &amp_core::supervisor::LaunchEnds,
     ) -> (super::Shell, Arc<amp_core::manager_feed::ManagerFeed>) {
