@@ -552,6 +552,25 @@ pub fn unpad(mut rows: Vec<String>, width: usize) -> Vec<String> {
         .collect()
 }
 
+/// The screen's words on one line, so a wrapped line reads as one. Each row loses one box side
+/// edge (#2882: `│`, or `|` in the ASCII boxes) at its start and one at its end before its words
+/// are joined, so the edges of a box that wraps a line don't land inside the text. Only edges
+/// are dropped: a `│` or `|` inside a row stays. A token wider than a row (a long path) is
+/// hard-broken by the wrap (amp-tui `wrap.rs`) and reads here as two words.
+pub fn flat(screen: &str) -> String {
+    const EDGES: [char; 2] = ['│', '|'];
+    screen
+        .lines()
+        .flat_map(|row| {
+            let row = row.trim();
+            let row = row.strip_prefix(EDGES).unwrap_or(row);
+            let row = row.strip_suffix(EDGES).unwrap_or(row);
+            row.split_whitespace()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Runs the binary in `dir/project` with HOME in `dir/home`, the file credential store,
 /// `AMP_MCP_URL=url` and no other AMP_* settings. `env` adds variables.
 pub async fn run(dir: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
