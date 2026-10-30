@@ -361,6 +361,24 @@ pub trait ReloadControl: Send + Sync {
     fn reload(&self) -> ReloadFuture;
 }
 
+/// The block a manager turn opens with when workers ended since the last one (AMP #2857): one
+/// line per end, from [`amp_core::supervisor::LaunchEnd::line`]. `None` when nothing ended, so a
+/// turn with nothing to report is the prompt as typed.
+fn worker_summaries(ends: &[amp_core::supervisor::LaunchEnd]) -> Option<String> {
+    if ends.is_empty() {
+        return None;
+    }
+    let mut block = String::from(
+        "[worker summaries: runs you launched that have ended since your last turn. Their ",
+    );
+    block.push_str("tickets are already updated in AMP; carry on from here.]");
+    for end in ends {
+        block.push_str("\n- ");
+        block.push_str(&end.line());
+    }
+    Some(block)
+}
+
 /// A key being typed for `/connect` (never drawn).
 struct SecretEntry {
     args: String,
@@ -2353,6 +2371,14 @@ impl Shell {
             }
             amp_core::chat_event::PromptOrigin::Local => prompt.clone(),
         };
+        // #2857: workers that ended since the last turn are delivered here, at the top of the turn
+        // that starts now — and only here. Draining takes each end out of the supervisor's queue,
+        // so the next turn never sees it again, and an end that arrives while this run is going
+        // stays queued for the turn after it (#2835).
+        let model_text = match self.take_worker_summaries() {
+            Some(summaries) => format!("{summaries}\n\n{model_text}"),
+            None => model_text,
+        };
         if self.view.feed().is_some() {
             let prompt_id = prompt_id.unwrap_or_else(|| format!("p_{}", self.prompts));
             let run_id = format!("run_{}", self.prompts);
@@ -2384,6 +2410,14 @@ impl Shell {
             };
             let _ = done.send(result);
         });
+    }
+
+    /// The ends of this chat's workers that finished since the last turn, as a block the model
+    /// reads at the top of the turn starting now (AMP #2835, #2857). `None` when nothing is
+    /// waiting. Consuming them is what makes them arrive once: a later turn's drain is empty.
+    fn take_worker_summaries(&self) -> Option<String> {
+        let ends = self.supervisor.as_ref()?.take_launch_ends();
+        worker_summaries(&ends)
     }
 
     /// Asks the running prompt to stop; it then finishes as aborted, and the transcript says
@@ -4542,7 +4576,74 @@ fn count(n: u64, one: &str, many: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_answer, parse_id, short_role};
+    use super::{clean_answer, parse_id, short_role, worker_summaries};
+
+    /// #2857: a turn opens with the ends the manager has not seen, once. The block is `None` with
+    /// nothing queued (the prompt goes as typed), and a second look at the same drained ends has
+    /// nothing left to say.
+    #[test]
+    fn worker_summaries_are_one_block_that_a_turn_uses_once() {
+        use amp_core::supervisor::{LaunchEnd, WorkerOutcome, WorkerReport};
+
+        assert_eq!(
+            worker_summaries(&[]),
+            None,
+            "nothing ended: the prompt as typed"
+        );
+
+        let report = |outcome, error: Option<&str>| WorkerReport {
+            task_id: 2857,
+            agent_id: "amp:amp-worker-backend".into(),
+            role: "amp-worker-backend".into(),
+            outcome,
+            dispatch_id: String::new(),
+            started: true,
+            returned: None,
+            final_message: String::new(),
+            error: error.map(str::to_owned),
+            model: "wf/wf-1".into(),
+            cwd: std::path::PathBuf::from("/r"),
+            worktree: None,
+            branch: None,
+            workspace: amp_core::workspace::Placement::Shared,
+            session_file: None,
+            turns: 0,
+            tool_calls: 0,
+            tool_errors: 0,
+            usage: amp_core::events::UsageJson::default(),
+            duration_ms: 0,
+            notes: Vec::new(),
+            totals: amp_core::events::Totals::default(),
+        };
+        let ends = vec![
+            LaunchEnd {
+                task_id: 2854,
+                agent_id: "amp:amp-worker-backend".into(),
+                result: Ok(report(WorkerOutcome::Completed, None)),
+            },
+            LaunchEnd {
+                task_id: 2855,
+                agent_id: "amp:amp-worker-frontend".into(),
+                result: Ok(report(WorkerOutcome::Error, Some("the model failed"))),
+            },
+        ];
+
+        let block = worker_summaries(&ends).expect("two ends, so a block");
+        assert!(
+            block.contains("#2854 completed by amp:amp-worker-backend"),
+            "{block}"
+        );
+        assert!(
+            block.contains("#2855 error by amp:amp-worker-frontend: the model failed"),
+            "{block}"
+        );
+        // One line per end, under one header: the model reads where each run got to.
+        assert_eq!(
+            block.lines().filter(|l| l.starts_with("- ")).count(),
+            2,
+            "{block}"
+        );
+    }
 
     #[test]
     fn ids_and_answers() {
