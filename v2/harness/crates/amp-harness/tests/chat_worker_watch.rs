@@ -220,6 +220,18 @@ impl Chat {
 
     /// [`Self::start`] with the chat's PATH (#2395: a fake browser opener in front).
     fn start_with_path(dir: &Path, url: &str, cols: u16, rows: u16, path: &str) -> Self {
+        Self::start_with_env(dir, url, cols, rows, path, &[])
+    }
+
+    /// [`Self::start_with_path`] with extra environment (AMP #2858: a slow faux stream).
+    fn start_with_env(
+        dir: &Path,
+        url: &str,
+        cols: u16,
+        rows: u16,
+        path: &str,
+        env: &[(&str, &str)],
+    ) -> Self {
         let size = Winsize {
             ws_row: rows,
             ws_col: cols,
@@ -251,6 +263,7 @@ impl Chat {
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("OPENROUTER_API_KEY")
             .env_remove("RUST_LOG")
+            .envs(env.iter().copied())
             .stdin(stdio())
             .stdout(stdio())
             .stderr(stdio())
@@ -876,6 +889,92 @@ async fn the_chat_launches_workers_and_takes_prompts_while_they_run() {
     );
     assert!(t[echo..].contains("what happened?"), "{t}");
     assert_eq!(amp.mock.calls_to("amp_complete_task").len(), 1);
+
+    for _ in 0..3 {
+        chat.send(b"\x03");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// AMP #2858 end to end, on a real pty with the chat's default (Launch) dispatch: Esc during a
+/// later reply stops only that reply. The note says the launched worker keeps running (never
+/// "stopping the worker ... too"), the worker goes on to complete its ticket, and nothing hands
+/// the ticket back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn esc_in_launch_mode_stops_the_reply_and_leaves_the_worker_running() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = workdir("chat-launch-esc", Some(2));
+    let config = dir.join("home/.config/amp-harness");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("config.toml"), CONFIG).unwrap();
+    let run = json!({"name": "amp_run_ticket",
+        "arguments": {"task_id": KNOWN, "agent_id": "amp:amp-worker-backend", "worktree": false}});
+    let nap = json!({"text": "Working.",
+        "tool_calls": [{"name": "bash", "arguments": {"command": "sleep 12"}}]});
+    let complete = json!({"tool_calls": [{"name": "amp_complete_task",
+        "arguments": {"task_id": KNOWN}}]});
+    // At 40 tokens (160 characters) a second, this reply takes well over a minute to stream.
+    let long = "A long answer that is still streaming. ".repeat(300);
+    let script = json!({
+        "boss": [
+            {"tool_calls": [run]},
+            {"text": "Dispatched."},
+            {"text": long}
+        ],
+        "wf": [nap, complete, {"text": "done"}]
+    });
+    std::fs::write(dir.join("script.json"), script.to_string()).unwrap();
+    let path = std::env::var("PATH").unwrap_or_default();
+    let mut chat = Chat::start_with_env(
+        &dir,
+        &amp.url,
+        120,
+        40,
+        &path,
+        &[("AMP_HARNESS_FAUX_TOKENS_PER_SECOND", "40")],
+    );
+    chat.wait("the editor", |s| s.text().contains("/ for commands"))
+        .await;
+
+    chat.send(b"run ticket 2085\r");
+    chat.wait("the dispatch turn ended with the worker running", |s| {
+        s.text().contains("Dispatched.") && chip(s, KNOWN).is_some_and(|l| l.contains("running"))
+    })
+    .await;
+
+    // A later reply, stopped with Esc while it streams.
+    chat.send(b"tell me a long story\r");
+    chat.wait("the long reply streaming", |s| {
+        s.text().contains("A long answer that is still streaming.")
+    })
+    .await;
+    chat.send(b"\x1b");
+    let s = chat
+        .wait("the reply-only stop note", |s| {
+            s.text().contains(&format!(
+                "stopping the reply; the worker on #{KNOWN} keeps running (/workers to stop it)"
+            ))
+        })
+        .await;
+    dump("esc stopped the reply, worker still running", &s);
+    let t = s.text();
+    assert!(!t.contains("too; its ticket goes back to ready"), "{t}");
+    assert!(
+        chip(&s, KNOWN).is_some_and(|l| l.contains("running")),
+        "the worker is still running: {t}"
+    );
+
+    // The worker carries on and closes its ticket; nothing returned it to ready.
+    let s = chat
+        .wait("the worker's end notice", |s| {
+            s.text()
+                .contains(&format!("worker ended: #{KNOWN} completed"))
+        })
+        .await;
+    dump("worker completed after the reply was stopped", &s);
+    assert!(s.text().contains("Stopped."), "{}", s.text());
+    assert_eq!(amp.mock.calls_to("amp_complete_task").len(), 1);
+    assert!(handed_back(&amp).is_empty(), "{:?}", handed_back(&amp));
 
     for _ in 0..3 {
         chat.send(b"\x03");
