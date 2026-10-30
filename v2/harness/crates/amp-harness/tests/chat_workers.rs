@@ -357,10 +357,16 @@ async fn open_follow_switch_stop_and_read_a_finished_worker() {
         "thinking is collapsed as in the main chat: {screen}"
     );
     assert!(screen.contains("Esc back to the chat"), "{screen}");
-    // #2251: the session's bar, transcript and keys line sit inside the shared padding.
+    // #2251: the session's bar, transcript and keys line sit inside the shared padding (#2882:
+    // in boxes whose edges take its last column).
     for row in screen.lines().filter(|l| !l.trim().is_empty()) {
+        let boxed = row.trim_start().starts_with(['┌', '│', '└']);
         assert!(
-            row.starts_with("  ") && row.chars().count() <= 148,
+            if boxed {
+                row.starts_with(' ') && row.chars().count() <= 149
+            } else {
+                row.starts_with("  ") && row.chars().count() <= 148
+            },
             "{row:?}"
         );
     }
@@ -496,7 +502,7 @@ async fn open_follow_switch_stop_and_read_a_finished_worker() {
     r.shell.submit("/workers").await;
     assert!(
         r.screen()
-            .contains("Enter/click watch · Ctrl+X stop · Ctrl+G open in AMP"),
+            .contains("Enter watch · Ctrl+X stop · Ctrl+G open in AMP"),
         "{}",
         r.screen()
     );
@@ -621,7 +627,7 @@ async fn esc_leaving_a_session_hints_before_the_next_esc_stops_the_workers() {
     assert!(r.shell.expire_hints(Instant::now() + ESC_HINT_FOR));
     assert_eq!(
         r.shell.view().working_message().as_deref(),
-        Some("Working…")
+        Some(amp_tui::view::REPLYING)
     );
 
     // Back in, out again: the hint is back, and the next Esc stops the reply and its workers,

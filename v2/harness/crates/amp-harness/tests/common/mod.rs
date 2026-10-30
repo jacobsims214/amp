@@ -522,23 +522,33 @@ impl Output {
 }
 
 /// `--snapshot` rows of a `width`-column screen without the chat's padding: the left padding
-/// (`[tui] padding`, #2251; halved at 80 columns or fewer, #2344) and the blank row above and
-/// below the screen (#2344, checked blank), so a test that checks where something sits reads rows
-/// and columns as before. amp-tui's `tests/padding.rs` covers the padding itself.
+/// (`[tui] padding`, #2251; halved at 80 columns or fewer, #2344), the blank row above the
+/// screen (#2344, checked blank), and the boxes' side edges (#2882: a box's `│` sits in
+/// the padding's last column, so it reads as padding; the right one goes), so a test that checks
+/// where something sits reads rows and columns as before. amp-tui's `tests/padding.rs` and
+/// `tests/boxes.rs` cover the padding and the boxes themselves.
 pub fn unpad(mut rows: Vec<String>, width: usize) -> Vec<String> {
+    // The blank row above the screen (since #2882, none below it).
     let gap = amp_tui::Gap::rows_at(rows.len());
     for _ in 0..gap {
         assert!(rows[0].trim().is_empty(), "top padding row: {rows:#?}");
-        assert!(
-            rows[rows.len() - 1].trim().is_empty(),
-            "bottom padding row: {rows:#?}"
-        );
         rows.remove(0);
-        rows.pop();
     }
-    let pad = " ".repeat(amp_tui::Padding::new(amp_tui::DEFAULT_PADDING).at(width));
+    let cols = amp_tui::Padding::new(amp_tui::DEFAULT_PADDING).at(width);
+    let pad = " ".repeat(cols);
+    let edge = format!("{}│", " ".repeat(cols.saturating_sub(1)));
     rows.into_iter()
-        .map(|r| r.strip_prefix(&pad).map(str::to_owned).unwrap_or(r))
+        .map(|r| match r.strip_prefix(&edge) {
+            Some(inner) if cols > 0 => {
+                let inner = inner.trim_end();
+                inner
+                    .strip_suffix('│')
+                    .unwrap_or(inner)
+                    .trim_end()
+                    .to_owned()
+            }
+            _ => r.strip_prefix(&pad).map(str::to_owned).unwrap_or(r),
+        })
         .collect()
 }
 

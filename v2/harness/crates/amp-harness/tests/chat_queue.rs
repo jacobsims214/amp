@@ -958,7 +958,13 @@ async fn the_loop_guard_stops_automatic_turns_until_the_person_speaks() {
     assert_eq!(r.wakes(), WAKE_LIMIT, "{:?}", r.turns());
     assert_eq!(r.turns().len(), 1 + WAKE_LIMIT);
     // Joined, so a wrapped line reads as one.
-    let screen = r.screen().split_whitespace().collect::<Vec<_>>().join(" ");
+    // (#2882: without the Conversation box's side edges.)
+    let screen = r
+        .screen()
+        .split_whitespace()
+        .filter(|w| *w != "│")
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
         screen.contains(&format!(
             "The manager started {WAKE_LIMIT} turns by itself in the last 10 minutes"

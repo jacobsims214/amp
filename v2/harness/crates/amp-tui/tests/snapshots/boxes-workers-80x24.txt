@@ -1,0 +1,24 @@
+                                                                                |
+┌─ ▀▀▀▀▀▀▀▀ AMP #2 · simstech · ada@example.com ───────────────── ● connected ─┐|
+│ transcript.                                                                  │|
+│                                                                              │|
+│ ▶ worker started  #2143 Thinking toggle i… · worker-frontend (deepseek-v4.1) │|
+│                                                                              │|
+│ while they run, draft the tickets for M5 remote pairing                      │|
+│ I drafted one ticket per criterion: pairing from the phone, the device list  │|
+│ in /remote, and revoking a device. They're in the plan as drafts.            │|
+│                                                                              │|
+│ ■ worker finished #2142 Fix instal… · worker-backend · completed after 4m02s │|
+└──────────────────────────────────────────────────────────────────────────────┘|
+┌─ Workers · 1 running · 1 done · 2 elsewhere ─────────────────────────────────┐|
+│ › ▸ #2143 Thinking toggle in… · worker-frontend · running 5m40s · 31.2k tok  │|
+│   ■ #2142 Fix installer setup han… · worker-backend · completed after 4m02s  │|
+│   elsewhere                                                                  │|
+│   ■ #2104 M3-2 AMP metadata poller · worker-backend · in progress 1h12m      │|
+│   ■ #2106 M3-3 Header a… · worker-backend (deepseek-v4.1) · in progress 48m  │|
+└─ ↑↓ select · Enter watch · Ctrl+X stop · Ctrl+G open in AMP · Esc close ─────┘|
+┌─ Message ────────────────────────────────────────────────────────────────────┐|
+│ / for commands                                                               │|
+└──────────────────────────────────────────────────────────────────────────────┘|
+ ■  2 QUESTIONS  │ plan: 2 waiting for your approval │ ■ 3 In progress          |
+ ~/dev/amp (main) • manager                        deepseek-v4.1 • thinking off |

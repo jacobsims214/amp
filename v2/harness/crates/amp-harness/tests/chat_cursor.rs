@@ -24,7 +24,9 @@ use nix::{pty::Winsize, pty::openpty};
 
 /// The sizes checked, and the editor's first column (1-based) at each: 2 columns of padding
 /// at 120, 1 at 80.
-const SIZES: [(u16, u16, usize); 2] = [(120, 40, 3), (80, 24, 2)];
+// The editor's first text column, 1-based: inside the Message box (#2882), after its edge and
+// one column of padding (the padding alone put it a column further left).
+const SIZES: [(u16, u16, usize); 2] = [(120, 40, 4), (80, 24, 3)];
 
 const CONFIG: &str = r#"
 [providers.faux]

@@ -2,7 +2,8 @@
 //! which the terminal shows as a blinking bar ([`amp_tui::terminal`]); a panel with the keys hides
 //! it; a click into the editor box focuses it and moves the insertion point. Positions are
 //! checked with multi-line and wide-character input at 120x40 and 80x24 (the padding on every
-//! side moves the cursor with it). The terminal's escape sequences are checked on a real pty by
+//! side moves the cursor with it; since #2882 the editor is inside the Message box, so its text
+//! starts after the box's edge and one column of padding: column 2 at 80, 3 above). The terminal's escape sequences are checked on a real pty by
 //! `crates/amp-harness/tests/chat_cursor.rs`.
 
 use std::sync::Arc;
@@ -25,14 +26,14 @@ fn text_row(view: &ChatView, width: usize, height: usize) -> usize {
 
 #[test]
 fn the_cursor_sits_at_the_insertion_point_inside_the_padding() {
-    for (width, height, side) in [(120, 40, 2), (80, 24, 1)] {
+    for (width, height, side) in [(120, 40, 3), (80, 24, 2)] {
         let view = ChatView::new();
         let row = text_row(&view, width, height);
-        // The editor's text row is right above its bottom rule; the blank bottom row stays
-        // blank.
+        // The editor's text row is right above the Message box's bottom edge, the last row
+        // drawn (no blank bottom row since #2882; this view has no status line or footer).
         let rows = view.render_plain(width, height);
-        assert!(rows[row + 1].trim_start().starts_with('─'), "{rows:#?}");
-        assert_eq!(rows[height - 1], "", "{rows:#?}");
+        assert!(rows[row + 1].trim_start().starts_with('└'), "{rows:#?}");
+        assert_eq!(row + 2, height, "{rows:#?}");
         assert_eq!(view.cursor_position(width, height), Some((row, side)));
 
         // Wide characters take two columns each.
@@ -50,20 +51,25 @@ fn the_cursor_sits_at_the_insertion_point_inside_the_padding() {
         assert_eq!(c, side + 2, "{width}x{height}");
         let rows = view.render_plain(width, height);
         assert!(rows[r - 1].contains("héllo 世界"), "{rows:#?}");
-        assert!(rows[r].trim_start().starts_with("ab"), "{rows:#?}");
+        assert!(rows[r].trim_start().starts_with("│ ab"), "{rows:#?}");
     }
 }
 
 #[test]
 fn the_cursor_follows_wrapped_input() {
     let view = ChatView::new();
-    let (width, height, side) = (80, 24, 1);
-    // 78 inner columns; the cursor's line wraps at 77, so 80 characters is two rows.
+    let (width, height, side) = (80, 24, 2);
+    // 76 columns inside the Message box (#2882); the cursor's line wraps at 75, so 80
+    // characters is two rows.
     view.editor().insert(&"x".repeat(80));
     let (r, c) = view.cursor_position(width, height).unwrap();
-    assert_eq!(c, side + 3);
+    assert_eq!(c, side + 5);
     let rows = view.render_plain(width, height);
-    assert_eq!(rows[r - 1].trim(), "x".repeat(77), "{rows:#?}");
+    assert_eq!(
+        rows[r - 1].trim(),
+        format!("│ {}  │", "x".repeat(75)),
+        "{rows:#?}"
+    );
 }
 
 #[test]
@@ -84,7 +90,7 @@ fn no_cursor_without_input_focus() {
 
 #[test]
 fn a_click_maps_to_the_text_under_it() {
-    let (width, height, side) = (120, 40, 2);
+    let (width, height, side) = (120, 40, 3);
     let view = ChatView::new();
     view.editor().insert("hello world\n世界x");
     let (second, _) = view.cursor_position(width, height).unwrap();
@@ -121,7 +127,7 @@ fn a_click_maps_to_the_text_under_it() {
     );
     // Outside the box: nothing.
     assert_eq!(view.editor_hit(width, height, 0, side), None);
-    assert_eq!(view.editor_hit(width, height, height - 1, side), None);
+    assert_eq!(view.editor_hit(width, height, first - 3, side), None);
 }
 
 struct Rig {

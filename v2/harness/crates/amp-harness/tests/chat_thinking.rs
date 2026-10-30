@@ -281,9 +281,13 @@ impl Drop for Chat {
 
 /// The 0-based row of the collapsed (`▸`) or open (`▾`) thinking header, if one shows.
 fn header_row(screen: &[String], glyph: char) -> Option<usize> {
-    screen
-        .iter()
-        .position(|r| r.trim_start().starts_with(&format!("{glyph} Thought for ")))
+    // (#2882: inside the Conversation box's left edge.)
+    screen.iter().position(|r| {
+        r.trim_start()
+            .trim_start_matches('│')
+            .trim_start()
+            .starts_with(&format!("{glyph} Thought for "))
+    })
 }
 
 fn shown(screen: &[String]) -> String {
@@ -328,6 +332,8 @@ async fn thinking_at(cols: u16, rows: u16) {
     let row = header_row(&screen, '▸').unwrap_or_else(|| panic!("{}", shown(&screen)));
     assert!(
         screen[row]
+            .trim_end()
+            .trim_end_matches('│')
             .trim_end()
             .ends_with("s · Ctrl+T or click to open"),
         "{}",

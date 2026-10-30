@@ -205,9 +205,13 @@ impl Rig {
 
     fn panel_lines(&self) -> Vec<String> {
         let screen = self.shell.view().render_plain(W, H);
+        // #2882: the panel is the box after the Conversation box.
         let Some(start) = screen
             .iter()
-            .position(|l| l.trim_start().starts_with("── "))
+            .enumerate()
+            .skip_while(|(_, l)| !l.trim_start().starts_with('└'))
+            .find(|(_, l)| l.trim_start().starts_with("┌─ "))
+            .map(|(i, _)| i)
         else {
             return Vec::new();
         };
@@ -219,8 +223,12 @@ impl Rig {
     }
 }
 
+/// The screen's words on one line, without the boxes' side edges (#2882).
 fn flat(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    s.split_whitespace()
+        .filter(|w| *w != "│")
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -229,7 +237,7 @@ async fn keys_run_the_selected_rows_commands_and_only_its_own() {
     rig.submit("/mcp").await;
     assert_eq!(rig.calls(), vec![("mcp".to_owned(), String::new())]);
     let panel = rig.panel_lines().join("\n");
-    assert!(panel.contains("── MCP servers"), "{panel}");
+    assert!(panel.contains("┌─ MCP servers"), "{panel}");
     assert!(panel.contains("› ● fs     ready · 2 tools"), "{panel}");
     // The hint names Enter's word and the selected row's keys only.
     assert!(

@@ -876,8 +876,8 @@ pub enum CtrlC {
 pub const STOPPED_WAITING: &str = "Stopped waiting for plan approval. The manager carries on when \
                                    you reply.";
 
-/// The spinner's own message while a run is going.
-const WORKING: &str = "Working…";
+/// The spinner's own message while a run is going (the Message box's title, #2882).
+const WORKING: &str = crate::view::REPLYING;
 
 /// What the caller does after a submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2701,7 +2701,7 @@ impl Shell {
 
     /// #2384: while the model writes a tool call's arguments (a plan's `amp_create_tasks` can
     /// stream for 40 s), the spinner line says what it is writing and how far it got
-    /// ([`amp_render::streaming_line`]) instead of only "Working…". Back to "Working…" once the
+    /// ([`amp_render::streaming_line`]) instead of only "manager replying". Back to "manager replying" once the
     /// call is complete.
     fn follow_streaming(&mut self, event: &AgentEvent) {
         use rpi_ai::types::{AssistantMessageEvent as E, Content};
@@ -2769,7 +2769,7 @@ impl Shell {
         }
     }
 
-    /// The spinner's message when no hint is shown: what the model is writing, else "Working…".
+    /// The spinner's message when no hint is shown: what the model is writing, else "manager replying".
     fn working_text(&self) -> String {
         let text = match &self.streaming {
             Some(call) => amp_render::streaming_line(&call.name, &call.json),
@@ -3343,7 +3343,7 @@ impl Shell {
         }
     }
 
-    /// Puts the spinner line back to "Working…" once [`ESC_HINT`] has been shown for
+    /// Puts the spinner line back to "manager replying" once [`ESC_HINT`] has been shown for
     /// [`ESC_HINT_FOR`] at `now`, and the empty editor back to its placeholder once
     /// [`QUIT_HINT_FOR`] has passed. Returns true when either changed. [`Shell::poll`] calls it.
     pub fn expire_hints(&mut self, now: Instant) -> bool {
@@ -5630,7 +5630,7 @@ mod tests {
         );
         assert!(!screen.contains("follow-up 6\""), "{screen}");
         assert!(!screen.contains("still working"), "{screen}");
-        assert_eq!(shell.working_text(), "Working… · 5 queued");
+        assert_eq!(shell.working_text(), "manager replying · 5 queued");
         shell.running = false;
         shell.after_run(true);
         assert!(shell.queued_prompts().is_empty());
@@ -5639,7 +5639,7 @@ mod tests {
             screen.contains("dropped 5 queued prompts (↑ recalls them)"),
             "{screen}"
         );
-        assert_eq!(shell.working_text(), "Working…");
+        assert_eq!(shell.working_text(), "manager replying");
         assert_eq!(
             super::dropped_notice(1),
             "dropped the queued prompt (↑ recalls it)"

@@ -101,7 +101,12 @@ async fn an_openrouter_400_is_one_sentence_shown_once() {
         .expect("idle");
 
     let screen = shell.view().render_plain(W, H).join("\n");
-    let flat = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    // (#2882: without the Conversation box's side edges.)
+    let flat = screen
+        .split_whitespace()
+        .filter(|w| *w != "│")
+        .collect::<Vec<_>>()
+        .join(" ");
     assert_eq!(flat.matches(SENTENCE).count(), 1, "shown once\n{screen}");
     for unwanted in [
         "user_id",

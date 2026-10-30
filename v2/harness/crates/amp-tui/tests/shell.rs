@@ -110,10 +110,9 @@ async fn a_prompt_renders_the_reply_and_the_footer() {
 
     let lines = rig.shell.view().render_plain(W, H);
     assert_eq!(lines.len(), H, "the frame fills the screen");
-    // The one-row footer (compact, #2346) is the last line above the bottom padding row
-    // (#2344): cwd (branch) • role, then stats … model.
-    assert_eq!(lines[H - 1], "", "a blank row below the footer");
-    let footer = &lines[H - V - 1];
+    // The one-row footer (compact, #2346) is the last line (#2882: no blank row below it since
+    // the boxes): cwd (branch) • role, then stats … model.
+    let footer = &lines[H - 1];
     assert!(
         footer.contains("/work/amp (harness-m2) • manager"),
         "{footer}"
@@ -189,7 +188,7 @@ async fn slash_commands() {
     // #2188: /model opens a picker with the current model selected; ↓ Enter switches.
     rig.say("/model").await;
     let screen = rig.screen();
-    assert!(screen.contains("── model "), "{screen}");
+    assert!(screen.contains("┌─ model "), "{screen}");
     let current = format!("› ● {}/{}", rig.model.provider, rig.model.id);
     assert!(screen.contains(&current), "{screen}");
     assert!(
@@ -210,9 +209,9 @@ async fn slash_commands() {
     assert_eq!(rig.shell.info().model_id, "faux-2");
     let lines = rig.shell.view().render_plain(W, H);
     assert!(
-        lines[H - V - 1].ends_with("faux-2 • thinking off"),
+        lines[H - 1].ends_with("faux-2 • thinking off"),
         "{}",
-        lines[H - V - 1]
+        lines[H - 1]
     );
     assert!(rig.screen().contains("model: faux/faux-2"));
 
@@ -250,15 +249,24 @@ async fn the_chrome_slots_render_nothing_without_metadata() {
         lines[..3 + V].iter().any(|l| l.contains("AMP harness")),
         "{lines:#?}"
     );
-    // A component in the header slot shows above the transcript.
+    // A component in the header slot shows above the transcript, inside the Conversation box
+    // (#2882), whose top edge is under the top padding row (#2344).
     view.header_slot()
         .add_child(Arc::new(rpi_tui::Text::new("HEADER", 0, 0)));
     let lines = view.render_plain(W, H);
-    // Inside the left padding (#2251), under the top padding row (#2344).
     assert_eq!(lines[0], "");
+    assert!(
+        lines[V].trim_start().starts_with("┌─ Conversation"),
+        "{lines:#?}"
+    );
+    // In the box's text column: the padding's columns, then the edge's padding (#2251).
     assert_eq!(
-        lines[V],
-        format!("{}HEADER", " ".repeat(amp_tui::DEFAULT_PADDING))
+        lines[V + 1],
+        format!(
+            "{}│ HEADER{}│",
+            " ".repeat(amp_tui::DEFAULT_PADDING - 1),
+            " ".repeat(W - 2 * (amp_tui::DEFAULT_PADDING - 1) - 9)
+        )
     );
 }
 

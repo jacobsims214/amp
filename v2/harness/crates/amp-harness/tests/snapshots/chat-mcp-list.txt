@@ -1,7 +1,7 @@
-── MCP servers ───────────────────────────────────────────────────────────────────────────────────────────
-  1 of 1 ready · 1 not trusted · 1 disabled
-› ● fs     stdio · user  ready · 2 tools
-  ○ off    stdio · user  disabled
-  ● shared stdio · repo  not trusted (T trusts it)
-  add one: /mcp add <name> <url> · stdio, edit, import, secrets: `amp-harness mcp …` in a terminal
-  ↑↓ select · Enter details · r restart · t test · d disable · Esc close
+┌─ MCP servers ────────────────────────────────────────────────────────────────────────────────────────────┐
+│   1 of 1 ready · 1 not trusted · 1 disabled
+│ › ● fs     stdio · user  ready · 2 tools
+│   ○ off    stdio · user  disabled
+│   ● shared stdio · repo  not trusted (T trusts it)
+│   add one: /mcp add <name> <url> · stdio, edit, import, secrets: `amp-harness mcp …` in a terminal
+└─ ↑↓ select · Enter details · r restart · t test · d disable · Esc close ─────────────────────────────────┘

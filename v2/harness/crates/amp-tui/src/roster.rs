@@ -9,10 +9,11 @@
 //! the id, agent and live numbers, so lines fall back to the bare id.
 //!
 //! Lines that read the roster on every frame:
-//! - [`WorkerStrip`], above the editor while workers run: one chip per worker
-//!   (`▸ #2142 Fix installer setup hand-off · worker-backend (wf-1) · running 3m12s · 48k tok ·
-//!   ctx 31%`) and the hint `2 running · click one or Ctrl+W to watch`. Ctrl+W focuses it
-//!   (←/→ choose, Enter watch, o open in AMP, Esc back).
+//! - [`WorkerStrip`], the Workers box above the editor while workers run (#2882): one chip per
+//!   worker (`▸ #2142 Fix installer setup hand-off · worker-backend (wf-1) · running 3m12s · 48k
+//!   tok · ctx 31%`); its title counts them and names the keys ([`WorkerStrip::titles`]:
+//!   `Workers · 2 running` … `Ctrl+W watch · /workers all`). Ctrl+W focuses it (←/→ choose,
+//!   Enter watch, o open in AMP, Esc back).
 //! - [`WorkerNotice`]: `▶ worker started` / `■ worker finished` lines in the transcript.
 //! - the dispatch line's second row (`run_ticket #2142`, `dispatch_task #2142`), through
 //!   [`Roster::detail`].
@@ -129,7 +130,8 @@ impl WorkerEntry {
         }
     }
 
-    fn state_color(&self) -> Color {
+    /// The colour of its state word: accent while it runs, then how it ended.
+    pub fn state_color(&self) -> Color {
         let c = theme().colors;
         match self.phase {
             Phase::Running | Phase::Queued => c.accent,
@@ -672,26 +674,47 @@ impl WorkerStrip {
         self.with(|s| s.viewing = task_id);
     }
 
-    fn hint(&self, shown: &[WorkerEntry], hidden: usize) -> String {
+    /// The keys for the box's title: what Ctrl+W gave it, the session shown, or how to get
+    /// there.
+    fn hint(&self) -> String {
         let (focused, viewing) = self.with(|s| (s.focused, s.viewing));
-        let live = shown.iter().filter(|e| e.is_live()).count();
-        let more = if hidden > 0 {
-            format!(" · +{hidden} more in /workers")
-        } else {
-            String::new()
-        };
         if focused {
-            return format!("←/→ choose · Enter watch · o open in AMP · Esc back{more}");
+            return "←/→ choose · Enter watch · o open in AMP · Esc back".to_owned();
         }
         if let Some(v) = viewing {
-            return format!("watching #{v} · click another worker to switch{more}");
+            return format!("watching #{v} · click another to switch");
         }
-        let running = if live == 1 {
-            "1 running".to_owned()
-        } else {
-            format!("{live} running")
-        };
-        format!("{running} · click one or Ctrl+W to watch{more}")
+        "Ctrl+W watch · /workers all".to_owned()
+    }
+
+    /// The Workers box's titles (#2882, artifact #26): `Workers · 2 running · 1 queued` (and
+    /// `+N more` past [`STRIP_ROWS`]) on the left, the keys on the right; bold and bright while
+    /// Ctrl+W gave it the keys. The count replaces the old hint line and the status line's
+    /// `workers N`.
+    pub fn titles(&self, _width: usize) -> crate::frame::Titles {
+        let shown = self.shown();
+        let focused = self.is_focused();
+        let count = |f: &dyn Fn(&WorkerEntry) -> bool| shown.iter().filter(|e| f(e)).count();
+        let running = count(&|e| matches!(e.phase, Phase::Running | Phase::Stopping));
+        let queued = count(&|e| e.phase == Phase::Queued);
+        let done = count(&|e| !e.is_live());
+        let mut left = vec!["Workers".to_owned()];
+        for (n, word) in [(running, "running"), (queued, "queued"), (done, "done")] {
+            if n > 0 {
+                left.push(format!("{n} {word}"));
+            }
+        }
+        let hidden = shown.len().saturating_sub(STRIP_ROWS);
+        if hidden > 0 {
+            left.push(format!("+{hidden} more in /workers"));
+        }
+        let c = theme().colors;
+        crate::frame::Titles {
+            left: crate::frame::label(&left.join(" · "), focused),
+            right: (if focused { c.accent } else { c.dim }).fg(&self.hint()),
+            bottom: String::new(),
+            focused,
+        }
     }
 }
 
@@ -730,10 +753,6 @@ impl Component for WorkerStrip {
             };
             lines.push(format!("{} {body}", color.fg(glyph)));
         }
-        let hidden = shown.len().saturating_sub(STRIP_ROWS);
-        let hint = self.hint(&shown, hidden);
-        let hint_color = if focused { c.accent } else { c.dim };
-        lines.push(hint_color.fg(&shorten(&hint, width)));
         lines
     }
 
@@ -764,6 +783,8 @@ pub struct WorkerNotice {
     roster: Roster,
     /// What it showed last, for when the roster no longer has the worker.
     last: Mutex<Option<WorkerEntry>>,
+    /// A blank row above it (not right under another notice, #2882).
+    gap_above: bool,
 }
 
 impl WorkerNotice {
@@ -773,7 +794,14 @@ impl WorkerNotice {
             kind,
             roster,
             last: Mutex::new(None),
+            gap_above: true,
         }
+    }
+
+    /// Whether a blank row sits above it (a run of notices has none between them, #2882).
+    pub fn with_gap_above(mut self, gap: bool) -> Self {
+        self.gap_above = gap;
+        self
     }
 
     pub fn task_id(&self) -> i64 {
@@ -805,7 +833,12 @@ impl Component for WorkerNotice {
             NoticeKind::Finished => ChipStyle::WithId,
         };
         let body = chip(&entry, width.saturating_sub(lead_w), style);
-        vec![String::new(), truncate_to_width(&(lead + &body), width, "")]
+        let line = truncate_to_width(&(lead + &body), width, "");
+        if self.gap_above {
+            vec![String::new(), line]
+        } else {
+            vec![line]
+        }
     }
 
     fn invalidate(&self) {}
@@ -987,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn the_strip_lists_live_workers_with_a_hint_and_takes_the_keys() {
+    fn the_strip_lists_live_workers_and_titles_its_box_and_takes_the_keys() {
         let roster = Roster::default();
         let mut entries = BTreeMap::new();
         entries.insert(2142, entry());
@@ -1014,10 +1047,14 @@ mod tests {
         assert!(!roster.set(entries), "unchanged");
         let strip = WorkerStrip::new(roster);
         let lines: Vec<String> = strip.render(100).iter().map(|l| plain(l)).collect();
-        assert_eq!(lines.len(), 3, "{lines:?}");
+        // #2882: one row per worker; the count and the keys are the box's title.
+        assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].starts_with("▸ #2142 "), "{lines:?}");
         assert!(lines[1].starts_with("▸ #2143 Thinking toggle"), "{lines:?}");
-        assert_eq!(lines[2], "2 running · click one or Ctrl+W to watch");
+        let t = strip.titles(96);
+        assert_eq!(plain(&t.left), "Workers · 2 running");
+        assert_eq!(plain(&t.right), "Ctrl+W watch · /workers all");
+        assert!(!t.focused);
         // Focused: the finished one is listed too; ←/→ move, the selection is marked.
         assert!(strip.focus());
         assert_eq!(strip.selected(), Some(2142));
@@ -1027,16 +1064,16 @@ mod tests {
         assert_eq!(strip.selected(), Some(2100));
         let lines: Vec<String> = strip.render(100).iter().map(|l| plain(l)).collect();
         assert!(lines[2].starts_with("❯ #2100"), "{lines:?}");
-        assert!(
-            lines[3].starts_with("←/→ choose · Enter watch"),
-            "{lines:?}"
-        );
+        let t = strip.titles(96);
+        assert!(t.focused, "Ctrl+W gave it the keys");
+        assert_eq!(plain(&t.left), "Workers · 2 running · 1 done");
+        assert!(plain(&t.right).starts_with("←/→ choose · Enter watch"));
         strip.blur();
         strip.set_viewing(Some(2143));
         let lines: Vec<String> = strip.render(100).iter().map(|l| plain(l)).collect();
         assert!(lines[1].starts_with("◆ #2143"), "{lines:?}");
         assert!(
-            lines.last().unwrap().starts_with("watching #2143"),
+            plain(&strip.titles(96).right).starts_with("watching #2143"),
             "{lines:?}"
         );
         for line in strip.render(60) {

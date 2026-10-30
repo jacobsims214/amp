@@ -187,10 +187,22 @@ impl Screen {
         }
     }
 
+    /// The screen's rows, the boxes' side edges (#2882) as blanks (columns unchanged), so a row
+    /// reads as it did inside the padding alone; the boxes' top and bottom edges stay.
     fn lines(&self) -> Vec<String> {
         self.rows
             .iter()
-            .map(|r| r.iter().collect::<String>().trim_end().to_owned())
+            .map(|r| {
+                let mut s = r.iter().collect::<String>().trim_end().to_owned();
+                let lead = s.len() - s.trim_start().len();
+                if s[lead..].starts_with('│') {
+                    s.replace_range(lead..lead + '│'.len_utf8(), " ");
+                    if s.ends_with('│') {
+                        s.pop();
+                    }
+                }
+                s.trim_end().to_owned()
+            })
             .collect()
     }
 
@@ -369,7 +381,13 @@ fn chip(screen: &Screen, id: i64) -> Option<String> {
     screen
         .lines()
         .into_iter()
-        .find(|l| l.trim_start().starts_with(&needle))
+        .find(|l| inner(l).starts_with(&needle))
+}
+
+/// A row's text inside a box's left edge (#2882) and past `/workers`' selection mark, or the
+/// row trimmed.
+fn inner(l: &str) -> &str {
+    l.trim_start().trim_start_matches(['│', '›', ' '])
 }
 
 /// `running 12s` → 12 seconds (minutes too).
@@ -427,7 +445,9 @@ async fn watch_at(cols: u16, rows: u16) {
     let s = chat
         .wait("two chips, a name and the hint", |s| {
             let t = s.text();
-            t.contains("2 running · click one or Ctrl+W to watch")
+            // #2882: the Workers box's title has the count and the keys.
+            t.contains("Workers · 2 running")
+                && t.contains("Ctrl+W watch · /workers all")
                 && chip(s, KNOWN).is_some_and(|l| l.contains("M1-4 CLI") && l.contains("ctx "))
                 && chip(s, UNKNOWN).is_some_and(|l| l.contains(" tok"))
         })
@@ -532,7 +552,7 @@ async fn watch_at(cols: u16, rows: u16) {
     }
     assert!(
         !lines.iter().any(|l| {
-            let l = l.trim();
+            let l = l.trim().trim_matches('│').trim();
             l == "▸ Thinking" || l.starts_with("▸ Thinking · Ctrl+T")
         }),
         "{t}"
@@ -546,7 +566,7 @@ async fn watch_at(cols: u16, rows: u16) {
     chat.send(b"\x1b");
     chat.wait("the chat again", |s| {
         let t = s.text();
-        t.contains("run both tickets") && t.contains("click one or Ctrl+W to watch")
+        t.contains("run both tickets") && t.contains("Ctrl+W watch · /workers all")
     })
     .await;
 
@@ -561,7 +581,7 @@ async fn watch_at(cols: u16, rows: u16) {
     assert!(
         s.lines()
             .iter()
-            .any(|l| l.trim_start().starts_with(&format!("❯ #{KNOWN}"))),
+            .any(|l| inner(l).starts_with(&format!("❯ #{KNOWN}"))),
         "{}",
         s.text()
     );
@@ -569,7 +589,7 @@ async fn watch_at(cols: u16, rows: u16) {
     chat.wait("the selection to move", |s| {
         s.lines()
             .iter()
-            .any(|l| l.trim_start().starts_with(&format!("❯ #{UNKNOWN}")))
+            .any(|l| inner(l).starts_with(&format!("❯ #{UNKNOWN}")))
     })
     .await;
     chat.send(b"\r");
@@ -586,20 +606,26 @@ async fn watch_at(cols: u16, rows: u16) {
     let s = chat
         .wait("the /workers panel", |s| {
             let t = s.text();
-            t.contains("AMP · workers") && t.contains("Enter/click watch")
+            // #2882: one box, titled with the counts, the key hint in its bottom edge.
+            t.contains("┌─ Workers · 2 running") && t.contains("Enter watch")
         })
         .await;
     dump("/workers panel", &s);
     let t = s.text();
     assert!(t.contains(&format!("#{KNOWN} M1-4 CLI")), "{t}");
-    assert!(t.contains("amp:amp-worker-backend · local"), "{t}");
+    // One row per worker: its chip (id, name, agent), no "local" on every row.
+    assert!(
+        chip(&s, KNOWN).is_some_and(|l| l.contains("worker-backend")),
+        "{t}"
+    );
+    assert!(!s.lines().iter().any(|l| l.ends_with("· local")), "{t}");
     for line in s.lines() {
         assert!(line.chars().count() <= width, "{line:?}");
     }
     let row = s
         .lines()
         .iter()
-        .position(|l| l.contains(&format!("#{UNKNOWN} ")) && l.contains("· local"))
+        .position(|l| l.contains(&format!("▸ #{UNKNOWN} ")) && l.contains("worker-backend"))
         .unwrap();
     chat.click(row, 6);
     chat.wait("the session of #9002 from /workers", |s| {
@@ -639,7 +665,7 @@ async fn watch_at(cols: u16, rows: u16) {
     assert!(
         !s.lines()
             .iter()
-            .any(|l| l.trim_start().starts_with('▸') && l.contains("running ")),
+            .any(|l| inner(l).starts_with('▸') && l.contains("running ")),
         "{t}"
     );
     let (row, col) = find(&s, &format!("■ worker finished #{KNOWN}"))
@@ -702,8 +728,7 @@ async fn typing_with_the_workers_panel_open_goes_to_the_editor() {
         .await;
     chat.send(b"run both tickets\r");
     chat.wait("two running workers", |s| {
-        s.text()
-            .contains("2 running · click one or Ctrl+W to watch")
+        s.text().contains("Workers · 2 running")
     })
     .await;
 
@@ -711,8 +736,8 @@ async fn typing_with_the_workers_panel_open_goes_to_the_editor() {
     let s = chat
         .wait("the workers panel and its hint", |s| {
             let t = s.text();
-            t.contains("AMP · workers")
-                && t.contains("Enter/click watch · Ctrl+X stop · Ctrl+G open in AMP · Esc close")
+            t.contains("┌─ Workers ·")
+                && t.contains("Enter watch · Ctrl+X stop · Ctrl+G open in AMP · Esc close")
         })
         .await;
     dump("workers panel", &s);
@@ -739,7 +764,7 @@ async fn typing_with_the_workers_panel_open_goes_to_the_editor() {
         "xo hello",
         "exactly the typed text: {t}"
     );
-    assert!(t.contains("AMP · workers"), "the panel stays open: {t}");
+    assert!(t.contains("┌─ Workers ·"), "the panel stays open: {t}");
     assert!(!t.contains("stop the worker on"), "x asked nothing: {t}");
     assert!(!opened.exists(), "o opened nothing: {t}");
     assert!(handed_back(&amp).is_empty(), "{t}");
@@ -879,7 +904,13 @@ async fn the_chat_launches_workers_and_takes_prompts_while_they_run() {
     //    and it receives the end at its top.
     let s = chat
         .wait("the automatic turn's echo", |s| {
-            s.text().contains("Next turn saw: [worker summaries")
+            // The echo streams: wait for the summary's entry too, not only its start.
+            let t = s.text();
+            t.find("Next turn saw: [worker summaries")
+                .is_some_and(|at| {
+                    t[at..].contains(&format!("#{KNOWN} completed"))
+                        && t[at..].contains("[amp-harness] Workers you launched")
+                })
         })
         .await;
     dump("the automatic turn saw the worker's end", &s);
