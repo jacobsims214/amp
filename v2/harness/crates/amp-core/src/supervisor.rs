@@ -1282,8 +1282,9 @@ impl Supervisor {
 
     /// Stops the live worker on `task_id` because `by` (the person at the chat) asked to
     /// (#2252). Its run ends as `cancelled` with the error [`stopped_from_chat`]: run reporting
-    /// records it abandoned and hands the ticket back to ready (#2204), and the manager's
-    /// `amp_run_ticket` returns with a note saying who stopped it. A worker still waiting for a
+    /// records it abandoned and hands the ticket back to ready (#2204), and the manager is told
+    /// who stopped it in a note: in `amp_run_ticket`'s result in Await mode, or in a later turn's
+    /// `[worker summaries]` ([`LaunchEnd::summary`]) in Launch mode. A worker still waiting for a
     /// slot is never dispatched.
     pub fn stop_worker(&self, task_id: i64, by: &str) -> Result<(), StopError> {
         let live = self.live.lock().unwrap();
@@ -2096,7 +2097,8 @@ impl Supervisor {
                 if closed.is_none()
                     && let Some(by) = stopped_by.lock().unwrap().clone()
                 {
-                    // #2252: the manager reads this in amp_run_ticket's result.
+                    // #2252: the manager reads this in amp_run_ticket's result (Await mode) or
+                    // in a later turn's [worker summaries] via LaunchEnd::summary (Launch mode).
                     notes.push(format!(
                         "{by} watched this worker and stopped it from the chat; ask them \
                          before running #{} again",

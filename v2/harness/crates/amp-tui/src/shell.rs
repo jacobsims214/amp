@@ -4925,7 +4925,8 @@ impl Shell {
 
     /// The `y` to [`Shell::ask_stop`]: stops the worker as the person (run reporting records the
     /// run abandoned, `stopped by <person> from the chat`, and returns the ticket to ready; the
-    /// manager's `amp_run_ticket` returns saying so).
+    /// manager is told so in `amp_run_ticket`'s result in Await mode, or in a later turn's
+    /// `[worker summaries]` in Launch mode).
     pub fn confirm_stop(&mut self) -> Result<i64, String> {
         let id = self
             .stop_confirm
