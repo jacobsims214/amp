@@ -4,8 +4,9 @@
 # The sources (v2/.opencode) are written for opencode. The harness has no `task` tool, no
 # `amp_amp_` double prefix, no `subagent_depth`, and its manager does not edit `.opencode/**`.
 # Workers run through the manager's `amp_run_ticket(task_id, agent_id)` tool (D7), which
-# dispatches the ticket in AMP, gives the worker its own worktree, runs it in the foreground and
-# returns its final message. Run reporting is automatic (D8).
+# dispatches the ticket in AMP, gives the worker its own worktree, and in the chat launches it in
+# the background (an ack now, its summary in a later turn); run -p awaits it and returns its final
+# message. Run reporting is automatic (D8).
 #
 # Rule kinds (per file, applied in order, then the global rules):
 #   paragraph: <substring>  + with: <text>   replace the whole blank-line-separated paragraph
