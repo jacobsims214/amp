@@ -446,7 +446,12 @@ fn record_is_stale(err: &Result<(), String>) -> bool {
         return false;
     };
     let e = e.to_ascii_lowercase();
-    e.contains("not in progress") || e.contains("not found") || e.contains("unknown task")
+    // "no longer current": the ticket was returned and dispatched again since (AMP #2909), so
+    // this record's run is over and the ticket is another run's.
+    e.contains("not in progress")
+        || e.contains("not found")
+        || e.contains("unknown task")
+        || e.contains("no longer current")
 }
 
 /// What a worker is, known before it starts (hooks get this).
@@ -815,10 +820,12 @@ pub trait WorkerHooks: Send + Sync {
 
     /// Hands ticket `task_id` back after this process abandoned its worker (#2204): AMP moves it
     /// from in progress to ready, so it isn't left in progress with nobody on it. `why` is one
-    /// line for the ticket's history. Run reporting calls it from `on_finish` for a `cancelled`
+    /// line for the ticket's history. `dispatch_id` is the run's dispatch token ("" when there is
+    /// none): it is what lets AMP return a ticket the harness already started (AMP #2909). Run
+    /// reporting calls it from `on_finish` for a `cancelled`
     /// worker (the chat stopped or quit), and [`Supervisor::release_unfinished`] calls it when
     /// the chat quits without waiting for `on_finish`.
-    async fn release(&self, _task_id: i64, _why: &str) -> Result<(), String> {
+    async fn release(&self, _task_id: i64, _dispatch_id: &str, _why: &str) -> Result<(), String> {
         Err("no run reporting in this process".to_owned())
     }
 
@@ -942,6 +949,9 @@ struct LiveWorker {
     agent_id: String,
     /// AMP has the dispatch (the ticket is in progress).
     dispatched: bool,
+    /// The dispatch token AMP gave this run ("" until dispatched, or on a server without one):
+    /// what hands its started ticket back with `amp_return_task` (AMP #2909).
+    dispatch_id: String,
     /// Whether the worker has closed its ticket yet (set once it is running).
     watch: Option<Arc<WorkerWatch>>,
     phase: WorkerPhase,
@@ -1142,6 +1152,24 @@ impl Supervisor {
             .collect()
     }
 
+    /// The dispatch token of this process's run on `task_id` (AMP #2909): its live worker's, or
+    /// failing that (the live entry went with a crashed task) the ledger's record of this
+    /// process's dispatch. "" when there is none.
+    fn dispatch_of(&self, task_id: i64) -> String {
+        if let Some(w) = self.live.lock().unwrap().get(&task_id)
+            && !w.dispatch_id.is_empty()
+        {
+            return w.dispatch_id.clone();
+        }
+        let pid = self.ledger.pid();
+        self.ledger
+            .records()
+            .into_iter()
+            .find(|r| r.task_id == task_id && r.pid == pid)
+            .map(|r| r.dispatch_id)
+            .unwrap_or_default()
+    }
+
     /// Returns every [`Supervisor::unfinished`] ticket to ready through the hooks
     /// ([`WorkerHooks::release`]), all at once, within `bound`. Quitting without waiting calls
     /// it, because the workers' own `on_finish` will not get to run (#2204). Each ticket comes
@@ -1161,7 +1189,8 @@ impl Supervisor {
         let mut set = tokio::task::JoinSet::new();
         for id in &ids {
             let (hooks, id, why) = (Arc::clone(&hooks), *id, why.to_owned());
-            set.spawn(async move { (id, hooks.release(id, &why).await) });
+            let dispatch_id = self.dispatch_of(id);
+            set.spawn(async move { (id, hooks.release(id, &dispatch_id, &why).await) });
         }
         let mut out = Vec::new();
         let _ = tokio::time::timeout(bound, async {
@@ -1205,7 +1234,7 @@ impl Supervisor {
         for rec in orphans {
             let why = orphan_reason(&rec);
             let result = match self.hooks.clone() {
-                Some(hooks) => hooks.release(rec.task_id, &why).await,
+                Some(hooks) => hooks.release(rec.task_id, &rec.dispatch_id, &why).await,
                 None => Err("no run reporting in this process".to_owned()),
             };
             if result.is_ok() || record_is_stale(&result) {
@@ -1614,6 +1643,9 @@ impl Supervisor {
                     ..DispatchResult::default()
                 }
             });
+        if let Some(w) = self.live.lock().unwrap().get_mut(&req.task_id) {
+            w.dispatch_id = dispatched.dispatch_id.clone();
+        }
         let dispatch = Dispatch::new(&dispatched.dispatch_id, progress);
         // The ledger is what the next startup sweeps: this ticket is ours from here until its
         // worker closes it or it is handed back.
@@ -1777,7 +1809,11 @@ impl Supervisor {
         } else {
             match &self.hooks {
                 Some(hooks) => match hooks
-                    .release(task_id, &format!("worker crashed: {what}"))
+                    .release(
+                        task_id,
+                        &self.dispatch_of(task_id),
+                        &format!("worker crashed: {what}"),
+                    )
                     .await
                 {
                     Ok(()) => why.push_str(&format!("; #{task_id} was returned to ready")),
@@ -1820,6 +1856,7 @@ impl Supervisor {
             LiveWorker {
                 agent_id: agent_id.to_owned(),
                 dispatched: false,
+                dispatch_id: String::new(),
                 watch: None,
                 phase: WorkerPhase::Queued,
                 model: None,

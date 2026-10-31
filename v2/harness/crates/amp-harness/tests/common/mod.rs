@@ -327,6 +327,23 @@ impl ServerHandler for MockAmp {
                 Some(4046) | Some(4048) => tool_error(
                     "task 4046 was started (by amp:amp-worker-backend): returning it would pull                      it out from under a worker that is running. Block it with a question, or                      close it out with closeout_reason",
                 ),
+                // AMP #2909: 4049 answers like a current server. Its ticket was started (the
+                // harness claimed it), and only the run holding its current dispatch may return
+                // it; no token, or a stale one, is refused.
+                Some(4049) => match args["dispatch_id"].as_str() {
+                    Some("d_mock4049") => ok_json(json!({
+                        "task_id": 4049, "state": "backlog", "returned": true,
+                        "returned_reason": args["reason"],
+                    })),
+                    Some(d) if !d.is_empty() => tool_error(&format!(
+                        "task 4049: dispatch \"{d}\" is no longer current (current: d_mock4049)"
+                    )),
+                    _ => tool_error(
+                        "task 4049 was started (by amp:amp-worker-backend): returning it would pull \
+                         it out from under a worker that is running. Block it with a question, or \
+                         close it out with closeout_reason",
+                    ),
+                },
                 Some(4047) => tool_error("task 4047 not found"),
                 Some(4042) => tool_error("task 4042 is owned by someone else"),
                 Some(id) => ok_json(json!({

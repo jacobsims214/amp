@@ -494,8 +494,10 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 // release of a ticket whose worker ended without closing it
 // (amp_return_task). It clears the dispatch, records the reason, and writes
 // an audit entry. system marks the automatic return, which no caller asked
-// for; otherwise p is named.
-func (s *Service) ReturnTask(ctx context.Context, p authz.Principal, taskID int, reason string, system bool) (*domain.Task, error) {
+// for; otherwise p is named. dispatchID, when it is the ticket's current
+// dispatch, lets the run holding it return its own started ticket (AMP
+// #2909); "" keeps the old rule (a started ticket is refused).
+func (s *Service) ReturnTask(ctx context.Context, p authz.Principal, taskID int, reason, dispatchID string, system bool) (*domain.Task, error) {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		return nil, authz.BadRequest("reason is required: it's what the manager and the history see, e.g. \"worker amp-worker-x timed out after 20 min\"")
@@ -510,7 +512,7 @@ func (s *Service) ReturnTask(ctx context.Context, p authz.Principal, taskID int,
 	}
 	replyCh := make(chan actor.ReplyGetTask, 1)
 	if err := s.Registry.Send(t.ProjectID, &actor.MsgReturnTask{TaskID: taskID, Reason: reason,
-		By: p.UserRef(), ByName: byName, ReplyCh: replyCh}); err != nil {
+		DispatchID: strings.TrimSpace(dispatchID), By: p.UserRef(), ByName: byName, ReplyCh: replyCh}); err != nil {
 		return nil, err
 	}
 	reply := actor.Await(ctx, replyCh)
@@ -518,6 +520,9 @@ func (s *Service) ReturnTask(ctx context.Context, p authz.Principal, taskID int,
 		return nil, &authz.Error{Status: 409, Msg: reply.Err.Error()}
 	}
 	details := map[string]any{"reason": reason, "automatic": system}
+	if d := strings.TrimSpace(dispatchID); d != "" {
+		details["dispatch_id"] = d
+	}
 	if !system {
 		s.Record(ctx, p, domain.AuditEntry{ProjectID: intRef(t.ProjectID), TargetType: "task", TargetID: idStr(taskID), TargetName: t.Name,
 			Action: "task.return", Summary: fmt.Sprintf("returned ticket %d to ready (%s)", taskID, reason), Details: details})

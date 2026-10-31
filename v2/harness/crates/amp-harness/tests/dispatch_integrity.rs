@@ -358,8 +358,8 @@ async fn every_end_that_does_not_close_the_ticket_returns_it_and_tells_the_manag
     assert_eq!(returned, vec![2110, 2111, 2112], "{returned:?}");
 }
 
-/// 3. A ticket AMP refuses to return because it was started is set back to ready instead — the
-/// documented fallback, and the run says so rather than pretending it was returned.
+/// 3. A ticket an older AMP (before #2909) refuses to return because it was started is set back to
+/// ready instead — the documented fallback, and the run says so rather than pretending it was returned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_started_ticket_amp_will_not_return_is_set_back_to_ready_and_the_run_says_so() {
     let f = fixture("fallback").await;
@@ -379,6 +379,8 @@ async fn a_started_ticket_amp_will_not_return_is_set_back_to_ready_and_the_run_s
     assert_eq!(r.outcome, WorkerOutcome::Stopped, "{r:?}");
     let returned = f.calls("amp_return_task");
     assert_eq!(returned[0]["task_id"], 4046);
+    // The token went along; this older server refused anyway, so the fallback ran.
+    assert_eq!(returned[0]["dispatch_id"], "d_mock4046");
     let states = f.calls("amp_set_task_state");
     assert_eq!(states.len(), 1, "{states:?}");
     assert_eq!(states[0]["task_id"], 4046);
@@ -404,6 +406,69 @@ async fn a_started_ticket_amp_will_not_return_is_set_back_to_ready_and_the_run_s
         ) && !r.notes.iter().any(|n| n.contains("could not be returned")),
         "{:?}",
         r.notes
+    );
+    assert!(notices.lines().is_empty(), "{:?}", notices.lines());
+}
+
+/// 3a. AMP #2909: on a current server, the harness returns its own started ticket with the run's
+/// dispatch_id, so AMP records a real return (returned_reason, the `returned` list) and the
+/// fallback never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_started_ticket_is_returned_with_its_dispatch_id_on_a_current_server() {
+    let f = fixture("return-with-dispatch").await;
+    let (sup, notices) = f.supervisor_with_notices(config());
+    f.script(vec![
+        step(
+            "Nothing.",
+            json!([{"name": "bash", "arguments": {"command": "true"}}]),
+        ),
+        step("Stopping here.", json!([])),
+    ]);
+    // 4049: the mock's current-server ticket, returned only with its own dispatch_id.
+    let r = sup
+        .run_ticket(req(4049, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Stopped, "{r:?}");
+    // The harness started it for its worker...
+    let claims = f.calls("amp_claim_task");
+    assert_eq!(claims[0]["dispatch_id"], "d_mock4049", "{claims:?}");
+    // ...and hands it back with the same token, through the returned path only.
+    let returned = f.calls("amp_return_task");
+    assert_eq!(returned.len(), 1, "{returned:?}");
+    assert_eq!(returned[0]["task_id"], 4049);
+    assert_eq!(returned[0]["dispatch_id"], "d_mock4049");
+    assert!(
+        returned[0]["reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("returned to ready by amp-harness: ")),
+        "{returned:?}"
+    );
+    assert!(
+        f.calls("amp_set_task_state").is_empty(),
+        "no fallback on a server that accepts the return: {:?}",
+        f.calls("amp_set_task_state")
+    );
+    assert_eq!(r.returned, Some(Ok(())), "it is in ready");
+    // The run's note is the returned path's, not the fallback's.
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n == &amp_core::run_report::Released::Returned.note(4049)),
+        "{:?}",
+        r.notes
+    );
+    assert!(
+        !r.notes
+            .iter()
+            .any(|n| n.contains("set back rather than returned") || n.contains("already started")),
+        "{:?}",
+        r.notes
+    );
+    assert!(
+        f.ledger.records().iter().all(|r| r.task_id != 4049),
+        "{:?}",
+        f.ledger.records()
     );
     assert!(notices.lines().is_empty(), "{:?}", notices.lines());
 }
@@ -479,6 +544,10 @@ async fn startup_releases_the_tickets_of_a_dead_chat_and_tells_the_person() {
         .filter_map(|c| c["task_id"].as_i64())
         .collect();
     assert_eq!(ids, vec![2120, 2121], "{returned:?}");
+    // AMP #2909: each with the dead run's dispatch_id from the ledger, so AMP returns the ticket
+    // even though that run had started it.
+    assert_eq!(returned[0]["dispatch_id"], "d_dead2120", "{returned:?}");
+    assert_eq!(returned[1]["dispatch_id"], "d_dead2121", "{returned:?}");
     assert!(
         returned[0]["reason"]
             .as_str()

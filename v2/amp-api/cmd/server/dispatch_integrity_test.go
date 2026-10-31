@@ -626,6 +626,74 @@ func TestDispatchIntegrity_ReturnTask(t *testing.T) {
 	}
 }
 
+// The run holding a ticket's current dispatch may return its own started
+// ticket (AMP #2909): the harness claims for its worker, so every ticket it
+// hands back is started. It comes back returned (reason, returned list,
+// history) with the start cleared. Without the dispatch_id, or with a stale
+// one, a started ticket is still refused.
+func TestDispatchIntegrity_ReturnStartedByCurrentHolder(t *testing.T) {
+	s := setupMCP(t)
+	ctx := context.Background()
+
+	id := mkIn(t, s, s.storyID, "harness worker gave up")
+	tok := dispatchClaims(t, s, id)
+	s.call(t, "amp_claim_task", map[string]interface{}{"task_id": float64(id), "dispatch_id": tok})
+
+	// No dispatch_id: refused as before, and nothing changes.
+	msg := s.callExpectError(t, "amp_return_task", map[string]interface{}{"task_id": float64(id), "reason": "give up"})
+	if !strings.Contains(msg, "was started") {
+		t.Fatalf("return of a started ticket without dispatch_id: %q", msg)
+	}
+	// A stale dispatch_id: refused, naming the current one.
+	msg = s.callExpectError(t, "amp_return_task", map[string]interface{}{"task_id": float64(id), "reason": "give up",
+		"dispatch_id": "d_notthecurrentone"})
+	if !strings.Contains(msg, "no longer current") || !strings.Contains(msg, tok) {
+		t.Fatalf("return with a stale dispatch_id: %q", msg)
+	}
+	if task, _ := s.repo.GetTask(ctx, id); task.State != domain.TaskStateInProgress || task.StartedAt == nil || task.DispatchID != tok {
+		t.Fatalf("refused returns changed the ticket: state %s started %v dispatch %q", task.State, task.StartedAt, task.DispatchID)
+	}
+
+	// The current holder returns it.
+	reason := "abandoned: cancelled: the manager's run was cancelled"
+	out := s.call(t, "amp_return_task", map[string]interface{}{"task_id": float64(id), "reason": reason, "dispatch_id": tok})
+	if out["returned"] != true || out["state"] != "backlog" || out["returned_reason"] != reason {
+		t.Fatalf("return by the current holder = %v", out)
+	}
+	task, _ := s.repo.GetTask(ctx, id)
+	if task.State != domain.TaskStateBacklog || task.ReturnedAt == nil || task.ReturnedReason != reason {
+		t.Fatalf("returned ticket: state %s returned_at %v reason %q", task.State, task.ReturnedAt, task.ReturnedReason)
+	}
+	if task.StartedAt != nil || task.StartedBy != "" || task.DispatchID != "" || task.DispatchedAt != nil {
+		t.Fatalf("returned ticket kept its run: started %v by %q, dispatch %q at %v",
+			task.StartedAt, task.StartedBy, task.DispatchID, task.DispatchedAt)
+	}
+	hist, _ := s.repo.GetTicketHistory(ctx, id)
+	var returned *domain.ActivityLog
+	for i := range hist {
+		if hist[i].Action == "returned" {
+			returned = &hist[i]
+		}
+	}
+	if returned == nil || !strings.Contains(returned.Detail, "Returned to ready: "+reason) {
+		t.Fatalf("return history = %+v", hist)
+	}
+	board := s.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(s.projectID), "owner": "any"})
+	list := board["returned"].([]interface{})
+	if len(list) != 1 {
+		t.Fatalf("returned list = %v", list)
+	}
+	if item := list[0].(map[string]interface{}); int(item["id"].(float64)) != id || item["returned_reason"] != reason {
+		t.Fatalf("returned item = %v", item)
+	}
+
+	// The same token again is now stale: the dispatch it named is gone.
+	msg = s.callExpectError(t, "amp_return_task", map[string]interface{}{"task_id": float64(id), "reason": "again", "dispatch_id": tok})
+	if !strings.Contains(msg, "not in progress") && !strings.Contains(msg, "no longer current") {
+		t.Fatalf("second return with the spent token: %q", msg)
+	}
+}
+
 // The backfill: an in_progress ticket that predates started_at reads as
 // started, so nothing in flight is flagged or returned.
 func TestDispatchIntegrity_BackfillLeavesTicketsInFlightAlone(t *testing.T) {

@@ -555,15 +555,31 @@ func (a *TaskActor) handleClaimStart(msg *MsgClaimStart) (bool, error) {
 }
 
 // handleReturn sends a dispatched ticket back to ready because no worker
-// started it: the watchdog's automatic return, or a harness releasing a
-// ticket whose worker ended without closing it (amp_return_task). It clears
-// the dispatch, stamps the return, and leaves the state ready (or blocked
-// when a dependency is open, as any ticket moved back is).
+// started it, or because the run holding its current dispatch ended without
+// closing it: the watchdog's automatic return, or a harness releasing its
+// worker's ticket (amp_return_task, with the dispatch_id when the worker
+// had started it). It clears the dispatch and any start, stamps the return,
+// and leaves the state ready (or blocked when a dependency is open, as any
+// ticket moved back is). A started ticket without its current dispatch_id
+// is refused, as is a stale dispatch_id.
 func (a *TaskActor) handleReturn(msg *MsgReturnTask) error {
 	if a.task.State != domain.TaskStateInProgress {
 		return fmt.Errorf("task %d is %s, not in progress: only a dispatched ticket can be returned", a.task.ID, a.task.State)
 	}
-	if a.task.StartedAt != nil {
+	// A token that isn't the current one is a run that is already over (the
+	// ticket was returned and dispatched again): it can't hand back a
+	// dispatch that belongs to a newer worker.
+	if msg.DispatchID != "" && !a.task.CurrentDispatch(msg.DispatchID) {
+		current := "none (the ticket was already returned to ready)"
+		if a.task.DispatchID != "" {
+			current = a.task.DispatchID
+		}
+		return fmt.Errorf("task %d: dispatch %q is no longer current (current: %s): this run is over and the ticket isn't its to return",
+			a.task.ID, msg.DispatchID, current)
+	}
+	// The holder of the current dispatch may return its own started ticket
+	// (AMP #2909): it is the run giving up, not someone pulling a live run.
+	if a.task.StartedAt != nil && !a.task.CurrentDispatch(msg.DispatchID) {
 		// A started ticket is somebody's work: returning it would cancel a
 		// live run behind its back. The caller blocks it or completes it.
 		return fmt.Errorf("task %d was started (by %s): returning it would pull it out from under a worker that is running. "+

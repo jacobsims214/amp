@@ -670,10 +670,13 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		"Send a dispatched ticket back to ready because its worker never started it or ended without closing it: a harness "+
 			"releasing a run that crashed, timed out or was stopped, or a manager undoing a dispatch. Clears the dispatch, records "+
 			"returned_at/returned_reason so the ticket shows under amp_list_tasks' returned list until it is dispatched again, and "+
-			"writes history and an audit entry. Refused on a started ticket: block or close that one out instead.",
+			"writes history and an audit entry. A started ticket is returned only by the run holding its current dispatch: pass that "+
+			"dispatch_id (a harness giving back its own worker's ticket). Without it, or with a stale one, a started ticket is refused: "+
+			"block or close that one out instead.",
 		props{
-			"task_id": num("REQUIRED. Task ID."),
-			"reason":  str("REQUIRED. Why it is being returned, naming the outcome: e.g. 'worker amp:amp-worker-backend timed out after 20 min'."),
+			"task_id":     num("REQUIRED. Task ID."),
+			"reason":      str("REQUIRED. Why it is being returned, naming the outcome: e.g. 'worker amp:amp-worker-backend timed out after 20 min'."),
+			"dispatch_id": str("Optional. The ticket's current dispatch_id, when you hold it: lets you return the ticket after its worker started it. A dispatch_id that is no longer current is refused."),
 		}), wrap(ctx, s.guard(authz.Member, s.returnTask)))
 	mcp.AddTool(tool("amp_answer_question",
 		"Answer a ticket's question (a ticket an agent blocked with amp_block_task): the answer is posted on the ticket as a comment "+
@@ -2294,7 +2297,7 @@ func (s *Server) returnTask(rctx context.Context, args map[string]interface{}) (
 	if err != nil || strings.TrimSpace(reason) == "" {
 		return nil, fmt.Errorf("reason is required: it names why the worker didn't finish, e.g. \"worker amp:amp-worker-backend timed out after 20 min\"")
 	}
-	t, err := s.svc.ReturnTask(rctx, caller(rctx).p, taskID, reason, false)
+	t, err := s.svc.ReturnTask(rctx, caller(rctx).p, taskID, reason, optStr(args, "dispatch_id", ""), false)
 	if err != nil {
 		return nil, err
 	}

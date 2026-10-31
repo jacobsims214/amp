@@ -129,12 +129,15 @@ type ReplyStart struct {
 }
 
 // MsgReturnTask sends a dispatched ticket back to ready because no worker
-// started it (AMP #2801): the watchdog's automatic return, or a harness
+// started it (AMP #2801), or because the run holding its dispatch gave up: the watchdog's automatic return, or a harness
 // releasing a ticket whose worker ended without closing it
 // (amp_return_task).
 type MsgReturnTask struct {
 	TaskID int
 	Reason string
+	// DispatchID, when it is the ticket's current dispatch, lets that run
+	// return its own started ticket (AMP #2909). A stale one is refused.
+	DispatchID string
 	// By names who returned it in the history ("system" for the watchdog).
 	By      *int
 	ByName  string

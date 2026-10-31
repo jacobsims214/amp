@@ -223,8 +223,8 @@ impl WorkerHooks for Recording {
         self.finished.finished.lock().unwrap().push(report.clone());
     }
 
-    async fn release(&self, task_id: i64, why: &str) -> Result<(), String> {
-        self.reporter.release(task_id, why).await
+    async fn release(&self, task_id: i64, dispatch_id: &str, why: &str) -> Result<(), String> {
+        self.reporter.release(task_id, dispatch_id, why).await
     }
 
     fn notice(&self, text: &str) {
@@ -889,12 +889,12 @@ impl WorkerHooks for PanicsInFinish {
         panic!("boom in on_finish");
     }
 
-    async fn release(&self, task_id: i64, why: &str) -> Result<(), String> {
+    async fn release(&self, task_id: i64, dispatch_id: &str, why: &str) -> Result<(), String> {
         self.released
             .lock()
             .unwrap()
             .push((task_id, why.to_owned()));
-        self.reporter.release(task_id, why).await
+        self.reporter.release(task_id, dispatch_id, why).await
     }
 }
 
