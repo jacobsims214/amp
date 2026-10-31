@@ -16,8 +16,10 @@
 //!     `abandoned`, `run_note` "abandoned: <reason>"), the same usage and git fields, so the
 //!     run and its tokens are on the ticket and the manager sees it as quiet. A worker the chat
 //!     stopped (`cancelled`: Esc/Ctrl+C on the reply, or quitting) leaves nobody on its ticket,
-//!     so its ticket is also handed back to ready ([`WorkerHooks::release`]:
-//!     `amp_set_task_state` backlog, with a "returned to ready by amp-harness" reason; #2204).
+//!     so its ticket is also handed back to ready ([`WorkerHooks::release`]: `amp_return_task`
+//!     with the run's dispatch_id, so AMP records the return even though the harness started the
+//!     ticket (AMP #2909); `amp_set_task_state` backlog on an older server that refuses it, with
+//!     a "returned to ready by amp-harness" reason; #2204).
 //! - [`SessionUsageTool`] is the native `amp_session_usage`, so the existing prompts (amp-execution
 //!   step 6) keep working: the session's own model, tokens and cost so far.
 //!
@@ -309,21 +311,26 @@ impl RunReporter {
     }
 
     /// Hands the ticket back, saying which path did it. `Ok` means it is in ready now, by
-    /// whichever path worked; `Err` is AMP's own message when nothing did.
-    async fn hand_back(&self, task_id: i64, why: &str) -> Result<Released, String> {
-        // AMP #2801's returned path first: amp_return_task clears the dispatch, records
-        // returned_at/returned_reason (so the ticket shows up under the manager's `returned`
-        // list), and writes the history and audit entry. It refuses a ticket that was started,
-        // though — a live run must not be pulled out from under its worker — and a started
-        // ticket is exactly what a worker that got to its first turn leaves behind.
+    /// whichever path worked; `Err` is AMP's own message when nothing did. `dispatch_id` is the
+    /// run's dispatch token ("" when the server gave none).
+    async fn hand_back(
+        &self,
+        task_id: i64,
+        dispatch_id: &str,
+        why: &str,
+    ) -> Result<Released, String> {
+        // AMP #2801's returned path first: amp_return_task clears the dispatch and the start,
+        // records returned_at/returned_reason (so the ticket shows up under the manager's
+        // `returned` list), and writes the history and audit entry. A started ticket — which is
+        // what every harness run leaves behind, because the harness claims for its worker — is
+        // returned only for the run holding its current dispatch (AMP #2909), so the token goes
+        // with the call. A stale token is refused (the ticket is another run's now).
         let reason = release_reason(why);
-        let returned = self
-            .call(
-                RETURN_TOOL,
-                json!({"task_id": task_id, "reason": reason}),
-                RELEASE_TIMEOUT,
-            )
-            .await;
+        let mut args = json!({"task_id": task_id, "reason": reason});
+        if !dispatch_id.is_empty() {
+            args["dispatch_id"] = json!(dispatch_id);
+        }
+        let returned = self.call(RETURN_TOOL, args, RELEASE_TIMEOUT).await;
         tracing::debug!(ticket = task_id, why = %why, ok = returned.is_ok(), "handing a ticket back");
         match returned {
             Ok(()) => {
@@ -331,6 +338,8 @@ impl RunReporter {
                 Ok(Released::Returned)
             }
             Err(e) if is_refused_started(&e) => {
+                // An older server (before AMP #2909) refuses a started ticket even with its
+                // dispatch_id; so does any server when there is no token to present.
                 // Documented fallback, not a workaround: amp_return_task's own refusal says to
                 // "block it with a question, or close it out with closeout_reason"; the harness
                 // does neither (the work didn't finish and it has no question), so it uses the
@@ -443,8 +452,8 @@ pub fn is_refused_started(message: &str) -> bool {
 pub enum Released {
     /// AMP's returned path: `amp_return_task` cleared the dispatch and recorded the return.
     Returned,
-    /// The fallback: AMP refused `amp_return_task` because the ticket was started, so
-    /// `amp_set_task_state` put it back. The dispatch token is not cleared and no return is
+    /// The fallback: AMP refused `amp_return_task` because the ticket was started (a server
+    /// older than AMP #2909, or no dispatch_id to present), so `amp_set_task_state` put it back. The dispatch token is not cleared and no return is
     /// recorded, so the ticket is re-dispatchable but not listed under AMP's `returned`.
     SetBack,
 }
@@ -600,7 +609,7 @@ impl WorkerHooks for RunReporter {
         // or was cancelled has nobody on it. The manager is told, in words, either way.
         let id = worker.task_id;
         let why = abandoned_note(report);
-        let released = self.hand_back(id, &why).await;
+        let released = self.hand_back(id, &worker.dispatch_id, &why).await;
         report.returned = Some(released.as_ref().map(|_| ()).map_err(String::clone));
         report.notes.push(match &released {
             Ok(how) => how.note(id),
@@ -626,8 +635,8 @@ impl WorkerHooks for RunReporter {
 
     /// [`WorkerHooks::release`]: the ticket is in ready when this is `Ok` (`Err` is AMP's own
     /// message). [`RunReporter::hand_back`] is the same work with the path it took.
-    async fn release(&self, task_id: i64, why: &str) -> Result<(), String> {
-        self.hand_back(task_id, why).await.map(|_| ())
+    async fn release(&self, task_id: i64, dispatch_id: &str, why: &str) -> Result<(), String> {
+        self.hand_back(task_id, dispatch_id, why).await.map(|_| ())
     }
 }
 

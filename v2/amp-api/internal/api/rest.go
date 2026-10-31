@@ -1533,7 +1533,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			Reason string `json:"reason"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		t, err := h.svc.ReturnTask(r.Context(), pr, taskID, body.Reason, false)
+		t, err := h.svc.ReturnTask(r.Context(), pr, taskID, body.Reason, "", false)
 		if err != nil {
 			fail(w, err, 400)
 			return

@@ -72,8 +72,8 @@ impl WorkerHooks for SlowReporter {
         self.0.on_finish(worker, report).await;
     }
 
-    async fn release(&self, task_id: i64, why: &str) -> Result<(), String> {
-        self.0.release(task_id, why).await
+    async fn release(&self, task_id: i64, dispatch_id: &str, why: &str) -> Result<(), String> {
+        self.0.release(task_id, dispatch_id, why).await
     }
 }
 

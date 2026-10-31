@@ -68,14 +68,15 @@ func (r *Repo) StartTask(ctx context.Context, taskID int, by string) (time.Time,
 }
 
 // ReturnTask records that a dispatched ticket went back to ready without a
-// worker starting it: the reason, when, and no dispatch any more. agent_id
+// worker finishing it: the reason, when, and no dispatch or start any more
+// (a run holding the current dispatch may return its own started ticket). agent_id
 // is kept as the record of who it was dispatched to (reported in the
 // returned list; the next dispatch overwrites it). The state itself is set
 // by the ticket's actor (backlog, or blocked on open deps).
 func (r *Repo) ReturnTask(ctx context.Context, taskID int, reason string) error {
 	_, err := r.db.Exec(ctx,
 		`UPDATE tasks SET returned_at = NOW(), returned_reason = $1, dispatch_id = '',
-		        dispatched_at = NULL, updated_at = NOW()
+		        dispatched_at = NULL, started_at = NULL, started_by = '', updated_at = NOW()
 		 WHERE id = $2`,
 		reason, taskID,
 	)
