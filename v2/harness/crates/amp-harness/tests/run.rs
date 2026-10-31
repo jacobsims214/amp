@@ -6,7 +6,7 @@
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use common::{MockAmp, Output, run, spawn, workdir};
 use serde_json::{Value, json};
@@ -590,13 +590,17 @@ async fn run_waits_for_its_worker_even_when_config_and_env_say_launch() {
     assert_eq!(result["outcome"], "completed", "{result}");
 }
 
-/// Writes one dispatch-ledger record the way the supervisor writes it.
-fn ledger_record(dir: &Path, task_id: i64, dispatch_id: &str, pid: u32) {
-    use amp_core::dispatch_ledger::DispatchRecord;
+/// Writes one dispatch-ledger record the way the supervisor writes it, for the server at `url`
+/// (AMP #2948), and says where.
+fn ledger_record(dir: &Path, url: &str, task_id: i64, dispatch_id: &str, pid: u32) -> PathBuf {
+    use amp_core::dispatch_ledger::{DispatchRecord, record_file_name, server_key};
+    let server = server_key(url);
+    let path = dir.join(record_file_name(&server, task_id));
     std::fs::write(
-        dir.join(format!("t{task_id}.json")),
+        &path,
         serde_json::to_string(&DispatchRecord {
             task_id,
+            server,
             dispatch_id: dispatch_id.into(),
             agent_id: "amp:amp-worker-backend".into(),
             pid,
@@ -605,6 +609,7 @@ fn ledger_record(dir: &Path, task_id: i64, dispatch_id: &str, pid: u32) {
         .unwrap(),
     )
     .unwrap();
+    path
 }
 
 /// AMP #2910: `run -p` sweeps the dispatch ledger at startup, as the chat does. A ticket whose
@@ -618,7 +623,7 @@ async fn run_releases_a_dead_harness_dispatch_at_startup_and_leaves_a_live_one()
     let dir = setup("run-orphans", json!([{"text": "Nothing else to do."}]));
     let ledger = dir.join("home/.local/state/amp-harness").join(LEDGER_DIR);
     std::fs::create_dir_all(&ledger).unwrap();
-    ledger_record(&ledger, 2150, "d_dead2150", 0);
+    let dead = ledger_record(&ledger, &amp.url, 2150, "d_dead2150", 0);
     // A live process: this test holds a lock under pid 4243's name, the way a running harness
     // holds its own.
     let held = std::fs::File::options()
@@ -628,7 +633,7 @@ async fn run_releases_a_dead_harness_dispatch_at_startup_and_leaves_a_live_one()
         .open(ledger.join("live-4243.lock"))
         .unwrap();
     held.try_lock().unwrap();
-    ledger_record(&ledger, 2151, "d_live2151", 4243);
+    let live = ledger_record(&ledger, &amp.url, 2151, "d_live2151", 4243);
 
     let out = harness(&dir, &amp.url, &["run", "-p", "anything?", "--json"]).await;
     assert_eq!(
@@ -673,8 +678,8 @@ async fn run_releases_a_dead_harness_dispatch_at_startup_and_leaves_a_live_one()
     assert_eq!(of_type(&events, "result")[0]["outcome"], "completed");
 
     // The dead run's record is gone; the live one's is still somebody's.
-    assert!(!ledger.join("t2150.json").exists());
-    assert!(ledger.join("t2151.json").exists());
+    assert!(!dead.exists());
+    assert!(live.exists());
     drop(held);
 }
 
@@ -687,7 +692,7 @@ async fn run_text_mode_says_the_startup_release_on_stderr() {
     let dir = setup("run-orphans-text", json!([{"text": "All quiet."}]));
     let ledger = dir.join("home/.local/state/amp-harness").join(LEDGER_DIR);
     std::fs::create_dir_all(&ledger).unwrap();
-    ledger_record(&ledger, 2152, "d_dead2152", 0);
+    let _ = ledger_record(&ledger, &amp.url, 2152, "d_dead2152", 0);
 
     let out = harness(&dir, &amp.url, &["run", "-p", "anything?"]).await;
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);

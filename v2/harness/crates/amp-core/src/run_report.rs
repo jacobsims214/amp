@@ -299,7 +299,9 @@ impl RunReporter {
     /// to sweep (AMP #2802).
     fn forget(&self, task_id: i64) {
         if let Some(ledger) = &self.ledger {
-            ledger.clear(task_id);
+            // AMP #2948: this server's record of the ticket; another server's #task_id stays.
+            let server = crate::dispatch_ledger::server_key(&self.mcp.session().url);
+            ledger.clear(&server, task_id);
         }
     }
 
@@ -670,6 +672,22 @@ impl WorkerHooks for RunReporter {
     /// message). [`RunReporter::hand_back`] is the same work with the path it took.
     async fn release(&self, task_id: i64, dispatch_id: &str, why: &str) -> Result<(), String> {
         self.hand_back(task_id, dispatch_id, why).await.map(|_| ())
+    }
+
+    async fn release_with_token(
+        &self,
+        task_id: i64,
+        dispatch_id: &str,
+        why: &str,
+    ) -> Result<(), String> {
+        // AMP #2948: no token, nothing that proves the ticket is this server's; and no
+        // amp_set_task_state fallback, which checks no token.
+        if dispatch_id.is_empty() {
+            return Err("no dispatch token to present".to_owned());
+        }
+        let args =
+            json!({"task_id": task_id, "reason": release_reason(why), "dispatch_id": dispatch_id});
+        self.call(RETURN_TOOL, args, RELEASE_TIMEOUT).await
     }
 }
 

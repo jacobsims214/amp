@@ -65,7 +65,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::{AgentSpec, Runtime, SessionKind},
-    dispatch_ledger::{DispatchRecord, Ledger},
+    dispatch_ledger::{DispatchRecord, Ledger, server_key},
     events::{RunEvent, Totals, assistant_text},
     policy::DISPATCH_TOOL,
     project::ProjectMarker,
@@ -430,6 +430,12 @@ pub fn orphan_notice(rec: &DispatchRecord, result: &Result<(), String>) -> Strin
             "#{0} was returned to ready: the chat that dispatched it to {1} ended before its worker \
              finished. Re-dispatch it, or ask your user.",
             rec.task_id, rec.agent_id
+        ),
+        // AMP #2948: a record from an older harness with no server and no token: AMP was not
+        // asked, so the line doesn't say it refused.
+        Err(e) if rec.is_legacy() && rec.dispatch_id.is_empty() => format!(
+            "#{0} was dispatched to {1} by a chat that ended before its worker finished, but {2}.",
+            rec.task_id, rec.agent_id, e
         ),
         Err(e) => format!(
             "#{0} was dispatched to {1} by a chat that ended before its worker finished, and AMP \
@@ -849,6 +855,19 @@ pub trait WorkerHooks: Send + Sync {
         Err("no run reporting in this process".to_owned())
     }
 
+    /// Hands ticket `task_id` back **only** through `amp_return_task` with `dispatch_id`, never
+    /// by any fallback that doesn't check the token (AMP #2948). For a ledger record that doesn't
+    /// say which AMP server it was made on: a server that didn't issue `dispatch_id` refuses it,
+    /// so a ticket with the same number on another server is never touched.
+    async fn release_with_token(
+        &self,
+        _task_id: i64,
+        _dispatch_id: &str,
+        _why: &str,
+    ) -> Result<(), String> {
+        Err("no run reporting in this process".to_owned())
+    }
+
     /// Tells the person at the manager's chat something the harness noticed about a ticket, above
     /// the editor (`⚠ #123 was returned: worker amp-x timed out after 20 min`). The default does
     /// nothing; a process with a chat prints it. AMP #2802: a returned ticket whose manager was
@@ -1181,11 +1200,11 @@ impl Supervisor {
         {
             return w.dispatch_id.clone();
         }
-        let pid = self.ledger.pid();
+        let (pid, server) = (self.ledger.pid(), self.server());
         self.ledger
             .records()
             .into_iter()
-            .find(|r| r.task_id == task_id && r.pid == pid)
+            .find(|r| r.task_id == task_id && r.pid == pid && r.server == server)
             .map(|r| r.dispatch_id)
             .unwrap_or_default()
     }
@@ -1245,21 +1264,33 @@ impl Supervisor {
     /// as one stuck in progress. A record whose ticket AMP won't take back (already completed,
     /// someone else's run since) is dropped only when AMP says it isn't in progress any more;
     /// otherwise it is kept, so the next startup tries again.
+    ///
+    /// AMP #2948: only the records made on the server this process is connected to are swept;
+    /// another server's are neither released nor dropped. A legacy record (no server) goes
+    /// through [`Supervisor::release_legacy_orphan`]'s token-only path.
     pub async fn release_orphans(&self) -> Vec<OrphanRelease> {
-        let orphans = self.ledger.orphans();
+        // AMP #2948: only this server's records. A ticket id means something only on the server
+        // that issued it; another server's orphans stay on disk for a harness connected to it.
+        let server = self.server();
+        let orphans = self.ledger.orphans(&server);
         if orphans.is_empty() {
             return Vec::new();
         }
         let mut out = Vec::new();
         for rec in orphans {
             let why = orphan_reason(&rec);
-            let result = match self.hooks.clone() {
-                Some(hooks) => hooks.release(rec.task_id, &rec.dispatch_id, &why).await,
-                None => Err("no run reporting in this process".to_owned()),
+            let result = if rec.is_legacy() {
+                self.release_legacy_orphan(&rec, &why).await
+            } else {
+                let result = match self.hooks.clone() {
+                    Some(hooks) => hooks.release(rec.task_id, &rec.dispatch_id, &why).await,
+                    None => Err("no run reporting in this process".to_owned()),
+                };
+                if result.is_ok() || record_is_stale(&result) {
+                    self.ledger.clear_record(&rec);
+                }
+                result
             };
-            if result.is_ok() || record_is_stale(&result) {
-                self.ledger.clear(rec.task_id);
-            }
             if let Some(hooks) = &self.hooks {
                 hooks.notice(&orphan_notice(&rec, &result));
             }
@@ -1269,6 +1300,54 @@ impl Supervisor {
             });
         }
         out
+    }
+
+    /// The server this process is connected to now, as the ledger names it (AMP #2948). Read at
+    /// each use: `/server` swaps the connection inside a running process.
+    fn server(&self) -> String {
+        server_key(&self.rt.mcp.session().url)
+    }
+
+    /// A record from a harness older than AMP #2948, which didn't note the server: it may be
+    /// another server's ticket with the same number. So it is released only by the token AMP
+    /// gave that dispatch, through `amp_return_task` alone (a server that didn't issue the token
+    /// refuses it; the `amp_set_task_state` fallback checks no token and would move another
+    /// server's ticket). It is dropped only when that worked: a refusal can't tell "stale here"
+    /// from "another server's", so the record is kept and the person is told how to clear it.
+    async fn release_legacy_orphan(&self, rec: &DispatchRecord, why: &str) -> Result<(), String> {
+        let path = self.ledger.record_path(rec);
+        if rec.dispatch_id.is_empty() {
+            return Err(format!(
+                "its ledger record, from an older harness, names neither the AMP server nor a \
+                 dispatch token, so this harness can't tell which server's #{} it is and left it \
+                 alone. Check #{} on the server you dispatched it on, then delete {}",
+                rec.task_id,
+                rec.task_id,
+                path.display()
+            ));
+        }
+        let result = match self.hooks.clone() {
+            Some(hooks) => {
+                hooks
+                    .release_with_token(rec.task_id, &rec.dispatch_id, why)
+                    .await
+            }
+            None => Err("no run reporting in this process".to_owned()),
+        };
+        match result {
+            Ok(()) => {
+                self.ledger.clear_record(rec);
+                Ok(())
+            }
+            Err(e) => Err(format!(
+                "{e}. Its ledger record is from an older harness that didn't note the AMP server, \
+                 so it may be another server's #{}: it was kept. Once #{} is not stuck on the \
+                 server you dispatched it on, delete {}",
+                rec.task_id,
+                rec.task_id,
+                path.display()
+            )),
+        }
     }
 
     /// Releases the tickets this machine dispatched whose harness process is gone, within `bound`.
@@ -1670,6 +1749,7 @@ impl Supervisor {
         // The ledger is what the next startup sweeps: this ticket is ours from here until its
         // worker closes it or it is handed back.
         if let Err(e) = self.ledger.record(
+            &self.server(),
             req.task_id,
             &dispatched.dispatch_id,
             dispatched.agent().unwrap_or(&agent_id),

@@ -16,7 +16,7 @@ use std::{
 
 use amp_core::{
     agent::{Runtime, RuntimeOptions},
-    dispatch_ledger::{DispatchRecord, LEDGER_DIR, Ledger},
+    dispatch_ledger::{DispatchRecord, LEDGER_DIR, Ledger, record_file_name, server_key},
     faux::StepSpec,
     project::ProjectMarker,
     providers::StaticKeys,
@@ -132,6 +132,34 @@ async fn fixture_with(name: &str, mock: MockAmp) -> Fixture {
 }
 
 impl Fixture {
+    /// The mock AMP as the ledger names it (AMP #2948).
+    fn server(&self) -> String {
+        server_key(&self.amp.url)
+    }
+
+    /// Writes `rec` where the ledger keeps it, the way the supervisor writes it.
+    fn write_record(&self, rec: &DispatchRecord) {
+        let dir = self.rt.state_dir.join(LEDGER_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(record_file_name(&rec.server, rec.task_id)),
+            serde_json::to_string(rec).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A record of `task_id` on `server` from a process that cannot be running (pid 0).
+    fn dead(&self, server: &str, task_id: i64, dispatch_id: &str) -> DispatchRecord {
+        DispatchRecord {
+            task_id,
+            server: server.to_owned(),
+            dispatch_id: dispatch_id.to_owned(),
+            agent_id: "amp:amp-worker-backend".into(),
+            pid: 0,
+            at_ms: 1,
+        }
+    }
+
     fn report(&self) -> (Arc<RunReporter>, Arc<Notices>) {
         let notices = Arc::new(Notices::default());
         let seen = Arc::clone(&notices);
@@ -504,8 +532,12 @@ async fn when_amp_refuses_both_paths_the_note_names_both() {
         r.notes
     );
     // The ledger keeps it: the ticket may still be in progress, so the next startup tries again.
+    // AMP #2948: on the record of the server it was dispatched on.
     assert!(
-        f.ledger.records().iter().any(|r| r.task_id == 4048),
+        f.ledger
+            .records()
+            .iter()
+            .any(|r| r.task_id == 4048 && r.server == f.server()),
         "{:?}",
         f.ledger.records()
     );
@@ -516,26 +548,16 @@ async fn when_amp_refuses_both_paths_the_note_names_both() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn startup_releases_the_tickets_of_a_dead_chat_and_tells_the_person() {
     let f = fixture("orphans").await;
-    let dir = f.rt.state_dir.join(LEDGER_DIR);
-    std::fs::create_dir_all(&dir).unwrap();
     // Two records from a process that cannot be running (pid 0 has no harness liveness lock),
-    // written the way the supervisor writes them.
+    // written the way the supervisor writes them, on this server.
     for (task_id, agent) in [
         (2120, "amp:amp-worker-backend"),
         (2121, "amp:amp-worker-docs"),
     ] {
-        std::fs::write(
-            dir.join(format!("t{task_id}.json")),
-            serde_json::to_string(&DispatchRecord {
-                task_id,
-                dispatch_id: format!("d_dead{task_id}"),
-                agent_id: agent.into(),
-                pid: 0,
-                at_ms: 1,
-            })
-            .unwrap(),
-        )
-        .unwrap();
+        f.write_record(&DispatchRecord {
+            agent_id: agent.into(),
+            ..f.dead(&f.server(), task_id, &format!("d_dead{task_id}"))
+        });
     }
     let (sup, notices) = f.supervisor_with_notices(config());
     let releases = sup.release_orphans().await;
@@ -587,18 +609,10 @@ async fn startup_leaves_a_live_chats_dispatch_alone() {
         .open(dir.join("live-4242.lock"))
         .unwrap();
     held.try_lock().unwrap();
-    std::fs::write(
-        dir.join("t2130.json"),
-        serde_json::to_string(&DispatchRecord {
-            task_id: 2130,
-            dispatch_id: "d_live".into(),
-            agent_id: "amp:amp-worker-backend".into(),
-            pid: 4242,
-            at_ms: 1,
-        })
-        .unwrap(),
-    )
-    .unwrap();
+    f.write_record(&DispatchRecord {
+        pid: 4242,
+        ..f.dead(&f.server(), 2130, "d_live")
+    });
     let sup = f.supervisor(config());
     assert!(sup.release_orphans().await.is_empty());
     assert!(f.calls("amp_return_task").is_empty());
@@ -718,22 +732,10 @@ async fn a_server_without_amp_return_task_gets_the_ticket_back_by_set_state() {
     assert!(notices.lines().is_empty(), "{:?}", notices.lines());
 }
 
-/// Writes a ledger record for `task_id` from a process that cannot be running (pid 0).
+/// Writes a ledger record for `task_id` on the fixture's server, from a process that cannot be
+/// running (pid 0).
 fn dead_record(f: &Fixture, task_id: i64) {
-    let dir = f.rt.state_dir.join(LEDGER_DIR);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join(format!("t{task_id}.json")),
-        serde_json::to_string(&DispatchRecord {
-            task_id,
-            dispatch_id: format!("d_dead{task_id}"),
-            agent_id: "amp:amp-worker-backend".into(),
-            pid: 0,
-            at_ms: 1,
-        })
-        .unwrap(),
-    )
-    .unwrap();
+    f.write_record(&f.dead(&f.server(), task_id, &format!("d_dead{task_id}")));
 }
 
 /// 5b. AMP #2946: an orphan on a server without amp_return_task goes back by set_state, and its
@@ -778,6 +780,135 @@ async fn an_orphan_record_survives_an_unknown_tool_error() {
     );
     let kept: Vec<i64> = f.ledger.records().iter().map(|r| r.task_id).collect();
     assert_eq!(kept, vec![4042], "the record is kept for the next startup");
+}
+
+/// 5d. AMP #2948: a record made on another AMP server (prod, while this harness now talks to a
+/// local cluster) is that server's: the sweep neither hands it back here nor drops it, even
+/// when this server has a ticket with the same number — which is swept on its own record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn startup_leaves_another_servers_orphans_alone() {
+    let f = fixture("orphans-other-server").await;
+    let prod = server_key("https://amp.example.com/mcp");
+    assert_ne!(prod, f.server());
+    f.write_record(&f.dead(&prod, 2160, "d_prod2160"));
+    f.write_record(&f.dead(&prod, 2161, "d_prod2161"));
+    // The same ticket number, dispatched on this server: its own record.
+    f.write_record(&f.dead(&f.server(), 2161, "d_here2161"));
+    assert_eq!(f.ledger.records().len(), 3, "{:?}", f.ledger.records());
+
+    let (sup, notices) = f.supervisor_with_notices(config());
+    let releases = sup.release_orphans().await;
+    assert_eq!(releases.len(), 1, "{releases:?}");
+    assert_eq!(releases[0].record.server, f.server());
+    assert!(releases[0].result.is_ok(), "{releases:?}");
+    // AMP heard about this server's #2161 only, with this server's token.
+    let returned = f.calls("amp_return_task");
+    assert_eq!(returned.len(), 1, "{returned:?}");
+    assert_eq!(returned[0]["task_id"], 2161);
+    assert_eq!(returned[0]["dispatch_id"], "d_here2161");
+    assert!(f.calls("amp_set_task_state").is_empty());
+    assert_eq!(notices.lines().len(), 1, "{:?}", notices.lines());
+    // Prod's records are still there, untouched, for a harness connected to prod.
+    let left: Vec<(i64, String, String)> = f
+        .ledger
+        .records()
+        .into_iter()
+        .map(|r| (r.task_id, r.server, r.dispatch_id))
+        .collect();
+    assert_eq!(
+        left,
+        vec![
+            (2160, prod.clone(), "d_prod2160".to_owned()),
+            (2161, prod.clone(), "d_prod2161".to_owned()),
+        ]
+    );
+    // A second startup on this server still leaves them alone.
+    let again = sup.release_orphans().await;
+    assert!(again.is_empty(), "{again:?}");
+    assert_eq!(f.ledger.records().len(), 2);
+}
+
+/// 5e. AMP #2948: a record from an older harness doesn't say which server it was made on, so
+/// it is handed back only by its dispatch token through amp_return_task — never by the
+/// set_state fallback, which checks no token and would move another server's ticket. It is
+/// dropped only when that worked; a refusal (which can't tell "stale here" from "another
+/// server's") keeps it, and so does a record with no token, and the person is told how to
+/// clear it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_without_a_server_is_released_only_by_its_token() {
+    let f = fixture("orphans-legacy").await;
+    let dir = f.rt.state_dir.join(LEDGER_DIR);
+    std::fs::create_dir_all(&dir).unwrap();
+    // As a harness before #2948 wrote them: no `server` field, file `t<ticket>.json`.
+    for (task_id, token) in [
+        (2170, "d_old2170"), // returned with its token
+        (4046, "d_old4046"), // refused: started, on an older server
+        (4049, "d_other"),   // refused: not this server's current dispatch
+        (2171, ""),          // no token at all
+    ] {
+        std::fs::write(
+            dir.join(format!("t{task_id}.json")),
+            json!({"task_id": task_id, "dispatch_id": token,
+                   "agent_id": "amp:amp-worker-backend", "pid": 0, "at_ms": 1})
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let (sup, notices) = f.supervisor_with_notices(config());
+    let releases = sup.release_orphans().await;
+    assert_eq!(releases.len(), 4, "{releases:?}");
+    assert!(releases.iter().all(|r| r.record.is_legacy()));
+
+    // amp_return_task, with the token, for the three that have one; nothing for 2171.
+    let returned = f.calls("amp_return_task");
+    let sent: Vec<(i64, &str)> = returned
+        .iter()
+        .map(|c| {
+            (
+                c["task_id"].as_i64().unwrap(),
+                c["dispatch_id"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        sent,
+        vec![(2170, "d_old2170"), (4046, "d_old4046"), (4049, "d_other")],
+        "{returned:?}"
+    );
+    // Never the fallback: 4046's "started" refusal would have taken it for a record with a server.
+    assert!(
+        f.calls("amp_set_task_state").is_empty(),
+        "{:?}",
+        f.calls("amp_set_task_state")
+    );
+
+    let by_id = |id: i64| releases.iter().find(|r| r.record.task_id == id).unwrap();
+    assert!(by_id(2170).result.is_ok());
+    for id in [4046, 4049, 2171] {
+        let err = by_id(id).result.as_ref().unwrap_err();
+        assert!(err.contains("older harness"), "{id}: {err}");
+        assert!(err.contains(&format!("t{id}.json")), "{id}: {err}");
+    }
+    assert!(
+        by_id(2171)
+            .result
+            .as_ref()
+            .unwrap_err()
+            .contains("left it alone")
+    );
+    assert!(
+        notices.any("#2170 was returned to ready"),
+        "{:?}",
+        notices.lines()
+    );
+    assert!(
+        notices.any("#4049 was dispatched") && notices.any("delete"),
+        "{:?}",
+        notices.lines()
+    );
+    // Only the one AMP took back is gone; the rest wait for the person.
+    let kept: Vec<i64> = f.ledger.records().iter().map(|r| r.task_id).collect();
+    assert_eq!(kept, vec![2171, 4046, 4049]);
 }
 
 /// 6. A claim AMP refuses ends the run instead of letting the worker work a dispatch that is no
