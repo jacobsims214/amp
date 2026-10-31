@@ -378,7 +378,9 @@ dispatch_cases() {
   log "[$LEG] dispatch ok: worker-backend on wf/wf-1 completed #$t2 (run has model and tokens); policy denials visible"
 
   # 2. Abandoned run: the worker's script runs out after one step, so it ends as `error` without
-  #    closing its ticket, and the harness reports an abandoned run with a note.
+  #    closing its ticket; the harness reports an abandoned run with a note and, since #2802, hands
+  #    the ticket back to the backlog (ready to dispatch again). The server may also record
+  #    returned_at/returned_reason on the ticket (#2909): accepted, not required.
   #    Ticket three was created and approved with the plan; ticket two's completion made it ready.
   jq -nc --argjson t "$t3" '{
     boss: [
@@ -396,14 +398,15 @@ dispatch_cases() {
     die "[$LEG] abandoned: expected the worker to end as error with a run-report note"
   }
   out="$(runs_of "$t3")"
-  jq -e '(.task.state == "in_progress") and
+  jq -e '(.task.state == "backlog") and
+      ((.task.returned_reason // "") | type == "string") and
       ([.runs[]? | select(.outcome == "abandoned" and .model == "wf/wf-1" and .agent_id == "amp:amp-worker-backend"
         and (.note | startswith("abandoned: error:") and (startswith("abandoned: error: error") | not))
         and ((.input_tokens // 0) + (.output_tokens // 0)) > 0)] | length) == 1' >/dev/null <<<"$out" || {
     printf '%s\n' "$out" | head -c 4000 >&2
-    die "[$LEG] abandoned: expected one abandoned run on #$t3 with a note, the worker model and tokens"
+    die "[$LEG] abandoned: expected #$t3 returned to backlog with one abandoned run carrying a note, the worker model and tokens"
   }
-  log "[$LEG] abandoned ok: #$t3 has an abandoned run ($(jq -r '[.runs[] | select(.outcome == "abandoned")][0].note' <<<"$out" | cut -c1-80))"
+  log "[$LEG] abandoned ok: #$t3 back in backlog with an abandoned run ($(jq -r '[.runs[] | select(.outcome == "abandoned")][0].note' <<<"$out" | cut -c1-80))"
 }
 
 # --- live chrome, answering a question, /open (M3-6, smoke v3) -------------------------------------
@@ -462,7 +465,7 @@ chrome_cases() {
   out="$(call amp_list_tasks "{\"project_id\":$P_ID,\"owner\":\"any\"}")"
   expect "$out" "[.questions[].id] == [$t4]" "expected #$t4 as the board's only question"
 
-  # 1. render-chrome --live: project, counts (a question, the abandoned worker's ticket in progress).
+  # 1. render-chrome --live: project, counts (a question; the abandoned worker's ticket was returned to the backlog).
   check_chrome "$t4" "with a question"
 
   # 2. Answer it through the chat's /questions panel: Enter on the question, the answer, then y.
