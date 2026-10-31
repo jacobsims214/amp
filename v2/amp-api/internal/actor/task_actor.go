@@ -437,6 +437,12 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 	if err := a.repo.ClearTaskDispatch(context.Background(), a.task.ID, false); err != nil {
 		return false, fmt.Errorf("db clear dispatch: %w", err)
 	}
+	// Nor is it returned any more: a returned ticket closed out directly (or
+	// completed in the UI) leaves the returned list and loses its tag (AMP #2947).
+	if err := a.repo.ClearTaskReturn(context.Background(), a.task.ID); err != nil {
+		return false, fmt.Errorf("db clear return: %w", err)
+	}
+	a.task.ReturnedAt, a.task.ReturnedReason = nil, ""
 	now := time.Now()
 	a.task.State = domain.TaskStateCompleted
 	a.task.CompletedAt = &now
@@ -780,6 +786,13 @@ func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *in
 		return fmt.Errorf("db clear dispatch: %w", err)
 	}
 	a.task.DispatchID = ""
+	if state == domain.TaskStateCompleted {
+		// A done ticket isn't returned any more (AMP #2947).
+		if err := a.repo.ClearTaskReturn(context.Background(), a.task.ID); err != nil {
+			return fmt.Errorf("db clear return: %w", err)
+		}
+		a.task.ReturnedAt, a.task.ReturnedReason = nil, ""
+	}
 	a.task.State = state
 	a.task.UpdatedAt = time.Now()
 	// A block reason only means something while blocked; leaving the old

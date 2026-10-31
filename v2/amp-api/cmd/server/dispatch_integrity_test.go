@@ -944,3 +944,123 @@ func TestDispatchIntegrity_DispatchClearsArePersisted(t *testing.T) {
 			got.State, got.DispatchID, got.StartedAt, got.StartedBy)
 	}
 }
+
+// A returned ticket that is then completed isn't "returned" any more
+// (AMP #2947): closed out directly with closeout_reason, moved to completed
+// with amp_set_task_state, or completed by a person in the web UI, it loses
+// returned_at/returned_reason in the database and leaves the returned list
+// (the repository's and amp_list_tasks'). Re-read from the database, so a
+// reloaded actor agrees.
+func TestDispatchIntegrity_CompletionClearsReturned(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	alice := w.s.as(w.alice)
+	ctx := context.Background()
+	reload := func(id int) *domain.Task {
+		t.Helper()
+		task, err := w.s.repo.GetTask(ctx, id)
+		if err != nil {
+			t.Fatalf("reload %d: %v", id, err)
+		}
+		return task
+	}
+	inRepoReturned := func(id int) bool {
+		t.Helper()
+		list, err := w.s.repo.Returned(ctx, w.s.projectID)
+		if err != nil {
+			t.Fatalf("Returned: %v", err)
+		}
+		for _, r := range list {
+			if r.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+	inListReturned := func(id int) bool {
+		t.Helper()
+		out := alice.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(w.s.projectID)})
+		list, _ := out["returned"].([]interface{})
+		for _, r := range list {
+			if m, _ := r.(map[string]interface{}); m != nil && m["id"] == float64(id) {
+				return true
+			}
+		}
+		return false
+	}
+	// returned dispatches a ticket, returns it, and records a run on it, so
+	// it can be closed out directly; it checks the ticket reads as returned.
+	returned := func(name string) int {
+		t.Helper()
+		id := mkIn(t, alice, w.s.storyID, name)
+		dispatchClaims(t, alice, id)
+		alice.call(t, "amp_return_task", map[string]interface{}{"task_id": float64(id), "reason": "worker never started"})
+		alice.call(t, "amp_report_run", map[string]interface{}{"task_id": float64(id), "outcome": "progress",
+			"model": "m", "branch": "b", "commit": "abcdef1"})
+		if got := reload(id); got.ReturnedAt == nil || got.ReturnedReason == "" {
+			t.Fatalf("%d after return: returned_at %v reason %q, want both set", id, got.ReturnedAt, got.ReturnedReason)
+		}
+		if !inRepoReturned(id) || !inListReturned(id) {
+			t.Fatalf("%d after return: missing from the returned list", id)
+		}
+		return id
+	}
+	cleared := func(id int, how string) {
+		t.Helper()
+		got := reload(id)
+		if got.State != domain.TaskStateCompleted {
+			t.Fatalf("%s: state %s, want completed", how, got.State)
+		}
+		if got.ReturnedAt != nil || got.ReturnedReason != "" {
+			t.Fatalf("%s: returned_at %v reason %q in the database, want cleared", how, got.ReturnedAt, got.ReturnedReason)
+		}
+		if inRepoReturned(id) {
+			t.Fatalf("%s: still in Repo.Returned", how)
+		}
+		if inListReturned(id) {
+			t.Fatalf("%s: still in amp_list_tasks' returned list", how)
+		}
+	}
+
+	conn, err := pgx.Connect(ctx, os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+
+	// 1. Closed out directly, the path the decision gives returned work.
+	closed := returned("returned, then closed out")
+	out := alice.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(closed),
+		"closeout_reason": "its commit landed before the return"})
+	if out["closeout"] != true {
+		t.Fatalf("closeout = %v", out)
+	}
+	cleared(closed, "closeout")
+
+	// 2. Moved to completed with amp_set_task_state. Off the web UI that
+	// needs an in-progress ticket, and a dispatch clears the stamp itself,
+	// so the stamp is one that survived in the database (written before
+	// this fix): the state change must clear it there too.
+	set := mkIn(t, alice, w.s.storyID, "stamped, then set completed")
+	dispatchClaims(t, alice, set)
+	if _, err := conn.Exec(ctx, `UPDATE tasks SET returned_at = NOW(), returned_reason = 'legacy' WHERE id = $1`, set); err != nil {
+		t.Fatal(err)
+	}
+	alice.call(t, "amp_set_task_state", map[string]interface{}{"task_id": float64(set), "state": "completed",
+		"reason": "done elsewhere"})
+	cleared(set, "set_state(completed)")
+
+	// 3. Completed by a person in the web UI.
+	ui := returned("returned, then completed in the UI")
+	ra.want(t, http.StatusOK, "alice", http.MethodPost, fmt.Sprintf("/api/tasks/%d/complete", ui), map[string]any{"note": "done"})
+	cleared(ui, "UI completion")
+
+	// Belt and braces: a completed ticket whose stamp survived (data written
+	// before this fix) still isn't listed.
+	if _, err := conn.Exec(ctx, `UPDATE tasks SET returned_at = NOW(), returned_reason = 'legacy' WHERE id = $1`, closed); err != nil {
+		t.Fatal(err)
+	}
+	if inRepoReturned(closed) {
+		t.Fatalf("a completed ticket with a stale return stamp is listed by Repo.Returned")
+	}
+}

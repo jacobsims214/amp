@@ -97,6 +97,18 @@ func (r *Repo) ClearTaskDispatch(ctx context.Context, taskID int, release bool) 
 	return err
 }
 
+// ClearTaskReturn drops a ticket's return stamp once it is completed: done
+// work isn't "returned" any more, whether it was closed out directly or
+// completed by a person in the web UI without a re-dispatch (AMP #2947).
+// The actor clears the same fields in memory in the same step.
+func (r *Repo) ClearTaskReturn(ctx context.Context, taskID int) error {
+	_, err := r.db.Exec(ctx,
+		`UPDATE tasks SET returned_at = NULL, returned_reason = '' WHERE id = $1 AND returned_at IS NOT NULL`,
+		taskID,
+	)
+	return err
+}
+
 // CountRuns is the number of runs recorded on a ticket: the closeout rule
 // lets a never-started ticket be closed out only when it has prior work.
 func (r *Repo) CountRuns(ctx context.Context, taskID int) (int, error) {
@@ -170,13 +182,14 @@ type ReturnedTicket struct {
 }
 
 // Returned lists a project's tickets that were returned and not dispatched
-// again, most recent first.
+// again, most recent first. A completed ticket is never listed, even if its
+// return stamp somehow survived (completion clears it, AMP #2947).
 func (r *Repo) Returned(ctx context.Context, projectID int) ([]ReturnedTicket, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT id, project_id, name, COALESCE(agent_id, ''), returned_at, returned_reason,
 		       GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (NOW() - returned_at)) / 60))::int
 		  FROM tasks
-		 WHERE project_id = $1 AND returned_at IS NOT NULL
+		 WHERE project_id = $1 AND returned_at IS NOT NULL AND state <> 'completed'
 		 ORDER BY returned_at DESC, id`, projectID)
 	if err != nil {
 		return nil, err
