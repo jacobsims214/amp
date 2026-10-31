@@ -102,18 +102,11 @@ code { font: 500 13px var(--font-data); background: var(--surface); border: 1px 
 .readout { display: flex; flex-wrap: wrap; gap: 10px 28px; color: var(--star-2); font-size: 12px; }
 .readout b { color: var(--star); font-weight: 500; }
 
-/* ---- Screenshot placeholders: obviously not real screenshots ---- */
+/* ---- Screenshots: real amp-harness 0.2.0 terminal captures (each carries its own window title bar) ---- */
 .shot { margin: 0; border: 1px solid var(--void-line); background: var(--void); min-width: 0; }
-.shot .tbar { display: flex; align-items: center; gap: 7px; padding: 9px 12px; border-bottom: 1px solid var(--void-line); background: var(--void-2); }
-.shot .tbar i { width: 9px; height: 9px; display: block; background: var(--void-line); }
-.shot .tbar span { margin-left: 8px; font: 500 11.5px var(--font-data); color: var(--star-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.shot .body { aspect-ratio: 16 / 10; position: relative; display: grid; place-content: center; justify-items: center; gap: 10px; padding: 24px; text-align: center;
-  background: repeating-linear-gradient(-45deg, rgba(232,236,242,.045) 0 10px, transparent 10px 20px); }
-.shot .body::before { content: ""; position: absolute; inset: 14px; border: 1px dashed var(--star-3); pointer-events: none; }
-.shot .ph-tag { font: 600 12px/1 var(--font-label); letter-spacing: .2em; text-transform: uppercase; color: var(--void); background: var(--band-3); padding: 6px 9px; }
-.shot .ph-what { font: 600 clamp(16px, 1.9vw, 20px)/1.25 var(--font-body); color: var(--star); max-width: 30ch; }
-.shot .ph-note { font: 500 12px/1.5 var(--font-data); color: var(--star-2); max-width: 44ch; }
-.shots .shot .ph-what { font-size: 16px; }
+.shot img { display: block; width: 100%; height: auto; }
+.shots .shot { display: flex; flex-direction: column; }
+.shots .shot figcaption { margin-top: auto; }
 .shot figcaption { padding: 10px 14px; font-size: 14px; color: var(--star-2); border-top: 1px solid var(--void-line); }
 
 /* ---- What it is ---- */
@@ -270,20 +263,14 @@ footer a:hover { color: var(--star); }
           <div class="ph"><span class="label">Install · one line</span><button type="button" class="copy" data-copy="hero-install" aria-label="Copy the install command">Copy</button></div>
 <pre class="code w" id="hero-install">curl -fsSL https://raw.githubusercontent.com/jacobsims214/amp/main/v2/harness/install.sh | sh</pre>
         </div>
-        <div class="pre">Not released yet: until the first <span class="mono">harness-v*</span> release, <a href="#prerelease">build it from source</a>.</div>
+        <div class="pre">Latest release: <span class="mono">harness-v0.2.0</span>. Or <a href="#prerelease">build it from source</a>.</div>
         <div class="ctas">
           <a class="btn solid" href="#install">Install and set up</a>
           <a class="btn" href="#features">What it does</a>
         </div>
       </div>
-      <figure class="shot" data-shot="hero-chat" role="img" aria-label="Placeholder for a screenshot of the amp-harness chat. No screenshot yet.">
-        <!-- Placeholder: #2301 replaces this frame with a real capture of the chat. -->
-        <div class="tbar" aria-hidden="true"><i></i><i></i><i></i><span>amp-harness · ~/src/shop</span></div>
-        <div class="body" aria-hidden="true">
-          <span class="ph-tag">Screenshot placeholder</span>
-          <span class="ph-what">The chat: AMP header, a ticket in progress, workers on the status line</span>
-          <span class="ph-note">Not a real capture. A screenshot of amp-harness goes here.</span>
-        </div>
+      <figure class="shot" data-shot="hero-chat">
+        <img src="chat-02-dispatch.webp" width="899" height="520" fetchpriority="high" alt="amp-harness 0.2.0 chat in a terminal. The header shows the AMP project, signed-in user, server and the manager's model. Asked to work the ready tickets, the manager dispatches tickets #650 and #651 to backend workers, and the Workers box shows both running with their time, tokens and cost.">
       </figure>
     </div>
     <div class="bands-h" aria-hidden="true"></div>
@@ -409,15 +396,13 @@ footer a:hover { color: var(--star); }
       </div>
       <div class="prerelease" id="prerelease">
         <div>
-          <h3>Before the first release</h3>
-          <p>The one-liner downloads a published <code>harness-v*</code> release. Until the first one is out, it stops with "no harness-v* release found". Build from a checkout instead; you need git and rustup.</p>
+          <h3>Build from source</h3>
+          <p>The one-liner downloads the newest published <code>harness-v*</code> release, 0.2.0 today. To build from a checkout instead, you need git and rustup.</p>
           <p>Platforms: macOS 13 or newer (Apple silicon or Intel), and Linux on x86_64 or aarch64 with glibc 2.35 or newer. Alpine and other musl systems aren't supported yet.</p>
         </div>
         <div class="panel">
           <div class="ph"><span class="label">Build from source</span><button type="button" class="copy" data-copy="install-source" aria-label="Copy the build-from-source commands">Copy</button></div>
 <pre class="code" id="install-source">git clone https://github.com/jacobsims214/amp.git && cd amp
-<span class="c"># until the harness reaches main</span>
-git checkout harness-m4
 <span class="c"># release build, installed by install.sh</span>
 make -C v2/harness install</pre>
         </div>
@@ -450,22 +435,16 @@ make -C v2/harness install</pre>
 <span class="p" aria-hidden="true">$ </span><b>amp-harness doctor</b></div></div>
       </div>
       <div class="shots">
-        <figure class="shot" data-shot="setup" role="img" aria-label="Placeholder for a screenshot of amp-harness setup. No screenshot yet.">
-          <!-- Placeholder: #2301 fills this with a real capture of setup. -->
-          <div class="tbar" aria-hidden="true"><i></i><i></i><i></i><span>amp-harness setup</span></div>
-          <div class="body" aria-hidden="true"><span class="ph-tag">Screenshot placeholder</span><span class="ph-what">First run: server, login, project, provider</span><span class="ph-note">Not a real capture.</span></div>
+        <figure class="shot" data-shot="setup">
+          <img src="setup-02-provider.webp" width="899" height="520" loading="lazy" decoding="async" alt="The one-line installer downloading amp-harness 0.2.0, verifying its checksum and starting setup: setup confirms the AMP server, signs in, keeps the folder linked to project #183 Acme Notes, and asks which model provider the agents use: OpenRouter, Anthropic, OpenAI or your own OpenAI-compatible endpoint.">
           <figcaption>Setup, step by step</figcaption>
         </figure>
-        <figure class="shot" data-shot="workers" role="img" aria-label="Placeholder for a screenshot of workers running in the chat. No screenshot yet.">
-          <!-- Placeholder: #2301 fills this with a real capture of /workers. -->
-          <div class="tbar" aria-hidden="true"><i></i><i></i><i></i><span>amp-harness · /workers</span></div>
-          <div class="body" aria-hidden="true"><span class="ph-tag">Screenshot placeholder</span><span class="ph-what">Workers running on tickets</span><span class="ph-note">Not a real capture.</span></div>
+        <figure class="shot" data-shot="workers">
+          <img src="chat-03-workers-finished.webp" width="899" height="520" loading="lazy" decoding="async" alt="The amp-harness chat after two workers finish tickets #650 and #651, each with its run time and tokens. The manager carries on by itself, dispatches the next ticket, #652, and the Workers box shows it running.">
           <figcaption>Workers, live in the chat</figcaption>
         </figure>
-        <figure class="shot" data-shot="doctor" role="img" aria-label="Placeholder for a screenshot of amp-harness doctor. No screenshot yet.">
-          <!-- Placeholder: #2301 fills this with a real capture of doctor. -->
-          <div class="tbar" aria-hidden="true"><i></i><i></i><i></i><span>amp-harness doctor</span></div>
-          <div class="body" aria-hidden="true"><span class="ph-tag">Screenshot placeholder</span><span class="ph-what">Doctor's checks, each with its fix</span><span class="ph-note">Not a real capture.</span></div>
+        <figure class="shot" data-shot="doctor">
+          <img src="doctor-01-checks.webp" width="899" height="548" loading="lazy" decoding="async" alt="amp-harness doctor output: a list of checks for config, credentials, connection, versions, contract tools, project, roles, model providers, each MCP server, skills, agents and workspace isolation, ending in &quot;No failures (1 warning)&quot;. The warning about the file credential store comes with its fix.">
           <figcaption>Doctor, checking it all</figcaption>
         </figure>
       </div>
