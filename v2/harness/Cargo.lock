@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "amp-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "amp-mcp",
  "async-trait",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "amp-harness"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "amp-core",
  "amp-mcp",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "amp-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "amp-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "amp-core",
  "amp-mcp",
