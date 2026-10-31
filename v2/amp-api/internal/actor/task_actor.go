@@ -409,8 +409,10 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 	// worker ever presented a token there, because its plugin doesn't claim.
 	// Its first activity was the start and this completion is that same
 	// run's end, so labelling it a closeout would be false for every older
-	// plugin (AMP #2801, backward compatibility).
-	closeout := !msg.InUI && a.task.CompleteIsCloseout(msg.DispatchID)
+	// plugin (AMP #2801, backward compatibility). An explicit closeout reason
+	// overrides that reading: the caller has said it isn't the worker
+	// (AMP #2908).
+	closeout := !msg.InUI && a.task.CompletionIsCloseout(msg.DispatchID, msg.CloseoutReason)
 	if msg.DispatchID != "" && !a.task.CurrentDispatch(msg.DispatchID) && a.task.DispatchID != "" {
 		return false, fmt.Errorf("task %d: dispatch %q is no longer current (the ticket was returned and re-dispatched as %q); "+
 			"re-read the ticket and use the dispatch_id in your prompt, or close it out with closeout_reason if you aren't its worker",

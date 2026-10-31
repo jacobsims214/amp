@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // ---- Enums ----
 
@@ -309,6 +312,21 @@ func (t *Task) CompleteIsCloseout(dispatchID string) bool {
 		return true
 	}
 	return t.StartedAt != nil
+}
+
+// CompletionIsCloseout is CompleteIsCloseout for a caller that may also give
+// an explicit closeoutReason (amp_complete_task's closeout_reason). A
+// non-empty reason is the caller saying it isn't the worker, so without the
+// current token it is a closeout even where CompleteIsCloseout would read a
+// bare completion as an old plugin's own: a dispatched ticket nobody started,
+// or one whose start was inferred (AMP #2908). A bare completion with no
+// reason keeps the backward-compatible reading. The reason must be the
+// caller's explicit one, never a run note standing in for it.
+func (t *Task) CompletionIsCloseout(dispatchID, closeoutReason string) bool {
+	if t.CompleteIsCloseout(dispatchID) {
+		return true
+	}
+	return !t.IsHuman() && !t.CurrentDispatch(dispatchID) && strings.TrimSpace(closeoutReason) != ""
 }
 
 // CurrentDispatch reports whether id is the ticket's current dispatch token.

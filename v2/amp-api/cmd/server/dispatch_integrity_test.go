@@ -351,6 +351,94 @@ func TestDispatchIntegrity_CloseoutLabelling(t *testing.T) {
 	}
 }
 
+// A dispatched ticket nobody started, completed without the dispatch token
+// (AMP #2908): with an explicit closeout_reason it is a labelled closeout;
+// without one it stays the old plugin's own completion (backward
+// compatibility); with the current token it is the worker's.
+func TestDispatchIntegrity_CloseoutReasonOnNeverStarted(t *testing.T) {
+	s := setupMCP(t)
+	ctx := context.Background()
+	historyOf := func(id int, action string) *domain.ActivityLog {
+		hist, _ := s.repo.GetTicketHistory(ctx, id)
+		for i := range hist {
+			if hist[i].Action == action {
+				return &hist[i]
+			}
+		}
+		return nil
+	}
+	lastRunNote := func(id int) string {
+		runs, _ := s.repo.TaskRuns(ctx, id)
+		if len(runs) == 0 {
+			return ""
+		}
+		return runs[len(runs)-1].Note
+	}
+	startedBy := func(id int) string {
+		tk, err := s.repo.GetTask(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tk.StartedBy
+	}
+
+	// 1. With a reason: a closeout, labelled everywhere.
+	closed := mkIn(t, s, s.storyID, "dispatched, never started, closed out")
+	dispatchClaims(t, s, closed)
+	out := s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(closed),
+		"closeout_reason": "worker connection lost", "model": "m"})
+	if out["closeout"] != true || out["closeout_reason"] != "worker connection lost" {
+		t.Fatalf("closeout with a reason = %v", out)
+	}
+	if next, _ := out["next"].(string); !strings.Contains(next, "Closed out by you") {
+		t.Errorf("closeout next = %q", next)
+	}
+	if h := historyOf(closed, "closed_out"); h == nil || !strings.Contains(h.Detail, "(not the worker): worker connection lost") {
+		t.Fatalf("closeout history = %+v", h)
+	}
+	if historyOf(closed, "completed") != nil {
+		t.Errorf("closeout also recorded as the worker's completion")
+	}
+	if got := startedBy(closed); got != domain.StartedByCloseout {
+		t.Errorf("started_by = %q, want %q", got, domain.StartedByCloseout)
+	}
+	if note := lastRunNote(closed); note != "closeout: worker connection lost" {
+		t.Errorf("run note = %q", note)
+	}
+
+	// 2. No reason: unchanged, the old plugin's own completion.
+	legacy := mkIn(t, s, s.storyID, "dispatched, never started, bare completion")
+	dispatchClaims(t, s, legacy)
+	out = s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(legacy), "model": "m", "run_note": "did the work"})
+	if out["closeout"] == true {
+		t.Fatalf("bare completion of a never-started ticket labelled a closeout: %v", out)
+	}
+	if h := historyOf(legacy, "completed"); h == nil || !strings.Contains(h.Detail, "Task completed by agent") {
+		t.Fatalf("legacy completion history = %+v", h)
+	}
+	if historyOf(legacy, "closed_out") != nil {
+		t.Errorf("legacy completion has a closed_out row")
+	}
+	if got := startedBy(legacy); got != domain.StartedByInferred {
+		t.Errorf("started_by = %q, want %q", got, domain.StartedByInferred)
+	}
+	if note := lastRunNote(legacy); note != "did the work" {
+		t.Errorf("legacy run note = %q", note)
+	}
+
+	// 3. The current token: the worker's, even with a reason.
+	worker := mkIn(t, s, s.storyID, "dispatched, worker completes without claiming")
+	tok := dispatchClaims(t, s, worker)
+	out = s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(worker), "dispatch_id": tok,
+		"closeout_reason": "ignored for the worker"})
+	if out["closeout"] == true {
+		t.Fatalf("the worker's own completion was labelled a closeout: %v", out)
+	}
+	if h := historyOf(worker, "completed"); h == nil || historyOf(worker, "closed_out") != nil {
+		t.Fatalf("worker completion history = %+v", h)
+	}
+}
+
 // The watchdog returns a ticket nobody started once its project's return
 // timeout has passed, and a manager sees it in the returned list until it is
 // dispatched again.
