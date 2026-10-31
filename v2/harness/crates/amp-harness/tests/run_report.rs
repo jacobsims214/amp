@@ -284,7 +284,11 @@ async fn a_completed_run_carries_model_tokens_cost_and_pushed_git_without_overwr
 
     // A closed ticket needs no amp_report_run.
     assert!(f.calls("amp_report_run").is_empty());
-    assert!(r.notes.is_empty(), "{:?}", r.notes);
+    // AMP #2802: the harness started the ticket for its worker, with the dispatch token, so the
+    // run says so. A completed run has nothing to hand back, so that is the only note.
+    assert_eq!(r.notes.len(), 1, "{:?}", r.notes);
+    assert!(r.notes[0].contains("started #2085"), "{:?}", r.notes);
+    assert!(f.calls("amp_return_task").is_empty(), "nothing to return");
 
     // The worker's amp_session_usage answered with its configured model and live usage.
     let transcript = std::fs::read_to_string(r.session_file.as_ref().unwrap()).unwrap();
@@ -456,9 +460,49 @@ async fn abandoned_runs_are_reported_with_usage_git_and_a_note() {
         r.notes
     );
 
-    // #2204: none of these was stopped by the chat, so their manager decides what happens to the
-    // ticket next; nothing was handed back.
-    assert!(f.calls("amp_set_task_state").is_empty());
+    // AMP #2802: every end that doesn't close the ticket hands it back, not just the chat's own
+    // stops. All four were dispatched and none closed its ticket, so each went back to ready
+    // through amp_return_task (the returned path: it clears the dispatch and records
+    // returned_reason, which is what the manager's `returned` list reads).
+    let returned: Vec<Value> = f.calls("amp_return_task");
+    let ids: Vec<i64> = returned
+        .iter()
+        .filter_map(|r| r["task_id"].as_i64())
+        .collect();
+    assert_eq!(ids, vec![2085, 2086, 7, 4041], "{returned:?}");
+    for r in &returned {
+        assert!(
+            r["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("returned to ready by amp-harness: abandoned:"),
+            "{r}"
+        );
+    }
+    // Their reasons name the outcome, so the ticket's history says what happened.
+    assert!(
+        returned[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("abandoned: error"),
+        "{}",
+        returned[0]
+    );
+    assert!(
+        returned[2]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("abandoned: stopped"),
+        "{}",
+        returned[2]
+    );
+    // Nothing needed the set-state fallback: none of these had claimed its ticket (the mock's
+    // amp_claim_task answers already_started, but the ticket stays returnable in this mock), so
+    // amp_return_task took them.
+    assert!(
+        f.calls("amp_set_task_state").is_empty(),
+        "no fallback needed"
+    );
 }
 
 /// #2225: a worker whose model repeats one call is stopped at the 5th identical call, and its
@@ -606,11 +650,11 @@ async fn a_worker_stopped_after_closing_its_ticket_is_not_abandoned() {
         "{}",
         runs[0]
     );
-    // #2204: the chat stopped it, so nobody is on the ticket: it is handed back to ready.
-    let released = f.calls("amp_set_task_state");
+    // #2204 + AMP #2802: the chat stopped it, so nobody is on the ticket: it is handed back to
+    // ready. AMP's own returned path takes it (amp_return_task), which also records why.
+    let released = f.calls("amp_return_task");
     assert_eq!(released.len(), 1, "{released:?}");
     assert_eq!(released[0]["task_id"], 2090);
-    assert_eq!(released[0]["state"], "backlog");
     assert!(
         released[0]["reason"]
             .as_str()
@@ -618,6 +662,10 @@ async fn a_worker_stopped_after_closing_its_ticket_is_not_abandoned() {
             .starts_with("returned to ready by amp-harness: abandoned: cancelled"),
         "{}",
         released[0]
+    );
+    assert!(
+        f.calls("amp_set_task_state").is_empty(),
+        "the returned path took it"
     );
     assert!(
         r.notes
@@ -638,7 +686,7 @@ async fn a_worker_stopped_after_closing_its_ticket_is_not_abandoned() {
     let runs = f.calls("amp_report_run");
     assert_eq!(runs.len(), 2, "{runs:?}");
     assert_eq!(runs[1]["task_id"], 2091);
-    assert_eq!(f.calls("amp_set_task_state")[1]["task_id"], 2091);
+    assert_eq!(f.calls("amp_return_task")[1]["task_id"], 2091);
 
     // 6. AMP refuses to take the ticket back: the report says so, nothing fails.
     let signal = CancellationToken::new();

@@ -254,36 +254,26 @@ async fn user_bubbles_have_the_same_padding_every_time() {
     for text in ["one", "two", "three"] {
         let at = rows
             .iter()
-            .position(|r| r.trim() == text)
+            // (#2882: inside the Conversation box's side edges.)
+            .position(|r| r.trim().trim_matches('│').trim() == text)
             .unwrap_or_else(|| panic!("{text} in {rows:#?}"));
         // The bubble (compact, #2346): the text on the surface with no padding rows, then a
         // blank row outside it.
         assert!(frame[at].contains("\x1b[48;"), "{text}: on the surface");
-        assert!(
-            rows[at - 1].trim().is_empty(),
-            "{text}: gap above: {rows:#?}"
-        );
+        let blank = |r: &String| r.trim().trim_matches('│').trim().is_empty();
+        assert!(blank(&rows[at - 1]), "{text}: gap above: {rows:#?}");
         assert!(
             !frame[at - 1].contains("\x1b[48;"),
             "{text}: gap above is not surface"
         );
-        assert!(
-            rows[at + 1].trim().is_empty(),
-            "{text}: gap below: {rows:#?}"
-        );
+        assert!(blank(&rows[at + 1]), "{text}: gap below: {rows:#?}");
         assert!(
             !frame[at + 1].contains("\x1b[48;"),
             "{text}: gap below is not surface"
         );
         // Never two blank rows in a row around a bubble.
-        assert!(
-            !rows[at - 2].trim().is_empty(),
-            "{text}: one gap above: {rows:#?}"
-        );
-        assert!(
-            !rows[at + 2].trim().is_empty(),
-            "{text}: one gap below: {rows:#?}"
-        );
+        assert!(!blank(&rows[at - 2]), "{text}: one gap above: {rows:#?}");
+        assert!(!blank(&rows[at + 2]), "{text}: one gap below: {rows:#?}");
     }
 }
 

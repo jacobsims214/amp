@@ -414,6 +414,10 @@ func main() {
 	}
 	go service.New(repo, registry, kbSvc).RunAuditCheckpoints(ctx, time.Hour, repo.TryNamedLock)
 	go service.New(repo, registry, kbSvc).RunAuditRetention(ctx, auditRetention, 24*time.Hour, repo.TryNamedLock)
+	// A dispatched ticket nobody starts is returned to ready after its
+	// project's not_started_return_minutes (AMP #2801). One replica at a
+	// time (advisory lock); the state change goes through the project actor.
+	go service.New(repo, registry, kbSvc).RunDispatchWatchdog(ctx, service.WatchdogInterval, repo.TryNamedLock)
 
 	// Health check (unauthenticated, used by k8s probes)
 	var draining atomic.Bool

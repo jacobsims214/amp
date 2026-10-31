@@ -37,9 +37,15 @@ Terminal.app over ssh, send Shift+Enter as a plain Enter, so it **sends** the me
 Up in an empty (or one-line) editor recalls the prompts you sent earlier in this chat, newest first; Down goes forward again, and Down past the
 newest gives back what you had typed. In a multi-line draft Up and Down move the cursor, and in
 the `/` menu and the panels they move the selection. Workers' prompts are not in this history.
-Esc stops the reply, and with it any worker this chat started (the transcript names them). Esc that
-closes a panel, the `/` menu or a worker's session doesn't: for 2 s the spinner line says `Esc again to
-stop the reply` (naming the live workers, e.g. `… and the worker on #222`), and only the next Esc stops it.
+Esc stops the manager's reply only. Workers it launched keep running, and the transcript says so
+(`stopping the reply; the worker on #222 keeps running (/workers to stop it)`); `/workers` or quitting
+stops them. A launch from this reply that is still waiting for a slot is cancelled instead, and never
+dispatched. With `[workers] dispatch = "await"` the workers run inside the reply, so Esc stops them too.
+Esc that closes a panel, the `/` menu or a worker's session doesn't stop the reply: for 2 s the spinner
+line says `Esc again to stop the reply`, and only the next Esc stops it. The hint names only the
+launches that Esc would cancel (e.g. `… and the worker on #222`), or in Await mode the live workers.
+A prompt you send while a reply runs is queued (`queued #1 · runs after this reply: …`, up to 5) and
+runs on its own after the reply; stopping the reply drops the queue (↑ recalls it).
 The model's thinking shows as one `▸ Thought for 12s` line: click it, or
 press Ctrl+T, to open it (Ctrl+T opens the lowest one on screen), and `/config thinking` switches
 between collapsed, full and hidden (see [configuration](configuration.md)). Ctrl+O shows tool
@@ -129,19 +135,60 @@ It builds the same session as the chat and exits 0 when the run completes.
 
 When the manager dispatches a ticket (its `amp_run_ticket` tool), the harness:
 
-1. waits for a free worker slot, then marks the ticket dispatched in AMP;
-2. gives a role that edits files a place of its own (read-only roles work in your folder): in a
+1. waits for a free worker slot, then dispatches the ticket in AMP (`amp_dispatch_task`), which
+   hands back a dispatch ID and the ready-made worker prompt;
+2. starts the worker and **starts the ticket with it** (`amp_claim_task(task_id, dispatch_id)`):
+   the harness claims on its worker's behalf, so a ticket it dispatched is never left "not started",
+   and the dispatch ID is injected into the worker's `amp_complete_task` / `amp_block_task` calls;
+3. gives a role that edits files a place of its own (read-only roles work in your folder): in a
    git repository with a commit, a git worktree `<repo>/.worktrees/<ticket>` on branch
    `amp-<ticket>`; anywhere else (no git repository, a new folder another repository doesn't
    track, a repository with no commit yet), a folder `amp-work/<ticket>/`, and the worker is told
    not to commit or open pull requests. `[workers] isolation` changes this; see
    `harness/git-and-the-harness.md`;
-3. runs the worker on its role's model until it finishes, times out or uses up its turns;
-4. **reports the run to the ticket by itself**: model, tokens, cost, branch, commit. A worker
-   that stops without closing its ticket is recorded as abandoned, with the reason.
+4. runs the worker on its role's model until it finishes, times out or uses up its turns;
+5. **reports the run to the ticket by itself**: model, tokens, cost, branch, commit. A worker
+   that stops without closing its ticket is recorded as abandoned, with the reason, and the ticket
+   goes back to ready so you can re-dispatch it. A dispatch whose worker never ran (the harness
+   died between the two steps) is released when the harness starts again, or by AMP's watchdog at
+   30 minutes.
 
 Workers never wait on a prompt: their shell runs with no terminal input, and every command has a
 time limit.
+
+### The manager carries on when workers end
+
+In the chat, workers run in the background: the manager's turn ends once it has launched them,
+and you can keep talking to it. When a worker ends, the chat shows `worker ended: #N …`. If the
+chat is idle then (no reply running, nothing you typed waiting, no prompt from a paired device
+waiting), it **starts the manager's next turn by itself**, the way it resumes after a plan
+approval. The transcript marks that turn: `↻ a worker you launched ended while the chat was idle:
+the manager carries on by itself (an automatic turn, not a prompt from you; …)`, followed by the
+turn's prompt, `[amp-harness] Workers you launched have ended: …`. The turn opens with the
+summary of every worker that ended since the manager's last turn, so it can run the next wave,
+review, open fix tickets or report to you.
+
+- **One turn for ends close together.** The chat waits half a second after the newest end, so
+  workers that finish together give one turn with all their summaries. Each end reaches exactly
+  one turn.
+- **Busy?** While a reply runs or a prompt waits, nothing starts: the next turn (yours, or the
+  queued prompt's) carries the summaries. Nothing starts during a `/server` switch or while
+  quitting.
+- **Loop guard.** At most 5 automatic turns within 10 minutes with no prompt from you. One more
+  pauses this, and the chat warns: `⏸ The manager started 5 turns by itself in the last 10
+  minutes with no prompt from you, so it stops waking for worker ends. …`. The ended workers wait
+  for your next prompt, which carries their summaries and turns waking back on. Workers that take
+  minutes each never reach the limit; a manager stuck relaunching workers that fail at once does.
+- **Turn it off** in config.toml (or with `AMP_HARNESS_WAKE_ON_WORKER_END=false`). Ends then wait
+  for your next prompt:
+
+  ```toml
+  [manager]
+  wake_on_worker_end = false
+  ```
+
+  With `[workers] dispatch = "await"` the manager waits for each worker inside its own turn, so
+  this setting has nothing to do.
 
 ## Worker limits
 

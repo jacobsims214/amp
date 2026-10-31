@@ -96,7 +96,7 @@ From the session page (My work → My sessions, or the link) you can:
 - send a message. On the laptop it shows tagged `[remote: Safari on iPhone]`. If a reply is still
   running, it is **queued** and runs when the reply ends (up to 5 wait); the laptop shows
   `[remote: …] queued #1: "…"`;
-- press **Stop** (stops the reply, its workers, and drops the queue);
+- press **Stop** (stops the reply and drops the queue; workers it launched keep running, so stop one from `/workers` on the laptop);
 - **Disconnect** (ends remote control).
 
 You can't, from the web: run slash commands (a message starting with `/` is sent as text),

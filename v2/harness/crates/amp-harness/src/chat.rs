@@ -199,6 +199,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     let mouse = load_mouse(&args)?;
     let padding = load_padding(&args)?;
     amp_tui::density::set(load_density(&args)?);
+    amp_tui::frame::set_ascii(load_ascii(&args)?);
 
     // First run (D12): ask for whatever is missing before connecting for real. In --snapshot only
     // with scripted answers (AMP_HARNESS_PROMPTS=stdin), so render checks never stop on a question.
@@ -219,6 +220,9 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         wait_mcp: false,
         // #2241: ask about untrusted repo MCP servers (in the terminal, before the TUI opens).
         ask_trust: true,
+        // AMP #2837: workers run in the background, so the person can keep talking to the manager
+        // while they work; an explicit `[workers] dispatch = "await"` (or the env var) still wins.
+        dispatch: session::CHAT_DISPATCH,
     })
     .await?;
     let settings = args.conn.settings()?;
@@ -238,6 +242,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     shell.set_padding(padding);
     // #2425: after asking for plan approval, wait for it in AMP and resume the manager.
     shell.set_auto_resume(load_auto_resume(&args)?);
+    // #2891: a launched worker that ends while the chat is idle starts the manager's next turn.
+    shell.set_wake_on_worker_end(load_wake_on_worker_end(&args)?);
     // A suggested first prompt (new project: seed the KB; new user: the AMP guide). Nothing is
     // sent until the person presses Enter.
     if let Some(text) = outcome.and_then(|o| o.prefill) {
@@ -247,6 +253,31 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     shell.set_connect(crate::connect::ChatConnect::new(Arc::clone(&session.rt))?);
     // Quitting mid-dispatch cancels the manager's workers and waits for their run reports (D8).
     shell.set_supervisor(session.supervisor.clone());
+    // AMP #2802: a ticket that comes back (returned by this chat) is said to the person, above
+    // the editor, as well as to the manager.
+    if let Some(reporter) = &session.reporter {
+        let notes = shell.notifier();
+        reporter.set_notice(Arc::new(move |text: &str| notes.notice(text)));
+    }
+    // AMP #2802: tickets this machine dispatched whose chat is gone (it crashed, was killed, or
+    // the machine rebooted) are handed back now, before the manager's first turn: nothing is
+    // left in progress with nobody on it. Bounded, so a slow AMP can't hold the chat up.
+    if let Some(sup) = session.supervisor.clone() {
+        let notes = shell.notifier();
+        tokio::spawn(async move {
+            for release in sup
+                .release_orphans_within(amp_core::supervisor::ORPHAN_RELEASE_TIMEOUT)
+                .await
+            {
+                let text = release.notice();
+                if release.result.is_ok() {
+                    notes.notice(text);
+                } else {
+                    notes.error(text);
+                }
+            }
+        });
+    }
     let project_id = session.project.as_ref().map(|p| p.project_id);
     // #2356: `/project` says where a parent folder's marker is.
     let project_marker = session
@@ -671,6 +702,22 @@ fn load_auto_resume(args: &ChatArgs) -> Result<bool, CliError> {
     let env = |k: &str| std::env::var(k).ok();
     amp_core::approval_wait::resolve_auto_resume(&env, config_text(args).as_deref())
         .map_err(CliError::usage)
+}
+
+/// `[manager] wake_on_worker_end` (#2891): `AMP_HARNESS_WAKE_ON_WORKER_END`, then config.toml,
+/// else on.
+fn load_wake_on_worker_end(args: &ChatArgs) -> Result<bool, CliError> {
+    let env = |k: &str| std::env::var(k).ok();
+    amp_core::approval_wait::resolve_wake_on_worker_end(&env, config_text(args).as_deref())
+        .map_err(CliError::usage)
+}
+
+/// Box glyphs in ASCII (#2882): `AMP_HARNESS_ASCII`, then config.toml `[tui] ascii`, else by
+/// the terminal (`TERM=dumb`, a locale that isn't UTF-8).
+fn load_ascii(args: &ChatArgs) -> Result<bool, CliError> {
+    let env = |k: &str| std::env::var(k).ok();
+    amp_tui::theme::select::resolve_ascii(&env, config_text(args).as_deref())
+        .map_err(|e| CliError::usage(e.to_string()))
 }
 
 /// How tightly the chat is laid out (#2346): `AMP_HARNESS_DENSITY`, then config.toml `[tui]

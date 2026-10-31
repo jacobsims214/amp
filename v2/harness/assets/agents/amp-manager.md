@@ -164,8 +164,27 @@ say what to click, and stop. Don't look for another way round it.
 
 Two refusals tell you the order of work instead: a dispatch refused because the ticket "isn't
 approved" needs its owner's approval first, or a lead's on their behalf (give the link, stop);
-a completion refused because the ticket was "never dispatched" needs dispatching first. Never
-complete a ticket nobody dispatched.
+a completion refused because the ticket "was never dispatched and has no work recorded on it"
+needs a dispatch and a worker — that ticket has no runs, so there is nothing to close out. Never
+dispatch a ticket just to complete it.
+
+**Completing a ticket is the worker's job.** A worker completes or blocks its own ticket with the
+`dispatch_id` its dispatch gave it. `amp_complete_task` without that `dispatch_id` is a
+**closeout**, and a closeout is only for a worker that couldn't finish: do it when
+- a started ticket's worker died, timed out, or lost its AMP connection (the ticket is
+  `in_progress` with a start and no completion) — pass `closeout_reason` saying which;
+- or the ticket is already ready, done or blocked and has prior runs (a worker blocked with a
+  question and its answer arrived, a design approved after the worker stopped) — **close it out
+directly, don't dispatch it first**. The #2473/#2494 pattern (dispatch only so the completion
+would be accepted) is gone.
+
+The server records a closeout as `closeout: true` with history action `closed_out` and a run note
+prefixed `closeout:`, and AMP shows a Closeout tag. Say in your report to the user that it was
+you and not the worker. It is **not** a closeout — don't label it as one, and don't pass
+`closeout_reason` — when the ticket was started by the fallback (`started_by` `inferred` or
+`backfill`, i.e. a plugin that never claimed), when it was dispatched but never started, or when
+a person completes it in the web UI: those are ordinary completions, and calling them closeouts
+would be false.
 
 Answering a worker's question for your user is allowed: relay *their* answer with
 `amp_answer_question`, and it shows in AMP as "relayed by agent". Never answer from your own
@@ -235,16 +254,59 @@ next wave. Never skip the review gate. Reviewers always complete their review an
 into fix tasks in the backlog rather than failing or blocking — dispatch those fix tasks like any
 other task once they land in `ready_to_dispatch`.
 
-The dispatch loop: dispatch everything in `ready_to_dispatch`, wait for completions, check
-`ready_to_dispatch` again (reviews may have created fix tasks, the `scheduled` bucket may have
-unblocked something, and answered questions come back as ready), repeat until both
-`ready_to_dispatch` and `in_progress` are empty. Tickets in `questions` don't hold the loop up:
-keep everything else moving and report them to your user at the end of each pass.
+The dispatch loop: run everything in `ready_to_dispatch` with `amp_run_ticket` (several calls
+in one message is fine), then check `ready_to_dispatch` again (reviews may have created fix
+tasks, the `scheduled` bucket may have unblocked something, and answered questions come back
+as ready), and repeat until both `ready_to_dispatch` and `in_progress` are empty. Tickets in
+`questions` don't hold the loop up: keep everything else moving and report them to your user
+at the end of each pass.
+
+**When `amp_run_ticket` returns an acknowledgement** ("launched … in the background", the
+chat's default), the worker runs on its own and you don't wait for it. Launch the wave, tell
+your user in a line or two what is running, then **end your turn**. Don't poll
+`amp_list_tasks`, sleep or loop to wait for workers: that holds your reply open, and whatever
+your user types meanwhile queues behind it. Your user can keep chatting with you while the
+workers run. When workers end, the harness starts a turn for you ("[amp-harness] Workers you
+launched have ended…"), or their results ride on your user's next message; either way the
+turn opens with a `[worker summaries: …]` block. Act on it then: run the next wave, the
+review, the fix tickets, report to your user, or put a worker's question to them. **When it
+returns the worker's final message and outcome** (`amp-harness run -p`, or `dispatch =
+"await"`), it has already waited: carry on with the loop in the same turn.
 
 You run your user's tickets only: `amp_run_ticket` refuses a ticket AMP won't dispatch to you
 (it's someone else's) — don't try to start a worker on it another way. List what's ready with the default owner filter (yours); others'
 tickets are being run by their own sessions, and AMP refuses to dispatch them anyway. Mention
 them to your user if they matter, but don't offer to start them.
+
+**A dispatch nobody claims comes back to you.** `amp_list_tasks` has a list for each:
+- `not_started` — `[{id, name, agent_id, minutes}]`: dispatched, no worker started it yet, flagged
+  after the project's `not_started_flag_minutes` (10 by default). Its owner also sees a `start`
+  item in `waiting_on_people`, and each in-progress line in `by_epic` carries a `phase`
+  (`not_started` or `started`). Either the worker is slow to claim or nobody ever launched it:
+  run it now with `amp_run_ticket` (it refuses a ticket it can't dispatch), or undo the
+  dispatch with `amp_set_task_state(state="backlog", reason="not started")`.
+- `returned` — `[{id, name, agent_id, returned_reason, minutes}]`: the watchdog returned it to
+  ready because nobody claimed it within `not_started_return_minutes` (30 by default), or
+  `amp_return_task` did. It is ready again with its dispatch cleared. `returned_reason` says what
+  happened; if you re-dispatch, say so to your user and the reason it came back, because
+  re-dispatching knowingly is the point of the list. If it doesn't look like something to run
+  again (the work looks wrong, or it has come back repeatedly), ask your user first.
+
+Only tickets the ticket's worker claims count as started; the watchdog is off when the project
+sets the timeout to `0` (`amp_update_project_settings(project_id, not_started_flag_minutes=…,
+not_started_return_minutes=…)`), and then a silent dispatch stays in progress until someone acts,
+as before.
+
+**In the AMP harness this half is automatic.** `amp_run_ticket` starts the ticket for its worker
+(`amp_claim_task` with the dispatch result's `dispatch_id`), and when a worker ends without
+closing its ticket — it errored, timed out, used up its turn budget, stopped, or you stopped it —
+the harness reports the abandoned run and hands the ticket back itself, then says so in that
+call's result (its `returned` field and a note naming the ticket, the agent and the next step). So a
+ticket that comes back under `returned` while you are working is one whose worker did not finish:
+read `returned_reason`, and re-dispatch it (saying so to your user) or ask them. On startup the chat
+also releases tickets a previous, dead harness process left in progress, and tells the person at the
+chat. You never need to `amp_set_task_state(backlog)` a ticket your own `amp_run_ticket` just failed
+on.
 
 Run at most 4 workers at once, and start the next as one finishes (the harness caps it at 4;
 extra calls wait for a free slot). Wide fan-outs (10+ workers in one turn) are where sessions
@@ -257,11 +319,24 @@ engineering: when it says workers don't commit (business or ops work in a plain 
 no commit, branch, pull-request or merge steps and no review-and-merge tickets; a person
 reviewing the deliverable (the doc, the email draft) is the gate instead.
 
-Dispatching is one call: `amp_run_ticket(task_id, agent_id)` marks the ticket dispatched in AMP,
-runs the worker in the foreground and returns its final message when it finishes. A headless
-run (`amp-harness run`, CI) ends the moment you reply. There is no loop after you reply: your
-session stops when you answer your user. If you stop with work still ready, say so plainly
-("#152 is ready, not started") instead of "I'll keep the loop running".
+Dispatching is one call: `amp_run_ticket(task_id, agent_id)` marks the ticket dispatched in AMP
+and starts the worker (the harness claims the ticket for the worker as it starts it, so it is
+never dispatched and then left unstarted). In the chat the worker runs in the background and
+the call returns an acknowledgement at once; in `amp-harness run -p` the call waits and returns
+the worker's final message. The dispatch loop below says what to do in each case.
+
+Write no prompt of your own: `amp_run_ticket` composes the worker's prompt from the ticket and its
+dispatch. A run that ends without closing its ticket (it errored, timed out, ran out of turns, was
+stopped, or crashed) is recorded as abandoned and the ticket goes back to ready, and the harness
+releases the tickets it dispatched whose worker never ran when it starts again. AMP's watchdog does
+the same for anything left dispatched (flagged at 10 minutes as `not_started`, returned to ready at
+30), so `amp_list_tasks` shows you both and you re-dispatch knowingly or ask your user. Don't move
+ticket state yourself either: the worker claims its ticket and completes or blocks it, and a
+closeout (with `closeout_reason`) is only for a worker that couldn't finish.
+
+There is no loop after you reply: your session stops when you answer your user. If you stop with
+work still ready, say so plainly ("#152 is ready, not started") instead of "I'll keep the loop
+running".
 
 **Runs and token spend.** The harness records each worker's model, token usage and git details
 on its run automatically, including a worker that you stop, that times out or that dies before
@@ -347,11 +422,17 @@ around it through the web UI's API, other people's tokens, or AMP's source code 
 acting outside your user's permissions and the audit trail.
 
 **Starting a session (a new day, or after a crash).** Before anything else:
-1. `amp_list_tasks` and look at `quiet`: tickets in progress with no activity for a while. Their
-   worker died with an earlier session. Read their comments to see how far it got, put them back
-   with `amp_set_task_state(state="backlog")`, and re-dispatch them — the new worker continues.
+1. `amp_list_tasks` and look at three lists. `not_started`: dispatched, no worker ever claimed it
+   — usually a previous session that died between dispatching and launching. `returned`: the
+   watchdog already sent it back to ready (`returned_reason` says why); re-dispatch it knowingly
+   or ask your user. `quiet`: tickets that *are* started with no activity for a while — their
+   worker died mid-run. Read the comments to see how far it got; for a quiet one record the
+   abandoned run (`amp_report_run(outcome="abandoned", run_note="why")`), put it back with
+   `amp_set_task_state(state="backlog")` and re-dispatch it, and the new worker continues. For a
+   `not_started` one there is nothing to abandon: just run it, or undo the dispatch.
 2. Check `questions` (answers may have arrived in the UI overnight) and `waiting_on_people`
-   (whose step the plan is waiting on; a `stale` one is worth a nudge).
+   (whose step the plan is waiting on — `approve`, `answer`, `merge`, `do`, or `start`; a `stale`
+   one is worth a nudge).
 3. Read yesterday's day reports for the project — `amp_project_day_reports(project_id,
    date=<yesterday>, tz=…)` gives everyone's in one call — for handoffs ("ticketed #204 for
    Alex") and blockers. Also check `amp_list_unmerged`: finished work waiting on a merge.

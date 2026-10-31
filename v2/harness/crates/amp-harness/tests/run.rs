@@ -6,7 +6,7 @@
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use common::{MockAmp, Output, run, spawn, workdir};
 use serde_json::{Value, json};
@@ -518,4 +518,195 @@ async fn the_manager_has_a_native_amp_session_usage_tool() {
     );
     // It is native: AMP never saw the call.
     assert!(amp.mock.calls_to("amp_session_usage").is_empty());
+}
+
+/// AMP #2884: `run -p` ends when the manager's reply ends, so it must never launch a worker in
+/// the background. With `[workers] dispatch = "launch"` in config.toml and
+/// AMP_HARNESS_WORKER_DISPATCH=launch, `amp_run_ticket` still waits: its result is the worker's
+/// report (not a launch ack), and the worker closed its ticket before the process exited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_waits_for_its_worker_even_when_config_and_env_say_launch() {
+    let amp = spawn(MockAmp::new(), None).await;
+    // One shared faux queue, popped in order because the manager waits: manager, worker, worker,
+    // manager.
+    let dir = setup(
+        "run-headless-await",
+        json!([
+            {"tool_calls": [{"name": "amp_run_ticket", "id": "call-1",
+                "arguments": {"task_id": 4242, "agent_id": "amp-worker-backend"}}]},
+            {"text": "Done.", "tool_calls": [{"name": "amp_complete_task", "arguments": {"task_id": 4242}}]},
+            {"text": "Finished #4242."},
+            {"text": "Worker said: {{last_tool_result}}"}
+        ]),
+    );
+    let config = dir.join("home/.config/amp-harness/config.toml");
+    let mut toml = std::fs::read_to_string(&config).unwrap();
+    toml.push_str("\n[workers]\ndispatch = \"launch\"\n");
+    std::fs::write(&config, toml).unwrap();
+
+    let script = dir.join("script.json");
+    let state = dir.join("home/.local/state");
+    let out = run(
+        &dir,
+        &amp.url,
+        &["run", "-p", "run #4242", "--json"],
+        &[
+            ("AMP_HARNESS_FAUX_SCRIPT", script.to_str().unwrap()),
+            ("XDG_STATE_HOME", state.to_str().unwrap()),
+            ("AMP_HARNESS_WORKER_DISPATCH", "launch"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        out.code, 0,
+        "stderr: {}\nstdout: {}",
+        out.stderr, out.stdout
+    );
+    let events = json_lines(&out);
+
+    let end = of_type(&events, "tool_end")
+        .into_iter()
+        .find(|e| e["id"] == "call-1")
+        .unwrap_or_else(|| panic!("no amp_run_ticket result: {}", out.stdout));
+    assert_eq!(end["is_error"], false, "{end}");
+    let text = end["text"].as_str().unwrap();
+    let report: Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("amp_run_ticket result is not a report ({e}): {text}"));
+    assert_eq!(report["outcome"], "completed", "{report}");
+    assert_eq!(report["task_id"], 4242, "{report}");
+    assert!(
+        report.get("queued").is_none(),
+        "a launch ack, not a report: {report}"
+    );
+    // The worker closed its ticket while the run was still alive.
+    assert_eq!(
+        amp.mock.calls_to("amp_complete_task").len(),
+        1,
+        "{}",
+        out.stderr
+    );
+    let result = events.last().unwrap();
+    assert_eq!(result["type"], "result");
+    assert_eq!(result["outcome"], "completed", "{result}");
+}
+
+/// Writes one dispatch-ledger record the way the supervisor writes it, for the server at `url`
+/// (AMP #2948), and says where.
+fn ledger_record(dir: &Path, url: &str, task_id: i64, dispatch_id: &str, pid: u32) -> PathBuf {
+    use amp_core::dispatch_ledger::{DispatchRecord, record_file_name, server_key};
+    let server = server_key(url);
+    let path = dir.join(record_file_name(&server, task_id));
+    std::fs::write(
+        &path,
+        serde_json::to_string(&DispatchRecord {
+            task_id,
+            server,
+            dispatch_id: dispatch_id.into(),
+            agent_id: "amp:amp-worker-backend".into(),
+            pid,
+            at_ms: 1,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    path
+}
+
+/// AMP #2910: `run -p` sweeps the dispatch ledger at startup, as the chat does. A ticket whose
+/// dispatching harness process is gone (pid 0 holds no liveness lock) is handed back with its
+/// dispatch_id before the prompt runs, and said on stderr and as an `orphan_released` event; a
+/// record whose process still holds its lock is somebody's running worker and is left alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_releases_a_dead_harness_dispatch_at_startup_and_leaves_a_live_one() {
+    use amp_core::dispatch_ledger::LEDGER_DIR;
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = setup("run-orphans", json!([{"text": "Nothing else to do."}]));
+    let ledger = dir.join("home/.local/state/amp-harness").join(LEDGER_DIR);
+    std::fs::create_dir_all(&ledger).unwrap();
+    let dead = ledger_record(&ledger, &amp.url, 2150, "d_dead2150", 0);
+    // A live process: this test holds a lock under pid 4243's name, the way a running harness
+    // holds its own.
+    let held = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(ledger.join("live-4243.lock"))
+        .unwrap();
+    held.try_lock().unwrap();
+    let live = ledger_record(&ledger, &amp.url, 2151, "d_live2151", 4243);
+
+    let out = harness(&dir, &amp.url, &["run", "-p", "anything?", "--json"]).await;
+    assert_eq!(
+        out.code, 0,
+        "stderr: {}\nstdout: {}",
+        out.stderr, out.stdout
+    );
+
+    // AMP got one return: the dead run's ticket, with that run's dispatch_id (#2909).
+    let returned = amp.mock.calls_to("amp_return_task");
+    assert_eq!(returned.len(), 1, "{returned:?}");
+    assert_eq!(returned[0]["task_id"], 2150, "{returned:?}");
+    assert_eq!(returned[0]["dispatch_id"], "d_dead2150", "{returned:?}");
+
+    // A CI log shows it on stderr.
+    assert!(
+        out.stderr
+            .lines()
+            .any(|l| l.starts_with("amp-harness: #2150 was returned to ready")),
+        "{}",
+        out.stderr
+    );
+    assert!(!out.stderr.contains("#2151"), "{}", out.stderr);
+
+    // --json: `session` stays first, then one orphan_released event, before the run's events.
+    let events = json_lines(&out);
+    assert_eq!(events[0]["type"], "session", "{}", out.stdout);
+    assert_eq!(events[1]["type"], "orphan_released", "{}", out.stdout);
+    let released = of_type(&events, "orphan_released");
+    assert_eq!(released.len(), 1, "{}", out.stdout);
+    assert_eq!(released[0]["task_id"], 2150);
+    assert_eq!(released[0]["dispatch_id"], "d_dead2150");
+    assert_eq!(released[0]["ok"], true);
+    assert!(
+        released[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("#2150 was returned to ready"),
+        "{}",
+        released[0]
+    );
+    assert_eq!(of_type(&events, "result")[0]["outcome"], "completed");
+
+    // The dead run's record is gone; the live one's is still somebody's.
+    assert!(!dead.exists());
+    assert!(live.exists());
+    drop(held);
+}
+
+/// AMP #2910: in text mode the release is one `amp-harness: ` stderr line, and the answer still
+/// streams to stdout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_text_mode_says_the_startup_release_on_stderr() {
+    use amp_core::dispatch_ledger::LEDGER_DIR;
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = setup("run-orphans-text", json!([{"text": "All quiet."}]));
+    let ledger = dir.join("home/.local/state/amp-harness").join(LEDGER_DIR);
+    std::fs::create_dir_all(&ledger).unwrap();
+    let _ = ledger_record(&ledger, &amp.url, 2152, "d_dead2152", 0);
+
+    let out = harness(&dir, &amp.url, &["run", "-p", "anything?"]).await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(
+        amp.mock.calls_to("amp_return_task")[0]["dispatch_id"],
+        "d_dead2152"
+    );
+    assert!(
+        out.stderr
+            .lines()
+            .any(|l| l.starts_with("amp-harness: #2152 was returned to ready")),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stdout.contains("All quiet."), "{}", out.stdout);
+    assert!(!out.stdout.contains("#2152"), "{}", out.stdout);
 }

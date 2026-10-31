@@ -28,6 +28,11 @@ export const mergeItem = (): ProjectWaitItem => ({
   completed_at: H(2), merge_state: 'needed', pr_url: 'https://github.com/o/r/pull/88', branch: 'fix/board-mine', holding_up: [2490, 2491],
   task: task(2471, { state: 'completed', completed_at: H(2), merge_state: 'needed', agent_id: 'amp-worker-frontend' }),
 })
+export const startItem = (): ProjectWaitItem => ({
+  ...base, kind: 'start', key: 'task:2803', task_id: 2803, task_ids: [2803], name: 'UI: not started states', since: H(0.5),
+  state: 'not_started', agent_id: 'amp:amp-worker-frontend', not_started_minutes: 32,
+  task: task(2803, { state: 'in_progress', phase: 'not_started', started_at: null, agent_id: 'amp:amp-worker-frontend', dispatched_at: H(0.5) }),
+})
 export const doItem = (): ProjectWaitItem => ({
   ...base, kind: 'do', key: 'task:2481', task_id: 2481, task_ids: [2481], name: 'Rotate the Dex client secret in prod', since: H(1),
   state: 'backlog', performer: 'human', human_reason: 'access',
@@ -46,18 +51,19 @@ export const doneItems = (): DoneItem[] => [
 
 function counts(items: ProjectWaitItem[], coming: number): WaitCounts {
   const n = (k: string) => items.filter(i => i.kind === k).length
-  return { waiting: items.length, approve: n('approve'), answer: n('answer'), merge: n('merge'), do: n('do'), coming_up: coming }
+  return { waiting: items.length, approve: n('approve'), answer: n('answer'), merge: n('merge'), start: n('start'), do: n('do'), coming_up: coming }
 }
 
 export function myWork(state: 'busy' | 'empty' | 'done', over: Partial<ProjectMyWork> = {}): ProjectMyWork {
-  const items = state === 'busy' ? [approveItem(), answerItem(), mergeItem(), doItem()] : []
+  const items = state === 'busy' ? [approveItem(), answerItem(), mergeItem(), startItem(), doItem()] : []
   const coming = state === 'empty' ? [] : [comingItem()]
   return {
-    project_id: 2, user_id: 9, read_only: false, kinds: ['approve', 'answer', 'merge', 'do'],
+    project_id: 2, user_id: 9, read_only: false, kinds: ['approve', 'answer', 'merge', 'start', 'do'],
     counts: counts(items, coming.length),
     items: {
       approve: items.filter(i => i.kind === 'approve'), answer: items.filter(i => i.kind === 'answer'),
-      merge: items.filter(i => i.kind === 'merge'), do: items.filter(i => i.kind === 'do'),
+      merge: items.filter(i => i.kind === 'merge'), start: items.filter(i => i.kind === 'start'),
+      do: items.filter(i => i.kind === 'do'),
     },
     coming_up: coming,
     done_today: state === 'empty' ? [] : doneItems(),

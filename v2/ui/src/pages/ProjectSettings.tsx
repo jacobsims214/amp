@@ -111,7 +111,7 @@ export function ProjectSettings() {
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-[200px_minmax(0,1fr)] gap-6 px-7 py-6 items-start">
         <nav className="hidden lg:grid gap-0.5 sticky top-6" aria-label="Settings sections">
           <span className="amp-label px-2.5 pb-2">Settings</span>
-          {['General', 'Plan approval', 'Merges', 'Metadata', 'Team access', 'Knowledge bases', 'Trash', ...(canManage ? ['GitHub merge webhook', 'Webhooks', 'Audit log', 'Danger zone'] : [])].map(t => (
+          {['General', 'Plan approval', 'Merges', 'Dispatch watchdog', 'Metadata', 'Team access', 'Knowledge bases', 'Trash', ...(canManage ? ['GitHub merge webhook', 'Webhooks', 'Audit log', 'Danger zone'] : [])].map(t => (
             <a key={t} href={`#${slug(t)}`} className="px-2.5 py-1.5 text-[13px] text-ink-2 hover:text-ink hover:bg-surface-3">{t}</a>
           ))}
         </nav>
@@ -205,6 +205,12 @@ export function ProjectSettings() {
                 </p>
               </Section>
 
+              <Section title="Dispatch watchdog"
+                description="A ticket is dispatched before its worker starts it. A dispatched ticket no worker starts is flagged for its owner after the first timeout, and returned to ready after the second: the manager then dispatches it again, or asks you. 0 turns either off. A ticket a worker has started is never returned this way.">
+                <WatchdogMinutes project={project} pid={pid} canManage={canManage}
+                  onSaved={setProject} onError={setError} />
+              </Section>
+
               <Section title="Metadata"
                 description="Free-form fields for integrations and reporting, e.g. jira_board, initiative, capitalizable. Every epic, story, and ticket in the project inherits them and can override them.">
                 <MetadataEditor key={project.id} initial={project.metadata} readOnly={!canManage}
@@ -294,6 +300,93 @@ export function ProjectSettings() {
           )}
         </div>
       </div>
+    </div>
+  )
+}
+
+/**
+ * The dispatch watchdog's two timeouts (AMP #2801, story 444): the minutes
+ * after which a dispatched ticket no worker started is flagged for its owner
+ * (`not_started_flag_minutes`), and after which it is returned to ready
+ * (`not_started_return_minutes`). 0 turns each off; both save on the button,
+ * not on every keystroke, so a half-typed number is never sent.
+ */
+function WatchdogMinutes({ project, pid, canManage, onSaved, onError }: {
+  project: Project; pid: number; canManage: boolean
+  onSaved: (p: Project) => void; onError: (m: string | null) => void
+}) {
+  const DEFAULT_FLAG = 10
+  const DEFAULT_RETURN = 30
+  const flag = project.not_started_flag_minutes ?? DEFAULT_FLAG
+  const ret = project.not_started_return_minutes ?? DEFAULT_RETURN
+  const [flagText, setFlagText] = useState(String(flag))
+  const [retText, setRetText] = useState(String(ret))
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+  // Re-sync when the project is reloaded or another section saves it.
+  useEffect(() => { setFlagText(String(flag)); setRetText(String(ret)) }, [flag, ret])
+
+  const parse = (s: string) => (/^\d+$/.test(s.trim()) ? Number(s.trim()) : null)
+  const flagNum = parse(flagText)
+  const retNum = parse(retText)
+  const bad = flagNum == null || retNum == null || flagNum > 1440 || retNum > 1440
+  const dirty = flagNum !== flag || retNum !== ret
+
+  const save = async () => {
+    if (bad || !dirty) return
+    setSaving(true); onError(null); setSaved(false)
+    try {
+      onSaved(await api.updateProjectSettings(pid, {
+        not_started_flag_minutes: flagNum!, not_started_return_minutes: retNum!,
+      }))
+      setSaved(true)
+    } catch (e) {
+      onError(e instanceof Error ? e.message : 'Could not change the setting')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const fields: { key: 'flag' | 'return'; label: string; value: string; set: (s: string) => void; n: number | null }[] = [
+    { key: 'flag', label: 'Flag it for its owner after', value: flagText, set: setFlagText, n: flagNum },
+    { key: 'return', label: 'Return it to ready after', value: retText, set: setRetText, n: retNum },
+  ]
+
+  return (
+    <div className="grid gap-3">
+      <div className="grid gap-3 sm:grid-cols-2">
+        {fields.map(f => (
+          <div key={f.key}>
+            <label htmlFor={`watchdog-${f.key}`} className={labelCls}>{f.label}</label>
+            <div className="flex items-center gap-2">
+              <input id={`watchdog-${f.key}`} className={inputCls} inputMode="numeric" disabled={!canManage}
+                value={f.value} onChange={e => { f.set(e.target.value); setSaved(false) }} />
+              <span className="text-[13px] text-ink-2 whitespace-nowrap">minutes</span>
+            </div>
+            {f.n === 0 && <p className="m-0 mt-1 text-[12px] text-ink-2">Off: this never happens.</p>}
+          </div>
+        ))}
+      </div>
+      {bad
+        ? <p role="alert" className="m-0 text-[12px] text-danger-ink">Each timeout is a whole number of minutes, 0 (off) to 1440.</p>
+        : <p className="m-0 text-[12px] text-ink-2 leading-relaxed">
+          {flagNum === 0
+            ? 'The flag is off: an unstarted ticket shows on the board, but its owner is not told.'
+            : `A dispatched ticket no worker starts shows “Dispatched · not started”, filled in after ${flagNum} min.`}{' '}
+          {retNum === 0
+            ? 'The automatic return is off: the ticket stays dispatched until someone returns it.'
+            : retNum! <= flagNum!
+              ? `It is returned to ready after ${retNum} min, so it never reaches the flag first: raise “Return it” above the flag to see it flagged.`
+              : `It is returned to ready after ${retNum} min if still unstarted.`}
+        </p>}
+      {canManage && (
+        <div className="flex items-center gap-3">
+          <button type="button" onClick={save} disabled={bad || !dirty || saving} className="amp-btn amp-btn-primary">
+            {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}Save watchdog
+          </button>
+          {saved && !dirty && <span className="text-xs text-success-ink">Saved</span>}
+        </div>
+      )}
     </div>
   )
 }

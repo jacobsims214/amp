@@ -16,8 +16,10 @@
 //!     `abandoned`, `run_note` "abandoned: <reason>"), the same usage and git fields, so the
 //!     run and its tokens are on the ticket and the manager sees it as quiet. A worker the chat
 //!     stopped (`cancelled`: Esc/Ctrl+C on the reply, or quitting) leaves nobody on its ticket,
-//!     so its ticket is also handed back to ready ([`WorkerHooks::release`]:
-//!     `amp_set_task_state` backlog, with a "returned to ready by amp-harness" reason; #2204).
+//!     so its ticket is also handed back to ready ([`WorkerHooks::release`]: `amp_return_task`
+//!     with the run's dispatch_id, so AMP records the return even though the harness started the
+//!     ticket (AMP #2909); `amp_set_task_state` backlog on an older server that refuses it, with
+//!     a "returned to ready by amp-harness" reason; #2204).
 //! - [`SessionUsageTool`] is the native `amp_session_usage`, so the existing prompts (amp-execution
 //!   step 6) keep working: the session's own model, tokens and cost so far.
 //!
@@ -44,8 +46,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     events::Totals,
     supervisor::{
-        BLOCK_TOOL, COMPLETE_TOOL, WorkerHooks, WorkerInfo, WorkerOutcome, WorkerReport,
-        task_id_arg,
+        BLOCK_TOOL, COMPLETE_TOOL, RETURN_TOOL, SET_STATE_TOOL, WorkerHooks, WorkerInfo,
+        WorkerOutcome, WorkerReport, task_id_arg,
     },
     tools::result_text,
 };
@@ -56,8 +58,6 @@ pub const SESSION_USAGE_TOOL: &str = "amp_session_usage";
 pub const REPORT_RUN_TOOL: &str = "amp_report_run";
 /// The `amp_report_run` outcome for a worker that ended without closing its ticket.
 pub const ABANDONED: &str = "abandoned";
-/// AMP's tool that hands an abandoned ticket back (in progress -> ready).
-pub const SET_STATE_TOOL: &str = "amp_set_task_state";
 /// The AMP state "ready" is stored as (AMP keeps it blocked while a dependency is open).
 pub const READY_STATE: &str = "backlog";
 /// How long `on_finish` waits for AMP to take an abandoned run (shutdown waits on it).
@@ -247,14 +247,156 @@ pub fn abandoned_note(report: &WorkerReport) -> String {
     note
 }
 
+/// How the person at the manager's chat is told something: a line of text, above the editor. Set
+/// by the chat once its shell exists ([`RunReporter::set_notice`]).
+pub type Notice = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// The supervisor's run-reporting hooks (D8). Pass it to `Supervisor::with_hooks`.
 pub struct RunReporter {
     mcp: Arc<AmpMcpClient>,
+    /// The dispatch ledger, so a ticket this reporter hands back or sees closed stops being an
+    /// orphan for the next startup (AMP #2802). `None` in a process without one.
+    ledger: Option<Arc<crate::dispatch_ledger::Ledger>>,
+    /// How the person at the manager's chat is told a ticket came back. Empty in a process with
+    /// no chat yet (`run -p`, tests): the run's notes still record it. A slot rather than a plain
+    /// field because the chat's notifier exists only once its shell does ([`RunReporter::set_notice`]).
+    notice: Mutex<Option<Notice>>,
 }
 
 impl RunReporter {
     pub fn new(mcp: Arc<AmpMcpClient>) -> Arc<Self> {
-        Arc::new(Self { mcp })
+        Arc::new(Self {
+            mcp,
+            ledger: None,
+            notice: Mutex::new(None),
+        })
+    }
+
+    /// The same reporter, also keeping `ledger` in step with what it does.
+    pub fn with_ledger(self: Arc<Self>, ledger: Arc<crate::dispatch_ledger::Ledger>) -> Arc<Self> {
+        Arc::new(Self {
+            mcp: Arc::clone(&self.mcp),
+            ledger: Some(ledger),
+            notice: Mutex::new(self.tell_target()),
+        })
+    }
+
+    /// Where the person at the chat is told a ticket came back (`None`: nowhere yet). The chat
+    /// sets it once it has a notifier ([`RunReporter::set_notice`]); an `Arc` shared with the
+    /// same reporter keeps working.
+    pub fn set_notice(&self, notice: Notice) {
+        *self.notice.lock().unwrap_or_else(|e| e.into_inner()) = Some(notice);
+    }
+
+    fn tell_target(&self) -> Option<Notice> {
+        self.notice
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Forgets a ticket in the dispatch ledger: nothing is left in progress for a next startup
+    /// to sweep (AMP #2802).
+    fn forget(&self, task_id: i64) {
+        if let Some(ledger) = &self.ledger {
+            // AMP #2948: this server's record of the ticket; another server's #task_id stays.
+            let server = crate::dispatch_ledger::server_key(&self.mcp.session().url);
+            ledger.clear(&server, task_id);
+        }
+    }
+
+    /// Tells the person at the chat, when this process has one.
+    fn tell(&self, text: &str) {
+        if let Some(f) = self.tell_target() {
+            f(text);
+        }
+    }
+
+    /// Hands the ticket back, saying which path did it. `Ok` means it is in ready now, by
+    /// whichever path worked; `Err` is AMP's own message when nothing did. `dispatch_id` is the
+    /// run's dispatch token ("" when the server gave none).
+    async fn hand_back(
+        &self,
+        task_id: i64,
+        dispatch_id: &str,
+        why: &str,
+    ) -> Result<Released, String> {
+        // AMP #2801's returned path first: amp_return_task clears the dispatch and the start,
+        // records returned_at/returned_reason (so the ticket shows up under the manager's
+        // `returned` list), and writes the history and audit entry. A started ticket — which is
+        // what every harness run leaves behind, because the harness claims for its worker — is
+        // returned only for the run holding its current dispatch (AMP #2909), so the token goes
+        // with the call. A stale token is refused (the ticket is another run's now).
+        let reason = release_reason(why);
+        let mut args = json!({"task_id": task_id, "reason": reason});
+        if !dispatch_id.is_empty() {
+            args["dispatch_id"] = json!(dispatch_id);
+        }
+        let returned = self.call(RETURN_TOOL, args, RELEASE_TIMEOUT).await;
+        tracing::debug!(ticket = task_id, why = %why, ok = returned.is_ok(), "handing a ticket back");
+        match returned {
+            Ok(()) => {
+                self.forget(task_id);
+                Ok(Released::Returned)
+            }
+            Err(e) if is_refused_started(&e) || is_unknown_tool(&e, RETURN_TOOL) => {
+                // An older server (before AMP #2909) refuses a started ticket even with its
+                // dispatch_id; so does any server when there is no token to present. A server
+                // older still (before AMP #2801, or one that rolled it back) has no
+                // amp_return_task at all: mcp-go answers "tool 'amp_return_task' not found",
+                // and the ticket goes back the way #2204 always sent it (AMP #2946).
+                // Documented fallback, not a workaround: amp_return_task's own refusal says to
+                // "block it with a question, or close it out with closeout_reason"; the harness
+                // does neither (the work didn't finish and it has no question), so it uses the
+                // manager's escape hatch — the same `amp_set_task_state(backlog)` the #2204
+                // cancellation path has always used. The refusal is recorded, so the difference
+                // is visible in the run's notes and on the ticket's own history.
+                let out = self
+                    .call(
+                        SET_STATE_TOOL,
+                        json!({
+                            "task_id": task_id,
+                            "state": READY_STATE,
+                            "reason": reason,
+                        }),
+                        RELEASE_TIMEOUT,
+                    )
+                    .await;
+                match &out {
+                    // The ticket IS back in ready: the fallback did what the returned path would
+                    // have. `Ok` means exactly that (see [`Released::SetBack`]), so the person is
+                    // not told a ticket they can re-dispatch is stuck in progress.
+                    Ok(()) => {
+                        self.forget(task_id);
+                        if is_refused_started(&e) {
+                            Ok(Released::SetBack)
+                        } else {
+                            Ok(Released::SetBackOldServer)
+                        }
+                    }
+                    Err(fallback) => {
+                        Err(format!("{RETURN_TOOL}: {e}; {SET_STATE_TOOL}: {fallback}"))
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// One AMP tool call, `Ok(())` when it succeeded. `Err` is AMP's own message.
+    async fn call(&self, tool: &str, args: Value, timeout: Duration) -> Result<(), String> {
+        let Value::Object(args) = args else {
+            return Err(format!("{tool}: arguments must be an object"));
+        };
+        match self
+            .mcp
+            .call_tool_with_timeout(tool, Some(args), timeout)
+            .await
+        {
+            Ok(r) if r.is_error == Some(true) => Err(result_text(&r).trim().to_owned()),
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     /// `amp_report_run` for a worker that ended without closing its ticket.
@@ -272,6 +414,11 @@ impl RunReporter {
         args.insert("task_id".into(), json!(worker.task_id));
         args.insert("outcome".into(), json!(ABANDONED));
         args.insert("agent_id".into(), json!(worker.agent_id));
+        // AMP #2801: the token identifies the run this report is about (an annotation: the report
+        // itself starts the ticket by the fallback when its worker never claimed).
+        if !worker.dispatch_id.is_empty() {
+            args.insert("dispatch_id".into(), json!(worker.dispatch_id));
+        }
         let note = abandoned_note(report);
         args.insert("run_note".into(), json!(note));
         match self
@@ -300,6 +447,123 @@ pub fn release_reason(why: &str) -> String {
     reason
 }
 
+/// Whether AMP refused `amp_return_task` because the ticket was started (AMP #2801: "task N was
+/// started (by X): returning it would pull it out from under a worker that is running"). That is
+/// the one refusal the harness answers by setting the state back instead.
+pub fn is_refused_started(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("was started") || m.contains("started (by")
+}
+
+/// Whether `message` says the server has no tool named `tool` (AMP #2946): an AMP from before
+/// that tool existed. mcp-go answers an unknown tool with a JSON-RPC error, "tool 'X' not found:
+/// tool not found"; other servers say "unknown tool X". A ticket that isn't found ("task 12 not
+/// found") is not this.
+pub fn is_unknown_tool(message: &str, tool: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    let tool = tool.to_ascii_lowercase();
+    m.contains("tool not found")
+        || m.contains(&format!("unknown tool {tool}"))
+        || m.contains(&format!("unknown tool: {tool}"))
+        || (m.contains(&format!("tool '{tool}'")) && m.contains("not found"))
+        || (m.contains(&format!("tool \"{tool}\"")) && m.contains("not found"))
+}
+
+/// How a ticket got back to ready, when it did (AMP #2802). Both are a success — the ticket is in
+/// ready either way — but the difference is visible, so nobody has to guess which call did it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Released {
+    /// AMP's returned path: `amp_return_task` cleared the dispatch and recorded the return.
+    Returned,
+    /// The fallback: AMP refused `amp_return_task` because the ticket was started (a server
+    /// older than AMP #2909, or no dispatch_id to present), so `amp_set_task_state` put it back. The dispatch token is not cleared and no return is
+    /// recorded, so the ticket is re-dispatchable but not listed under AMP's `returned`.
+    SetBack,
+    /// The fallback on a server that has no `amp_return_task` at all (before AMP #2801, or after
+    /// rolling it back): `amp_set_task_state` put it back, as #2204 always did (AMP #2946).
+    SetBackOldServer,
+}
+
+impl Released {
+    /// What the run's note says it did. Both lines start `returned #N to ready` so a reader (and
+    /// a test) can tell the ticket is out of progress without parsing the mechanism.
+    pub fn note(self, task_id: i64) -> String {
+        match self {
+            Self::Returned => {
+                format!("returned #{task_id} to ready in AMP (nobody is working on it now)")
+            }
+            Self::SetBack => format!(
+                "returned #{task_id} to ready in AMP: it was already started, so {RETURN_TOOL} \
+                 refused it and {SET_STATE_TOOL} put it back instead (that does not clear the \
+                 dispatch or record a return)"
+            ),
+            Self::SetBackOldServer => format!(
+                "returned #{task_id} to ready in AMP: this AMP server has no {RETURN_TOOL}, so \
+                 {SET_STATE_TOOL} put it back instead (that does not record a return)"
+            ),
+        }
+    }
+}
+
+/// What the person at the chat is told when a worker's ticket came back, in the manager's own
+/// words (AMP #2802 item 3). Names the ticket, the agent and the outcome, so the person can
+/// decide: re-dispatch it, or look at the ticket.
+pub fn returned_notice(
+    worker: &WorkerInfo,
+    report: &WorkerReport,
+    released: &Result<Released, String>,
+) -> String {
+    let what = match report.outcome {
+        WorkerOutcome::Timeout => format!("timed out after {}", human(report.duration_ms)),
+        WorkerOutcome::TurnBudget => "used up its turn budget".to_owned(),
+        WorkerOutcome::Cancelled => "was stopped".to_owned(),
+        WorkerOutcome::Error => match report.error.as_deref().map(str::trim) {
+            Some(e) if !e.is_empty() => format!("failed: {e}"),
+            _ => "failed".to_owned(),
+        },
+        WorkerOutcome::Stopped => "stopped without finishing".to_owned(),
+        // Closed tickets never reach here.
+        WorkerOutcome::Completed | WorkerOutcome::Blocked => "finished".to_owned(),
+    };
+    match released {
+        Ok(how) => match how {
+            Released::Returned => format!(
+                "#{0} was returned: worker {1} {what}. It's back in ready; re-dispatch it or ask \
+                 your user.",
+                worker.task_id, worker.agent_id
+            ),
+            // Also back in ready, but by the fallback: say so, so nobody looks for it under
+            // AMP's `returned` list and fails to find it.
+            Released::SetBack => format!(
+                "#{0} was returned: worker {1} {what}. It's back in ready (it had already been \
+                 started, so it was set back rather than returned); re-dispatch it or ask your user.",
+                worker.task_id, worker.agent_id
+            ),
+            Released::SetBackOldServer => format!(
+                "#{0} was returned: worker {1} {what}. It's back in ready (this AMP server is too \
+                 old to record a return, so it was set back); re-dispatch it or ask your user.",
+                worker.task_id, worker.agent_id
+            ),
+        },
+        Err(e) => format!(
+            "#{0}: worker {1} {what}, and it could not be returned: {e}. It may still be in \
+             progress; check the ticket.",
+            worker.task_id, worker.agent_id
+        ),
+    }
+}
+
+/// `20 min`, `3 s`, `1 h 2 min`: how long a run took, for a notice.
+fn human(ms: u64) -> String {
+    let secs = ms / 1000;
+    match secs {
+        0 => "under a second".to_owned(),
+        s if s < 60 => format!("{s} s"),
+        s if s < 3600 => format!("{} min", s / 60),
+        s => format!("{} h {} min", s / 3600, (s % 3600) / 60),
+    }
+}
+
 type HookFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Option<BeforeToolCallResult>> + Send>>;
 
@@ -313,6 +577,10 @@ impl WorkerHooks for RunReporter {
         let no_git = worktree.is_none()
             && (!worker.git || worker.workspace == crate::workspace::Placement::Folder);
         let totals = Arc::clone(&worker.totals);
+        // AMP #2801/#2802: the dispatch_id makes the completion the worker's own rather than a
+        // closeout. The worker may not know it (an old prompt, a model that forgot), so the
+        // harness fills it in exactly as it fills the usage fields: only when it was left out.
+        let dispatch_id = worker.dispatch_id.clone();
         Some(Arc::new(
             move |ctx: BeforeToolCallContext<'_>, _signal: CancellationToken| -> HookFuture {
                 let name = ctx.tool_call.name.as_str();
@@ -324,6 +592,7 @@ impl WorkerHooks for RunReporter {
                 let args = ctx.args.clone();
                 let model = model.clone();
                 let worktree = worktree.clone();
+                let dispatch_id = dispatch_id.clone();
                 // Read now: the totals already include the message that made this call.
                 let totals = totals.lock().unwrap().clone();
                 Box::pin(async move {
@@ -331,7 +600,10 @@ impl WorkerHooks for RunReporter {
                         Some(wt) => git_state(wt).await,
                         None => None,
                     };
-                    let fields = run_fields(&model, &totals, git.as_ref());
+                    let mut fields = run_fields(&model, &totals, git.as_ref());
+                    if !dispatch_id.is_empty() {
+                        fields.insert("dispatch_id".into(), json!(dispatch_id));
+                    }
                     // #2364: a worker with no git of its own has no git fields; drop whatever
                     // it made up (a real run passed branch "__OMIT__").
                     let stripped = no_git.then(|| drop_git_fields(&args)).flatten();
@@ -359,44 +631,63 @@ impl WorkerHooks for RunReporter {
 
     async fn on_finish(&self, worker: &WorkerInfo, report: &mut WorkerReport) {
         if report.outcome.closed_ticket() {
+            // The worker closed its ticket: nothing is left in progress, so the ledger record
+            // that would have swept it at the next startup goes away (AMP #2802).
+            self.forget(worker.task_id);
             return;
         }
         let note = self.report_abandoned(worker, report).await;
         report.notes.push(note);
-        // #2204: a worker the chat stopped (Esc/Ctrl+C on the reply, or quitting) leaves nobody
-        // on its ticket: hand it back so it isn't stuck in progress. Other ends (error, timeout,
-        // turn budget, stopped) go back to a live manager, which decides what happens next.
-        if report.outcome == WorkerOutcome::Cancelled {
-            let id = worker.task_id;
-            report
-                .notes
-                .push(match self.release(id, &abandoned_note(report)).await {
-                    Ok(()) => {
-                        format!("returned #{id} to ready in AMP (nobody is working on it now)")
-                    }
-                    Err(e) => format!("could not return #{id} to ready in AMP: {e}"),
-                });
-        }
+        // AMP #2802: every end that doesn't close the ticket hands it back. AMP's whole point in
+        // the dispatch-integrity work is that a ticket must not stay in progress with nobody on
+        // it, and a chat whose worker errored, timed out, used up its turn budget, was stopped,
+        // or was cancelled has nobody on it. The manager is told, in words, either way.
+        let id = worker.task_id;
+        let why = abandoned_note(report);
+        let released = self.hand_back(id, &worker.dispatch_id, &why).await;
+        report.returned = Some(released.as_ref().map(|_| ()).map_err(String::clone));
+        report.notes.push(match &released {
+            Ok(how) => how.note(id),
+            Err(e) => format!("could not return #{id} to ready in AMP: {e}"),
+        });
+        // AMP #2802 item 3: the manager is told, in words that say what to do next. This is the
+        // manager's conversation — `amp_run_ticket`'s result is what the manager reads, and the
+        // run's `returned` field says the same thing in machine form. It is deliberately *not*
+        // also a transcript row: the `■ worker finished` line for this run is already there, and
+        // a second paragraph per run pushed the conversation off a small screen (it is what
+        // broke #2347's 80x24 chat in `chat_worker_watch`). The /workers panel shows it too
+        // (`ticket returned to ready` / why not), so a person sees where the ticket went.
+        report
+            .notes
+            .push(returned_notice(worker, report, &released));
     }
 
-    async fn release(&self, task_id: i64, why: &str) -> Result<(), String> {
-        let args = json!({
-            "task_id": task_id,
-            "state": READY_STATE,
-            "reason": release_reason(why),
-        });
-        let Value::Object(args) = args else {
-            unreachable!()
-        };
-        match self
-            .mcp
-            .call_tool_with_timeout(SET_STATE_TOOL, Some(args), RELEASE_TIMEOUT)
-            .await
-        {
-            Ok(r) if r.is_error == Some(true) => Err(result_text(&r).trim().to_owned()),
-            Ok(_) => Ok(()),
-            Err(e) => Err(e.to_string()),
+    /// A ticket this process hands back while nobody is at the chat (the startup orphan sweep)
+    /// has no run to carry it, so it is said as a transcript line.
+    fn notice(&self, text: &str) {
+        self.tell(text);
+    }
+
+    /// [`WorkerHooks::release`]: the ticket is in ready when this is `Ok` (`Err` is AMP's own
+    /// message). [`RunReporter::hand_back`] is the same work with the path it took.
+    async fn release(&self, task_id: i64, dispatch_id: &str, why: &str) -> Result<(), String> {
+        self.hand_back(task_id, dispatch_id, why).await.map(|_| ())
+    }
+
+    async fn release_with_token(
+        &self,
+        task_id: i64,
+        dispatch_id: &str,
+        why: &str,
+    ) -> Result<(), String> {
+        // AMP #2948: no token, nothing that proves the ticket is this server's; and no
+        // amp_set_task_state fallback, which checks no token.
+        if dispatch_id.is_empty() {
+            return Err("no dispatch token to present".to_owned());
         }
+        let args =
+            json!({"task_id": task_id, "reason": release_reason(why), "dispatch_id": dispatch_id});
+        self.call(RETURN_TOOL, args, RELEASE_TIMEOUT).await
     }
 }
 
@@ -578,6 +869,9 @@ mod tests {
             agent_id: "amp:amp-worker-backend".into(),
             role: "amp-worker-backend".into(),
             outcome,
+            dispatch_id: String::new(),
+            started: false,
+            returned: None,
             final_message: String::new(),
             error: error.map(str::to_owned),
             model: "wf/wf-1".into(),

@@ -72,8 +72,8 @@ impl WorkerHooks for SlowReporter {
         self.0.on_finish(worker, report).await;
     }
 
-    async fn release(&self, task_id: i64, why: &str) -> Result<(), String> {
-        self.0.release(task_id, why).await
+    async fn release(&self, task_id: i64, dispatch_id: &str, why: &str) -> Result<(), String> {
+        self.0.release(task_id, dispatch_id, why).await
     }
 }
 
@@ -236,8 +236,24 @@ impl Rig {
         self.amp.mock.calls_to("amp_report_run")
     }
 
-    /// `amp_set_task_state` calls: tickets handed back to ready (#2204).
+    /// The tickets handed back to ready: `amp_return_task` (AMP #2801's returned path, which the
+    /// harness prefers) and `amp_set_task_state` (the fallback for a started ticket). What these
+    /// tests are about is that the ticket is no longer in progress with nobody on it (#2204), not
+    /// which of the two calls did it — `returned_calls` below is for the one test that reads the
+    /// reason text.
     fn releases(&self) -> Vec<Value> {
+        let mut all = self.amp.mock.calls_to("amp_return_task");
+        all.extend(self.amp.mock.calls_to("amp_set_task_state"));
+        all
+    }
+
+    /// Only `amp_return_task` calls: the returned path, with its `reason`.
+    fn returned_calls(&self) -> Vec<Value> {
+        self.amp.mock.calls_to("amp_return_task")
+    }
+
+    /// Only `amp_set_task_state` calls: the fallback for a ticket AMP won't return.
+    fn set_state_calls(&self) -> Vec<Value> {
         self.amp.mock.calls_to("amp_set_task_state")
     }
 
@@ -318,11 +334,21 @@ async fn quitting_mid_dispatch_waits_for_the_abandoned_run_report() {
         screen.contains("stopping 1 worker and reporting its runs"),
         "{screen}"
     );
-    // #2204: and the ticket is no longer in progress with nobody on it.
-    let released = r.releases();
+    // #2204: and the ticket is no longer in progress with nobody on it. AMP #2801's returned path
+    // is what does it now (`calls_to` gives a call's arguments, so the returned path's field is
+    // `reason`, not `state`).
+    assert_eq!(r.set_state_calls(), Vec::<Value>::new());
+    let released = r.returned_calls();
     assert_eq!(released.len(), 1, "{released:?}");
     assert_eq!(released[0]["task_id"], 2144);
-    assert_eq!(released[0]["state"], "backlog");
+    assert!(
+        released[0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cancelled"),
+        "{}",
+        released[0]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -352,10 +378,13 @@ async fn a_second_ctrl_c_skips_the_wait() {
         "{screen}"
     );
     assert_eq!(r.shell.released(), &[(2145, Ok(()))]);
+    // AMP #2801's returned path is what hands it back now (the mock answers it); the fallback is
+    // only for a ticket AMP refuses to return.
+    assert!(r.set_state_calls().is_empty(), "{:?}", r.set_state_calls());
     let released = r.releases();
     assert_eq!(released.len(), 1, "{released:?}");
     assert_eq!(released[0]["task_id"], 2145);
-    assert_eq!(released[0]["state"], "backlog");
+    assert_eq!(r.returned_calls()[0]["task_id"], 2145);
     assert!(
         released[0]["reason"]
             .as_str()
@@ -404,7 +433,7 @@ async fn ctrl_c_with_a_worker_running_asks_before_quitting() {
     let released = r.releases();
     assert_eq!(released.len(), 1, "{released:?}");
     assert_eq!(released[0]["task_id"], 2147);
-    assert_eq!(released[0]["state"], "backlog");
+    assert_eq!(r.returned_calls()[0]["task_id"], 2147);
 }
 
 /// #2204: `/quit` and Ctrl+D ask the same way; either confirms the other.

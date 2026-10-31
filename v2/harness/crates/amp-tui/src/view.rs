@@ -1,25 +1,33 @@
 //! The chat screen: pi's components laid out as D10 describes, updated from rpi agent events.
 //!
-//! Top to bottom:
-//! 1. **header slot**: the AMP header ([`crate::chrome`]: brand bands, instance/user,
-//!    org › project, MCP health; the current ticket);
-//! 2. the **transcript** in a primary scroll view (banner, user messages, assistant messages,
-//!    tool calls, notices), built from rpi-tui's own components so it reads like pi;
-//! 3. pi's **status slot** (the retry countdown);
-//! 4. the **AMP panel slot** ([`crate::overlay`]): what `/amp`, `/ticket`, `/workers`,
-//!    `/questions`, `/plan` and `/project` show, docked above the editor while open;
-//! 5. the **`/` menu** ([`crate::slash`]): the commands matching what is typed after `/`;
-//! 6. the **editor** (pi's, with the working spinner in its top border while a run is going, and
-//!    the dim placeholder [`PLACEHOLDER`] while it is empty);
-//! 7. **AMP status line slot**: [`crate::chrome`]'s status line (questions, workers, plan
-//!    approval, board counts, artifacts in review, run reported);
-//! 8. the **footer** ([`crate::footer`], #2186): cwd (branch) • session, `$0.004 · ctx 4%` and
-//!    model • thinking; one row below [`crate::footer::FOLD_BELOW`] columns, two above (one at
-//!    any width when compact, [`crate::density`]).
+//! Top to bottom, the sections in titled boxes ([`crate::frame`], AMP #2882, artifact #26):
+//! 1. the **Conversation box**: the AMP header ([`crate::chrome`]: brand bands, project, org,
+//!    user, host, MCP health) in its top edge; inside, the current ticket's line, a worker
+//!    session's bar, and the **transcript** in a primary scroll view (banner, user messages,
+//!    assistant messages, tool calls, notices), built from rpi-tui's own components so it reads
+//!    like pi;
+//! 2. pi's **status slot** (the retry countdown);
+//! 3. the **AMP panel box** ([`crate::overlay`]): what `/amp`, `/ticket`, `/workers`,
+//!    `/questions`, `/plan` and `/project` show, docked above the editor while open, titled
+//!    with the panel and its key hint in the bottom edge;
+//! 4. the **`/` menu** ([`crate::slash`]): the commands matching what is typed after `/`;
+//! 5. the **Workers box** ([`crate::roster::WorkerStrip`]), only while this chat's workers run
+//!    (and not while `/workers` shows them): one row per worker, the count and keys in its title;
+//! 6. the **Message box**: the editor (pi's, with the dim placeholder [`PLACEHOLDER`] while it
+//!    is empty); while a reply runs its title says `⠋ manager replying 12s · Esc stops`, with
+//!    the queued prompts' count;
+//! 7. **AMP status line slot** (outside the boxes): [`crate::chrome`]'s status line (questions,
+//!    plan approval, board counts, artifacts in review, run reported);
+//! 8. the **footer** ([`crate::footer`], #2186, outside the boxes): cwd (branch) • session,
+//!    `$0.004 · ctx 4%` and model • thinking; one row below [`crate::footer::FOLD_BELOW`]
+//!    columns, two above (one at any width when compact, [`crate::density`]).
 //!
-//! Every area sits [`crate::inset::Padding`] columns in from the left and right edges
-//! (`[tui] padding`, #2251; halved at 80 columns or fewer, #2344); the transcript's inset is
-//! inside its scroll view. A blank row sits above the header and below the footer
+//! The box with the keys (the Message box, an open panel, or the Workers box after Ctrl+W) has
+//! the brighter border and a bold title. Boxes sit [`crate::frame::margin`] columns from the
+//! edges and keep one column of padding inside, so the text keeps the column it had with
+//! [`crate::inset::Padding`] alone (`[tui] padding`, #2251; halved at 80 columns or fewer,
+//! #2344); the status line and footer keep that padding. A blank row sits above the screen (none
+//! below it since the boxes, #2882)
 //! ([`crate::inset::Gap`], #2344; none on terminals under 24 rows): call
 //! [`ChatView::set_height`] with the terminal's height before a frame.
 //!
@@ -56,8 +64,9 @@ use amp_core::provider_error;
 use crate::amp_render;
 use crate::chrome::{Chrome, clean, shorten};
 use crate::footer::Footer;
+use crate::frame::{BorderRow, Edge, Framed, Gutter, Spacer, Titles, TitlesFn};
 use crate::inset::{Gap, Inset, Padding};
-use crate::overlay::Panel;
+use crate::overlay::{Panel, PanelKind};
 use crate::roster::{NoticeKind, Roster, WorkerNotice, WorkerStrip};
 use crate::scroll::{TranscriptScroll, paint_pill};
 use crate::slash::CommandMenu;
@@ -68,13 +77,16 @@ use crate::transcript::{
 use rpi_agent::{AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, Content, StopReason, Usage};
 use rpi_tui::{
-    CURSOR_MARKER, Component, Container, Editor, EditorOptions, EditorStyle, Focusable,
+    CURSOR_MARKER, Component, Container, Editor, EditorOptions, EditorStyle, Focusable, HStack,
     Keybindings, ScrollView, StackChild, StackEntry, StatusIndicator, VStack, WorkingState,
     strip_ansi, theme,
 };
 
 /// The tools that hand a ticket to a worker: their line gets the worker's live row (#2347).
 const WORKER_TOOLS: &[&str] = &["amp_run_ticket", "amp_dispatch_task"];
+
+/// What the Message box's title says while the manager replies (#2882; was `Working…`).
+pub const REPLYING: &str = "manager replying";
 
 /// The dim hint in the empty editor (#2182).
 pub const PLACEHOLDER: &str = "/ for commands";
@@ -121,7 +133,7 @@ pub struct ChatView {
     /// Holds the editor, or the session's keys line.
     editor_slot: Arc<Container>,
     editor_view: Arc<dyn Component>,
-    session_shown: std::sync::atomic::AtomicBool,
+    session_shown: Arc<AtomicBool>,
     status: Arc<Container>,
     editor: Arc<Editor>,
     amp_status: Arc<Container>,
@@ -169,8 +181,14 @@ pub struct ChatView {
     placeholder: Arc<Mutex<&'static str>>,
     /// The left and right padding every area shares (#2251).
     padding: Padding,
-    /// The editor's inset (what the layout places), to find it in a frame for clicks (#2344).
+    /// The Message box (what the layout places), to find it in a frame for clicks (#2344).
     editor_box: Arc<dyn Component>,
+    message_box: Arc<Framed>,
+    /// The transcript holds rows that start at the screen's edge (the pairing link, #2423): the
+    /// Conversation box drops its sides and the transcript gets [`Self::inner_padding`].
+    flush: Arc<AtomicBool>,
+    /// The transcript's own inset: 0 inside the box's sides, the padding without them.
+    inner_padding: Padding,
     /// Whether the input has the keys: the editor then shows the terminal cursor (#2344).
     input_focus: Arc<AtomicBool>,
     /// The blank rows above and below the screen (#2344).
@@ -199,17 +217,26 @@ impl ChatView {
             Arc::new(Inset::new(c, padding.clone()))
         };
         let chrome = Chrome::new();
+        // #2882: the Workers box shows this chat's workers, so the status line leaves them out.
+        chrome.hide_workers(true);
         let roster = Roster::default();
         chrome.set_roster(roster.clone());
         let strip = Arc::new(WorkerStrip::new(roster.clone()));
+        // Inside the Conversation box, above the transcript: the current ticket's line.
         let header = Arc::new(Container::new());
-        header.add_child(chrome.header());
+        header.add_child(Arc::new(TicketLine(chrome.clone())));
         let transcript = Arc::new(Container::new());
         let transcript_slot = Arc::new(Container::new());
         transcript_slot.add_child(transcript.clone());
-        let scroll = TranscriptScroll::new(Arc::new(ScrollView::primary(inset(
+        // The transcript's entries keep their own one-column padding inside the box. While the
+        // transcript holds rows that must start at the screen's edge (the pairing link, #2423),
+        // the box has no sides and the transcript is inset as before the boxes.
+        let flush = Arc::new(AtomicBool::new(false));
+        let inner_padding = Padding::new(0);
+        let scroll = TranscriptScroll::new(Arc::new(ScrollView::primary(Arc::new(Inset::new(
             transcript_slot.clone(),
-        ))));
+            inner_padding.clone(),
+        )))));
         let session_slot = Arc::new(Container::new());
         let status = Arc::new(Container::new());
         let panel = Panel::new(chrome.clone());
@@ -227,6 +254,7 @@ impl ChatView {
         let hint = Arc::new(Mutex::new(None));
         let placeholder = Arc::new(Mutex::new(PLACEHOLDER));
         let input_focus = Arc::new(AtomicBool::new(true));
+        let session_shown = Arc::new(AtomicBool::new(false));
         let editor_slot = Arc::new(Container::new());
         let editor_view: Arc<dyn Component> = Arc::new(EditorView {
             editor: editor.clone(),
@@ -238,13 +266,79 @@ impl ChatView {
         let amp_status = Arc::new(Container::new());
         amp_status.add_child(chrome.status_line());
         let footer = Arc::new(Footer::new());
-        let editor_box = inset(editor_slot.clone());
         let gap = Gap::default();
 
-        let root = VStack::from_children(vec![
-            StackChild::Entry(StackEntry::new(Arc::new(gap.clone())).shrink(0)),
-            StackChild::Entry(StackEntry::new(inset(header.clone())).shrink(0)),
-            StackChild::Entry(StackEntry::new(inset(session_slot.clone())).shrink(0)),
+        // The Message box: bright while it has the keys (no panel open, the Workers box not
+        // focused), the reply's spinner on the right of its title.
+        let message_titles: TitlesFn = {
+            let (editor, panel, strip, shown) = (
+                editor.clone(),
+                panel.clone(),
+                strip.clone(),
+                Arc::clone(&session_shown),
+            );
+            Arc::new(move |_| {
+                let session = shown.load(Ordering::SeqCst);
+                let focused = session || (!panel.is_open() && !strip.is_focused());
+                Titles {
+                    left: crate::frame::label(if session { "Session" } else { "Message" }, focused),
+                    right: if session {
+                        String::new()
+                    } else {
+                        working_title(editor.working())
+                    },
+                    bottom: String::new(),
+                    focused,
+                }
+            })
+        };
+        let message_box = Arc::new(Framed::new(
+            editor_slot.clone(),
+            message_titles,
+            padding.clone(),
+        ));
+        let editor_box: Arc<dyn Component> = message_box.clone();
+        // The Workers box, unless `/workers` shows them in its own box.
+        let strip_box: Arc<dyn Component> = {
+            let (s, p) = (strip.clone(), panel.clone());
+            let titles: TitlesFn = Arc::new(move |w| s.titles(w));
+            Arc::new(Framed::new(
+                Arc::new(StripView {
+                    strip: strip.clone(),
+                    panel: p,
+                }),
+                titles,
+                padding.clone(),
+            ))
+        };
+        let panel_box: Arc<dyn Component> = {
+            let p = panel.clone();
+            let titles: TitlesFn = Arc::new(move |w| p.titles(w));
+            Arc::new(Framed::new(panel_slot, titles, padding.clone()))
+        };
+
+        // The Conversation box: the header in its top edge; its sides beside the transcript are
+        // columns of an HStack so the scroll view keeps the layout engine (scrolling, clicks,
+        // the "↓ new output" pill).
+        let header_titles: TitlesFn = {
+            let chrome = chrome.clone();
+            Arc::new(move |w| match chrome.header_title(w) {
+                Some((left, right)) => Titles {
+                    left,
+                    right,
+                    ..Titles::default()
+                },
+                None => Titles {
+                    left: crate::frame::label("Conversation", false),
+                    ..Titles::default()
+                },
+            })
+        };
+        let no_titles: TitlesFn = Arc::new(|_| Titles::default());
+        let drawn = Arc::new(AtomicBool::new(true));
+        let inside = VStack::from_children(vec![
+            StackChild::Entry(StackEntry::new(Arc::new(Pad(header.clone()))).shrink(0)),
+            StackChild::Entry(StackEntry::new(Arc::new(Pad(session_slot.clone()))).shrink(0)),
             StackChild::Entry(
                 StackEntry::new(scroll.view().clone())
                     .basis(0)
@@ -252,14 +346,62 @@ impl ChatView {
                     .shrink(1)
                     .min_size(1),
             ),
+        ]);
+        let middle = HStack::from_entries(vec![
+            StackEntry::new(Arc::new(Gutter::new(
+                padding.clone(),
+                Arc::clone(&drawn),
+                Arc::clone(&flush),
+                true,
+            )))
+            .shrink(0),
+            StackEntry::new(Arc::new(Edge::new(Arc::clone(&drawn)))).shrink(0),
+            StackEntry::new(Arc::new(inside)).basis(0).grow(1).shrink(1),
+            StackEntry::new(Arc::new(Spacer::new(
+                Arc::clone(&drawn),
+                Arc::clone(&flush),
+            )))
+            .shrink(0),
+            StackEntry::new(Arc::new(Edge::new(Arc::clone(&drawn)))).shrink(0),
+            StackEntry::new(Arc::new(Gutter::new(
+                padding.clone(),
+                Arc::clone(&drawn),
+                Arc::clone(&flush),
+                false,
+            )))
+            .shrink(0),
+        ]);
+
+        let root = VStack::from_children(vec![
+            StackChild::Entry(StackEntry::new(Arc::new(gap.clone())).shrink(0)),
+            StackChild::Entry(
+                StackEntry::new(Arc::new(BorderRow::new(
+                    true,
+                    header_titles,
+                    padding.clone(),
+                )))
+                .shrink(0),
+            ),
+            StackChild::Entry(
+                StackEntry::new(Arc::new(middle))
+                    .basis(0)
+                    .grow(1)
+                    .shrink(1)
+                    .min_size(1),
+            ),
+            StackChild::Entry(
+                StackEntry::new(Arc::new(BorderRow::new(false, no_titles, padding.clone())))
+                    .shrink(0),
+            ),
             StackChild::Entry(StackEntry::new(inset(status.clone()))),
-            StackChild::Entry(StackEntry::new(inset(panel_slot)).shrink(1)),
+            StackChild::Entry(StackEntry::new(panel_box).shrink(1)),
             StackChild::Entry(StackEntry::new(inset(menu_slot)).shrink(1)),
-            StackChild::Entry(StackEntry::new(inset(strip.clone())).shrink(1)),
+            StackChild::Entry(StackEntry::new(strip_box).shrink(1)),
             StackChild::Entry(StackEntry::new(editor_box.clone()).shrink(0).min_size(3)),
             StackChild::Entry(StackEntry::new(inset(amp_status.clone())).shrink(0)),
+            // #2882 (artifact #26): no blank row under the footer; the boxes already separate
+            // the screen, and the row goes to the conversation.
             StackChild::Entry(StackEntry::new(inset(footer.clone()))),
-            StackChild::Entry(StackEntry::new(Arc::new(gap.clone())).shrink(0)),
         ]);
         Self {
             header,
@@ -268,7 +410,7 @@ impl ChatView {
             session_slot,
             editor_slot,
             editor_view,
-            session_shown: std::sync::atomic::AtomicBool::new(false),
+            session_shown,
             status,
             editor,
             amp_status,
@@ -294,6 +436,9 @@ impl ChatView {
             placeholder,
             padding,
             editor_box,
+            message_box,
+            flush,
+            inner_padding,
             input_focus,
             gap,
             roster,
@@ -315,11 +460,15 @@ impl ChatView {
 
     /// Adds a `▶ worker started` / `■ worker finished` line for `task_id` (#2347).
     pub fn add_worker_notice(&self, task_id: i64, kind: NoticeKind) {
-        self.add_to_transcript(Arc::new(WorkerNotice::new(
-            task_id,
-            kind,
-            self.roster.clone(),
-        )));
+        // #2882: a run of notices isn't split by blank rows.
+        let after_notice = self
+            .transcript
+            .get_children()
+            .last()
+            .is_some_and(|c| c.as_any().is::<WorkerNotice>());
+        self.add_to_transcript(Arc::new(
+            WorkerNotice::new(task_id, kind, self.roster.clone()).with_gap_above(!after_notice),
+        ));
     }
 
     /// The terminal's height, before a frame is laid out (#2344): picks the blank rows above
@@ -385,12 +534,12 @@ impl ChatView {
         if row < rect.y || row >= rect.y + rect.height || column >= rect.x + rect.width {
             return None;
         }
-        let pad = self.padding.at(rect.width);
-        let inner = rect.width.saturating_sub(2 * pad);
+        let left = self.message_box.content_left(rect.width);
+        let inner = self.message_box.content_width(rect.width);
         // The box is a border row, the text rows, a border row.
         let text_rows = rect.height.saturating_sub(2).max(1);
         let visual = (row - rect.y).saturating_sub(1).min(text_rows - 1);
-        let col = column.saturating_sub(rect.x + pad);
+        let col = column.saturating_sub(rect.x + left);
         let text = self.editor.get_text();
         let lines: Vec<&str> = text.split('\n').collect();
         let (cursor_row, _) = self.editor.cursor_position();
@@ -436,6 +585,9 @@ impl ChatView {
     /// [`crate::MAX_PADDING`]). Narrow terminals get less ([`Padding::at`]).
     pub fn set_padding(&self, columns: usize) {
         self.padding.set(columns);
+        if self.flush.load(Ordering::Relaxed) {
+            self.inner_padding.set(columns);
+        }
         self.root.invalidate();
     }
 
@@ -517,8 +669,13 @@ impl ChatView {
         let frame = self.layout(width, height);
         let view: Arc<dyn Component> = self.scroll.view().clone();
         let rect = find_box(&frame.root, &view)?;
+        // The transcript fills the scroll view (the box's edges and margin are outside it), less
+        // its own inset while the box has no sides.
         let content = self.scroll.view().get_content_width(rect.width);
-        Some((rect, content.saturating_sub(2 * self.padding.at(content))))
+        Some((
+            rect,
+            content.saturating_sub(2 * self.inner_padding.at(content)),
+        ))
     }
 
     /// Every thinking header in the shown transcript at `width`: its line, its message and the
@@ -642,12 +799,21 @@ impl ChatView {
 
     /// Adds a component to the transcript (the ticket marker).
     pub fn add_to_transcript(&self, component: Arc<dyn Component>) {
+        // #2423: the pairing link's rows start at the screen's edge, so a selection of them is
+        // the link: the Conversation box drops its sides from then on (#2882).
+        if component.as_any().is::<crate::remote_ui::LinkBlock>()
+            && !self.flush.swap(true, Ordering::Relaxed)
+        {
+            self.inner_padding.set(self.padding.columns());
+            self.root.invalidate();
+        }
         self.scroll.touch();
         self.end_group();
         self.transcript.add_child(component);
     }
 
-    /// The header slot: the AMP header (2 lines, the second only while a ticket is current).
+    /// The header slot, inside the Conversation box: the current ticket's line (the rest of the
+    /// AMP header is the box's top edge, #2882).
     pub fn header_slot(&self) -> &Arc<Container> {
         &self.header
     }
@@ -810,7 +976,7 @@ impl ChatView {
                 self.editor.set_working(Some(WorkingState {
                     frame: 0,
                     started_at: Instant::now(),
-                    message: "Working…".to_owned(),
+                    message: REPLYING.to_owned(),
                 }));
             }
         } else if self.editor.working().is_some() {
@@ -818,7 +984,7 @@ impl ChatView {
         }
     }
 
-    /// The text next to the working spinner ("Working…", or a short hint), keeping the spinner's
+    /// The text next to the working spinner ([`REPLYING`], or a short hint), keeping the spinner's
     /// frame and elapsed time. Does nothing when no run is going.
     pub fn set_working_message(&self, message: &str) {
         if let Some(mut working) = self.editor.working()
@@ -1148,6 +1314,12 @@ impl Component for EditorView {
             self.editor.set_border_color(muted);
         }
         let mut lines = self.placeholder(self.editor.render(width));
+        // #2882: the Message box draws the edges; the editor's own rules (and the spinner in the
+        // top one, now in the box's title) go.
+        if lines.len() >= 2 {
+            lines.pop();
+            lines.remove(0);
+        }
         if !self.focus.load(Ordering::Relaxed) {
             for line in &mut lines {
                 *line = line.replace(CURSOR_MARKER, "");
@@ -1192,6 +1364,106 @@ impl EditorView {
             break;
         }
         lines
+    }
+}
+
+/// The Message box's right-hand title while a reply runs (#2882, artifact #26): the spinner,
+/// the message's head, the elapsed time, the rest of the message (`2 queued`), and `Esc stops`
+/// unless the message is already about Esc. Empty while nothing runs.
+fn working_title(working: Option<WorkingState>) -> String {
+    let Some(w) = working else {
+        return String::new();
+    };
+    let c = theme().colors;
+    let frames = rpi_tui::SPINNER_FRAMES;
+    let spinner = frames[w.frame % frames.len()];
+    let secs = w.started_at.elapsed().as_secs();
+    let elapsed = if secs >= 60 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    };
+    // The queued prompts' count (`… · 2 queued`, #2889) goes after the time; a streaming tool
+    // call's line ends `· ` for the time already (`Writing create_tasks 3 tickets · 7s`).
+    let (head, tail) = match w.message.rsplit_once(" · ") {
+        Some((h, t)) if t.ends_with(" queued") => (h.to_owned(), Some(t.to_owned())),
+        _ => (w.message.clone(), None),
+    };
+    let mut out = format!(
+        "{} {} {}",
+        c.accent.fg(&spinner.to_string()),
+        c.muted.fg(&head),
+        c.muted.fg(&elapsed)
+    );
+    if let Some(t) = tail {
+        out.push_str(&c.dim.fg(" · "));
+        out.push_str(&c.muted.fg(&t));
+    }
+    if !w.message.contains("Esc") {
+        out.push_str(&c.dim.fg(" · Esc stops"));
+    }
+    out
+}
+
+/// A component one column in from each side (inside the Conversation box, as the transcript's
+/// entries are).
+struct Pad(Arc<dyn Component>);
+
+impl Component for Pad {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.0
+            .render(width.saturating_sub(2))
+            .into_iter()
+            .map(|l| if l.is_empty() { l } else { format!(" {l}") })
+            .collect()
+    }
+
+    fn invalidate(&self) {
+        self.0.invalidate();
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Header line 2, the current ticket, as the Conversation box's first row (nothing without one).
+struct TicketLine(Chrome);
+
+impl Component for TicketLine {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.0.ticket_line(width).into_iter().collect()
+    }
+
+    fn invalidate(&self) {}
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// The Workers box's rows: none while `/workers` lists the workers in its own box.
+struct StripView {
+    strip: Arc<WorkerStrip>,
+    panel: Panel,
+}
+
+impl Component for StripView {
+    fn render(&self, width: usize) -> Vec<String> {
+        if self
+            .panel
+            .state()
+            .is_some_and(|s| s.kind == PanelKind::Workers)
+        {
+            return Vec::new();
+        }
+        self.strip.render(width)
+    }
+
+    fn invalidate(&self) {}
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

@@ -5,8 +5,13 @@
 //!   format. `auto` asks the terminal for its background colour (OSC 11) and picks light on a light
 //!   background, else dark (also when the terminal does not answer).
 //! - **Colour depth:** `AMP_HARNESS_COLOR`, then `[tui] color`, then `auto`. Values: `auto`,
-//!   `truecolor` (or `24bit`), `256`. `auto` is truecolor when `COLORTERM` is `truecolor`/`24bit`
-//!   (or `TERM` ends in `-direct`), else 256.
+//!   `truecolor` (or `24bit`), `256`, `none`. `auto` is none when `NO_COLOR` is set to anything
+//!   (<https://no-color.org>, #2882), else truecolor when `COLORTERM` is `truecolor`/`24bit` (or
+//!   `TERM` ends in `-direct`), else 256. An explicit `AMP_HARNESS_COLOR` / `[tui] color` wins
+//!   over `NO_COLOR`.
+//! - **Box glyphs** (#2882): `AMP_HARNESS_ASCII`, then `[tui] ascii`, then `auto`: ASCII
+//!   (`+ - |`) when `TERM` is `dumb` or the locale (`LC_ALL`, `LC_CTYPE`, `LANG`) is set and not
+//!   UTF-8; else the box-drawing characters ([`resolve_ascii`]).
 
 use std::{
     path::{Path, PathBuf},
@@ -23,6 +28,9 @@ pub const ENV_SHOW_THINKING: &str = "AMP_HARNESS_SHOW_THINKING";
 pub const ENV_MOUSE: &str = "AMP_HARNESS_MOUSE";
 pub const ENV_PADDING: &str = "AMP_HARNESS_PADDING";
 pub const ENV_DENSITY: &str = "AMP_HARNESS_DENSITY";
+pub const ENV_ASCII: &str = "AMP_HARNESS_ASCII";
+/// <https://no-color.org>: set to anything but empty, no colour (#2882).
+pub const ENV_NO_COLOR: &str = "NO_COLOR";
 
 /// Dark or light.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +46,9 @@ pub enum ColorDepth {
     TrueColor,
     /// xterm-256 indexes: the theme's `*256` values.
     Ansi256,
+    /// No colour (`NO_COLOR`, #2882): every colour is the terminal's default; bold, dim and
+    /// reverse video still mark things.
+    NoColor,
 }
 
 impl ColorDepth {
@@ -45,6 +56,7 @@ impl ColorDepth {
         match self {
             Self::TrueColor => "truecolor",
             Self::Ansi256 => "256",
+            Self::NoColor => "none",
         }
     }
 }
@@ -88,9 +100,10 @@ fn parse_depth(raw: &str) -> Result<Option<ColorDepth>, ThemeError> {
         "" | "auto" => None,
         "truecolor" | "24bit" | "24-bit" => Some(ColorDepth::TrueColor),
         "256" | "ansi256" => Some(ColorDepth::Ansi256),
+        "none" | "no" | "off" | "mono" => Some(ColorDepth::NoColor),
         other => {
             return Err(ThemeError(format!(
-                "unknown colour depth `{other}`: use auto, truecolor or 256"
+                "unknown colour depth `{other}`: use auto, truecolor, 256 or none"
             )));
         }
     })
@@ -115,6 +128,8 @@ struct TuiTable {
     padding: Option<toml::Value>,
     /// `compact` or `comfortable`, #2346.
     density: Option<String>,
+    /// `true`/`false`/`auto`: box glyphs in ASCII (#2882).
+    ascii: Option<toml::Value>,
 }
 
 /// How the chat shows thinking (#2177): `AMP_HARNESS_SHOW_THINKING`, then config.toml `[tui]
@@ -231,6 +246,59 @@ pub fn resolve_density(
     }
 }
 
+/// Whether the boxes are drawn in ASCII (#2882): `AMP_HARNESS_ASCII`, then config.toml `[tui]
+/// ascii`, then `auto` (ASCII for `TERM=dumb` or a locale that is set and not UTF-8). Values:
+/// `auto`, `on`/`true`, `off`/`false`.
+pub fn resolve_ascii(
+    env: &dyn Fn(&str) -> Option<String>,
+    config: Option<&str>,
+) -> Result<bool, ThemeError> {
+    let word = match env(ENV_ASCII).filter(|v| !v.trim().is_empty()) {
+        Some(v) => Some((v, ENV_ASCII.to_owned())),
+        None => {
+            let table = match config {
+                Some(text) => toml::from_str::<ConfigFile>(text)
+                    .map_err(|e| ThemeError(format!("config.toml [tui]: {e}")))?
+                    .tui
+                    .unwrap_or_default(),
+                None => TuiTable::default(),
+            };
+            match table.ascii {
+                None => None,
+                Some(toml::Value::Boolean(b)) => Some((b.to_string(), "[tui] ascii".to_owned())),
+                Some(toml::Value::String(v)) => Some((v, "[tui] ascii".to_owned())),
+                Some(other) => {
+                    return Err(ThemeError(format!(
+                        "[tui] ascii: unknown value `{other}`: use auto, on or off"
+                    )));
+                }
+            }
+        }
+    };
+    match word {
+        Some((v, _)) if v.trim().eq_ignore_ascii_case("auto") => Ok(ascii_by_terminal(env)),
+        Some((v, from)) => parse_on_off(&v).map_err(|e| ThemeError(format!("{from}: {e}"))),
+        None => Ok(ascii_by_terminal(env)),
+    }
+}
+
+/// ASCII boxes for `TERM=dumb`, or when the locale is set and isn't UTF-8.
+fn ascii_by_terminal(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    if env("TERM").is_some_and(|t| t.trim() == "dumb") {
+        return true;
+    }
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|k| env(k).filter(|v| !v.trim().is_empty()));
+    match locale {
+        Some(l) => {
+            let l = l.to_ascii_lowercase();
+            !(l.contains("utf-8") || l.contains("utf8"))
+        }
+        None => false,
+    }
+}
+
 fn parse_padding(v: &str) -> Result<usize, String> {
     match v.parse::<usize>() {
         Ok(n) if n <= crate::MAX_PADDING => Ok(n),
@@ -313,9 +381,12 @@ impl ThemeSettings {
     }
 }
 
-/// Truecolor when the environment says so (`COLORTERM=truecolor|24bit`, or a `*-direct` TERM),
-/// else 256 colours.
+/// No colour when `NO_COLOR` is set (#2882), truecolor when the environment says so
+/// (`COLORTERM=truecolor|24bit`, or a `*-direct` TERM), else 256 colours.
 pub fn detect_depth(env: &dyn Fn(&str) -> Option<String>) -> ColorDepth {
+    if env(ENV_NO_COLOR).is_some_and(|v| !v.is_empty()) {
+        return ColorDepth::NoColor;
+    }
     let colorterm = env("COLORTERM").unwrap_or_default().to_ascii_lowercase();
     let term = env("TERM").unwrap_or_default().to_ascii_lowercase();
     if matches!(colorterm.trim(), "truecolor" | "24bit") || term.ends_with("-direct") {

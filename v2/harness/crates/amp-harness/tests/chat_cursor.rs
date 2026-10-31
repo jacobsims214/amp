@@ -14,17 +14,19 @@ use std::{
     fs::File,
     io::{Read, Write},
     path::Path,
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use common::{MockAmp, spawn, workdir};
+use common::{MockAmp, pty_command, spawn, workdir};
 use nix::{pty::Winsize, pty::openpty};
 
 /// The sizes checked, and the editor's first column (1-based) at each: 2 columns of padding
 /// at 120, 1 at 80.
-const SIZES: [(u16, u16, usize); 2] = [(120, 40, 3), (80, 24, 2)];
+// The editor's first text column, 1-based: inside the Message box (#2882), after its edge and
+// one column of padding (the padding alone put it a column further left).
+const SIZES: [(u16, u16, usize); 2] = [(120, 40, 4), (80, 24, 3)];
 
 const CONFIG: &str = r#"
 [providers.faux]
@@ -59,7 +61,7 @@ impl Chat {
         };
         let pty = openpty(Some(&size), None).expect("openpty");
         let stdio = || Stdio::from(pty.slave.try_clone().unwrap());
-        let child = Command::new(env!("CARGO_BIN_EXE_amp-harness"))
+        let child = pty_command()
             .args(["--no-session", "--no-setup"])
             .current_dir(dir.join("project"))
             .env("HOME", dir.join("home"))

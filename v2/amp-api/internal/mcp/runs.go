@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -104,11 +105,33 @@ func (s *Server) reportRun(rctx context.Context, args map[string]interface{}) (*
 	if err != nil {
 		return nil, err
 	}
-	run, err := s.svc.RecordRun(rctx, caller(rctx).p, taskID, runFromArgs(args, optStr(args, "outcome", "")))
+	// A run report is the first activity on a dispatched ticket for a plugin
+	// that doesn't claim: it starts the ticket (AMP #2801). Not an abandoned
+	// run (a run that ended), nor the dispatcher's own report right after
+	// dispatching (AMP #2949).
+	// Started only once the run is recorded, so a caller the run is refused
+	// to doesn't start the ticket either.
+	outcome := optStr(args, "outcome", "")
+	run, err := s.svc.RecordRun(rctx, caller(rctx).p, taskID, runFromArgs(args, outcome))
 	if err != nil {
 		return nil, err
 	}
-	return jsonResult(run)
+	if strings.TrimSpace(outcome) != domain.RunAbandoned {
+		s.svc.InferStart(rctx, caller(rctx).p, taskID, "")
+	}
+	// The run's fields as before, plus next: an additive key on the run
+	// object's old shape would be read as a run field by old clients, so the
+	// result gains a wrapper only when the ticket is known.
+	out := map[string]interface{}{}
+	if b, err := json.Marshal(run); err == nil {
+		if err := json.Unmarshal(b, &out); err != nil {
+			out = map[string]interface{}{}
+		}
+	}
+	if t, err := s.repo.GetTask(context.Background(), taskID); err == nil {
+		out["next"] = reportRunNext(t)
+	}
+	return jsonResult(out)
 }
 
 func (s *Server) taskRuns(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -214,7 +237,8 @@ func (s *Server) restoreTasks(rctx context.Context, args map[string]interface{})
 // compactTasks is amp_list_tasks' default, small overview: one line per open
 // ticket under its epic (completed ones only when asked), the buckets as
 // IDs, and the questions with their text.
-func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domain.Task, ownerMode string, quiet []map[string]interface{}, people, comingUp []PersonWait, withDone bool) (*mcpgo.CallToolResult, error) {
+func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domain.Task, ownerMode string, quiet []map[string]interface{}, people, comingUp []PersonWait, withDone bool,
+	notStarted, returned []map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	epics, err := s.repo.ListEpics(rctx, projectID)
 	if err != nil {
 		return nil, err
@@ -244,6 +268,9 @@ func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domai
 		Agent   string `json:"assigned_to,omitempty"` // the agent profile that runs it
 		Human   string `json:"human,omitempty"`       // a person does it: why
 		WaitsOn []int  `json:"waits_on,omitempty"`
+		// Phase splits in_progress (AMP #2801): not_started (dispatched, no
+		// worker started it) or started. Absent on any other state.
+		Phase string `json:"phase,omitempty"`
 	}
 	type question struct {
 		ID       int    `json:"id"`
@@ -264,7 +291,8 @@ func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domai
 		if st == "completed" && !withDone {
 			continue
 		}
-		l := line{ID: t.ID, Name: t.Name, State: st, Owner: t.OwnerUserID, Agent: t.AssignedTo, Human: t.HumanReason}
+		l := line{ID: t.ID, Name: t.Name, State: st, Owner: t.OwnerUserID, Agent: t.AssignedTo, Human: t.HumanReason,
+			Phase: domain.PhaseOf(t.State, t.StartedAt)}
 		if t.IsHuman() {
 			l.Agent = ""
 		}
@@ -281,8 +309,10 @@ func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domai
 		"scheduled":         len(buckets["scheduled"]),
 		"completed":         len(buckets["completed"]),
 		"quiet":             quiet,
-		"waiting_on_people": people,   // never dispatch these: tell your user who the work is waiting on, by kind
-		"coming_up":         comingUp, // people's human tickets not actionable yet
+		"not_started":       notStarted, // dispatched, no worker started it: start the worker, or undo the dispatch
+		"returned":          returned,   // returned to ready before a worker started it: re-dispatch knowingly or ask the user
+		"waiting_on_people": people,     // never dispatch these: tell your user who the work is waiting on, by kind
+		"coming_up":         comingUp,   // people's human tickets not actionable yet
 		"by_epic":           byEpic,
 		"count":             len(tasks),
 		"owner_filter":      ownerMode,

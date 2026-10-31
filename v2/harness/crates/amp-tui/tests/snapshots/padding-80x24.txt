@@ -1,24 +1,24 @@
                                                                                 |
- ▀▀▀▀▀▀▀▀ ada@example.com · simstech › AMP #2                       ● connected |
- ■ In progress #2106 M3-3 Header and AMP status line              ▌ AMP Harness |
-                                                                                |
-     fn padded(width: usize, padding: usize) -> usize { width - 2 * padding }   |
-      // inner                                                                  |
-                                                                                |
-  Done.                                                                         |
-                                                                                |
- ── ■ In progress #2106 M3-3 Header and AMP status line ─────────────────────── |
- ── AMP · workers ───────────────────────────────────────────────────────────── |
- › ■ In progress running #2105 M3-5 Inline t… · amp:amp-worker-backend · local  |
-     claude-opus-5-5 · ######h##m · ↑0 ↓0 $0.00                                 |
-   □ Ready queued #2111 · amp:amp-worker-backend · local                        |
-     claude-opus-5-5 · ######h##m · ↑0 ↓0 $0.00                                 |
-   ■ In progress #2104 M3-2 AMP metadata… · amp:amp-worker-backend · elsewhere  |
-   ■ In progress #2106 M3-3 Header and A… · amp:amp-worker-backend · elsewhere  |
-   ↑↓ select · Enter/click watch · Ctrl+X stop · Ctrl+G open in AMP · Esc close |
- ────────────────────────────────────────────────────────────────────────────── |
- / for commands                                                                 |
- ────────────────────────────────────────────────────────────────────────────── |
+┌─ ▀▀▀▀▀▀▀▀ AMP #2 · simstech · ada@example.com ───────────────── ● connected ─┐|
+│ ■ In progress #2106 M3-3 Header and AMP status line           ▌ AMP Harness  │|
+│ └────────┴─────────────┴────────────────┘                                    │|
+│                                                                              │|
+│    fn padded(width: usize, padding: usize) -> usize { width - 2 * padding    │|
+│    } // inner                                                                │|
+│                                                                              │|
+│ Done.                                                                        │|
+│                                                                              │|
+│ ── ■ In progress #2106 M3-3 Header and AMP status line ────────────────────  │|
+└──────────────────────────────────────────────────────────────────────────────┘|
+┌─ Workers · 1 running · 1 queued · 2 elsewhere ───────────────────────────────┐|
+│ › ▸ #2105 M3-5 Inline ticket chips · worker-backend · running ######h##m     │|
+│   □ #2111 · worker-backend (claude-opus-5-5) · queued ######h##m             │|
+│   elsewhere                                                                  │|
+│   ■ #2104 M3-2 AMP metadata poller · worker-backend · in progress            │|
+│   ■ #2106 M3-3 Header and AMP status line · worker-backend · in progress     │|
+└─ ↑↓ select · Enter watch · Ctrl+X stop · Ctrl+G open in AMP · Esc close ─────┘|
+┌─ Message ────────────────────────────────────────────────────────────────────┐|
+│ / for commands                                                               │|
+└──────────────────────────────────────────────────────────────────────────────┘|
  ■  2 QUESTIONS  │ plan: 2 waiting for your approval           unreported #2106 |
  /work/amp (harness-m4) • manager · #2106       ctx <1% · faux-1 • thinking off |
-                                                                                |

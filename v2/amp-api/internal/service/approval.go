@@ -70,32 +70,81 @@ func (s *Service) approvalGate(ctx context.Context, p authz.Principal, t *domain
 
 // CompleteTask marks an agent ticket done. A person in the web UI may
 // complete any ticket they can work. Anyone else (an agent over MCP, an API
-// token) only completes work that was dispatched and approved: the ticket
-// must be in progress, so a ticket never dispatched can't be closed by the
-// agent that skipped the dispatch. Human tickets go through
-// CompleteHumanTask.
+// token) completes dispatched and approved work, as its worker (with the
+// current dispatch_id) or as a closeout (AMP #2801): a completion by
+// somebody other than the worker, or of a ticket no worker started, is
+// allowed but recorded as a closeout with the caller's reason. Human
+// tickets go through CompleteHumanTask.
 func (s *Service) CompleteTask(ctx context.Context, p authz.Principal, taskID int) (*domain.Task, error) {
-	return s.CompleteTaskWithRun(ctx, p, taskID, nil)
+	t, _, err := s.CompleteTaskWithRun(ctx, p, taskID, nil, CompleteClaim{})
+	return t, err
 }
 
-// checkAgentCompletion applies the off-UI completion rules to agent ticket t.
-func (s *Service) checkAgentCompletion(ctx context.Context, p authz.Principal, t *domain.Task) error {
+// Closeout is what a completion recorded beyond the ticket: whether it was
+// a closeout (the caller wasn't the ticket's worker) and why.
+type Closeout struct {
+	Closeout bool   `json:"closeout"`
+	Reason   string `json:"-"`
+}
+
+// checkAgentCompletion applies the off-UI completion rules to agent ticket
+// t, returning whether the completion must go through as a closeout.
+//
+// A closeout is allowed where the worker's own completion would have been:
+// it takes prior work on the ticket (a run), which is what makes it a
+// closeout of somebody's finished work rather than a claim that work
+// happened. That is also how a ready ticket with runs is closed out without
+// dispatching it first (#2473/#2494).
+func (s *Service) checkAgentCompletion(ctx context.Context, p authz.Principal, t *domain.Task, dispatchID string) error {
 	if p.InUI() {
 		return nil
 	}
-	switch t.State {
-	case domain.TaskStateCompleted:
+	if t.State == domain.TaskStateCompleted {
 		return nil // idempotent
-	case domain.TaskStateInProgress:
-	default:
-		return &authz.Error{Status: 409, Msg: fmt.Sprintf("ticket %d is %s: it was never dispatched, so an agent can't complete it. "+
-			"Dispatch it first (amp_dispatch_task, once the plan is approved: %s), or a person completes it in the AMP web UI: %s.",
-			t.ID, t.State, s.PlanURL(t.ProjectID), s.TaskURL(t.ProjectID, t.ID))}
 	}
-	if err := s.openDepsGate(ctx, t, "completed"); err != nil {
+	worker := t.CurrentDispatch(dispatchID)
+	if t.State != domain.TaskStateInProgress {
+		// Never dispatched (or dispatched and returned): a closeout only,
+		// and only of work that has something to show for it.
+		if t.State == domain.TaskStateBlocked && hasOpenQuestion(t) {
+			return &authz.Error{Status: 409, Msg: fmt.Sprintf("ticket %d is waiting on a question (%q): a closeout doesn't answer or replace it. "+
+				"Relay the person's answer with amp_answer_question first, then close it out: %s", t.ID, t.BlockReason, s.TaskURL(t.ProjectID, t.ID))}
+		}
+		if t.State == domain.TaskStateBlocked {
+			if err := s.openDepsGate(ctx, t, "closed out"); err != nil {
+				return err
+			}
+		}
+		if err := s.closeoutEvidence(ctx, t); err != nil {
+			return err
+		}
+	} else if worker {
+		// The worker's own: it must have been started (the claim), or its
+		// completion is the fallback start of a plugin that doesn't claim.
+		if err := s.openDepsGate(ctx, t, "completed"); err != nil {
+			return err
+		}
+	} else if err := s.openDepsGate(ctx, t, "closed out"); err != nil {
 		return err
 	}
 	return s.approvalGate(ctx, p, t, "completed")
+}
+
+// closeoutEvidence refuses a closeout of a ticket with nothing on it: no
+// run, so no worker ever did anything there. Without it, an agent could mark
+// any ready ticket done.
+func (s *Service) closeoutEvidence(ctx context.Context, t *domain.Task) error {
+	n, err := s.Repo.CountRuns(ctx, t.ID)
+	if err != nil {
+		return &authz.Error{Status: 503, Msg: fmt.Sprintf("ticket %d: couldn't read its runs (%v); nothing changed, try again", t.ID, err)}
+	}
+	if n > 0 {
+		return nil
+	}
+	return &authz.Error{Status: 409, Msg: fmt.Sprintf("ticket %d is %s: it was never dispatched and has no work recorded on it, so an agent "+
+		"can't complete or close it out. Dispatch it and let its worker do it (amp_dispatch_task, once the plan is approved: %s), "+
+		"or a person completes it in the AMP web UI: %s.",
+		t.ID, t.State, s.PlanURL(t.ProjectID), s.TaskURL(t.ProjectID, t.ID))}
 }
 
 // openDepsGate refuses (409) moving t forward off the web UI while any of
@@ -135,23 +184,34 @@ func (s *Service) openDepsGate(ctx context.Context, t *domain.Task, doing string
 // atomically, that the ticket is still in progress and that its
 // dependencies are complete.
 func (s *Service) sendComplete(ctx context.Context, p authz.Principal, t *domain.Task, offUI bool) error {
-	return s.sendCompleteMerge(ctx, p, t, offUI, false, "")
+	_, err := s.sendCompleteMerge(ctx, p, t, offUI, false, "", "", "")
+	return err
 }
 
 // sendCompleteMerge is sendComplete for work that may wait on a merge
-// (MsgCompleteTask.MergeRequired).
-func (s *Service) sendCompleteMerge(ctx context.Context, p authz.Principal, t *domain.Task, offUI, mergeRequired bool, mergeWhere string) error {
-	replyCh := make(chan actor.ReplySimple, 1)
+// (MsgCompleteTask.MergeRequired). dispatchID is the caller's claim to be
+// the ticket's worker; closeoutReason is why it is closing a ticket that
+// isn't its own work. The reply says whether the completion was recorded as
+// a closeout.
+func (s *Service) sendCompleteMerge(ctx context.Context, p authz.Principal, t *domain.Task, offUI, mergeRequired bool, mergeWhere, dispatchID, closeoutReason string) (actor.ReplyComplete, error) {
+	replyCh := make(chan actor.ReplyComplete, 1)
+	// A closeout of a ticket that isn't in progress is the one completion the
+	// actor would otherwise refuse off the UI: its prior work is what makes it
+	// one, and checkAgentCompletion has read it (AMP #2801).
+	closeoutOK := offUI && t.State != domain.TaskStateCompleted && !t.IsHuman() &&
+		t.State != domain.TaskStateInProgress && !(t.State == domain.TaskStateBlocked && hasOpenQuestion(t))
 	if err := s.Registry.Send(t.ProjectID, &actor.MsgCompleteTask{
 		TaskID: t.ID, By: p.UserRef(), ByName: p.Label(), RequireStarted: offUI, RequireDeps: offUI,
-		MergeRequired: mergeRequired, MergeWhere: mergeWhere, ReplyCh: replyCh,
+		MergeRequired: mergeRequired, MergeWhere: mergeWhere, DispatchID: dispatchID, CloseoutReason: closeoutReason,
+		CloseoutOK: closeoutOK, InUI: p.InUI(), ReplyCh: replyCh,
 	}); err != nil {
-		return err
+		return actor.ReplyComplete{}, err
 	}
-	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
-		return &authz.Error{Status: 409, Msg: reply.Err.Error()}
+	reply := actor.Await(ctx, replyCh)
+	if reply.Err != nil {
+		return reply, &authz.Error{Status: 409, Msg: reply.Err.Error()}
 	}
-	return nil
+	return reply, nil
 }
 
 // SetTaskState overrides a ticket's state (amp_set_task_state). A person in
@@ -163,6 +223,13 @@ func (s *Service) sendCompleteMerge(ctx context.Context, p authz.Principal, t *d
 // (to backlog from in progress or completed, or to blocked) is always
 // allowed; with a dependency open it lands blocked on it.
 func (s *Service) SetTaskState(ctx context.Context, p authz.Principal, taskID int, state domain.TaskState, reason string) (*domain.Task, error) {
+	return s.SetTaskStateAs(ctx, p, taskID, state, reason, "")
+}
+
+// SetTaskStateAs is SetTaskState by a caller that presents a dispatch_id:
+// the worker setting its own ticket's state, so a move to completed is the
+// worker's rather than a closeout (AMP #2801). Every other caller passes "".
+func (s *Service) SetTaskStateAs(ctx context.Context, p authz.Principal, taskID int, state domain.TaskState, reason, dispatchID string) (*domain.Task, error) {
 	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskWork)
 	if err != nil {
 		return nil, err
@@ -173,7 +240,7 @@ func (s *Service) SetTaskState(ctx context.Context, p authz.Principal, taskID in
 	if state == domain.TaskStateBlocked && strings.HasPrefix(strings.TrimSpace(reason), "scheduled:") {
 		return nil, authz.BadRequest("ticket %d: a block reason can't start with \"scheduled:\"; schedule a ticket with amp_set_task_start_at", taskID)
 	}
-	requireStarted, err := s.offUIStateGate(ctx, p, t, state, reason)
+	requireStarted, err := s.offUIStateGate(ctx, p, t, state, reason, dispatchID)
 	if err != nil {
 		s.auditTaskDenied(ctx, p, "task.state", t, err, map[string]any{"to": string(state)})
 		return nil, err
@@ -181,7 +248,7 @@ func (s *Service) SetTaskState(ctx context.Context, p authz.Principal, taskID in
 	replyCh := make(chan actor.ReplySimple, 1)
 	if err := s.Registry.Send(t.ProjectID, &actor.MsgSetTaskState{
 		TaskID: taskID, State: state, Reason: reason, By: p.UserRef(), ByName: p.Label(),
-		RequireStarted: requireStarted, RequireDeps: !p.InUI(), ReplyCh: replyCh,
+		RequireStarted: requireStarted, RequireDeps: !p.InUI(), DispatchID: dispatchID, InUI: p.InUI(), ReplyCh: replyCh,
 	}); err != nil {
 		return nil, err
 	}
@@ -207,7 +274,7 @@ func (s *Service) SetTaskState(ctx context.Context, p authz.Principal, taskID in
 // offUIStateGate applies SetTaskState's rules for callers off the web UI
 // (see SetTaskState), returning whether the actor must re-check that the
 // ticket is still in progress.
-func (s *Service) offUIStateGate(ctx context.Context, p authz.Principal, t *domain.Task, state domain.TaskState, reason string) (bool, error) {
+func (s *Service) offUIStateGate(ctx context.Context, p authz.Principal, t *domain.Task, state domain.TaskState, reason, dispatchID string) (bool, error) {
 	requireStarted := false
 	if !p.InUI() {
 		// A ticket waiting on a person's answer keeps its question until it's
@@ -240,7 +307,7 @@ func (s *Service) offUIStateGate(ctx context.Context, p authz.Principal, t *doma
 			if t.IsHuman() {
 				return false, authz.RequireUI(p, fmt.Sprintf("Marking ticket %d (a person's ticket) done", t.ID), s.TaskURL(t.ProjectID, t.ID))
 			}
-			if err := s.checkAgentCompletion(ctx, p, t); err != nil {
+			if err := s.checkAgentCompletion(ctx, p, t, dispatchID); err != nil {
 				return false, err
 			}
 			requireStarted = t.State != domain.TaskStateCompleted

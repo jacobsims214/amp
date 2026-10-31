@@ -1087,6 +1087,7 @@ mod tests {
             outcome: None,
             error: None,
             stopped_by: None,
+            returned: None,
             session_file: None,
             branch: None,
             context_window: None,

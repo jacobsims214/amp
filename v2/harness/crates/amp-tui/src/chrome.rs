@@ -165,6 +165,8 @@ struct Inputs {
     pending: HashMap<String, i64>,
     /// The chat waits for a person's plan approval in AMP (#2425): the approval link (My work).
     approval_wait: Option<String>,
+    /// The status line leaves this chat's workers out (#2882: the Workers box shows them).
+    hide_workers: bool,
 }
 
 /// Everything one frame of the chrome shows.
@@ -181,6 +183,9 @@ pub struct ChromeData {
     /// The chat waits for a person's plan approval in AMP and resumes the manager by itself
     /// (#2425): the approval link (the project's My work tab, #2495).
     pub approval_wait: Option<String>,
+    /// The status line shows `workers N` (#2882: not in the boxed chat, whose Workers box says
+    /// it; `render-chrome` and the tests keep it).
+    pub show_workers: bool,
 }
 
 impl ChromeData {
@@ -193,6 +198,7 @@ impl ChromeData {
             mcp: None,
             roster: Vec::new(),
             approval_wait: None,
+            show_workers: true,
         }
     }
 }
@@ -221,6 +227,26 @@ impl Chrome {
             i.fixed = Some(Arc::new(meta));
             i.handle = None;
         });
+    }
+
+    /// Leaves this chat's workers off the status line (#2882: the boxed chat's Workers box shows
+    /// them while they run).
+    pub fn hide_workers(&self, hide: bool) {
+        self.with(|i| i.hide_workers = hide);
+    }
+
+    /// The header for the conversation box's top edge (#2882): its left and right parts within
+    /// `width` cells, or `None` without a metadata source.
+    pub fn header_title(&self, width: usize) -> Option<(String, String)> {
+        let data = self.data()?;
+        Some(header_title(&data, &palette(), width))
+    }
+
+    /// Header line 2 (the current ticket) at `width`, or `None` without one.
+    pub fn ticket_line(&self, width: usize) -> Option<String> {
+        let data = self.data()?;
+        let id = data.meta.ticket_id?;
+        Some(ticket_line(&Style::current(), &data, &palette(), id, width))
     }
 
     /// Where local workers come from (the manager's supervisor).
@@ -294,22 +320,24 @@ impl Chrome {
 
     /// This frame's data, or `None` without a metadata source (the chrome is then hidden).
     pub fn data(&self) -> Option<ChromeData> {
-        let (meta, workers, mcp, reports, last_report, roster, approval_wait) = self.with(|i| {
-            let meta = match (&i.fixed, &i.handle) {
-                (Some(m), _) => Some(Arc::clone(m)),
-                (None, Some(h)) => Some(h.snapshot()),
-                (None, None) => None,
-            };
-            (
-                meta,
-                i.workers.clone(),
-                i.mcp.clone(),
-                i.reports.clone(),
-                i.last_report,
-                i.roster.clone(),
-                i.approval_wait.clone(),
-            )
-        });
+        let (meta, workers, mcp, reports, last_report, roster, approval_wait, hide) =
+            self.with(|i| {
+                let meta = match (&i.fixed, &i.handle) {
+                    (Some(m), _) => Some(Arc::clone(m)),
+                    (None, Some(h)) => Some(h.snapshot()),
+                    (None, None) => None,
+                };
+                (
+                    meta,
+                    i.workers.clone(),
+                    i.mcp.clone(),
+                    i.reports.clone(),
+                    i.last_report,
+                    i.roster.clone(),
+                    i.approval_wait.clone(),
+                    i.hide_workers,
+                )
+            });
         Some(ChromeData {
             meta: meta?,
             workers: workers.map(|f| f()).unwrap_or_default(),
@@ -318,6 +346,7 @@ impl Chrome {
             mcp: mcp.map(|f| f()).filter(|s| s.total > 0),
             roster: roster.map(|r| r.all()).unwrap_or_default(),
             approval_wait,
+            show_workers: !hide,
         })
     }
 
@@ -566,6 +595,46 @@ fn fit_keeping(style: &Style, left: Vec<Seg>, right: Vec<Seg>, width: usize) -> 
 }
 
 fn fit_with(style: &Style, left: Vec<Seg>, right: Vec<Seg>, width: usize, keep: bool) -> String {
+    let (left, right) = fit_segs(style, left, right, width, keep);
+    let used = line_width(style, &left, &right);
+    if used > width {
+        // Only unbreakable segments are left and they still don't fit: plain text, cut.
+        let gap = " ".repeat(MIN_GAP);
+        let plain = rpi_tui::strip_ansi(&format!(
+            "{}{gap}{}",
+            join(style, &left),
+            join(style, &right)
+        ));
+        return shorten(plain.trim(), width);
+    }
+    let l = join(style, &left);
+    if right.is_empty() {
+        return l;
+    }
+    let gap = width - side_width(style, &left) - side_width(style, &right);
+    format!("{l}{}{}", " ".repeat(gap), join(style, &right))
+}
+
+/// [`fit`]'s segment dropping, with the two sides returned apart (#2882: the header in a box's
+/// top edge, where the rule fills the gap). A left side that still doesn't fit is cut as plain
+/// text, and the right one goes.
+fn fit_parts(style: &Style, left: Vec<Seg>, right: Vec<Seg>, width: usize) -> (String, String) {
+    let (left, right) = fit_segs(style, left, right, width, false);
+    if line_width(style, &left, &right) > width {
+        let plain = rpi_tui::strip_ansi(&join(style, &left));
+        return (shorten(plain.trim(), width), String::new());
+    }
+    (join(style, &left), join(style, &right))
+}
+
+/// Drops segments by rank until `left` and `right` fit `width` (see [`fit_keeping`] for `keep`).
+fn fit_segs(
+    style: &Style,
+    left: Vec<Seg>,
+    right: Vec<Seg>,
+    width: usize,
+    keep: bool,
+) -> (Vec<Seg>, Vec<Seg>) {
     let mut l: Vec<(usize, Seg)> = left.into_iter().enumerate().collect();
     let mut r: Vec<(usize, Seg)> = right.into_iter().enumerate().collect();
     let width_of = |l: &[(usize, Seg)], r: &[(usize, Seg)]| {
@@ -598,23 +667,7 @@ fn fit_with(style: &Style, left: Vec<Seg>, right: Vec<Seg>, width: usize, keep: 
     }
     let left: Vec<Seg> = l.into_iter().map(|(_, s)| s).collect();
     let right: Vec<Seg> = r.into_iter().map(|(_, s)| s).collect();
-    let used = line_width(style, &left, &right);
-    if used > width {
-        // Only unbreakable segments are left and they still don't fit: plain text, cut.
-        let gap = " ".repeat(MIN_GAP);
-        let plain = rpi_tui::strip_ansi(&format!(
-            "{}{gap}{}",
-            join(style, &left),
-            join(style, &right)
-        ));
-        return shorten(plain.trim(), width);
-    }
-    let l = join(style, &left);
-    if right.is_empty() {
-        return l;
-    }
-    let gap = width - side_width(style, &left) - side_width(style, &right);
-    format!("{l}{}{}", " ".repeat(gap), join(style, &right))
+    (left, right)
 }
 
 fn stale<T>(f: &Fetched<T>) -> bool {
@@ -690,6 +743,92 @@ fn header_line1(style: &Style, data: &ChromeData, p: &AmpPalette, width: usize) 
         }
     }
     fit(style, left, right, width)
+}
+
+/// The header in the conversation box's top edge (#2882, artifact #26): the brand bands, the
+/// project (bold, linked to its Mission page) and its `#id`, the org, the user and the AMP host
+/// on the left; the MCP health dot, its word and the protocol on the right. The host and the
+/// protocol go first when it is narrow, then the org and the user; the project and the health
+/// word stay.
+pub fn header_title(data: &ChromeData, p: &AmpPalette, width: usize) -> (String, String) {
+    let style = Style::current();
+    let c = &style.colors;
+    let meta = &data.meta;
+    let mut left = vec![Seg::new(p.brand_bands(BAND_CELLS), Lead::Space, 4).then_space()];
+    let is_stale = stale(&meta.project) || stale(&meta.user);
+    match meta.project_id {
+        None => left.push(Seg::new(c.dim.fg("no project"), Lead::Space, 2)),
+        Some(pid) => {
+            let name = match meta.project.get() {
+                Some(pr) => {
+                    let name = clean(&pr.name);
+                    let name = if name.is_empty() {
+                        clean(&pr.code)
+                    } else {
+                        name
+                    };
+                    if is_stale {
+                        c.dim.fg(&name)
+                    } else {
+                        rpi_tui::bold(&c.text.fg(&name))
+                    }
+                }
+                None => c.dim.fg("project"),
+            };
+            let text = match &meta.instance {
+                Some(inst) => link(&inst.project_url(pid), &name),
+                None => name,
+            };
+            left.push(Seg::new(
+                format!("{text} {}", c.dim.fg(&format!("#{pid}"))),
+                Lead::Space,
+                2,
+            ));
+            if meta.project.get().is_some()
+                && let Some(org) = meta.org_name().map(clean).filter(|o| !o.is_empty())
+            {
+                left.push(Seg::new(style.paint(c.muted, &org, is_stale), Lead::Dot, 7));
+            }
+        }
+    }
+    if let Some(user) = meta.user.get() {
+        let email = clean(&user.email);
+        if !email.is_empty() {
+            left.push(Seg::new(
+                style.paint(c.muted, &email, stale(&meta.user)),
+                Lead::Dot,
+                6,
+            ));
+        }
+    }
+    match &meta.instance {
+        Some(inst) => left.push(Seg::new(c.dim.fg(&clean(inst.host())), Lead::Dot, 8)),
+        None => {
+            let word = if disconnected(meta) {
+                "retrying…"
+            } else {
+                "connecting…"
+            };
+            left.push(Seg::new(c.dim.fg(word), Lead::Dot, 3));
+        }
+    }
+    let health = &meta.health.connection;
+    let dot = match health.level() {
+        HealthLevel::Ok => c.success,
+        HealthLevel::Degraded => c.warning,
+        HealthLevel::Down => c.error,
+    };
+    let mut right = vec![
+        Seg::new(dot.fg("●"), Lead::Space, 1),
+        Seg::new(c.muted.fg(&health_word(health)), Lead::Space, 1),
+    ];
+    if let Some(inst) = &meta.instance {
+        let protocol = clean(&inst.protocol);
+        if !protocol.is_empty() {
+            right.push(Seg::new(c.dim.fg(&protocol), Lead::Space, 9));
+        }
+    }
+    fit_parts(&style, left, right, width)
 }
 
 /// `org › project` linked to the project's Mission page, plus a dim `#id`.
@@ -856,13 +995,18 @@ pub fn render_status(data: &ChromeData, p: &AmpPalette, width: usize) -> Vec<Str
         };
         let label = format!(" {} {word} ", b.question);
         let text = match (q.chip, board_stale) {
+            (Some(_), false) if p.mono => {
+                format!("{} {}", q.glyph, crate::theme::reverse(&label))
+            }
             (Some((fg, bg)), false) => format!("{} {}", q.mark.fg(&q.glyph), bg.bg(&fg.fg(&label))),
             _ => c.dim.fg(&format!("{}{label}", q.glyph)),
         };
         left.push(Seg::new(text, Lead::Bar, 0));
     }
 
-    left.push(workers_seg(&style, data, p));
+    if data.show_workers {
+        left.push(workers_seg(&style, data, p));
+    }
 
     // #2245: the external MCP servers, `mcp 3/4` (/mcp lists them).
     if let Some(m) = data.mcp {

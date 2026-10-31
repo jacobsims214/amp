@@ -99,10 +99,34 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 	case *MsgCompleteTask:
 		pid, ok := a.tasks[msg.TaskID]
 		if !ok {
-			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("task %d not found in story %d", msg.TaskID, a.story.ID)}
+			msg.ReplyCh <- ReplyComplete{Err: fmt.Errorf("task %d not found in story %d", msg.TaskID, a.story.ID)}
 			return
 		}
-		replyCh := make(chan ReplySimple, 1)
+		replyCh := make(chan ReplyComplete, 1)
+		fwd := *msg
+		fwd.ReplyCh = replyCh
+		ctx.Send(pid, &fwd)
+		msg.ReplyCh <- <-replyCh
+
+	case *MsgClaimStart:
+		pid, ok := a.tasks[msg.TaskID]
+		if !ok {
+			msg.ReplyCh <- ReplyStart{Err: fmt.Errorf("task %d not found in story %d", msg.TaskID, a.story.ID)}
+			return
+		}
+		replyCh := make(chan ReplyStart, 1)
+		fwd := *msg
+		fwd.ReplyCh = replyCh
+		ctx.Send(pid, &fwd)
+		msg.ReplyCh <- <-replyCh
+
+	case *MsgReturnTask:
+		pid, ok := a.tasks[msg.TaskID]
+		if !ok {
+			msg.ReplyCh <- ReplyGetTask{Err: fmt.Errorf("task %d not found in story %d", msg.TaskID, a.story.ID)}
+			return
+		}
+		replyCh := make(chan ReplyGetTask, 1)
 		fwd := *msg
 		fwd.ReplyCh = replyCh
 		ctx.Send(pid, &fwd)

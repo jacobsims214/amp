@@ -98,8 +98,15 @@ impl Rig {
             .expect("idle");
     }
 
+    /// The screen, the boxes' side edges as blanks (#2882).
     fn screen(&self) -> String {
-        self.shell.view().render_plain(W, H).join("\n")
+        self.shell
+            .view()
+            .render_plain(W, H)
+            .iter()
+            .map(|l| l.replace('│', " ").trim_end().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The styled frame line that holds `text`.
@@ -191,7 +198,7 @@ async fn esc_closing_a_panel_mid_run_hints_and_the_next_esc_stops() {
     assert!(rig.shell.expire_hints(Instant::now() + ESC_HINT_FOR));
     assert_eq!(
         rig.shell.view().working_message().as_deref(),
-        Some("Working…")
+        Some(amp_tui::view::REPLYING)
     );
 
     // Open it and close it again: the hint is back; the second Esc stops the reply.

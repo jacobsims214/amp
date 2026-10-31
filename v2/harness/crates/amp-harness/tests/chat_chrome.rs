@@ -72,20 +72,22 @@ async fn eighty_by_twenty_four_leaves_at_least_fifteen_transcript_rows() {
     )
     .await;
     let text = lines.join("\n");
-    // The header's two rows: line 1 keeps the dot and "connected"; line 2 is the ticket.
-    assert!(lines[0].ends_with("● connected"), "{text}");
+    // #2882: the header is the Conversation box's top edge and keeps the dot and "connected";
+    // the ticket's line is the box's first row.
+    assert!(lines[0].contains("● connected ─┐"), "{text}");
     assert!(lines[1].contains("#2085"), "{text}");
-    // Every row between the header and the editor's top rule is the transcript's.
-    let rule = lines
+    // Every row between the ticket's line and the box's bottom edge is the transcript's.
+    let message = lines
         .iter()
-        .position(|l| l.starts_with("────"))
-        .expect("the editor's top rule");
-    let transcript = rule - 2;
+        .position(|l| l.starts_with("┌─ Message"))
+        .expect("the Message box");
+    assert!(lines[message - 1].starts_with("└──"), "{text}");
+    let transcript = message - 3;
     let visible = lines.iter().filter(|l| l.contains("• row ")).count();
     assert!(transcript >= 15, "{transcript} transcript rows:\n{text}");
     assert_eq!(visible, transcript, "{text}");
-    // Below the editor: the AMP status line and a one-row footer, nothing else.
-    assert_eq!(lines.len() - rule, 5, "{text}");
+    // Below it: the Message box, the AMP status line and a one-row footer, nothing else.
+    assert_eq!(lines.len() - message, 5, "{text}");
     let footer = &lines[lines.len() - 1];
     assert!(footer.contains("• manager · #2085"), "{footer}");
     assert!(footer.contains("ctx "), "{footer}");
@@ -106,9 +108,21 @@ async fn eighty_by_twenty_four_leaves_at_least_fifteen_transcript_rows() {
 #[tokio::test]
 async fn the_banner_session_line_is_one_row_and_light_has_no_stray_background() {
     let lines = screen("chrome-banner", &["--ansi", "--theme", "light"]).await;
+    // (#2882: the Conversation box's side edges as blanks, as `unpad` does for plain rows.)
     let plain: Vec<String> = lines
         .iter()
-        .map(|l| strip(l).trim_end().to_owned())
+        .map(|l| {
+            let p = strip(l);
+            let p = p.trim_end();
+            match p.strip_prefix('│') {
+                Some(inner) => inner
+                    .strip_suffix('│')
+                    .unwrap_or(inner)
+                    .trim_end()
+                    .to_owned(),
+                None => p.to_owned(),
+            }
+        })
         .collect();
     let text = plain.join("\n");
     let at = plain
@@ -124,7 +138,10 @@ async fn the_banner_session_line_is_one_row_and_light_has_no_stray_background() 
     assert!(plain[at + 1].trim().is_empty(), "{text}");
     // The transcript sets foregrounds only: no background colour anywhere above the editor (the
     // review's yellow highlight was SGR 103, a truecolor red component replayed on its own).
-    let rule = plain.iter().position(|l| l.starts_with("────")).unwrap();
+    let rule = plain
+        .iter()
+        .position(|l| l.starts_with("┌─ Message"))
+        .unwrap();
     for line in &lines[..rule] {
         assert!(!has_background(line), "background in {line:?}");
     }

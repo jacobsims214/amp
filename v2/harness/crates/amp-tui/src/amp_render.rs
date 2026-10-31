@@ -511,6 +511,13 @@ pub fn result_summary(name: &str, raw: &str, is_error: bool) -> String {
             Some(agent) => Some(format!("dispatched to {}", clean(agent))),
             None => say("dispatched"),
         },
+        // AMP #2801/#2802: the worker starting its ticket. It says so once; a second claim (or
+        // one with no token) anyway started it, so it reads the same.
+        "claim_task" => say(if v["already_started"].as_bool() == Some(true) {
+            "started (already started)"
+        } else {
+            "started"
+        }),
         "complete_task" => {
             let mut out = "done".to_owned();
             if v["run"].is_object() {
@@ -609,7 +616,10 @@ impl TicketMarker {
 }
 
 impl Component for TicketMarker {
-    fn render(&self, width: usize) -> Vec<String> {
+    fn render(&self, full: usize) -> Vec<String> {
+        // One column clear on each side, as the transcript's text has (#2882: the rule would
+        // otherwise run into the Conversation box's edges).
+        let width = full.saturating_sub(2);
         let c = rpi_tui::theme().colors;
         let p = palette();
         let rule = rpi_tui::theme().border_style.chars().horizontal;
@@ -652,7 +662,7 @@ impl Component for TicketMarker {
             line.push(' ');
             line.push_str(&c.border_muted.fg(&rule.repeat(width - used - 1)));
         }
-        vec![String::new(), line]
+        vec![String::new(), format!(" {line}")]
     }
 
     fn invalidate(&self) {}
@@ -1097,6 +1107,16 @@ mod tests {
                 "amp_dispatch_task",
                 r#"{"task_id":5,"dispatched_to":"amp:amp-worker-backend"}"#,
                 "dispatched to amp:amp-worker-backend",
+            ),
+            (
+                "amp_claim_task",
+                r#"{"task":{"id":5},"started_at":"2026-10-29T15:41:00Z","phase":"started","dispatch_id":"d_x","already_started":false}"#,
+                "started",
+            ),
+            (
+                "amp_claim_task",
+                r#"{"task":{"id":5},"already_started":true}"#,
+                "started (already started)",
             ),
             (
                 "amp_complete_task",

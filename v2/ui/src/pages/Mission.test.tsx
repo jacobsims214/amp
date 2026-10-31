@@ -29,12 +29,12 @@ const tasks: Task[] = [
   task(2490, { owner_user_id: 9, performer: 'human', state: 'blocked', dependency_ids: [2481] }),
   task(2491, { owner_user_id: 8, state: 'in_progress', agent_id: 'amp:amp-worker-frontend', dispatched_at: at }),
 ]
-let counts: MyWorkCounts = { counts: { waiting: 3, approve: 0, answer: 1, merge: 1, do: 1, coming_up: 0 }, projects: { 2: { waiting: 3, approve: 0, answer: 1, merge: 1, do: 1, coming_up: 0 } } }
+let counts: MyWorkCounts = { counts: { waiting: 3, approve: 0, answer: 1, merge: 1, start: 0, do: 1, coming_up: 0 }, projects: { 2: { waiting: 3, approve: 0, answer: 1, merge: 1, start: 0, do: 1, coming_up: 0 } } }
 // Waiting on people comes from the server (Service.WaitingOn per person), in
 // user id order; the panel orders it (you first, then most waiting).
-const wc = (o: Partial<MyWorkCounts['counts']>) => ({ waiting: 0, approve: 0, answer: 0, merge: 0, do: 0, coming_up: 0, ...o })
+const wc = (o: Partial<MyWorkCounts['counts']>) => ({ waiting: 0, approve: 0, answer: 0, merge: 0, start: 0, do: 0, coming_up: 0, ...o })
 const PEOPLE: PeopleWaiting = { project_id: 2, people: [
-  { user_id: ME, counts: wc({ waiting: 3, answer: 1, merge: 1, do: 1 }), coming_up: [], items: [
+  { user_id: ME, counts: wc({ waiting: 3, answer: 1, merge: 1, start: 0, do: 1 }), coming_up: [], items: [
     { kind: 'answer', task_ids: [2473], since: at }, { kind: 'merge', task_ids: [2471], since: at }, { kind: 'do', task_ids: [2481], since: at }] },
   { user_id: 8, counts: wc({ waiting: 2, answer: 1, merge: 1 }), coming_up: [], items: [
     { kind: 'answer', task_ids: [2477], since: at }, { kind: 'merge', task_ids: [2462], since: at }] },
@@ -69,7 +69,7 @@ beforeEach(() => { resetWaitCounts(); access = 'lead'; peopleWaiting = PEOPLE; p
 afterEach(async () => {
   await waitFor(() => expect(inFlight).toBe(0))
   server.resetHandlers()
-  counts = { counts: { waiting: 3, approve: 0, answer: 1, merge: 1, do: 1, coming_up: 0 }, projects: { 2: { waiting: 3, approve: 0, answer: 1, merge: 1, do: 1, coming_up: 0 } } }
+  counts = { counts: { waiting: 3, approve: 0, answer: 1, merge: 1, start: 0, do: 1, coming_up: 0 }, projects: { 2: { waiting: 3, approve: 0, answer: 1, merge: 1, start: 0, do: 1, coming_up: 0 } } }
 })
 afterAll(() => { server.close(); vi.unstubAllGlobals() })
 
@@ -94,7 +94,7 @@ describe('Mission (informational)', () => {
   })
 
   it('shows the quiet strip when nothing waits on you', async () => {
-    counts = { counts: { waiting: 0, approve: 0, answer: 0, merge: 0, do: 0, coming_up: 0 }, projects: {} }
+    counts = { counts: { waiting: 0, approve: 0, answer: 0, merge: 0, start: 0, do: 0, coming_up: 0 }, projects: {} }
     await open()
     expect(await screen.findByText('Nothing waits on you here')).toBeInTheDocument()
     expect(screen.getByText('Nothing waits on you here').closest('a')).toHaveAttribute('href', '/project/2/my-work')

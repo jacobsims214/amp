@@ -112,6 +112,12 @@ fn exec(args: &[&str]) -> String {
 /// doesn't exist yet; `agents new` and `models set manager …` run in "another terminal" (`exec:`)
 /// while the chat runs; after `/reload` the manager runs on its new model and dispatches the new
 /// agent, which runs on worker-backend's model through the fallback chain.
+///
+/// The chat launches workers in the background (AMP #2834/#2837): the dispatch returns an ack and
+/// the worker's end comes later, as a `worker ended:` notice and in the manager's next turn's
+/// `[worker summaries]` (AMP #2857/#2883). So the chat waits (bounded) for the worker to end
+/// before it asks the manager again, and the worker's final message (the `wf` script's) shows up
+/// in that turn.
 #[tokio::test]
 async fn the_chat_takes_cli_changes_on_reload() {
     let dir = setup("chat");
@@ -125,7 +131,11 @@ async fn the_chat_takes_cli_changes_on_reload() {
         &script,
         json!({
             "boss": [run_ticket("c1"), {"text": "before: {{last_tool_result}}"}],
-            "boss2": [run_ticket("c2"), {"text": "after reload: {{last_tool_result}}"}],
+            "boss2": [
+                run_ticket("c2"),
+                {"text": "after reload: {{last_tool_result}}"},
+                {"text": "summaries: {{last_user_message}}"}
+            ],
             "wf": [{"text": "Finished #4242."}]
         })
         .to_string(),
@@ -134,6 +144,26 @@ async fn the_chat_takes_cli_changes_on_reload() {
     let state = dir.join("home/.local/state");
     let new_agent = exec(&["agents", "new", "sql-expert", "--description", "Writes SQL"]);
     let set_model = exec(&["models", "set", "manager", "boss2/boss2-1", "--no-check"]);
+    // The worker's end: it stops without closing its ticket, so run reporting's on_finish calls
+    // `amp_report_run` and then hands the ticket back (`amp_return_task`), the last AMP call before
+    // the end is queued for the manager. The chat runs as another process, so a file says so.
+    let ended = dir.join("worker-ended");
+    let watcher = tokio::spawn({
+        let (mock, ended) = (amp.mock.clone(), ended.clone());
+        async move {
+            while mock.calls_to("amp_return_task").is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            std::fs::write(&ended, "").unwrap();
+        }
+    });
+    // Waits up to 30 s for that file, then a moment for the end to be queued.
+    let wait_worker = format!(
+        "exec:i=0; while [ ! -e '{}' ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done; \
+         [ -e '{}' ] && sleep 0.5",
+        ended.display(),
+        ended.display()
+    );
     let out = common::run(
         &dir,
         &amp.url,
@@ -151,6 +181,10 @@ async fn the_chat_takes_cli_changes_on_reload() {
             "/reload",
             "--input",
             "try again",
+            "--input",
+            &wait_worker,
+            "--input",
+            "what happened?",
         ],
         &[
             ("AMP_HARNESS_FAUX_SCRIPT", script.to_str().unwrap()),
@@ -158,6 +192,7 @@ async fn the_chat_takes_cli_changes_on_reload() {
         ],
     )
     .await;
+    watcher.abort();
     ok(&out, "the chat");
     let screen = &out.stdout;
     let flat = screen.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -181,14 +216,25 @@ async fn the_chat_takes_cli_changes_on_reload() {
         flat.contains("this chat now runs on boss2/boss2-1"),
         "{screen}"
     );
-    // After: the manager (on boss2) dispatched it once, and the worker finished.
+    // After: the manager (on boss2) dispatched it once, in the background.
     assert_eq!(
         amp.mock.calls_to("amp_dispatch_task"),
         vec![json!({"task_id": 4242, "agent_id": "amp:sql-expert"})],
         "{screen}"
     );
     assert!(flat.contains("after reload:"), "{screen}");
-    assert!(flat.contains("Finished #4242."), "{screen}");
+    assert!(flat.contains("Launched #4242"), "{screen}");
+    // The new agent has no model of its own: it falls back to worker-backend's, wf/wf-1.
+    assert!(flat.contains(r#""model": "wf/wf-1""#), "{screen}");
+    assert!(
+        flat.contains("worker started #4242 · sql-expert (wf-1)"),
+        "{screen}"
+    );
+    // The worker ran (on wf: only the `wf` script says "Finished #4242."), ended, and the
+    // manager's next turn was told so, with its final message.
+    assert!(flat.contains("worker ended: #4242"), "{screen}");
+    assert!(flat.contains("summaries: [worker summaries"), "{screen}");
+    assert!(flat.contains("final message: Finished #4242."), "{screen}");
     // The footer names the new model.
     assert!(screen.contains("boss2-1"), "{screen}");
 }

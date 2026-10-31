@@ -27,6 +27,9 @@ import (
 //   - answer: a ticket they own, blocked with a question (a block reason
 //     that isn't "scheduled:…").
 //   - merge: a ticket they own, completed, merge_state needed or abandoned.
+//   - start: a ticket they own, dispatched to an agent, that no worker has
+//     started (in_progress with no started_at: AMP #2801). Their worker was
+//     never launched, or died before claiming it.
 //   - do: a human ticket they own that is ready (backlog) or in progress.
 //
 // coming_up is their human tickets still waiting on dependencies, a
@@ -39,19 +42,24 @@ const (
 	WaitApprove = "approve"
 	WaitAnswer  = "answer"
 	WaitMerge   = "merge"
+	WaitStart   = "start"
 	WaitDo      = "do"
 )
 
 // WaitKinds is the display order of the kinds.
-var WaitKinds = []string{WaitApprove, WaitAnswer, WaitMerge, WaitDo}
+var WaitKinds = []string{WaitApprove, WaitAnswer, WaitMerge, WaitStart, WaitDo}
 
-// WaitCounts counts what waits on a person. Waiting is the sum of the four
-// kinds; ComingUp is shown but never part of Waiting.
+// WaitCounts counts what waits on a person. Waiting is the sum of the kinds;
+// ComingUp is shown but never part of Waiting.
 type WaitCounts struct {
-	Waiting  int `json:"waiting"`
-	Approve  int `json:"approve"`
-	Answer   int `json:"answer"`
-	Merge    int `json:"merge"`
+	Waiting int `json:"waiting"`
+	Approve int `json:"approve"`
+	Answer  int `json:"answer"`
+	Merge   int `json:"merge"`
+	// Start: a ticket of theirs dispatched to an agent that no worker has
+	// started (AMP #2801). Nothing is wrong with the ticket; its worker was
+	// never launched.
+	Start    int `json:"start"`
 	Do       int `json:"do"`
 	ComingUp int `json:"coming_up"`
 }
@@ -64,6 +72,8 @@ func (c *WaitCounts) add(kind string) {
 		c.Answer++
 	case WaitMerge:
 		c.Merge++
+	case WaitStart:
+		c.Start++
 	case WaitDo:
 		c.Do++
 	default:
@@ -102,6 +112,9 @@ type WaitItem struct {
 	Count    int    `json:"count,omitempty"`
 	// answer
 	Question string `json:"question,omitempty"`
+	// start: the agent it was dispatched to, and how long it has waited
+	AgentID           string `json:"agent_id,omitempty"`
+	NotStartedMinutes int    `json:"not_started_minutes,omitempty"`
 	// merge
 	MergeState  string     `json:"merge_state,omitempty"`
 	PRURL       string     `json:"pr_url,omitempty"`
@@ -210,6 +223,19 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 			add(it)
 			merges = append(merges, t.ID)
 			continue
+		case t.State == domain.TaskStateInProgress && t.StartedAt == nil && !t.IsHuman() && c.NotStartedFlagMinutes > 0:
+			// Dispatched, no worker started it, long enough to be flagged.
+			since := t.UpdatedAt
+			if t.DispatchedAt != nil {
+				since = *t.DispatchedAt
+			}
+			if time.Since(since) < time.Duration(c.NotStartedFlagMinutes)*time.Minute {
+				continue // too early to flag: still the normal case
+			}
+			it := single(c, WaitStart, since)
+			it.AgentID, it.NotStartedMinutes = t.AgentID, int(time.Since(since).Minutes())
+			add(it)
+			continue
 		}
 		if !t.IsHuman() || t.State == domain.TaskStateCompleted {
 			continue
@@ -307,7 +333,7 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 		}
 	}
 
-	rank := map[string]int{WaitApprove: 0, WaitAnswer: 1, WaitMerge: 2, WaitDo: 3}
+	rank := map[string]int{WaitApprove: 0, WaitAnswer: 1, WaitMerge: 2, WaitStart: 3, WaitDo: 4}
 	sort.SliceStable(w.Items, func(i, j int) bool {
 		a, b := w.Items[i], w.Items[j]
 		if rank[a.Kind] != rank[b.Kind] {

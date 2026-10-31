@@ -93,8 +93,14 @@ async fn rig() -> Rig {
 }
 
 impl Rig {
+    /// The screen's rows, the boxes' side edges as blanks (#2882).
     fn rows(&self) -> Vec<String> {
-        self.shell.view().render_plain(W, H)
+        self.shell
+            .view()
+            .render_plain(W, H)
+            .iter()
+            .map(|l| unbox(l))
+            .collect()
     }
 
     fn screen(&self) -> String {
@@ -135,6 +141,20 @@ impl Rig {
         self.screen();
         used
     }
+}
+
+/// `row` without a box's side edges (#2882): its first `│` (after the margin) and last one as
+/// blanks; a `│` in the content (a thinking section's bar) stays.
+fn unbox(row: &str) -> String {
+    let mut s = row.trim_end().to_owned();
+    if s.ends_with('│') {
+        s.pop();
+    }
+    let lead = s.len() - s.trim_start().len();
+    if s[lead..].starts_with('│') {
+        s.replace_range(lead..lead + '│'.len_utf8(), " ");
+    }
+    s.trim_end().to_owned()
 }
 
 #[tokio::test(flavor = "multi_thread")]

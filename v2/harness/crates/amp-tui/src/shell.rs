@@ -70,7 +70,7 @@ use std::{
 use amp_core::events::{RunEvent, Totals};
 use amp_core::meta::{MetaHandle, Topics};
 use amp_core::models::thinking_name;
-use amp_core::supervisor::Supervisor;
+use amp_core::supervisor::{DispatchMode, Supervisor};
 use amp_core::tickets::Status;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rpi_agent::AgentEvent;
@@ -361,6 +361,29 @@ pub trait ReloadControl: Send + Sync {
     fn reload(&self) -> ReloadFuture;
 }
 
+/// The block a manager turn opens with when workers ended since the last one (AMP #2857): one
+/// item per end, from [`amp_core::supervisor::LaunchEnd::summary`] (its line, then its notes —
+/// the #2802 hand-back notice among them — and the worker's trimmed final message, AMP #2883).
+/// `None` when nothing ended, so a turn with nothing to report is the prompt as typed. The header
+/// makes no claim about AMP of its own: a hand-back can fail, so each entry says where its
+/// ticket stands.
+fn worker_summaries(ends: &[amp_core::supervisor::LaunchEnd]) -> Option<String> {
+    if ends.is_empty() {
+        return None;
+    }
+    let mut block = String::from(
+        "[worker summaries: runs you launched that have ended since your last turn. Each entry \
+         says where its ticket stands: a worker that completed or blocked closed its own ticket, \
+         and the notes say whether any other ticket was returned to ready or could not be. Act \
+         on those notes and on any question in a final message.]",
+    );
+    for end in ends {
+        block.push_str("\n- ");
+        block.push_str(&end.summary());
+    }
+    Some(block)
+}
+
 /// A key being typed for `/connect` (never drawn).
 struct SecretEntry {
     args: String,
@@ -447,12 +470,218 @@ pub const STOPPED: &str = "Stopped.";
 /// ([`esc_hint`]).
 pub const ESC_HINT: &str = "Esc again to stop the reply";
 
+/// At most this many prompts wait for the running reply, here as on a paired device (AMP #2889).
+pub use amp_core::remote::link::QUEUE_MAX;
+
+/// The user turn the chat starts by itself when launched workers ended while it was idle (AMP
+/// #2891), as the plan-approval resume does (#2425). The worker summaries go above it, at the
+/// top of the turn ([`Shell::take_worker_summaries`]). No digits: every standalone number in a
+/// user message counts as a ticket the person named ([`amp_core::approval`]).
+pub const WAKE_PROMPT: &str = "[amp-harness] Workers you launched have ended: their summaries \
+     are above. Carry on with what they mean for the plan (the next wave, a review, fix tickets, \
+     or a report to the person).";
+
+/// How long the chat waits after the newest worker end it saw before it wakes the manager (AMP
+/// #2891): ends that land close together give one turn.
+pub const WAKE_SETTLE: Duration = Duration::from_millis(500);
+
+/// The loop guard on automatic turns (AMP #2891): at most [`WAKE_LIMIT`] of them within
+/// [`WAKE_WINDOW`] with no prompt from the person. One more pauses waking until the person sends
+/// a prompt; the ends wait for that prompt's turn, as when the switch is off.
+pub const WAKE_LIMIT: usize = 5;
+pub const WAKE_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// The transcript line above an automatic turn (AMP #2891): what started it, so it is not taken
+/// for something the person typed.
+pub fn wake_notice(ended: usize) -> String {
+    format!(
+        "↻ {} ended while the chat was idle: the manager carries on by itself (an automatic \
+         turn, not a prompt from you; [manager] wake_on_worker_end = false turns this off).",
+        if ended == 1 {
+            "a worker you launched".to_owned()
+        } else {
+            format!("{ended} workers you launched")
+        }
+    )
+}
+
+/// The warning when the loop guard stops waking the manager (AMP #2891).
+pub fn wake_paused_notice(ended: usize) -> String {
+    format!(
+        "⏸ The manager started {WAKE_LIMIT} turns by itself in the last {} minutes with no \
+         prompt from you, so it stops waking for worker ends. {} for your next prompt.",
+        WAKE_WINDOW.as_secs() / 60,
+        if ended == 1 {
+            "One ended worker waits".to_owned()
+        } else {
+            format!("{ended} ended workers wait")
+        }
+    )
+}
+
+/// The loop guard on the automatic turns worker ends start (AMP #2891). A prompt from the person
+/// resets it ([`WakeGuard::reset`]).
+#[derive(Debug, Default)]
+pub struct WakeGuard {
+    /// When the automatic turns since the person's last prompt started, within [`WAKE_WINDOW`].
+    times: std::collections::VecDeque<Instant>,
+    /// Tripped: no automatic turn until the person's next prompt.
+    paused: bool,
+}
+
+/// What [`WakeGuard::allow`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeVerdict {
+    /// Start the automatic turn (counted).
+    Wake,
+    /// The guard just tripped: say so once, start nothing.
+    Trip,
+    /// Already tripped: start nothing, say nothing.
+    Paused,
+}
+
+impl WakeGuard {
+    pub fn allow(&mut self, now: Instant) -> WakeVerdict {
+        if self.paused {
+            return WakeVerdict::Paused;
+        }
+        while self
+            .times
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= WAKE_WINDOW)
+        {
+            self.times.pop_front();
+        }
+        if self.times.len() >= WAKE_LIMIT {
+            self.paused = true;
+            return WakeVerdict::Trip;
+        }
+        self.times.push_back(now);
+        WakeVerdict::Wake
+    }
+
+    /// The person sent a prompt: automatic turns may start again, with a fresh count.
+    pub fn reset(&mut self) {
+        self.times.clear();
+        self.paused = false;
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+}
+
+/// The line a prompt typed during a reply leaves (AMP #2889): its place in the queue, that it
+/// runs on its own once the reply ends, and that Esc drops it (as a paired device's queue).
+pub fn queued_notice(position: usize, text: &str) -> String {
+    let preview: String = text.replace(['\n', '\t'], " ").chars().take(80).collect();
+    let more = if text.chars().count() > 80 { "…" } else { "" };
+    format!(
+        "queued #{position} · runs after this reply: \"{preview}{more}\" (Esc stops the reply \
+         and drops the queue)"
+    )
+}
+
+/// What a stopped reply says about the prompts it drops (AMP #2889).
+pub fn dropped_notice(n: usize) -> String {
+    if n == 1 {
+        "dropped the queued prompt (↑ recalls it)".to_owned()
+    } else {
+        format!("dropped {n} queued prompts (↑ recalls them)")
+    }
+}
+
 /// [`ESC_HINT`], naming this chat's live workers, which stopping the reply stops too (#2354).
 pub fn esc_hint(tickets: &[i64]) -> String {
     match tickets.len() {
         0 => ESC_HINT.to_owned(),
         1 => format!("{ESC_HINT} and the worker on #{}", tickets[0]),
         _ => format!("{ESC_HINT} and the workers on {}", ticket_list(tickets)),
+    }
+}
+
+/// How loud a launched worker's end is in the transcript (AMP #2861).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// The notice for one launched worker's end (AMP #2861): a completed ticket is plain news, one
+/// the worker blocked or stopped on wants the person, and a failure (or a dispatch that never
+/// happened) is an error. The text is [`amp_core::supervisor::LaunchEnd::line`], as the manager
+/// reads it at its next turn.
+fn launch_end_notice(end: &amp_core::supervisor::LaunchEnd) -> (EndLevel, String) {
+    use amp_core::supervisor::WorkerOutcome as O;
+    let level = match &end.result {
+        Ok(report) => match report.outcome {
+            O::Completed => EndLevel::Info,
+            O::Blocked | O::Stopped | O::Cancelled => EndLevel::Warn,
+            O::Error | O::Timeout | O::TurnBudget => EndLevel::Error,
+        },
+        Err(_) => EndLevel::Error,
+    };
+    (level, format!("worker ended: {}", end.line()))
+}
+
+/// A launch that ended with no worker session behind it (AMP #2862): what its
+/// [`amp_core::supervisor::LaunchEnd`] said.
+#[derive(Debug, Clone)]
+struct EndedLaunch {
+    agent_id: String,
+    /// The launch end's `Err` text: [`amp_core::supervisor::LAUNCH_CRASHED`] and what happened
+    /// to the ticket, or why it was never dispatched.
+    why: String,
+    at: std::time::SystemTime,
+}
+
+/// The live workers in `sessions` with their phases, by ticket: what the roster compares to
+/// decide whether it is out of date (AMP #2862).
+fn live_phases(
+    sessions: &[amp_core::supervisor::WorkerSessionInfo],
+) -> Vec<(i64, amp_core::supervisor::WorkerPhase)> {
+    let mut live: Vec<_> = sessions
+        .iter()
+        .filter_map(|s| s.phase.map(|p| (s.task_id, p)))
+        .collect();
+    live.sort_by_key(|(id, _)| *id);
+    live
+}
+
+/// The roster row of a launch that ended with no session (AMP #2862): a finished worker of this
+/// chat whose outcome says `crashed` or `not_dispatched`, and, for a crash, whether its ticket
+/// went back to ready (the `/workers` panel shows that as for any returned worker).
+fn ended_launch_entry(task_id: i64, end: &EndedLaunch) -> WorkerEntry {
+    use amp_core::supervisor::LAUNCH_CRASHED;
+    let crashed = end.why.starts_with(LAUNCH_CRASHED);
+    let returned_to = format!("#{task_id} was returned to ready");
+    let not_returned = format!("#{task_id} could not be returned to ready: ");
+    let still_open = format!("#{task_id} is still in progress in AMP");
+    let returned = if !crashed {
+        None
+    } else if end.why.contains(&returned_to) {
+        Some(Ok(()))
+    } else if let Some(at) = end.why.find(&not_returned) {
+        Some(Err(end.why[at + not_returned.len()..].trim().to_owned()))
+    } else if end.why.contains(&still_open) {
+        Some(Err("still in progress in AMP".to_owned()))
+    } else {
+        None
+    };
+    WorkerEntry {
+        task_id,
+        agent_id: end.agent_id.clone(),
+        phase: Phase::Finished,
+        state: format!(
+            "{} {}",
+            if crashed { "crashed" } else { "not dispatched" },
+            crate::roster::ago(end.at, std::time::SystemTime::now())
+        ),
+        outcome: Some(if crashed { "crashed" } else { "not_dispatched" }.to_owned()),
+        returned,
+        local: true,
+        ..WorkerEntry::default()
     }
 }
 
@@ -521,6 +750,92 @@ pub fn worker_stop_notice(tickets: &[i64]) -> String {
     }
 }
 
+/// What stopping the reply does to this chat's live workers (AMP #2858), for
+/// [`reply_stop_notice`] and the Esc hint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplyStop {
+    /// Every live worker of this chat.
+    pub live: Vec<i64>,
+    /// Launched during the reply being stopped and still waiting for a slot (not dispatched):
+    /// the reply's tool-call signal still cancels these. Launch mode only.
+    pub cancelled: Vec<i64>,
+    /// Live, not cancelled, and still waiting for a slot: they stay queued. Launch mode only.
+    pub queued: Vec<i64>,
+}
+
+/// The note when Esc, `/abort`, `/stop` or a remote Stop stops the reply (AMP #2858), or `None`
+/// when no worker of this chat is live.
+///
+/// - [`DispatchMode::Await`]: the workers run inside the reply's `amp_run_ticket` calls, so
+///   stopping the reply stops them: [`worker_stop_notice`], as before.
+/// - [`DispatchMode::Launch`]: a dispatched worker is the supervisor's and keeps running (only
+///   `/workers` or quitting stops it); a launch from this very reply that is still waiting for a
+///   slot is cancelled before AMP ever hears of it.
+pub fn reply_stop_notice(mode: DispatchMode, stop: &ReplyStop) -> Option<String> {
+    if stop.live.is_empty() {
+        return None;
+    }
+    if mode == DispatchMode::Await {
+        return Some(worker_stop_notice(&stop.live));
+    }
+    let mut parts = vec!["stopping the reply".to_owned()];
+    match stop.cancelled.as_slice() {
+        [] => {}
+        [one] => parts.push(format!(
+            "#{one} was still waiting for a slot, so its launch is cancelled and it is not \
+             dispatched"
+        )),
+        many => parts.push(format!(
+            "{} were still waiting for a slot, so their launches are cancelled and they are not \
+             dispatched",
+            hash_ids(many)
+        )),
+    }
+    let kept: Vec<i64> = stop
+        .live
+        .iter()
+        .copied()
+        .filter(|id| !stop.cancelled.contains(id))
+        .collect();
+    match kept.as_slice() {
+        [] => {}
+        [one] => {
+            let what = if stop.queued.contains(one) {
+                "stays queued for a slot"
+            } else {
+                "keeps running"
+            };
+            parts.push(format!("the worker on #{one} {what} (/workers to stop it)"));
+        }
+        many => {
+            let waiting: Vec<i64> = many
+                .iter()
+                .copied()
+                .filter(|id| stop.queued.contains(id))
+                .collect();
+            let mut line = format!(
+                "{} workers keep running on {} (/workers to stop one)",
+                many.len(),
+                hash_ids(many)
+            );
+            match waiting.as_slice() {
+                [] => {}
+                [one] => line.push_str(&format!("; #{one} is still queued for a slot")),
+                w => line.push_str(&format!("; {} are still queued for a slot", hash_ids(w))),
+            }
+            parts.push(line);
+        }
+    }
+    Some(parts.join("; "))
+}
+
+fn hash_ids(ids: &[i64]) -> String {
+    ids.iter()
+        .map(|id| format!("#{id}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// After Ctrl+D scrolled the transcript (or was held at its end), Ctrl+D on the empty editor
 /// doesn't quit until it has been left alone this long, so scrolling down with it (or holding
 /// it) stops at the latest output instead of quitting (#2185).
@@ -561,8 +876,8 @@ pub enum CtrlC {
 pub const STOPPED_WAITING: &str = "Stopped waiting for plan approval. The manager carries on when \
                                    you reply.";
 
-/// The spinner's own message while a run is going.
-const WORKING: &str = "Working…";
+/// The spinner's own message while a run is going (the Message box's title, #2882).
+const WORKING: &str = crate::view::REPLYING;
 
 /// What the caller does after a submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -604,6 +919,22 @@ pub struct Shell {
     cleared_done: Option<i64>,
     /// The manager's worker supervisor, so quitting can cancel and wait for its workers.
     supervisor: Option<Arc<Supervisor>>,
+    /// Copies of the supervisor's launched ends as they land (AMP #2861), shown as notices on the
+    /// tick. Display only: the queue itself is drained at the next turn's start (#2857).
+    launch_watch: Option<tokio::sync::broadcast::Receiver<amp_core::supervisor::LaunchEnd>>,
+    /// The supervisor's live workers and their phases as the roster last showed them (AMP
+    /// #2862): an agent event refreshes the roster when they changed, whatever tool ended.
+    roster_live: Vec<(i64, amp_core::supervisor::WorkerPhase)>,
+    /// Launches that ended with no session behind them (AMP #2862): the worker task crashed
+    /// (#2885), or the launch was never dispatched. The supervisor keeps no finished session for
+    /// these, so the roster keeps them from their launch end.
+    ended_launches: std::collections::BTreeMap<i64, EndedLaunch>,
+    /// Tests: the worker sessions the roster reads, in place of a supervisor's.
+    #[cfg(test)]
+    test_sessions: Option<Vec<amp_core::supervisor::WorkerSessionInfo>>,
+    /// Tickets with a live worker when the running reply started (AMP #2858): not this reply's
+    /// launches, so stopping it leaves them alone.
+    turn_live: Vec<i64>,
     /// `/connect`'s harness side, if the caller gave one.
     connect: Option<Arc<dyn ProviderConnect>>,
     /// A key being typed for `/connect`.
@@ -662,6 +993,10 @@ pub struct Shell {
     history: PromptHistory,
     /// The running prompt's run id in the manager feed (#2370).
     run_id: Option<String>,
+    /// Prompts typed here while a reply runs (AMP #2889), oldest first: each runs as its own
+    /// turn when the reply before it ends, as the remote link's follow-up queue does
+    /// ([`amp_core::remote::link::QUEUE_MAX`] at most). A stopped reply drops them.
+    prompt_queue: std::collections::VecDeque<String>,
     /// The worker chips last sent to the manager feed (#2370).
     fed_workers: Option<amp_core::chat_event::ChatEvent>,
     /// The status the remote link reports (#2373), refreshed on every poll once it exists.
@@ -681,6 +1016,18 @@ pub struct Shell {
     turn_refusals: Vec<amp_core::approval::Refusal>,
     /// The wait for a person's plan approval (#2425), between turns.
     approval_wait: Option<amp_core::approval_wait::ApprovalWait>,
+    /// `[manager] wake_on_worker_end` (AMP #2891, default on): launched workers that end while
+    /// the chat is idle start the manager's next turn ([`Shell::wake_on_worker_end`]).
+    wake_on_end: bool,
+    /// The turn being started is an automatic one ([`WAKE_PROMPT`]), so it doesn't reset the
+    /// loop guard the way a prompt from the person does.
+    waking: bool,
+    /// The loop guard on automatic turns.
+    wake_guard: WakeGuard,
+    /// When the newest worker end was shown ([`WAKE_SETTLE`]).
+    end_seen_at: Option<Instant>,
+    /// [`Shell::quit`] has begun: nothing new starts.
+    quitting: bool,
 }
 
 /// A tool call whose arguments are still streaming (#2384).
@@ -719,6 +1066,7 @@ impl Shell {
                 prompts: 0,
                 pending_model: None,
                 running: false,
+                prompt_queue: std::collections::VecDeque::new(),
                 done_tx,
                 meta: None,
                 opener: Arc::new(|url: &str| amp_mcp::oauth::open_browser(url)),
@@ -732,6 +1080,12 @@ impl Shell {
                 footer_ticket: None,
                 cleared_done: None,
                 supervisor: None,
+                launch_watch: None,
+                roster_live: Vec::new(),
+                ended_launches: Default::default(),
+                #[cfg(test)]
+                test_sessions: None,
+                turn_live: Vec::new(),
                 connect: None,
                 secret: None,
                 server: None,
@@ -768,6 +1122,11 @@ impl Shell {
                 turn_plan: false,
                 turn_refusals: Vec::new(),
                 approval_wait: None,
+                wake_on_end: true,
+                waking: false,
+                wake_guard: WakeGuard::default(),
+                end_seen_at: None,
+                quitting: false,
             },
             done_rx,
         )
@@ -880,12 +1239,10 @@ impl Shell {
                 let _ = reply.send(started);
             }
             crate::remote::RemoteCall::Stop { reply } => {
-                // As Esc / `/abort`: the reply stops, and with it the manager's workers.
+                // As Esc / `/abort`: the reply stops; what that does to the workers depends on
+                // the dispatch mode (AMP #2858).
                 if self.running {
-                    let live = self.live_tickets();
-                    if !live.is_empty() {
-                        self.view.add_warning(&worker_stop_notice(&live));
-                    }
+                    self.warn_reply_stop();
                     self.view.set_stopping(true);
                     self.clear_esc_hint();
                     let harness = Arc::clone(&self.harness);
@@ -1501,7 +1858,61 @@ impl Shell {
 
     /// Gives the shell the session's worker supervisor (the manager's; `None` for a worker role).
     pub fn set_supervisor(&mut self, supervisor: Option<Arc<Supervisor>>) {
+        self.launch_watch = supervisor.as_ref().map(|s| s.watch_launch_ends());
         self.supervisor = supervisor;
+    }
+
+    /// Shows every launched worker that ended since the last tick (AMP #2861), whether the
+    /// manager is idle or mid-reply: no dispatch tool result has to come back first. It reads
+    /// the supervisor's broadcast, never its queue, so the next turn still gets each end once
+    /// ([`Shell::take_worker_summaries`]). Returns whether anything was shown.
+    fn show_launch_ends(&mut self) -> bool {
+        use tokio::sync::broadcast::error::TryRecvError;
+        let Some(watch) = self.launch_watch.as_mut() else {
+            return false;
+        };
+        let mut shown = false;
+        loop {
+            match watch.try_recv() {
+                Ok(end) => {
+                    if let Err(why) = &end.result {
+                        self.ended_launches.insert(
+                            end.task_id,
+                            EndedLaunch {
+                                agent_id: end.agent_id.clone(),
+                                why: why.clone(),
+                                at: std::time::SystemTime::now(),
+                            },
+                        );
+                    }
+                    let (level, text) = launch_end_notice(&end);
+                    match level {
+                        EndLevel::Info => self.view.add_notice(&text),
+                        EndLevel::Warn => self.view.add_warning(&text),
+                        EndLevel::Error => self.view.add_error(&text),
+                    }
+                    shown = true;
+                }
+                Err(TryRecvError::Lagged(missed)) => {
+                    self.view.add_warning(&format!(
+                        "{missed} worker ends were not shown here; /workers lists them"
+                    ));
+                    shown = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Closed) => {
+                    self.launch_watch = None;
+                    break;
+                }
+            }
+        }
+        // AMP #2862: an end is news for the roster too (the worker is finished, crashed or never
+        // dispatched), not only when a dispatch tool call returns.
+        if shown {
+            self.end_seen_at = Some(Instant::now());
+            self.build_roster();
+        }
+        shown
     }
 
     /// Gives the shell `/connect` (amp-harness: keychain, provider checks, config).
@@ -1787,6 +2198,52 @@ impl Shell {
         });
     }
 
+    /// The supervisor's dispatch mode ([`DispatchMode::Await`] without one).
+    pub fn dispatch_mode(&self) -> DispatchMode {
+        self.supervisor
+            .as_ref()
+            .map_or(DispatchMode::Await, |s| s.config().dispatch)
+    }
+
+    /// What stopping the running reply would do to this chat's workers now (AMP #2858). In
+    /// Launch mode a worker is cancelled only when this reply launched it (it wasn't live when
+    /// the turn started, so its tool-call signal is this reply's) and it is still waiting for a
+    /// slot (queued, and AMP has no dispatch for it).
+    pub fn reply_stop(&self) -> ReplyStop {
+        let Some(sup) = self.supervisor.as_ref() else {
+            return ReplyStop::default();
+        };
+        let workers = sup.workers();
+        let live = workers.iter().map(|w| w.task_id).collect();
+        if sup.config().dispatch == DispatchMode::Await {
+            return ReplyStop {
+                live,
+                ..ReplyStop::default()
+            };
+        }
+        let dispatched = sup.unfinished();
+        let waiting = |w: &&amp_core::supervisor::WorkerStatus| {
+            w.phase == amp_core::supervisor::WorkerPhase::Queued && !dispatched.contains(&w.task_id)
+        };
+        let (cancelled, queued) = workers
+            .iter()
+            .filter(waiting)
+            .map(|w| w.task_id)
+            .partition(|id| !self.turn_live.contains(id));
+        ReplyStop {
+            live,
+            cancelled,
+            queued,
+        }
+    }
+
+    /// Warns what stopping the reply does to this chat's workers, if any are live (AMP #2858).
+    fn warn_reply_stop(&mut self) {
+        if let Some(note) = reply_stop_notice(self.dispatch_mode(), &self.reply_stop()) {
+            self.view.add_warning(&note);
+        }
+    }
+
     /// Tickets with a live (queued, running or reporting) worker.
     pub fn live_tickets(&self) -> Vec<i64> {
         self.supervisor
@@ -1823,6 +2280,9 @@ impl Shell {
         S: Future<Output = ()>,
         R: FnMut(&Self),
     {
+        // Quitting: nothing queued may start once the reply ends, nor any automatic turn.
+        self.quitting = true;
+        self.prompt_queue.clear();
         if self.settled() {
             return QuitOutcome::Idle;
         }
@@ -1970,6 +2430,74 @@ impl Shell {
         }
     }
 
+    /// `[manager] wake_on_worker_end` (AMP #2891, default on): a launched worker that ends while
+    /// the chat is idle starts the manager's next turn, which gets its summary. Off: the ends wait
+    /// for the person's next prompt, as before.
+    pub fn set_wake_on_worker_end(&mut self, on: bool) {
+        self.wake_on_end = on;
+    }
+
+    /// Whether the loop guard has stopped automatic turns until the person's next prompt.
+    pub fn wake_paused(&self) -> bool {
+        self.wake_guard.is_paused()
+    }
+
+    /// Starts one manager turn for the launched workers that ended (AMP #2891), the way the plan
+    /// approval resume does ([`Shell::watch_approval`]): a notice saying what started it, then
+    /// [`WAKE_PROMPT`] as the user turn. Only when the chat is idle: no reply running, no prompt
+    /// queued here or on a paired device (that prompt's turn carries the ends), no server switch,
+    /// no quit, and no worker end seen in the last [`WAKE_SETTLE`] (so ends close together give
+    /// one turn). It never takes the ends itself: [`Shell::start_run_as`] does, so each still
+    /// reaches exactly one turn, and ends that land during this turn wait for the next wake.
+    /// The [`WakeGuard`] caps how many such turns run with no prompt from the person.
+    fn wake_on_worker_end(&mut self, now: Instant) -> bool {
+        if !self.wake_on_end
+            || self.running
+            || self.switching
+            || self.quitting
+            || self.quit_confirm_until.is_some_and(|until| now < until)
+            || !self.prompt_queue.is_empty()
+            || self.remote_queue_len() > 0
+            || self
+                .end_seen_at
+                .is_some_and(|at| now.saturating_duration_since(at) < WAKE_SETTLE)
+        {
+            return false;
+        }
+        let pending = self
+            .supervisor
+            .as_ref()
+            .map_or(0, |s| s.pending_launch_ends());
+        if pending == 0 {
+            return false;
+        }
+        match self.wake_guard.allow(now) {
+            WakeVerdict::Paused => false,
+            WakeVerdict::Trip => {
+                self.view.add_warning(&wake_paused_notice(pending));
+                true
+            }
+            WakeVerdict::Wake => {
+                self.view.add_notice(&wake_notice(pending));
+                self.view.add_user(WAKE_PROMPT);
+                self.waking = true;
+                self.start_run(WAKE_PROMPT.to_owned());
+                true
+            }
+        }
+    }
+
+    /// Prompts from a paired device waiting in the remote link's queue (AMP #2891).
+    fn remote_queue_len(&self) -> usize {
+        let Some(Ok(link)) = self.remote.as_ref().map(|r| r.link.as_ref()) else {
+            return 0;
+        };
+        match link.current() {
+            amp_core::remote::RemoteState::On(on) => on.queue_len,
+            _ => 0,
+        }
+    }
+
     /// Whether the chat waits for a person's plan approval (#2425).
     pub fn waiting_for_approval(&self) -> bool {
         self.approval_wait.is_some()
@@ -2097,12 +2625,13 @@ impl Shell {
         }
         self.view.apply(event);
         self.follow_streaming(event);
-        // #2355: a worker's run has ended (the supervisor recorded it) by the time its
-        // `amp_run_ticket` returns: the strip stops saying running, and its finished notice lands
-        // now, before the manager's reply, not on the next tick.
-        if let AgentEvent::ToolExecutionEnd { tool_name, .. } = event
-            && tool_name == amp_core::policy::DISPATCH_TOOL
-        {
+        // AMP #2862: the roster follows the supervisor's live status, not the dispatch tool call.
+        // In Launch mode `amp_run_ticket` returns at once, while its worker is still queued or
+        // running; in Await mode (#2355) the worker has ended by then, so the strip stops
+        // saying running and its finished notice lands now, above the manager's reply. Either
+        // way, a change in who is live is what refreshes it. Streaming deltas are skipped: the
+        // tick catches anything they would.
+        if !matches!(event, AgentEvent::MessageUpdate { .. }) && self.live_changed() {
             self.build_roster();
         }
         if let AgentEvent::ToolExecutionStart {
@@ -2172,7 +2701,7 @@ impl Shell {
 
     /// #2384: while the model writes a tool call's arguments (a plan's `amp_create_tasks` can
     /// stream for 40 s), the spinner line says what it is writing and how far it got
-    /// ([`amp_render::streaming_line`]) instead of only "Working…". Back to "Working…" once the
+    /// ([`amp_render::streaming_line`]) instead of only "manager replying". Back to "manager replying" once the
     /// call is complete.
     fn follow_streaming(&mut self, event: &AgentEvent) {
         use rpi_ai::types::{AssistantMessageEvent as E, Content};
@@ -2240,11 +2769,15 @@ impl Shell {
         }
     }
 
-    /// The spinner's message when no hint is shown: what the model is writing, else "Working…".
+    /// The spinner's message when no hint is shown: what the model is writing, else "manager replying".
     fn working_text(&self) -> String {
-        match &self.streaming {
+        let text = match &self.streaming {
             Some(call) => amp_render::streaming_line(&call.name, &call.json),
             None => WORKING.to_owned(),
+        };
+        match self.prompt_queue.len() {
+            0 => text,
+            n => format!("{text} · {n} queued"),
         }
     }
 
@@ -2300,8 +2833,7 @@ impl Shell {
         // #2161: a sent prompt hands the keys back to the editor; a docked panel stays.
         self.editor_clicked = self.view.panel().is_open();
         if self.running {
-            self.view
-                .add_notice("still working: wait for the reply, or press Esc to abort it");
+            self.queue_prompt(trimmed);
             return Submit::Continue;
         }
         if self.switching {
@@ -2312,6 +2844,50 @@ impl Shell {
         self.view.add_user(trimmed);
         self.start_run(trimmed.to_owned());
         Submit::Continue
+    }
+
+    /// A prompt typed while a reply runs (AMP #2889): it waits its turn instead of being refused,
+    /// and the transcript and the spinner line say so. At most [`QUEUE_MAX`] wait, as on a paired
+    /// device; a stopped reply drops them ([`Shell::finish_run`]).
+    fn queue_prompt(&mut self, text: &str) {
+        if self.prompt_queue.len() >= QUEUE_MAX {
+            self.view.add_notice(&format!(
+                "{QUEUE_MAX} prompts are already queued: send it once one has run (↑ recalls it)"
+            ));
+            return;
+        }
+        self.prompt_queue.push_back(text.to_owned());
+        self.view
+            .add_notice(&queued_notice(self.prompt_queue.len(), text));
+        if self.esc_hint_until.is_none() {
+            self.show_working();
+        }
+    }
+
+    /// The prompts typed here that wait for the running reply to end (AMP #2889), oldest first.
+    pub fn queued_prompts(&self) -> Vec<String> {
+        self.prompt_queue.iter().cloned().collect()
+    }
+
+    /// After a reply ended (AMP #2889): a stopped one drops the queue and says so; otherwise the
+    /// oldest queued prompt runs now, as its own turn. Prompts from a paired device wait in the
+    /// remote link's queue and run after these, one per reply ([`amp_core::remote::link`]).
+    fn after_run(&mut self, stopped: bool) {
+        if stopped {
+            let n = self.prompt_queue.len();
+            self.prompt_queue.clear();
+            if n > 0 {
+                self.view.add_notice(&dropped_notice(n));
+            }
+            return;
+        }
+        if self.switching {
+            return;
+        }
+        if let Some(next) = self.prompt_queue.pop_front() {
+            self.view.add_user(&next);
+            self.start_run(next);
+        }
     }
 
     /// While any ticket waits for approval, re-reads the plan now (#2209, #2230): before the manager's
@@ -2344,7 +2920,15 @@ impl Shell {
         self.stop_approval_wait(None);
         self.turn_plan = false;
         self.turn_refusals.clear();
+        // AMP #2891: a turn that isn't an automatic wake is the person's (typed, queued, remote,
+        // or their plan approval), so automatic turns may start again afterwards.
+        if !std::mem::take(&mut self.waking) {
+            self.wake_guard.reset();
+        }
         self.running = true;
+        // AMP #2858: workers already live now were not launched by this reply, so stopping it
+        // can't cancel them.
+        self.turn_live = self.live_tickets();
         self.prompts += 1;
         // R-M16: the model sees where a remote turn came from; the feed shows the plain text.
         let model_text = match &origin {
@@ -2352,6 +2936,14 @@ impl Shell {
                 format!("[remote: {device_name}] {prompt}")
             }
             amp_core::chat_event::PromptOrigin::Local => prompt.clone(),
+        };
+        // #2857: workers that ended since the last turn are delivered here, at the top of the turn
+        // that starts now — and only here. Draining takes each end out of the supervisor's queue,
+        // so the next turn never sees it again, and an end that arrives while this run is going
+        // stays queued for the turn after it (#2835).
+        let model_text = match self.take_worker_summaries() {
+            Some(summaries) => format!("{summaries}\n\n{model_text}"),
+            None => model_text,
         };
         if self.view.feed().is_some() {
             let prompt_id = prompt_id.unwrap_or_else(|| format!("p_{}", self.prompts));
@@ -2386,15 +2978,24 @@ impl Shell {
         });
     }
 
+    /// The ends of this chat's workers that finished since the last turn, as a block the model
+    /// reads at the top of the turn starting now (AMP #2835, #2857). `None` when nothing is
+    /// waiting. Consuming them is what makes them arrive once: a later turn's drain is empty.
+    fn take_worker_summaries(&self) -> Option<String> {
+        let ends = self.supervisor.as_ref()?.take_launch_ends();
+        worker_summaries(&ends)
+    }
+
     /// Asks the running prompt to stop; it then finishes as aborted, and the transcript says
     /// "Stopped." once, below whatever the reply had streamed ([`Shell::finish_run`]).
+    ///
+    /// It stops only the reply: it never calls [`Supervisor::cancel_all`] (AMP #2858). In Await
+    /// mode the reply's `amp_run_ticket` calls end, and their workers with them; in Launch mode
+    /// dispatched workers keep running and only this reply's still-queued launches end
+    /// ([`reply_stop_notice`] says which). `/workers` stops one worker; quitting stops them all.
     pub async fn abort(&mut self) {
         if self.running {
-            let live = self.live_tickets();
-            if !live.is_empty() {
-                // Stopping the reply cancels the manager's amp_run_ticket, and so its workers.
-                self.view.add_warning(&worker_stop_notice(&live));
-            }
+            self.warn_reply_stop();
         }
         self.abort_quietly().await;
     }
@@ -2421,6 +3022,18 @@ impl Shell {
         self.view.set_stopping(false);
         // The reply's error line already says what went wrong: say it once (#2207).
         let error_shown = self.view.take_error_shown();
+        // AMP #2889: the run ended stopped exactly when its `run_end` says `aborted`, which is
+        // what makes the remote link drop its queue: the chat's queue goes with it, so the two
+        // never disagree. A reply that had already ended when Esc reached it ended `completed`
+        // (or `failed`), and both queues run on.
+        let stopped = match &result {
+            Ok(r) => match &r.outcome {
+                HarnessRunOutcome::Aborted { .. } => true,
+                HarnessRunOutcome::Failed { .. } => stopping,
+                HarnessRunOutcome::Completed { .. } | HarnessRunOutcome::Suspended { .. } => false,
+            },
+            Err(_) => stopping,
+        };
         if let Some(run_id) = self.run_id.take() {
             use amp_core::chat_event::{ChatEvent, RunOutcome};
             let (outcome, error) = match &result {
@@ -2484,6 +3097,7 @@ impl Shell {
                 amp_core::provider_error::summarize("", &e)
             )),
         }
+        self.after_run(stopped);
     }
 
     /// A key the editor doesn't get first: the `/` menu's keys ([`crate::slash::CommandMenu`]),
@@ -2653,8 +3267,20 @@ impl Shell {
 
     fn show_esc_hint(&mut self) {
         self.esc_hint_until = Some(Instant::now() + ESC_HINT_FOR);
-        self.view
-            .set_working_message(&esc_hint(&self.live_tickets()));
+        // AMP #2858: name only the workers the next Esc would stop (in Launch mode, this
+        // reply's launches still waiting for a slot).
+        let stopped = match self.dispatch_mode() {
+            DispatchMode::Await => self.live_tickets(),
+            DispatchMode::Launch => self.reply_stop().cancelled,
+        };
+        let mut hint = esc_hint(&stopped);
+        // AMP #2889: stopping the reply drops what was queued behind it.
+        match self.prompt_queue.len() {
+            0 => {}
+            1 => hint.push_str(" (drops the queued prompt)"),
+            n => hint.push_str(&format!(" (drops {n} queued prompts)")),
+        }
+        self.view.set_working_message(&hint);
     }
 
     fn clear_esc_hint(&mut self) {
@@ -2717,7 +3343,7 @@ impl Shell {
         }
     }
 
-    /// Puts the spinner line back to "Working…" once [`ESC_HINT`] has been shown for
+    /// Puts the spinner line back to "manager replying" once [`ESC_HINT`] has been shown for
     /// [`ESC_HINT_FOR`] at `now`, and the empty editor back to its placeholder once
     /// [`QUIT_HINT_FOR`] has passed. Returns true when either changed. [`Shell::poll`] calls it.
     pub fn expire_hints(&mut self, now: Instant) -> bool {
@@ -3263,6 +3889,7 @@ impl Shell {
         let mut changed = self.expire_hints(Instant::now());
         changed |= self.poll_remote();
         changed |= self.build_roster();
+        changed |= self.show_launch_ends();
         changed |= self.pump_sessions();
         while let Ok(msg) = self.msgs_rx.try_recv() {
             changed = true;
@@ -3378,7 +4005,10 @@ impl Shell {
         // The Done marker first (sync_meta), then let the finished ticket go.
         let synced = self.sync_meta();
         let watched = self.watch_approval();
-        changed | synced | watched | self.clear_done_ticket()
+        // AMP #2891: last, once everything that could start a turn (a queued prompt, a paired
+        // device's, the approval resume) has had its go.
+        let woke = self.wake_on_worker_end(Instant::now());
+        changed | synced | watched | woke | self.clear_done_ticket()
     }
 
     /// A current ticket stops being current once it is done (UX review #2175 finding 12,
@@ -4033,11 +4663,8 @@ impl Shell {
     fn build_roster(&mut self) -> bool {
         let now = std::time::SystemTime::now();
         let snap = self.meta.as_ref().map(|m| m.snapshot());
-        let sessions = self
-            .supervisor
-            .as_ref()
-            .map(|s| s.sessions())
-            .unwrap_or_default();
+        let sessions = self.worker_sessions();
+        self.roster_live = live_phases(&sessions);
         let mut entries: std::collections::BTreeMap<i64, WorkerEntry> = Default::default();
         for i in &sessions {
             let model = i.model.clone().unwrap_or_default();
@@ -4063,11 +4690,19 @@ impl Shell {
                     context_tokens: i.totals.context_tokens,
                     context_window: window,
                     branch: i.branch.clone(),
+                    returned: i.returned.clone(),
                     viewable: true,
                     local: true,
                     ..WorkerEntry::default()
                 },
             );
+        }
+        // AMP #2862: launches that ended with no session (crashed, or never dispatched) stay
+        // identifiable as this chat's finished workers until the ticket runs again.
+        for (id, end) in &self.ended_launches {
+            entries
+                .entry(*id)
+                .or_insert_with(|| ended_launch_entry(*id, end));
         }
         // Sessions read from disk (an earlier chat's workers).
         for (id, s) in &self.sessions {
@@ -4165,6 +4800,13 @@ impl Shell {
             }
             self.noticed.insert(i.task_id, live);
         }
+        // A live worker that left the supervisor with no session (its task crashed, AMP #2885)
+        // is not live any more; its launch end's notice already said how it ended (#2862).
+        for (id, live) in self.noticed.iter_mut() {
+            if *live && !sessions.iter().any(|i| i.task_id == *id) {
+                *live = false;
+            }
+        }
         // A worker that just started running was just dispatched: AMP's ready count changed.
         let mut dispatched = false;
         for i in &sessions {
@@ -4181,6 +4823,31 @@ impl Shell {
             self.view.strip().blur();
         }
         self.view.roster().set(entries)
+    }
+
+    /// This chat's worker sessions, live and finished, from the supervisor.
+    fn worker_sessions(&self) -> Vec<amp_core::supervisor::WorkerSessionInfo> {
+        #[cfg(test)]
+        if let Some(sessions) = &self.test_sessions {
+            return sessions.clone();
+        }
+        self.supervisor
+            .as_ref()
+            .map(|s| s.sessions())
+            .unwrap_or_default()
+    }
+
+    /// Whether the supervisor's live workers (tickets and phases) differ from what the roster
+    /// last showed (AMP #2862).
+    fn live_changed(&self) -> bool {
+        #[cfg(test)]
+        let has_source = self.supervisor.is_some() || self.test_sessions.is_some();
+        #[cfg(not(test))]
+        let has_source = self.supervisor.is_some();
+        if !has_source {
+            return false;
+        }
+        live_phases(&self.worker_sessions()) != self.roster_live
     }
 
     /// The context window of `model` (`provider/model`) from the chat's model list; 0 unknown.
@@ -4258,7 +4925,8 @@ impl Shell {
 
     /// The `y` to [`Shell::ask_stop`]: stops the worker as the person (run reporting records the
     /// run abandoned, `stopped by <person> from the chat`, and returns the ticket to ready; the
-    /// manager's `amp_run_ticket` returns saying so).
+    /// manager is told so in `amp_run_ticket`'s result in Await mode, or in a later turn's
+    /// `[worker summaries]` in Launch mode).
     pub fn confirm_stop(&mut self) -> Result<i64, String> {
         let id = self
             .stop_confirm
@@ -4541,7 +5209,172 @@ fn count(n: u64, one: &str, many: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_answer, parse_id, short_role};
+    use super::{clean_answer, parse_id, short_role, worker_summaries};
+
+    /// AMP #2891's loop guard: at most WAKE_LIMIT automatic turns within WAKE_WINDOW; the next
+    /// trips it once and it stays paused (silently) until the person's prompt resets it. Turns
+    /// older than the window stop counting.
+    #[test]
+    fn the_wake_guard_caps_automatic_turns_until_the_person_speaks() {
+        use super::{WAKE_LIMIT, WAKE_WINDOW, WakeGuard, WakeVerdict};
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let mut g = WakeGuard::default();
+        for i in 0..WAKE_LIMIT {
+            assert_eq!(
+                g.allow(t0 + Duration::from_secs(i as u64)),
+                WakeVerdict::Wake
+            );
+        }
+        assert_eq!(g.allow(t0 + Duration::from_secs(30)), WakeVerdict::Trip);
+        assert!(g.is_paused());
+        // Paused stays paused, even once the window has passed: only the person resumes it.
+        assert_eq!(g.allow(t0 + WAKE_WINDOW * 2), WakeVerdict::Paused);
+        g.reset();
+        assert!(!g.is_paused());
+        assert_eq!(g.allow(t0 + WAKE_WINDOW * 2), WakeVerdict::Wake);
+
+        // Spread out over more than the window, automatic turns go on: a long plan whose
+        // workers take minutes each never trips it.
+        let mut g = WakeGuard::default();
+        let every = WAKE_WINDOW / WAKE_LIMIT as u32 + Duration::from_secs(1);
+        for i in 0..(WAKE_LIMIT * 3) {
+            assert_eq!(
+                g.allow(t0 + every * i as u32),
+                WakeVerdict::Wake,
+                "turn {i}"
+            );
+        }
+    }
+
+    /// The automatic turn says what it is, and its prompt names no number (a number in a user
+    /// message counts as a ticket the person named).
+    #[test]
+    fn the_wake_turn_is_labelled_and_names_no_ticket() {
+        use super::{WAKE_PROMPT, wake_notice, wake_paused_notice};
+        assert!(
+            !WAKE_PROMPT.chars().any(|c| c.is_ascii_digit()),
+            "{WAKE_PROMPT}"
+        );
+        assert!(WAKE_PROMPT.starts_with("[amp-harness]"));
+        let one = wake_notice(1);
+        assert!(
+            one.contains("a worker you launched ended while the chat was idle"),
+            "{one}"
+        );
+        assert!(one.contains("not a prompt from you"), "{one}");
+        assert!(wake_notice(3).contains("3 workers you launched"));
+        let paused = wake_paused_notice(2);
+        assert!(paused.contains("stops waking"), "{paused}");
+        assert!(
+            paused.contains("2 ended workers wait for your next prompt"),
+            "{paused}"
+        );
+    }
+    use crate::roster::{Phase, WorkerEntry};
+    use std::sync::Arc;
+
+    /// #2857: a turn opens with the ends the manager has not seen, once. The block is `None` with
+    /// nothing queued (the prompt goes as typed), and a second look at the same drained ends has
+    /// nothing left to say.
+    #[test]
+    fn worker_summaries_are_one_block_that_a_turn_uses_once() {
+        use amp_core::supervisor::{LaunchEnd, WorkerOutcome, WorkerReport};
+
+        assert_eq!(
+            worker_summaries(&[]),
+            None,
+            "nothing ended: the prompt as typed"
+        );
+
+        let report = |outcome, error: Option<&str>| WorkerReport {
+            task_id: 2857,
+            agent_id: "amp:amp-worker-backend".into(),
+            role: "amp-worker-backend".into(),
+            outcome,
+            dispatch_id: String::new(),
+            started: true,
+            returned: None,
+            final_message: String::new(),
+            error: error.map(str::to_owned),
+            model: "wf/wf-1".into(),
+            cwd: std::path::PathBuf::from("/r"),
+            worktree: None,
+            branch: None,
+            workspace: amp_core::workspace::Placement::Shared,
+            session_file: None,
+            turns: 0,
+            tool_calls: 0,
+            tool_errors: 0,
+            usage: amp_core::events::UsageJson::default(),
+            duration_ms: 0,
+            notes: Vec::new(),
+            totals: amp_core::events::Totals::default(),
+        };
+        let mut failed = report(WorkerOutcome::Error, Some("the model failed"));
+        failed.returned = Some(Err("503".into()));
+        failed.notes = vec![
+            "#2855: worker amp:amp-worker-frontend failed: the model failed, and it could not be \
+             returned: 503. It may still be in progress; check the ticket."
+                .into(),
+        ];
+        let mut asked = report(WorkerOutcome::Blocked, None);
+        asked.final_message = format!("Per-user cache or shared?\n{}", "x".repeat(900));
+        let ends = vec![
+            LaunchEnd {
+                task_id: 2854,
+                agent_id: "amp:amp-worker-backend".into(),
+                result: Ok(report(WorkerOutcome::Completed, None)),
+            },
+            LaunchEnd {
+                task_id: 2855,
+                agent_id: "amp:amp-worker-frontend".into(),
+                result: Ok(failed),
+            },
+            LaunchEnd {
+                task_id: 2856,
+                agent_id: "amp:amp-worker-backend".into(),
+                result: Ok(asked),
+            },
+        ];
+
+        let block = worker_summaries(&ends).expect("two ends, so a block");
+        assert!(
+            block.contains("#2854 completed by amp:amp-worker-backend"),
+            "{block}"
+        );
+        assert!(
+            block.contains("#2855 error by amp:amp-worker-frontend: the model failed"),
+            "{block}"
+        );
+        // #2883: the failed hand-back reaches the model, and the header no longer claims every
+        // ticket is already updated.
+        assert!(
+            block.contains(
+                "    note: #2855: worker amp:amp-worker-frontend failed: the model \
+                 failed, and it could not be returned: 503"
+            ),
+            "{block}"
+        );
+        assert!(!block.contains("already updated in AMP"), "{block}");
+        // A blocked worker's question arrives, trimmed.
+        assert!(
+            block.contains(
+                "#2856 blocked by amp:amp-worker-backend\n    final message: \
+                 Per-user cache or shared?"
+            ),
+            "{block}"
+        );
+        assert!(block.contains("[trimmed;"), "{block}");
+        assert!(!block.contains(&"x".repeat(700)), "{block}");
+        // One item per end, under one header: the model reads where each run got to.
+        assert_eq!(
+            block.lines().filter(|l| l.starts_with("- ")).count(),
+            3,
+            "{block}"
+        );
+    }
 
     #[test]
     fn ids_and_answers() {
@@ -4629,5 +5462,524 @@ mod tests {
         assert_eq!(short_role("amp-manager"), "manager");
         assert_eq!(short_role("amp:amp-worker-backend"), "worker-backend");
         assert_eq!(short_role("reviewer"), "reviewer");
+    }
+
+    fn stop(live: &[i64], cancelled: &[i64], queued: &[i64]) -> super::ReplyStop {
+        super::ReplyStop {
+            live: live.to_vec(),
+            cancelled: cancelled.to_vec(),
+            queued: queued.to_vec(),
+        }
+    }
+
+    /// AMP #2858: in Await mode stopping the reply stops its workers, and says so as before.
+    #[test]
+    fn await_mode_keeps_the_old_stop_notice() {
+        use super::{DispatchMode::Await, reply_stop_notice, worker_stop_notice};
+        assert_eq!(reply_stop_notice(Await, &stop(&[], &[], &[])), None);
+        assert_eq!(
+            reply_stop_notice(Await, &stop(&[7], &[], &[])).as_deref(),
+            Some("stopping the worker on #7 too; its ticket goes back to ready")
+        );
+        assert_eq!(
+            reply_stop_notice(Await, &stop(&[7, 8], &[], &[])),
+            Some(worker_stop_notice(&[7, 8]))
+        );
+    }
+
+    /// AMP #2858: in Launch mode stopping the reply leaves dispatched workers running, and the
+    /// notice never says they stop or that their tickets go back to ready.
+    #[test]
+    fn launch_mode_says_the_workers_keep_running() {
+        use super::{DispatchMode::Launch, reply_stop_notice};
+        assert_eq!(reply_stop_notice(Launch, &stop(&[], &[], &[])), None);
+        let one = reply_stop_notice(Launch, &stop(&[7], &[], &[])).unwrap();
+        assert_eq!(
+            one,
+            "stopping the reply; the worker on #7 keeps running (/workers to stop it)"
+        );
+        let two = reply_stop_notice(Launch, &stop(&[7, 8], &[], &[])).unwrap();
+        assert_eq!(
+            two,
+            "stopping the reply; 2 workers keep running on #7, #8 (/workers to stop one)"
+        );
+        for note in [&one, &two] {
+            assert!(!note.contains("too"), "{note}");
+            assert!(!note.contains("back to ready"), "{note}");
+        }
+    }
+
+    /// AMP #2858: a launch from the stopped reply that still waits for a slot is cancelled and
+    /// never dispatched; one queued by an earlier reply stays queued; both are named apart from
+    /// the workers that keep running.
+    #[test]
+    fn launch_mode_names_cancelled_and_still_queued_launches() {
+        use super::{DispatchMode::Launch, reply_stop_notice};
+        assert_eq!(
+            reply_stop_notice(Launch, &stop(&[9], &[9], &[])).as_deref(),
+            Some(
+                "stopping the reply; #9 was still waiting for a slot, so its launch is \
+                 cancelled and it is not dispatched"
+            )
+        );
+        assert_eq!(
+            reply_stop_notice(Launch, &stop(&[7, 9, 10], &[9, 10], &[])).as_deref(),
+            Some(
+                "stopping the reply; #9, #10 were still waiting for a slot, so their launches \
+                 are cancelled and they are not dispatched; the worker on #7 keeps running \
+                 (/workers to stop it)"
+            )
+        );
+        assert_eq!(
+            reply_stop_notice(Launch, &stop(&[11], &[], &[11])).as_deref(),
+            Some(
+                "stopping the reply; the worker on #11 stays queued for a slot (/workers to stop it)"
+            )
+        );
+        assert_eq!(
+            reply_stop_notice(Launch, &stop(&[7, 8, 9, 11], &[9], &[11])).as_deref(),
+            Some(
+                "stopping the reply; #9 was still waiting for a slot, so its launch is \
+                 cancelled and it is not dispatched; 3 workers keep running on #7, #8, #11 \
+                 (/workers to stop one); #11 is still queued for a slot"
+            )
+        );
+    }
+
+    /// AMP #2858: with no supervisor (a worker role's chat) nothing is live, the mode is Await,
+    /// and stopping the reply has nothing to say about workers.
+    #[tokio::test]
+    async fn no_supervisor_means_await_and_no_worker_note() {
+        let ends = amp_core::supervisor::LaunchEnds::default();
+        let (shell, _feed) = watching_shell(&ends).await;
+        assert_eq!(shell.dispatch_mode(), super::DispatchMode::Await);
+        assert_eq!(shell.reply_stop(), super::ReplyStop::default());
+    }
+
+    /// A worker report for the #2861 tests: `task_id` ended with `outcome`.
+    fn ended(
+        task_id: i64,
+        outcome: amp_core::supervisor::WorkerOutcome,
+        error: Option<&str>,
+    ) -> amp_core::supervisor::LaunchEnd {
+        use amp_core::supervisor::{LaunchEnd, WorkerReport};
+        LaunchEnd {
+            task_id,
+            agent_id: "amp:amp-worker-backend".into(),
+            result: Ok(WorkerReport {
+                task_id,
+                agent_id: "amp:amp-worker-backend".into(),
+                role: "amp-worker-backend".into(),
+                outcome,
+                dispatch_id: String::new(),
+                started: true,
+                returned: None,
+                final_message: String::new(),
+                error: error.map(str::to_owned),
+                model: "wf/wf-1".into(),
+                cwd: std::path::PathBuf::from("/r"),
+                worktree: None,
+                branch: None,
+                workspace: amp_core::workspace::Placement::Shared,
+                session_file: None,
+                turns: 0,
+                tool_calls: 0,
+                tool_errors: 0,
+                usage: amp_core::events::UsageJson::default(),
+                duration_ms: 0,
+                notes: Vec::new(),
+                totals: amp_core::events::Totals::default(),
+            }),
+        }
+    }
+
+    /// A manager shell on a scripted model with a manager feed, watching `ends` the way
+    /// [`super::Shell::set_supervisor`] watches the supervisor's queue (#2861).
+    /// AMP #2889: a prompt sent during a reply is queued, not refused: the transcript says where
+    /// it is and that it runs after this reply, the spinner line counts the queue, a sixth is
+    /// refused as on a paired device, and a stopped reply drops them all and says so.
+    #[tokio::test]
+    async fn prompts_sent_during_a_reply_queue_up_to_five_and_a_stop_drops_them() {
+        let ends = amp_core::supervisor::LaunchEnds::default();
+        let (mut shell, _feed) = watching_shell(&ends).await;
+        shell.running = true;
+        shell.view.set_working(true);
+        for i in 1..=6 {
+            shell.submit(&format!("follow-up {i}")).await;
+        }
+        assert_eq!(
+            shell.queued_prompts(),
+            (1..=5)
+                .map(|i| format!("follow-up {i}"))
+                .collect::<Vec<_>>()
+        );
+        let screen = shell.view().render_plain(160, 60).join("\n");
+        assert!(
+            screen.contains(
+                "queued #1 · runs after this reply: \"follow-up 1\" (Esc stops the reply and \
+                 drops the queue)"
+            ),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("queued #5 · runs after this reply"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("5 prompts are already queued: send it once one has run"),
+            "{screen}"
+        );
+        assert!(!screen.contains("follow-up 6\""), "{screen}");
+        assert!(!screen.contains("still working"), "{screen}");
+        assert_eq!(shell.working_text(), "manager replying · 5 queued");
+        shell.running = false;
+        shell.after_run(true);
+        assert!(shell.queued_prompts().is_empty());
+        let screen = shell.view().render_plain(160, 60).join("\n");
+        assert!(
+            screen.contains("dropped 5 queued prompts (↑ recalls them)"),
+            "{screen}"
+        );
+        assert_eq!(shell.working_text(), "manager replying");
+        assert_eq!(
+            super::dropped_notice(1),
+            "dropped the queued prompt (↑ recalls it)"
+        );
+    }
+
+    /// AMP #2889: a long or multi-line prompt shows as one line of at most 80 characters.
+    #[test]
+    fn the_queued_line_is_one_short_line() {
+        let long = format!("line one\n{}", "x".repeat(200));
+        let line = super::queued_notice(2, &long);
+        assert!(line.starts_with("queued #2 · runs after this reply: \"line one xxx"));
+        assert!(line.contains("…\" (Esc stops the reply"));
+        assert!(!line.contains('\n'));
+    }
+
+    async fn watching_shell(
+        ends: &amp_core::supervisor::LaunchEnds,
+    ) -> (super::Shell, Arc<amp_core::manager_feed::ManagerFeed>) {
+        use rpi_ai::providers::faux::{FauxProvider, FauxScript};
+        use rpi_harness::{agent_harness::AgentHarness, types::AgentHarnessOptions};
+        let provider = FauxProvider::new(FauxScript::new());
+        let model = provider.default_model().clone();
+        let harness = AgentHarness::create(AgentHarnessOptions {
+            model: model.clone(),
+            session: amp_core::agent::memory_session(),
+            models: vec![provider],
+            ..Default::default()
+        })
+        .await
+        .expect("harness");
+        let info = super::ShellInfo {
+            role: "amp-manager".into(),
+            provider: model.provider.to_string(),
+            model_id: model.id.clone(),
+            thinking: rpi_ai::ThinkingLevel::Off,
+            requested_thinking: None,
+            context_window: 200_000,
+            cwd: "/work/amp".into(),
+            git_branch: None,
+            session_file: None,
+            banner: vec!["AMP harness · manager".into()],
+        };
+        let (mut shell, _done) = super::Shell::new(Arc::new(harness), info, vec![]);
+        let feed = amp_core::manager_feed::ManagerFeed::new();
+        shell.set_feed(Some(Arc::clone(&feed)));
+        shell.launch_watch = Some(ends.watch());
+        (shell, feed)
+    }
+
+    fn feed_notices(
+        feed: &amp_core::manager_feed::ManagerFeed,
+    ) -> Vec<(amp_core::chat_event::NoticeLevel, String)> {
+        use amp_core::chat_event::ChatEvent;
+        feed.since(0)
+            .expect("feed")
+            .into_iter()
+            .filter_map(|e| match e.event {
+                ChatEvent::Notice { level, text, .. } => Some((level, text)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #2861: a launched worker's end shows on the tick — with the manager idle and mid-reply —
+    /// as a transcript line and a feed notice, success as news and failure as an error. Nothing
+    /// here is a dispatch tool result: the shell only polls.
+    #[tokio::test]
+    async fn launched_ends_show_on_the_tick_idle_or_mid_reply() {
+        use amp_core::chat_event::NoticeLevel;
+        use amp_core::supervisor::{LaunchEnd, LaunchEnds, WorkerOutcome};
+
+        let ends = LaunchEnds::default();
+        let (mut shell, feed) = watching_shell(&ends).await;
+        assert!(!shell.show_launch_ends(), "nothing ended yet");
+
+        // Idle.
+        ends.push(ended(2854, WorkerOutcome::Completed, None));
+        assert!(!shell.is_running());
+        assert!(shell.poll(), "the tick shows the end");
+        let screen = shell.view().render_plain(120, 40).join("\n");
+        assert!(
+            screen.contains("worker ended: #2854 completed by amp:amp-worker-backend"),
+            "{screen}"
+        );
+
+        // Mid-reply: a run is going, and its tool calls have nothing to do with these workers.
+        shell.running = true;
+        ends.push(ended(2855, WorkerOutcome::Error, Some("the model failed")));
+        ends.push(LaunchEnd {
+            task_id: 2856,
+            agent_id: "amp:amp-worker-frontend".into(),
+            result: Err("AMP refused the dispatch".into()),
+        });
+        assert!(shell.show_launch_ends());
+        let screen = shell.view().render_plain(120, 40).join("\n");
+        assert!(
+            screen
+                .contains("worker ended: #2855 error by amp:amp-worker-backend: the model failed"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("#2856 was not dispatched to amp:amp-worker-frontend"),
+            "{screen}"
+        );
+        shell.running = false;
+
+        let notices = feed_notices(&feed);
+        let level_of = |needle: &str| {
+            notices
+                .iter()
+                .find(|(_, t)| t.contains(needle))
+                .map(|(l, _)| *l)
+                .unwrap_or_else(|| panic!("no notice for {needle}: {notices:?}"))
+        };
+        assert_eq!(level_of("#2854 completed"), NoticeLevel::Info);
+        assert_eq!(level_of("#2855 error"), NoticeLevel::Error);
+        assert_eq!(level_of("#2856 was not dispatched"), NoticeLevel::Error);
+        assert!(!shell.show_launch_ends(), "each end is shown once");
+    }
+
+    /// #2861: showing an end leaves it in the queue, so the next manager turn still gets every
+    /// end exactly once (#2857's drain), and the notices never repeat what the turn delivers.
+    #[tokio::test]
+    async fn showing_ends_leaves_the_next_turns_delivery_whole_and_once() {
+        use amp_core::supervisor::{LaunchEnds, WorkerOutcome};
+
+        let ends = LaunchEnds::default();
+        let (mut shell, _feed) = watching_shell(&ends).await;
+        ends.push(ended(2854, WorkerOutcome::Completed, None));
+        ends.push(ended(2855, WorkerOutcome::Error, Some("the model failed")));
+        assert!(shell.show_launch_ends());
+        assert_eq!(ends.len(), 2, "display does not consume the queue");
+
+        // What `Shell::take_worker_summaries` does at the next turn's start.
+        let block = worker_summaries(&ends.drain()).expect("both ends reach the turn");
+        assert_eq!(
+            block.lines().filter(|l| l.starts_with("- ")).count(),
+            2,
+            "{block}"
+        );
+        assert!(block.contains("#2854 completed"), "{block}");
+        assert!(block.contains("#2855 error"), "{block}");
+        assert_eq!(worker_summaries(&ends.drain()), None, "and only once");
+
+        // Draining sends nothing new to the watcher: the transcript does not show them again.
+        assert!(!shell.show_launch_ends());
+        let screen = shell.view().render_plain(120, 40).join("\n");
+        assert_eq!(screen.matches("worker ended: #2854").count(), 1, "{screen}");
+    }
+
+    /// A worker session for the #2862 roster tests: live in `phase`, or finished with `outcome`.
+    fn session(
+        task_id: i64,
+        phase: Option<amp_core::supervisor::WorkerPhase>,
+        outcome: Option<amp_core::supervisor::WorkerOutcome>,
+        returned: Option<Result<(), String>>,
+    ) -> amp_core::supervisor::WorkerSessionInfo {
+        let now = std::time::SystemTime::now();
+        amp_core::supervisor::WorkerSessionInfo {
+            task_id,
+            agent_id: "amp:amp-worker-backend".into(),
+            phase,
+            model: Some("wf/wf-1".into()),
+            cwd: None,
+            since: now,
+            ended: phase.is_none().then_some(now),
+            totals: amp_core::events::Totals::default(),
+            outcome,
+            error: None,
+            stopped_by: None,
+            returned,
+            session_file: None,
+            branch: None,
+            context_window: None,
+        }
+    }
+
+    /// A tool call ending in the manager's run.
+    fn tool_end(tool_name: &str) -> rpi_agent::AgentEvent {
+        rpi_agent::AgentEvent::ToolExecutionEnd {
+            tool_call_id: format!("call-{tool_name}"),
+            tool_name: tool_name.into(),
+            result: rpi_agent::AgentToolResult::text("ok"),
+            is_error: false,
+        }
+    }
+
+    fn roster_entry(shell: &super::Shell, task_id: i64) -> Option<WorkerEntry> {
+        shell
+            .view()
+            .roster()
+            .all()
+            .into_iter()
+            .find(|e| e.task_id == task_id)
+    }
+
+    /// AMP #2862: in Launch mode `amp_run_ticket` returns while its worker is queued, so the
+    /// tool call's end says nothing about the worker. The roster follows the supervisor: the
+    /// launch shows at once, the running worker stays running after the dispatch tool ended, and
+    /// the finish shows from the launch end, with no tool event at all.
+    #[tokio::test]
+    async fn the_roster_follows_a_launched_worker_from_start_to_finish() {
+        use amp_core::supervisor::{LaunchEnds, WorkerOutcome as O, WorkerPhase as P};
+
+        let ends = LaunchEnds::default();
+        let (mut shell, _feed) = watching_shell(&ends).await;
+        shell.test_sessions = Some(Vec::new());
+        shell.build_roster();
+        assert!(roster_entry(&shell, 2901).is_none());
+
+        // Background start: the launch is queued when the dispatch tool returns its ack.
+        shell.test_sessions = Some(vec![session(2901, Some(P::Queued), None, None)]);
+        shell.handle_event(&tool_end(amp_core::policy::DISPATCH_TOOL));
+        let e = roster_entry(&shell, 2901).expect("the launch shows at once");
+        assert_eq!(e.phase, Phase::Queued);
+        assert!(e.local);
+
+        // It gets a slot while the manager does something else.
+        shell.test_sessions = Some(vec![session(2901, Some(P::Running), None, None)]);
+        shell.handle_event(&tool_end("amp_get_task"));
+        assert_eq!(roster_entry(&shell, 2901).unwrap().phase, Phase::Running);
+        assert_eq!(shell.view().strip().shown().len(), 1, "the strip shows it");
+
+        // A later dispatch tool end with no change in who is live leaves it running.
+        shell.handle_event(&tool_end(amp_core::policy::DISPATCH_TOOL));
+        assert_eq!(roster_entry(&shell, 2901).unwrap().phase, Phase::Running);
+
+        // The finish: only the supervisor's state and its launch end, no tool call.
+        shell.test_sessions = Some(vec![session(2901, None, Some(O::Completed), None)]);
+        ends.push(ended(2901, O::Completed, None));
+        assert!(shell.show_launch_ends());
+        let e = roster_entry(&shell, 2901).expect("a finished worker stays listed");
+        assert_eq!(e.phase, Phase::Finished);
+        assert_eq!(e.outcome.as_deref(), Some("completed"));
+        assert!(shell.view().strip().shown().is_empty(), "nothing is live");
+    }
+
+    /// AMP #2862: Await mode keeps #2355's timing. The worker has ended by the time its tool
+    /// call returns, and the roster sees that from the supervisor at that event, so the finished
+    /// notice comes before the manager's reply. The tool's name plays no part.
+    #[tokio::test]
+    async fn await_mode_refreshes_when_the_worker_ends_inside_the_tool_call() {
+        use amp_core::supervisor::{LaunchEnds, WorkerOutcome as O, WorkerPhase as P};
+
+        let ends = LaunchEnds::default();
+        let (mut shell, _feed) = watching_shell(&ends).await;
+        shell.test_sessions = Some(vec![session(2902, Some(P::Running), None, None)]);
+        shell.handle_event(&tool_end("bash"));
+        assert_eq!(roster_entry(&shell, 2902).unwrap().phase, Phase::Running);
+
+        shell.test_sessions = Some(vec![session(2902, None, Some(O::Completed), None)]);
+        shell.handle_event(&tool_end(amp_core::policy::DISPATCH_TOOL));
+        let e = roster_entry(&shell, 2902).unwrap();
+        assert_eq!(
+            e.phase,
+            Phase::Finished,
+            "refreshed at the event, not the next tick"
+        );
+        assert!(!shell.live_changed());
+    }
+
+    /// AMP #2862: workers that ended badly stay identifiable in the roster after they finish:
+    /// an error whose ticket was returned, a stop whose return failed, a crashed worker task
+    /// (no session behind it, #2885) with either hand-back result, and a launch never
+    /// dispatched. They survive later rebuilds, and the panel says where each ticket went.
+    #[tokio::test]
+    async fn returned_failed_and_crashed_workers_stay_in_the_roster() {
+        use amp_core::supervisor::{LAUNCH_CRASHED, LaunchEnd, LaunchEnds, WorkerOutcome as O};
+
+        let ends = LaunchEnds::default();
+        let (mut shell, _feed) = watching_shell(&ends).await;
+        shell.test_sessions = Some(vec![
+            session(2911, None, Some(O::Error), Some(Ok(()))),
+            session(2912, None, Some(O::Cancelled), Some(Err("503".into()))),
+            session(2913, None, Some(O::Completed), None),
+        ]);
+        let crash = |id: i64, tail: &str| LaunchEnd {
+            task_id: id,
+            agent_id: "amp:amp-worker-frontend".into(),
+            result: Err(format!("{LAUNCH_CRASHED}: boom; #{id} {tail}")),
+        };
+        ends.push(crash(2914, "was returned to ready"));
+        ends.push(crash(
+            2915,
+            "could not be returned to ready: 502 Bad Gateway",
+        ));
+        ends.push(LaunchEnd {
+            task_id: 2916,
+            agent_id: "amp:amp-worker-backend".into(),
+            result: Err("AMP refused the dispatch".into()),
+        });
+        assert!(shell.show_launch_ends());
+        // Later ticks rebuild the roster; nothing ended is lost.
+        shell.build_roster();
+        shell.poll();
+
+        let get = |id| roster_entry(&shell, id).unwrap_or_else(|| panic!("#{id} is listed"));
+        let e = get(2911);
+        assert_eq!(
+            (e.phase, e.outcome.as_deref()),
+            (Phase::Finished, Some("error"))
+        );
+        assert_eq!(e.returned, Some(Ok(())));
+        let e = get(2912);
+        assert_eq!(e.outcome.as_deref(), Some("cancelled"));
+        assert_eq!(e.returned, Some(Err("503".into())));
+        assert_eq!(get(2913).outcome.as_deref(), Some("completed"));
+        let e = get(2914);
+        assert_eq!(
+            (e.phase, e.outcome.as_deref()),
+            (Phase::Finished, Some("crashed"))
+        );
+        assert_eq!(e.agent_id, "amp:amp-worker-frontend");
+        assert!(e.state.starts_with("crashed"), "{}", e.state);
+        assert_eq!(e.returned, Some(Ok(())));
+        let e = get(2915);
+        assert_eq!(e.outcome.as_deref(), Some("crashed"));
+        assert_eq!(e.returned, Some(Err("502 Bad Gateway".into())));
+        let e = get(2916);
+        assert_eq!(e.outcome.as_deref(), Some("not_dispatched"));
+        assert_eq!(e.returned, None);
+        assert!(
+            shell.view().roster().local().len() == 6,
+            "all six are this chat's workers"
+        );
+
+        // A crashed ticket that runs again shows its new session, not the crash.
+        shell.test_sessions.as_mut().unwrap().push(session(
+            2914,
+            Some(amp_core::supervisor::WorkerPhase::Running),
+            None,
+            None,
+        ));
+        shell.handle_event(&tool_end(amp_core::policy::DISPATCH_TOOL));
+        assert_eq!(get_phase(&shell, 2914), Phase::Running);
+    }
+
+    fn get_phase(shell: &super::Shell, task_id: i64) -> Phase {
+        roster_entry(shell, task_id).expect("listed").phase
     }
 }

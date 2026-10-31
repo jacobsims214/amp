@@ -1,16 +1,16 @@
-── agents ────────────────────────────────────────────────────────────────────────────────────────────────
-  agent             mode     from     model
-› designer          worker   built-in wf/wf-1
-  github-researcher worker   built-in wf/wf-1
-  github-reviewer   worker   built-in wf/wf-1
-  kb-curator        worker   built-in wf/wf-1
-  manager           primary  built-in boss/boss-1
-  media             worker   built-in wf/wf-1
-  researcher        worker   built-in wf/wf-1
-  reviewer          worker   built-in wf/wf-1
-  worker-backend    worker   built-in wf/wf-1
-  worker-docs       worker   built-in wf/wf-1
-  worker-frontend   worker   built-in wf/wf-1
-  sql-expert        worker   repo     wf/wf-1
-  new or changed agents: `amp-harness agents new|edit` in a terminal (/config shows the folders)
-  ↑↓ select · Enter details · Esc close
+┌─ agents ─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│   agent             mode     from     model
+│ › designer          worker   built-in wf/wf-1
+│   github-researcher worker   built-in wf/wf-1
+│   github-reviewer   worker   built-in wf/wf-1
+│   kb-curator        worker   built-in wf/wf-1
+│   manager           primary  built-in boss/boss-1
+│   media             worker   built-in wf/wf-1
+│   researcher        worker   built-in wf/wf-1
+│   reviewer          worker   built-in wf/wf-1
+│   worker-backend    worker   built-in wf/wf-1
+│   worker-docs       worker   built-in wf/wf-1
+│   worker-frontend   worker   built-in wf/wf-1
+│   sql-expert        worker   repo     wf/wf-1
+│   new or changed agents: `amp-harness agents new|edit` in a terminal (/config shows the folders)
+└─ ↑↓ select · Enter details · Esc close ──────────────────────────────────────────────────────────────────┘

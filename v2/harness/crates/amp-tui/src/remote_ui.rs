@@ -257,8 +257,8 @@ fn queue_lines(
         out.push(UiEvent::Line(
             NoticeLevel::Info,
             format!(
-                "[remote: {}] queued #{}: \"{}\" runs when the current reply ends (Esc drops \
-                 the queue).",
+                "[remote: {}] queued #{} · runs after this reply: \"{}\" (Esc stops the reply \
+                 and drops the queue)",
                 sanitize_for_terminal(&who, 64),
                 pos + 1,
                 sanitize_for_terminal(&item.preview.replace(['\n', '\t'], " "), 400)
@@ -552,8 +552,8 @@ mod tests {
         };
         assert_eq!(
             line,
-            "[remote: Phone] queued #1: \"hi]52;c;Zm9v there next[2J\" runs when the current \
-             reply ends (Esc drops the queue)."
+            "[remote: Phone] queued #1 · runs after this reply: \"hi]52;c;Zm9v there next[2J\" \
+             (Esc stops the reply and drops the queue)"
         );
     }
 

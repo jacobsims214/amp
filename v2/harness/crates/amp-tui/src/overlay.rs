@@ -507,9 +507,27 @@ impl Panel {
             .cloned()
     }
 
-    /// The component for the panel slot.
+    /// The component for the panel slot: the rows for the inside of a box ([`Self::titles`]).
     pub fn component(&self) -> Arc<dyn Component> {
         Arc::new(PanelView(self.clone()))
+    }
+
+    /// The open panel's box titles at content `width` (#2882): its title (bold: the open panel
+    /// has the keys) and its key hint in the bottom edge.
+    pub fn titles(&self, width: usize) -> crate::frame::Titles {
+        let Some(state) = self.state() else {
+            return crate::frame::Titles::default();
+        };
+        let data = self.chrome.data();
+        let c = colors();
+        crate::frame::Titles {
+            left: crate::frame::label(&panel_title(&state, data.as_ref()), true),
+            right: String::new(),
+            bottom: c
+                .dim
+                .fg(&panel_hint(&state, data.as_ref(), &palette(), width)),
+            focused: true,
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<PanelState>> {
@@ -531,7 +549,7 @@ impl Component for PanelView {
             .width
             .store(width, std::sync::atomic::Ordering::Relaxed);
         let data = self.0.chrome.data();
-        render_panel(&state, data.as_ref(), &palette(), width)
+        panel_body(&state, data.as_ref(), &palette(), width)
     }
 
     fn invalidate(&self) {}
@@ -568,6 +586,14 @@ pub enum Piece {
     /// Plain text about the value before it: kept on the row when everything fits, else drawn
     /// on a line of its own under the value (see [`render_panel`]).
     Note(String, Color),
+    /// A worker's one-line chip ([`crate::roster::chip`]), fitted to the room left like
+    /// [`Piece::Flex`] (#2882: `/workers` has one row per worker).
+    Chip(Box<crate::roster::WorkerEntry>),
+}
+
+/// A chip piece's text at `width`.
+fn chip_text(e: &crate::roster::WorkerEntry, width: usize) -> String {
+    crate::roster::chip(e, width, crate::roster::ChipStyle::WithId)
 }
 
 /// One line of a panel.
@@ -616,7 +642,7 @@ pub fn fit_pieces(pieces: &[Piece], width: usize) -> String {
         .iter()
         .map(|p| match p {
             Piece::Fixed(s) | Piece::Note(s, _) => visible_width(s),
-            Piece::Flex(..) => 0,
+            Piece::Flex(..) | Piece::Chip(..) => 0,
         })
         .sum();
     let gaps = pieces.len().saturating_sub(1);
@@ -641,6 +667,11 @@ pub fn fit_pieces(pieces: &[Piece], width: usize) -> String {
                 let w = visible_width(s);
                 (c.fg(s), w)
             }
+            Piece::Chip(e) => {
+                let text = chip_text(e, room);
+                let w = visible_width(&text);
+                (text, w)
+            }
         };
         let gap = usize::from(used > 0);
         if used + gap + w > width {
@@ -661,6 +692,7 @@ fn fits_whole(pieces: &[Piece], width: usize) -> bool {
         .iter()
         .map(|p| match p {
             Piece::Fixed(s) | Piece::Flex(s, _) | Piece::Note(s, _) => visible_width(s),
+            Piece::Chip(e) => visible_width(&chip_text(e, usize::MAX / 4)),
         })
         .sum();
     w + pieces.len().saturating_sub(1) <= width
@@ -671,7 +703,7 @@ fn flex_column(pieces: &[Piece]) -> usize {
     let mut col = 0;
     for p in pieces {
         match p {
-            Piece::Flex(..) => return col,
+            Piece::Flex(..) | Piece::Chip(..) => return col,
             Piece::Fixed(s) | Piece::Note(s, _) => col += visible_width(s) + 1,
         }
     }
@@ -1287,225 +1319,168 @@ pub(crate) fn parse_rfc3339(s: &str) -> Option<SystemTime> {
     Some(SystemTime::UNIX_EPOCH + Duration::new(secs, nanos))
 }
 
-/// `/workers` from the chat's roster (#2347): this chat's workers (live, then finished), then
-/// tickets in progress elsewhere. Each is a row with the web's shape (state, id, name, agent,
-/// where) and a detail row: model, state and elapsed time, tokens, context, cost, branch, what it
-/// waits on, story › epic. A worker elsewhere shows AMP's record of its last run, and when it was
-/// recorded.
-fn roster_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
-    use crate::roster::Phase;
-    let c = colors();
-    let m = &data.meta;
-    let board = m.board.get();
-    let asking = |id: i64| board.is_some_and(|b| b.questions.iter().any(|q| q.id == id));
-    let mut entries = data.roster.clone();
-    entries.sort_by_key(|e| (!e.local, !e.is_live(), e.task_id));
-    let mut rows = Vec::new();
-    for e in &entries {
-        let mark = if asking(e.task_id) {
-            p.state_mark(Status::Question)
-        } else {
-            match e.phase {
-                Phase::Queued => {
-                    format!("{} {}", p.state_mark(Status::Ready), c.muted.fg("queued"))
-                }
-                Phase::Running => format!(
-                    "{} {}",
-                    p.state_mark(Status::InProgress),
-                    p.state(Status::InProgress).text.fg("running")
-                ),
-                Phase::Stopping => format!(
-                    "{} {}",
-                    p.state_mark(Status::InProgress),
-                    c.warning.fg("stopping")
-                ),
-                Phase::Finished => {
-                    format!("{} {}", p.state_mark(Status::Done), c.muted.fg("finished"))
-                }
-                Phase::Elsewhere => p.state_mark(Status::InProgress),
-            }
-        };
-        let where_ = if e.local {
-            "· local"
-        } else if e.viewable {
-            "· elsewhere (session on disk)"
-        } else {
-            "· elsewhere"
-        };
-        let agent = if e.agent_id.is_empty() {
-            "unassigned".to_owned()
-        } else {
-            clean(&e.agent_id)
-        };
-        rows.push(
-            Row::new(vec![
-                fixed(mark),
-                fixed(ticket_id(m, e.task_id)),
-                flex(&e.name, c.text),
-                fixed(format!(
-                    "{} {} {}",
-                    c.dim.fg("·"),
-                    c.muted.fg(&agent),
-                    c.dim.fg(where_)
-                )),
-            ])
-            .target(ticket_target(e.task_id)),
-        );
-        let mut detail: Vec<String> = Vec::new();
-        if !e.model.is_empty() {
-            detail.push(clean(&e.model));
-        }
-        if !e.state.is_empty() {
-            detail.push(clean(&e.state));
-        }
-        let u = &e.usage;
-        match e.usage_recorded {
-            Some(at) => detail.push(format!(
-                "last run {} · recorded {}",
-                crate::roster::tok_label(e.tokens()),
-                crate::roster::ago(at, SystemTime::now())
-            )),
-            None if e.tokens() > 0 => detail.push(format!(
-                "{} (in {} · out {} · cached {})",
-                crate::roster::tok_label(e.tokens()),
-                tokens(u.input_tokens),
-                tokens(u.output_tokens),
-                tokens(u.cache_read_tokens + u.cache_write_tokens)
-            )),
-            None if !e.local => detail.push("no run recorded yet".to_owned()),
-            None => {}
-        }
-        if let Some(pc) = e.context_percent() {
-            detail.push(crate::roster::ctx_label(pc));
-        }
-        if u.cost_usd > 0.0 {
-            detail.push(format!("${:.2}", u.cost_usd));
-        }
-        if let Some(b) = e.branch.as_deref().filter(|b| !b.is_empty()) {
-            detail.push(format!("branch {}", clean(b)));
-        }
-        if !e.waiting_on.is_empty() {
-            let ids: Vec<String> = e.waiting_on.iter().map(|id| format!("#{id}")).collect();
-            detail.push(format!("waits on {}", ids.join(", ")));
-        }
-        let epic = e.epic_story();
-        if !epic.is_empty() {
-            detail.push(epic);
-        }
-        if !detail.is_empty() {
-            rows.push(Row::new(vec![flex(&detail.join(" · "), c.dim)]).indent(2));
-        }
-    }
-    rows
-}
-
-fn worker_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
-    let c = colors();
-    let m = &data.meta;
-    let board = m.board.get();
-    // The roster when it has every local worker (a chat with a supervisor); else the workers
-    // and the board as given (`render-chrome`, tests).
+/// The workers `/workers` lists (#2347): the chat's roster when it has every local worker (a
+/// chat with a supervisor); else the workers and the board as given (`render-chrome`, tests),
+/// made into the same entries.
+fn worker_entries(data: &ChromeData) -> Vec<crate::roster::WorkerEntry> {
+    use crate::roster::{Phase, WorkerEntry};
     let covered = data.workers.iter().all(|w| {
         data.roster
             .iter()
             .any(|e| e.task_id == w.task_id && e.local)
     });
-    if !data.roster.is_empty() && covered {
-        return roster_rows(data, p);
-    }
-    let name_of = |id: i64| -> String {
-        board
-            .and_then(|b| {
-                b.in_progress_tickets
-                    .iter()
-                    .find(|t| t.id == id)
-                    .map(|t| t.name.clone())
-                    .or_else(|| {
-                        b.questions
-                            .iter()
-                            .find(|q| q.id == id)
-                            .map(|q| q.name.clone())
-                    })
+    let mut entries = if !data.roster.is_empty() && covered {
+        data.roster.clone()
+    } else {
+        let board = data.meta.board.get();
+        let name_of = |id: i64| -> String {
+            board
+                .and_then(|b| {
+                    b.in_progress_tickets
+                        .iter()
+                        .find(|t| t.id == id)
+                        .map(|t| t.name.clone())
+                        .or_else(|| {
+                            b.questions
+                                .iter()
+                                .find(|q| q.id == id)
+                                .map(|q| q.name.clone())
+                        })
+                })
+                .unwrap_or_default()
+        };
+        let mut out: Vec<WorkerEntry> = data
+            .workers
+            .iter()
+            .map(|w| {
+                let queued = w.phase == WorkerPhase::Queued;
+                WorkerEntry {
+                    task_id: w.task_id,
+                    name: name_of(w.task_id),
+                    agent_id: w.agent_id.clone(),
+                    model: w.model.clone().unwrap_or_default(),
+                    phase: if queued {
+                        Phase::Queued
+                    } else {
+                        Phase::Running
+                    },
+                    state: format!(
+                        "{} {}",
+                        if queued { "queued" } else { "running" },
+                        elapsed(w.since)
+                    ),
+                    usage: w.totals.usage,
+                    local: true,
+                    viewable: true,
+                    ..WorkerEntry::default()
+                }
             })
+            .collect();
+        let local: Vec<i64> = data.workers.iter().map(|w| w.task_id).collect();
+        for t in board
+            .map(|b| b.in_progress_tickets.as_slice())
             .unwrap_or_default()
+            .iter()
+            .filter(|t| !local.contains(&t.id))
+        {
+            out.push(WorkerEntry {
+                task_id: t.id,
+                name: t.name.clone(),
+                // The assignee exactly as AMP stores it (the web UI shows it unmodified).
+                agent_id: t.assigned_to.clone().unwrap_or_default(),
+                phase: Phase::Elsewhere,
+                state: "in progress".to_owned(),
+                ..WorkerEntry::default()
+            });
+        }
+        out
     };
-    let asking = |id: i64| board.is_some_and(|b| b.questions.iter().any(|q| q.id == id));
-    let mut rows = Vec::new();
-    for w in &data.workers {
-        let status = if asking(w.task_id) {
-            Status::Question
-        } else if w.phase == WorkerPhase::Queued {
-            Status::Ready
-        } else {
-            Status::InProgress
-        };
-        // The web word first (palette mark), then what the local worker is doing.
-        let phase = match (status, w.phase) {
-            (Status::Question, _) => p.state_mark(Status::Question),
-            (_, WorkerPhase::Queued) => {
-                format!("{} {}", p.state_mark(Status::Ready), c.muted.fg("queued"))
-            }
-            _ => format!(
-                "{} {}",
-                p.state_mark(Status::InProgress),
-                p.state(Status::InProgress).text.fg("running")
-            ),
-        };
-        let u = &w.totals.usage;
-        let model = match w.model.as_deref().filter(|m| !m.is_empty()) {
-            Some(m) => format!("{m} · "),
-            None => String::new(),
-        };
-        let detail = format!(
-            "{model}{} · ↑{} ↓{} ${:.2}",
-            elapsed(w.since),
-            tokens(u.input_tokens + u.cache_read_tokens + u.cache_write_tokens),
-            tokens(u.output_tokens),
-            u.cost_usd
-        );
-        rows.push(
-            Row::new(vec![
-                fixed(phase),
-                fixed(ticket_id(m, w.task_id)),
-                flex(&name_of(w.task_id), c.text),
-                fixed(format!(
-                    "{} {} {}",
-                    c.dim.fg("·"),
-                    c.muted.fg(&clean(&w.agent_id)),
-                    c.dim.fg("· local")
-                )),
-            ])
-            .target(ticket_target(w.task_id)),
-        );
-        // The run's detail on its own line, so the row keeps the web's shape at any width.
-        rows.push(Row::new(vec![flex(&clean(&detail), c.dim)]).indent(2));
+    entries.sort_by_key(|e| (!e.local, !e.is_live(), e.task_id));
+    entries
+}
+
+/// The `/workers` box's title (#2882): `Workers · 1 running · 1 queued · 1 done · 2 elsewhere`.
+pub fn workers_title(data: Option<&ChromeData>) -> String {
+    use crate::roster::Phase;
+    let Some(data) = data else {
+        return "Workers".to_owned();
+    };
+    let entries = worker_entries(data);
+    let count =
+        |f: &dyn Fn(&crate::roster::WorkerEntry) -> bool| entries.iter().filter(|e| f(e)).count();
+    let running = count(&|e| e.local && matches!(e.phase, Phase::Running | Phase::Stopping));
+    let queued = count(&|e| e.local && e.phase == Phase::Queued);
+    let done = count(&|e| e.local && e.phase == Phase::Finished);
+    let elsewhere = count(&|e| !e.local);
+    let mut parts = vec!["Workers".to_owned()];
+    for (n, word) in [
+        (running, "running"),
+        (queued, "queued"),
+        (done, "done"),
+        (elsewhere, "elsewhere"),
+    ] {
+        if n > 0 {
+            parts.push(format!("{n} {word}"));
+        }
     }
-    let local: Vec<i64> = data.workers.iter().map(|w| w.task_id).collect();
-    for t in board
-        .map(|b| b.in_progress_tickets.as_slice())
-        .unwrap_or_default()
-        .iter()
-        .filter(|t| !local.contains(&t.id))
-    {
-        // The assignee exactly as AMP stores it (the web UI shows it unmodified).
-        let who = t.assigned_to.as_deref().unwrap_or("unassigned");
+    parts.join(" · ")
+}
+
+/// `/workers` (#2347; one row per worker since #2882, artifact #26): this chat's workers (live,
+/// then finished), then a dim `elsewhere` label and the tickets in progress elsewhere. Each row
+/// is a state mark and the worker's chip ([`crate::roster::chip`]: id, name, story › epic,
+/// agent (model), state and elapsed time, tokens, context, cost), fitted to the width. A worker
+/// whose ticket went back to ready (or didn't, AMP #2802) says so under its row.
+fn worker_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
+    use crate::roster::Phase;
+    let c = colors();
+    let board = data.meta.board.get();
+    let asking = |id: i64| board.is_some_and(|b| b.questions.iter().any(|q| q.id == id));
+    let entries = worker_entries(data);
+    let mut rows = Vec::new();
+    let mut labelled = false;
+    for e in &entries {
+        if !e.local && !labelled {
+            labelled = true;
+            rows.push(Row::new(vec![flex("elsewhere", c.dim)]));
+        }
+        let prog = p.state(Status::InProgress);
+        let mark = if asking(e.task_id) {
+            let q = p.state(Status::Question);
+            q.mark.fg(&q.glyph)
+        } else {
+            match e.phase {
+                Phase::Queued => {
+                    let r = p.state(Status::Ready);
+                    r.mark.fg(&r.glyph)
+                }
+                Phase::Running => prog.mark.fg("▸"),
+                Phase::Stopping => c.warning.fg("▸"),
+                Phase::Finished => e.state_color().fg(&p.state(Status::Done).glyph),
+                Phase::Elsewhere => prog.mark.fg(&prog.glyph),
+            }
+        };
         rows.push(
-            Row::new(vec![
-                fixed(p.state_mark(Status::InProgress)),
-                fixed(ticket_id(m, t.id)),
-                flex(&t.name, c.text),
-                fixed(format!(
-                    "{} {} {}",
-                    c.dim.fg("·"),
-                    c.muted.fg(&clean(who)),
-                    c.dim.fg("· elsewhere")
-                )),
-            ])
-            .target(ticket_target(t.id)),
+            Row::new(vec![fixed(mark), Piece::Chip(Box::new(e.clone()))])
+                .target(ticket_target(e.task_id)),
         );
+        // AMP #2802: where the worker's ticket went once its run ended without closing it.
+        match &e.returned {
+            Some(Ok(())) => {
+                rows.push(Row::new(vec![flex("ticket returned to ready", c.dim)]).indent(2));
+            }
+            Some(Err(why)) => rows.push(
+                Row::new(vec![flex(
+                    &format!("ticket NOT returned: {}", clean(why)),
+                    c.warning,
+                )])
+                .indent(2),
+            ),
+            None => {}
+        }
     }
     if rows.is_empty() {
-        let note = if board.is_none() && m.project_id.is_some() {
+        let note = if board.is_none() && data.meta.project_id.is_some() {
             "no local workers (the board is loading)"
         } else {
             "no workers: nothing is in progress"
@@ -2003,8 +1978,9 @@ fn hint(state: &PanelState, has_targets: bool, overflow: bool) -> String {
             "↑↓ select · Enter switch · Esc close".to_owned()
         }
         // #2395: chords only, so typing reaches the editor while /workers is open.
+        // #2882: short enough for the box's bottom edge at 80 columns (a click still watches).
         (Stage::Browse, PanelKind::Workers) if has_targets => format!(
-            "↑↓ select · Enter/click watch · {WORKERS_STOP_KEY} stop · {WORKERS_OPEN_KEY} open in AMP · Esc close"
+            "↑↓ select · Enter watch · {WORKERS_STOP_KEY} stop · {WORKERS_OPEN_KEY} open in AMP · Esc close"
         ),
         (Stage::Browse, PanelKind::Questions) if has_targets => {
             "↑↓ select · Enter answer · Tab editor · Esc close".to_owned()
@@ -2071,7 +2047,9 @@ fn layout(
 }
 
 /// The panel at `width`: a title rule, the rows (at most [`MAX_ROWS`], scrolled to the
-/// selection), the note and the key hint. Every line fits `width`.
+/// selection), the note and the key hint. Every line fits `width`. The boxed chat draws the
+/// title and the hint in its box's edges instead ([`panel_body`], [`panel_title`],
+/// [`panel_hint`]).
 pub fn render_panel(
     state: &PanelState,
     data: Option<&ChromeData>,
@@ -2092,7 +2070,37 @@ pub fn render_panel(
         rpi_tui::bold(&c.text.fg(&title)),
         c.border_muted.fg(&rule_char.repeat(fill))
     )];
+    let (body, hint) = panel_parts(state, data, p, width);
+    out.extend(body);
+    for part in wrap_hint(&hint, width.saturating_sub(2)) {
+        out.push(format!("  {}", c.dim.fg(&part)));
+    }
+    guard(out, width)
+}
 
+/// Nothing wider than `width` (the pieces are already fitted).
+fn guard(lines: Vec<String>, width: usize) -> Vec<String> {
+    lines
+        .into_iter()
+        .map(|l| {
+            if visible_width(&l) > width {
+                shorten(&chrome::plain(&l), width)
+            } else {
+                l
+            }
+        })
+        .collect()
+}
+
+/// The panel's rows (scrolled to the selection) and note at `width`, and its key hint.
+fn panel_parts(
+    state: &PanelState,
+    data: Option<&ChromeData>,
+    p: &AmpPalette,
+    width: usize,
+) -> (Vec<String>, String) {
+    let c = colors();
+    let mut out = Vec::new();
     let (lines, selected_line, n_targets) = layout(state, data, p, width);
     let max_rows = if state.kind == PanelKind::Info {
         MAX_INFO_ROWS
@@ -2123,19 +2131,58 @@ pub fn render_panel(
         }
     }
     let hint = hint(state, n_targets > 0, lines.len() > max_rows);
-    for part in wrap_hint(&hint, width.saturating_sub(2)) {
-        out.push(format!("  {}", c.dim.fg(&part)));
+    (out, hint)
+}
+
+/// Whether a key hint fits a box's bottom edge around content `width` cells wide (#2882).
+pub fn hint_fits_edge(hint: &str, width: usize) -> bool {
+    visible_width(hint) < width
+}
+
+/// The boxed panel's rows at `width` (the box's inner width, #2882): the rows and note, then
+/// the key hint when it doesn't fit the box's bottom edge ([`panel_hint`]).
+pub fn panel_body(
+    state: &PanelState,
+    data: Option<&ChromeData>,
+    p: &AmpPalette,
+    width: usize,
+) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
     }
-    // A last guard: nothing wider than the terminal (the pieces are already fitted).
-    out.into_iter()
-        .map(|l| {
-            if visible_width(&l) > width {
-                shorten(&chrome::plain(&l), width)
-            } else {
-                l
-            }
-        })
-        .collect()
+    // The rows keep the unboxed panel's two-cell indent's first cell for the selection marker.
+    let (mut body, hint) = panel_parts(state, data, p, width);
+    if !hint_fits_edge(&hint, width) {
+        let c = colors();
+        for part in wrap_hint(&hint, width) {
+            body.push(c.dim.fg(&part));
+        }
+    }
+    guard(body, width)
+}
+
+/// The boxed panel's title (#2882): `/workers` counts its workers ([`workers_title`]).
+pub fn panel_title(state: &PanelState, data: Option<&ChromeData>) -> String {
+    match state.kind {
+        PanelKind::Workers => workers_title(data),
+        _ => state.title(),
+    }
+}
+
+/// The boxed panel's key hint for its bottom edge at content `width`, or empty when it doesn't
+/// fit there (it is then the last rows, [`panel_body`]).
+pub fn panel_hint(
+    state: &PanelState,
+    data: Option<&ChromeData>,
+    p: &AmpPalette,
+    width: usize,
+) -> String {
+    let (_, hint) = panel_parts(state, data, p, width);
+    if hint_fits_edge(&hint, width) {
+        hint
+    } else {
+        String::new()
+    }
 }
 
 /// A URL is opened only when it came from [`Instance`]'s helpers and is a plain `http(s)` URL

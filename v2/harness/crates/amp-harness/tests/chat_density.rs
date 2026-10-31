@@ -93,13 +93,29 @@ async fn snapshot_with(density: Option<&str>, size: (usize, usize), extra: &[&st
     rows
 }
 
-/// The rows of the conversation in sight: everything above the editor's top border.
+/// The rows of the conversation in sight: everything above the Message box (#2882).
 fn transcript(rows: &[String]) -> &[String] {
     let editor = rows
         .iter()
-        .position(|r| r.trim_start().starts_with('─'))
-        .unwrap_or_else(|| panic!("no editor border in\n{}", rows.join("\n")));
+        .position(|r| r.trim_start().starts_with("┌─ Message"))
+        .unwrap_or_else(|| panic!("no Message box in\n{}", rows.join("\n")));
     &rows[..editor]
+}
+
+/// `row` without a box's side edges (#2882), so a row with nothing in the box reads blank.
+fn bare(row: &str) -> String {
+    let t = row.trim_end();
+    let t = t.strip_suffix('│').unwrap_or(t).trim_end();
+    let lead = t.len() - t.trim_start().len();
+    match t[lead..].strip_prefix('│') {
+        Some(rest) => format!("{} {rest}", &t[..lead]),
+        None => t.to_owned(),
+    }
+}
+
+/// The screen's rows, the boxes' side edges as blanks.
+fn bare_rows(rows: &[String]) -> Vec<String> {
+    rows.iter().map(|r| bare(r)).collect()
 }
 
 /// The non-blank rows of the conversation in sight.
@@ -113,8 +129,8 @@ fn content_lines(rows: &[String]) -> usize {
 #[tokio::test]
 async fn compact_shows_more_of_the_same_conversation() {
     for size in SIZES {
-        let compact = snapshot(None, size).await;
-        let comfortable = snapshot(Some("comfortable"), size).await;
+        let compact = bare_rows(&snapshot(None, size).await);
+        let comfortable = bare_rows(&snapshot(Some("comfortable"), size).await);
         let (before, after) = (content_lines(&comfortable), content_lines(&compact));
         if std::env::var_os("DENSITY_SCREENS").is_some() {
             println!("{size:?}: comfortable {before} content lines, compact {after}");
@@ -165,10 +181,7 @@ fn strip(s: &str) -> String {
 async fn compact_has_no_decorative_rows_a_one_row_footer_and_bold_only_for_headings() {
     for size in SIZES {
         let styled = snapshot_with(None, size, &["--ansi"]).await;
-        let rows: Vec<String> = styled
-            .iter()
-            .map(|r| strip(r).trim_end().to_owned())
-            .collect();
+        let rows: Vec<String> = styled.iter().map(|r| bare(&strip(r))).collect();
         let screen = rows.join("\n");
         // Never two blank rows in a row in the conversation: one between turns.
         let talk = transcript(&rows);
@@ -193,10 +206,11 @@ async fn compact_has_no_decorative_rows_a_one_row_footer_and_bold_only_for_headi
             rows[at + 3].trim_start().starts_with("Run it from"),
             "{screen}"
         );
-        // The footer is one row: the editor's bottom rule, the footer, the blank bottom row.
+        // The footer is one row: the Message box's bottom edge, then the footer (no blank bottom
+        // row since #2882).
         let bottom = rows
             .iter()
-            .rposition(|r| r.trim_start().starts_with('─'))
+            .rposition(|r| r.trim_start().starts_with('└'))
             .unwrap();
         assert!(rows[bottom + 1].contains("• manager"), "{screen}");
         assert!(rows[bottom + 1].ends_with("thinking off"), "{screen}");
@@ -208,8 +222,10 @@ async fn compact_has_no_decorative_rows_a_one_row_footer_and_bold_only_for_headi
         for (raw, row) in styled.iter().zip(&rows) {
             let t = row.trim();
             if raw.contains("\x1b[1m") {
+                // (#2882: the box with the keys has a bold title.)
                 assert!(
-                    ["Waves", "Board"].contains(&t)
+                    t.starts_with("┌─ Message")
+                        || ["Waves", "Board"].contains(&t)
                         || ["• Gate", "• Fixes", "• Merges"]
                             .iter()
                             .any(|g| t.starts_with(g)),
@@ -223,7 +239,7 @@ async fn compact_has_no_decorative_rows_a_one_row_footer_and_bold_only_for_headi
 
 #[tokio::test]
 async fn comfortable_keeps_the_roomier_layout() {
-    let rows = snapshot(Some("comfortable"), (120, 40)).await;
+    let rows = bare_rows(&snapshot(Some("comfortable"), (120, 40)).await);
     let screen = rows.join("\n");
     // The bubble's padding rows and the gap: two blank rows above and below the prompt.
     let at = rows
@@ -234,10 +250,10 @@ async fn comfortable_keeps_the_roomier_layout() {
         rows[at + 1].trim().is_empty() && rows[at + 2].trim().is_empty(),
         "{screen}"
     );
-    // The two-row footer at 120 columns.
+    // The two-row footer at 120 columns, under the Message box (#2882).
     let bottom = rows
         .iter()
-        .rposition(|r| r.trim_start().starts_with('─'))
+        .rposition(|r| r.trim_start().starts_with('└'))
         .unwrap();
     assert!(rows[bottom + 1].contains("• manager"), "{screen}");
     assert!(rows[bottom + 2].ends_with("thinking off"), "{screen}");

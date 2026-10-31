@@ -125,27 +125,53 @@ func (s *Service) ReconcileMergeMetadata(ctx context.Context, p authz.Principal,
 // knowing the run that finished it: when that run leaves work waiting on a
 // merge (mergeGateFor), the ticket completes with merge_state "needed" and
 // its dependents keep waiting. The caller records the run afterwards.
-func (s *Service) CompleteTaskWithRun(ctx context.Context, p authz.Principal, taskID int, run *domain.Run) (*domain.Task, error) {
+// complete carries the caller's claim to be the ticket's worker (the
+// dispatch_id it was given, if any) and, for a closeout, why.
+func (s *Service) CompleteTaskWithRun(ctx context.Context, p authz.Principal, taskID int, run *domain.Run, complete CompleteClaim) (*domain.Task, Closeout, error) {
 	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskWork)
 	if err != nil {
-		return nil, err
+		return nil, Closeout{}, err
 	}
 	if t.IsHuman() {
-		return nil, authz.BadRequest("ticket %d is a person's ticket; they mark it done in AMP: %s", taskID, s.TaskURL(t.ProjectID, taskID))
+		return nil, Closeout{}, authz.BadRequest("ticket %d is a person's ticket; they mark it done in AMP: %s", taskID, s.TaskURL(t.ProjectID, taskID))
 	}
-	if err := s.checkAgentCompletion(ctx, p, t); err != nil {
+	if err := s.checkAgentCompletion(ctx, p, t, complete.DispatchID); err != nil {
 		s.auditTaskDenied(ctx, p, "task.complete", t, err, nil)
-		return nil, err
+		return nil, Closeout{}, err
 	}
 	gate := t.State != domain.TaskStateCompleted && s.mergeGateFor(ctx, t, run, nil)
 	where := ""
 	if gate {
 		where = mergeWhere(*run)
 	}
-	if err := s.sendCompleteMerge(ctx, p, t, !p.InUI(), gate, where); err != nil {
-		return nil, err
+	// An explicit closeout_reason makes it a closeout even on a dispatched
+	// ticket nobody started; a bare completion there stays an old plugin's
+	// own (AMP #2908).
+	closeout := t.State != domain.TaskStateCompleted && !p.InUI() && t.CompletionIsCloseout(complete.DispatchID, complete.Reason)
+	reason := ""
+	if closeout {
+		reason = strings.TrimSpace(complete.Reason)
+		if reason == "" && run != nil {
+			reason = strings.TrimSpace(run.Note)
+		}
 	}
-	return s.Repo.GetTask(ctx, taskID)
+	reply, err := s.sendCompleteMerge(ctx, p, t, !p.InUI(), gate, where, complete.DispatchID, reason)
+	if err != nil {
+		return nil, Closeout{}, err
+	}
+	task, err := s.Repo.GetTask(ctx, taskID)
+	return task, Closeout{Closeout: reply.Closeout, Reason: reason}, err
+}
+
+// CompleteClaim is how a caller presents itself to a completion: the
+// dispatch_id it was dispatched with (the worker's own completion), and for
+// a closeout, why it is closing a ticket that isn't its own work. Reason is
+// only the caller's explicit closeout_reason, never a run note: a non-empty
+// one makes the completion a closeout without the current dispatch_id
+// (AMP #2908).
+type CompleteClaim struct {
+	DispatchID string
+	Reason     string
 }
 
 // setMergeState sends MsgSetMergeState to t's actor.

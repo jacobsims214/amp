@@ -471,12 +471,12 @@ async fn a_click_on_a_thinking_line_opens_and_closes_it() {
             &[inputs[0], inputs[1], &click, &again],
         )
         .await;
-        // The transcript from the first prompt to the editor (the banner and footer name the
-        // run's own dir, port and session).
+        // The transcript from the first prompt to the Conversation box's bottom edge (#2882; the
+        // banner and footer name the run's own dir, port and session).
         let turns = |rows: &[String]| -> Vec<String> {
             rows.iter()
                 .skip_while(|r| r.as_str() != " plan it")
-                .take_while(|r| !r.starts_with('─'))
+                .take_while(|r| !r.trim_start().starts_with('└'))
                 .cloned()
                 .collect()
         };
@@ -536,13 +536,14 @@ const WIDE: &str = "Plan:\n\n\
 
 /// The table's rows (top rule to bottom rule).
 fn table_rows(screen: &[String]) -> &[String] {
+    // A table's own edges have column joints (┬, ┴); the boxes' edges don't (#2882).
     let top = screen
         .iter()
-        .position(|r| r.trim_start().starts_with('┌'))
+        .position(|r| r.trim_start().starts_with('┌') && r.contains('┬'))
         .unwrap_or_else(|| panic!("no table\n{}", screen.join("\n")));
     let bottom = screen
         .iter()
-        .position(|r| r.trim_start().starts_with('└'))
+        .position(|r| r.trim_start().starts_with('└') && r.contains('┴'))
         .unwrap_or_else(|| panic!("no table bottom\n{}", screen.join("\n")));
     &screen[top..=bottom]
 }
@@ -635,7 +636,8 @@ async fn a_table_too_wide_for_the_row_falls_back_to_records() {
                 assert_eq!(joints(row), top, "{text}");
             }
         } else {
-            assert!(!text.contains('┌') && !text.contains('┼'), "{text}");
+            // (The boxes' corners are not a table, #2882.)
+            assert!(!text.contains('┬') && !text.contains('┼'), "{text}");
             let records = rows_from(&screen, "• Identifier: T-1");
             assert!(records[1].trim() == "Description: Parse tables", "{text}");
             assert!(

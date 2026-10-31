@@ -30,6 +30,8 @@ export interface HumanActionsProps {
   /** merge: the PR and branch from the latest run (My work items carry them) */
   prUrl?: string
   branch?: string
+  /** start: how long it has been dispatched, from the server's not_started_minutes */
+  minutes?: number
   /** who asked (answer); defaults to the ticket's agent */
   askedBy?: string
   /** called with the updated ticket (or null when only a merge record came back) */
@@ -40,6 +42,7 @@ export function HumanActions(props: HumanActionsProps) {
   const kind = props.kind === undefined ? actionKindOf(props.task) : props.kind
   if (kind === 'answer') return <AnswerAction {...props} />
   if (kind === 'merge') return <MergeAction {...props} />
+  if (kind === 'start') return <StartAction {...props} />
   if (kind === 'do') return <DoAction {...props} />
   return null
 }
@@ -159,6 +162,40 @@ function MergeAction({ task, canAct, prUrl, branch, onChanged }: HumanActionsPro
             {busy === 'merged' ? <Spin /> : <GitMerge size={12} aria-hidden="true" />}Mark merged</button>
         </>)}
       </div>
+    </div>
+  )
+}
+
+// ---- Start (a dispatched ticket no worker started) ----
+
+/**
+ * A ticket of yours is dispatched to an agent and no worker has started it
+ * (AMP #2801): the run was never launched, so nothing is happening on it.
+ * Returning it to ready clears the dispatch and puts it back where a manager
+ * (or you) dispatches it again; the watchdog does the same by itself at the
+ * project's not_started_return_minutes. "Keep waiting" changes nothing: the
+ * watchdog will still return it at the timeout.
+ */
+function StartAction({ task, canAct, minutes, onChanged }: HumanActionsProps) {
+  const { busy, error, run } = useRun(onChanged)
+  return (
+    <div className="grid gap-2.5" data-action="start">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[12.5px] text-ink-2">
+        <span>
+          Dispatched{task.agent_id ? <> to <b className="text-ink">{task.agent_id}</b></> : null}
+          {minutes != null ? ` ${minutes} min ago` : ''}; no worker has started it.
+        </span>
+      </div>
+      {error && <span role="alert" className="text-[12px] text-danger-ink">{error}</span>}
+      {!canAct
+        ? <span className="text-[12px] text-ink-2">Only its owner can return it to ready.</span>
+        : <div className="flex gap-2 flex-wrap items-center">
+          <button type="button" className="amp-btn amp-btn-primary amp-btn-sm" disabled={!!busy}
+            title="Clear the dispatch and put it back where it can be dispatched again"
+            onClick={() => run('return', () => api.returnTask(task.id, 'no worker started it'))}>
+            {busy === 'return' ? <Spin /> : <RotateCcw size={12} aria-hidden="true" />}Return to ready</button>
+          <span className="text-[12px] text-ink-3">Keep waiting, and AMP returns it by itself if no worker starts it.</span>
+        </div>}
     </div>
   )
 }

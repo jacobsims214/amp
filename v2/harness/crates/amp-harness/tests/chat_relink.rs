@@ -17,12 +17,12 @@ use std::{
     fs::File,
     io::{Read, Write},
     path::Path,
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use common::{MockAmp, spawn, workdir};
+use common::{MockAmp, pty_command, spawn, workdir};
 use nix::{pty::Winsize, pty::openpty};
 use serde_json::json;
 
@@ -179,7 +179,7 @@ impl Chat {
         };
         let pty = openpty(Some(&size), None).expect("openpty");
         let stdio = || Stdio::from(pty.slave.try_clone().unwrap());
-        let child = Command::new(env!("CARGO_BIN_EXE_amp-harness"))
+        let child = pty_command()
             .args(["--no-session", "--no-setup"])
             .current_dir(dir.join("project"))
             .env("HOME", dir.join("home"))
@@ -340,7 +340,8 @@ async fn the_chat_follows_an_amp_json_the_manager_writes() {
     );
     // The header names the project (the poller fetched it), and so does the banner.
     let top: String = screen[..4].join("\n");
-    assert!(top.contains("· AMP v2 #2"), "{}", shown(&screen));
+    // (#2882: the project leads the Conversation box's top edge, after the brand bands.)
+    assert!(top.contains("▀▀ AMP v2 #2"), "{}", shown(&screen));
     assert!(
         top.contains("project #2 AMP v2 · http://"),
         "{}",

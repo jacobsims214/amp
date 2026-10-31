@@ -695,4 +695,37 @@ mod tests {
         let dirs = OverrideDirs::discover_with_env(Some(Path::new("/repo")), &env(&[]));
         assert_eq!(dirs.repo, Some(PathBuf::from("/repo/.amp/harness")));
     }
+
+    /// AMP #2892: in the chat `amp_run_ticket` launches in the background (#2837) and the chat
+    /// wakes the manager when workers end (#2891), so the built-in manager prompt must tell it to
+    /// end its turn after launching and act on the worker summaries later, not to "wait for
+    /// completions" (which reads as: poll the board with the reply held open). The awaiting
+    /// wording for `run -p` stays.
+    #[test]
+    fn the_manager_prompt_ends_its_turn_after_a_launch() {
+        let flat = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+        let manager = flat(Assets::embedded_agent_text("amp-manager").expect("built-in manager"));
+        for want in [
+            "When `amp_run_ticket` returns an acknowledgement",
+            "then **end your turn**",
+            "Don't poll `amp_list_tasks`, sleep or loop to wait for workers",
+            "Your user can keep chatting with you while the workers run",
+            "[amp-harness] Workers you launched have ended",
+            "`[worker summaries: …]` block",
+            "it has already waited: carry on with the loop in the same turn",
+        ] {
+            assert!(manager.contains(want), "amp-manager.md lacks {want:?}");
+        }
+        assert!(
+            !manager.contains("wait for completions"),
+            "stale Await-only loop wording"
+        );
+        assert!(!manager.contains("runs the worker in the foreground"));
+
+        let planning = std::str::from_utf8(
+            Assets::embedded_skill_file("amp-planning", "SKILL.md").expect("built-in amp-planning"),
+        )
+        .unwrap();
+        assert!(flat(planning).contains("end your turn, and its result opens a later turn"));
+    }
 }

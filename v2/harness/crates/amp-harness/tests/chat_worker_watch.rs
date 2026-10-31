@@ -29,12 +29,12 @@ use std::{
     fs::File,
     io::{Read, Write},
     path::Path,
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use common::{MockAmp, spawn, workdir};
+use common::{MockAmp, pty_command, spawn, workdir};
 use nix::{pty::Winsize, pty::openpty};
 use serde_json::json;
 
@@ -187,10 +187,22 @@ impl Screen {
         }
     }
 
+    /// The screen's rows, the boxes' side edges (#2882) as blanks (columns unchanged), so a row
+    /// reads as it did inside the padding alone; the boxes' top and bottom edges stay.
     fn lines(&self) -> Vec<String> {
         self.rows
             .iter()
-            .map(|r| r.iter().collect::<String>().trim_end().to_owned())
+            .map(|r| {
+                let mut s = r.iter().collect::<String>().trim_end().to_owned();
+                let lead = s.len() - s.trim_start().len();
+                if s[lead..].starts_with('│') {
+                    s.replace_range(lead..lead + '│'.len_utf8(), " ");
+                    if s.ends_with('│') {
+                        s.pop();
+                    }
+                }
+                s.trim_end().to_owned()
+            })
             .collect()
     }
 
@@ -220,6 +232,18 @@ impl Chat {
 
     /// [`Self::start`] with the chat's PATH (#2395: a fake browser opener in front).
     fn start_with_path(dir: &Path, url: &str, cols: u16, rows: u16, path: &str) -> Self {
+        Self::start_with_env(dir, url, cols, rows, path, &[])
+    }
+
+    /// [`Self::start_with_path`] with extra environment (AMP #2858: a slow faux stream).
+    fn start_with_env(
+        dir: &Path,
+        url: &str,
+        cols: u16,
+        rows: u16,
+        path: &str,
+        env: &[(&str, &str)],
+    ) -> Self {
         let size = Winsize {
             ws_row: rows,
             ws_col: cols,
@@ -228,7 +252,7 @@ impl Chat {
         };
         let pty = openpty(Some(&size), None).expect("openpty");
         let stdio = || Stdio::from(pty.slave.try_clone().unwrap());
-        let child = Command::new(env!("CARGO_BIN_EXE_amp-harness"))
+        let child = pty_command()
             .args(["--no-session", "--no-setup"])
             .current_dir(dir.join("project"))
             .env("HOME", dir.join("home"))
@@ -247,9 +271,11 @@ impl Chat {
             .env_remove("AMP_HARNESS_PROFILE")
             .env_remove("AMP_HARNESS_MOUSE")
             .env_remove("AMP_HARNESS_MAX_WORKERS")
+            .env_remove("AMP_HARNESS_WORKER_DISPATCH")
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("OPENROUTER_API_KEY")
             .env_remove("RUST_LOG")
+            .envs(env.iter().copied())
             .stdin(stdio())
             .stdout(stdio())
             .stderr(stdio())
@@ -320,6 +346,15 @@ impl Drop for Chat {
     }
 }
 
+/// The calls that took a ticket out of progress, either path (AMP #2802): `amp_return_task` is
+/// the returned path the harness prefers, `amp_set_task_state` the fallback for a ticket AMP
+/// refuses to return because it was started.
+fn handed_back(amp: &common::Running) -> Vec<serde_json::Value> {
+    let mut all = amp.mock.calls_to("amp_return_task");
+    all.extend(amp.mock.calls_to("amp_set_task_state"));
+    all
+}
+
 fn dump(title: &str, screen: &Screen) {
     if std::env::var_os("AMP_TEST_DUMP").is_some() {
         eprintln!(
@@ -346,7 +381,13 @@ fn chip(screen: &Screen, id: i64) -> Option<String> {
     screen
         .lines()
         .into_iter()
-        .find(|l| l.trim_start().starts_with(&needle))
+        .find(|l| inner(l).starts_with(&needle))
+}
+
+/// A row's text inside a box's left edge (#2882) and past `/workers`' selection mark, or the
+/// row trimmed.
+fn inner(l: &str) -> &str {
+    l.trim_start().trim_start_matches(['│', '›', ' '])
 }
 
 /// `running 12s` → 12 seconds (minutes too).
@@ -386,7 +427,14 @@ async fn watch_at(cols: u16, rows: u16) {
     let dir = workdir(&format!("chat-worker-watch-{cols}x{rows}"), Some(2));
     let config = dir.join("home/.config/amp-harness");
     std::fs::create_dir_all(&config).unwrap();
-    std::fs::write(config.join("config.toml"), CONFIG).unwrap();
+    // #2355's ordering (each finished notice above the manager's reply) is the foreground's: the
+    // reply waits for its workers. The chat launches by default (AMP #2837), so this test asks
+    // for `await` explicitly, which also shows that an explicit setting still wins in the chat.
+    std::fs::write(
+        config.join("config.toml"),
+        format!("{CONFIG}\n[workers]\ndispatch = \"await\"\n"),
+    )
+    .unwrap();
     std::fs::write(dir.join("script.json"), script(8).to_string()).unwrap();
     let mut chat = Chat::start(&dir, &amp.url, cols, rows);
     chat.wait("the editor", |s| s.text().contains("/ for commands"))
@@ -397,7 +445,9 @@ async fn watch_at(cols: u16, rows: u16) {
     let s = chat
         .wait("two chips, a name and the hint", |s| {
             let t = s.text();
-            t.contains("2 running · click one or Ctrl+W to watch")
+            // #2882: the Workers box's title has the count and the keys.
+            t.contains("Workers · 2 running")
+                && t.contains("Ctrl+W watch · /workers all")
                 && chip(s, KNOWN).is_some_and(|l| l.contains("M1-4 CLI") && l.contains("ctx "))
                 && chip(s, UNKNOWN).is_some_and(|l| l.contains(" tok"))
         })
@@ -502,7 +552,7 @@ async fn watch_at(cols: u16, rows: u16) {
     }
     assert!(
         !lines.iter().any(|l| {
-            let l = l.trim();
+            let l = l.trim().trim_matches('│').trim();
             l == "▸ Thinking" || l.starts_with("▸ Thinking · Ctrl+T")
         }),
         "{t}"
@@ -516,7 +566,7 @@ async fn watch_at(cols: u16, rows: u16) {
     chat.send(b"\x1b");
     chat.wait("the chat again", |s| {
         let t = s.text();
-        t.contains("run both tickets") && t.contains("click one or Ctrl+W to watch")
+        t.contains("run both tickets") && t.contains("Ctrl+W watch · /workers all")
     })
     .await;
 
@@ -531,7 +581,7 @@ async fn watch_at(cols: u16, rows: u16) {
     assert!(
         s.lines()
             .iter()
-            .any(|l| l.trim_start().starts_with(&format!("❯ #{KNOWN}"))),
+            .any(|l| inner(l).starts_with(&format!("❯ #{KNOWN}"))),
         "{}",
         s.text()
     );
@@ -539,7 +589,7 @@ async fn watch_at(cols: u16, rows: u16) {
     chat.wait("the selection to move", |s| {
         s.lines()
             .iter()
-            .any(|l| l.trim_start().starts_with(&format!("❯ #{UNKNOWN}")))
+            .any(|l| inner(l).starts_with(&format!("❯ #{UNKNOWN}")))
     })
     .await;
     chat.send(b"\r");
@@ -556,20 +606,26 @@ async fn watch_at(cols: u16, rows: u16) {
     let s = chat
         .wait("the /workers panel", |s| {
             let t = s.text();
-            t.contains("AMP · workers") && t.contains("Enter/click watch")
+            // #2882: one box, titled with the counts, the key hint in its bottom edge.
+            t.contains("┌─ Workers · 2 running") && t.contains("Enter watch")
         })
         .await;
     dump("/workers panel", &s);
     let t = s.text();
     assert!(t.contains(&format!("#{KNOWN} M1-4 CLI")), "{t}");
-    assert!(t.contains("amp:amp-worker-backend · local"), "{t}");
+    // One row per worker: its chip (id, name, agent), no "local" on every row.
+    assert!(
+        chip(&s, KNOWN).is_some_and(|l| l.contains("worker-backend")),
+        "{t}"
+    );
+    assert!(!s.lines().iter().any(|l| l.ends_with("· local")), "{t}");
     for line in s.lines() {
         assert!(line.chars().count() <= width, "{line:?}");
     }
     let row = s
         .lines()
         .iter()
-        .position(|l| l.contains(&format!("#{UNKNOWN} ")) && l.contains("· local"))
+        .position(|l| l.contains(&format!("▸ #{UNKNOWN} ")) && l.contains("worker-backend"))
         .unwrap();
     chat.click(row, 6);
     chat.wait("the session of #9002 from /workers", |s| {
@@ -609,7 +665,7 @@ async fn watch_at(cols: u16, rows: u16) {
     assert!(
         !s.lines()
             .iter()
-            .any(|l| l.trim_start().starts_with('▸') && l.contains("running ")),
+            .any(|l| inner(l).starts_with('▸') && l.contains("running ")),
         "{t}"
     );
     let (row, col) = find(&s, &format!("■ worker finished #{KNOWN}"))
@@ -672,8 +728,7 @@ async fn typing_with_the_workers_panel_open_goes_to_the_editor() {
         .await;
     chat.send(b"run both tickets\r");
     chat.wait("two running workers", |s| {
-        s.text()
-            .contains("2 running · click one or Ctrl+W to watch")
+        s.text().contains("Workers · 2 running")
     })
     .await;
 
@@ -681,8 +736,8 @@ async fn typing_with_the_workers_panel_open_goes_to_the_editor() {
     let s = chat
         .wait("the workers panel and its hint", |s| {
             let t = s.text();
-            t.contains("AMP · workers")
-                && t.contains("Enter/click watch · Ctrl+X stop · Ctrl+G open in AMP · Esc close")
+            t.contains("┌─ Workers ·")
+                && t.contains("Enter watch · Ctrl+X stop · Ctrl+G open in AMP · Esc close")
         })
         .await;
     dump("workers panel", &s);
@@ -709,10 +764,10 @@ async fn typing_with_the_workers_panel_open_goes_to_the_editor() {
         "xo hello",
         "exactly the typed text: {t}"
     );
-    assert!(t.contains("AMP · workers"), "the panel stays open: {t}");
+    assert!(t.contains("┌─ Workers ·"), "the panel stays open: {t}");
     assert!(!t.contains("stop the worker on"), "x asked nothing: {t}");
     assert!(!opened.exists(), "o opened nothing: {t}");
-    assert!(amp.mock.calls_to("amp_set_task_state").is_empty(), "{t}");
+    assert!(handed_back(&amp).is_empty(), "{t}");
     assert!(s.text().contains("2 running"), "{}", s.text());
 
     // Ctrl+G opens the selected row's ticket in AMP, whatever the editor holds.
@@ -748,7 +803,7 @@ async fn typing_with_the_workers_panel_open_goes_to_the_editor() {
     dump("stop question in the workers panel", &s);
     chat.send(b"y");
     let deadline = Instant::now() + Duration::from_secs(20);
-    while amp.mock.calls_to("amp_set_task_state").is_empty() {
+    while handed_back(&amp).is_empty() {
         assert!(
             Instant::now() < deadline,
             "y stopped nothing:\n{}",
@@ -756,7 +811,10 @@ async fn typing_with_the_workers_panel_open_goes_to_the_editor() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let states = amp.mock.calls_to("amp_set_task_state");
+    // AMP #2802: a stopped worker's ticket goes back through `amp_return_task` (the returned
+    // path); `amp_set_task_state` is only the fallback for a ticket AMP won't return. What
+    // matters here is that the ticket is out of progress, once.
+    let states = handed_back(&amp);
     assert_eq!(states.len(), 1, "{states:?}");
     assert_eq!(states[0]["task_id"], json!(id), "{states:?}");
     let s = chat.screen();
@@ -765,6 +823,212 @@ async fn typing_with_the_workers_panel_open_goes_to_the_editor() {
         "the typed text is still in the editor: {}",
         s.text()
     );
+
+    for _ in 0..3 {
+        chat.send(b"\x03");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// AMP #2837 end to end, on a real pty with the chat's default settings (no `[workers] dispatch`):
+/// the manager dispatches a ticket and its turn ends at once with the worker still running; the
+/// editor takes a new prompt, which the manager answers while the worker runs; the worker's end
+/// shows as a notice; and, with nobody typing, the chat starts the manager's next turn by itself
+/// (AMP #2891), which receives the worker's summary at its top (the faux manager echoes what that
+/// turn was sent). The person's next prompt then goes without it: each end reaches one turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_chat_launches_workers_and_takes_prompts_while_they_run() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = workdir("chat-launch-default", Some(2));
+    let config = dir.join("home/.config/amp-harness");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("config.toml"), CONFIG).unwrap();
+    let run = json!({"name": "amp_run_ticket",
+        "arguments": {"task_id": KNOWN, "agent_id": "amp:amp-worker-backend", "worktree": false}});
+    let nap = json!({"text": "Working.",
+        "tool_calls": [{"name": "bash", "arguments": {"command": "sleep 6"}}]});
+    let complete = json!({"tool_calls": [{"name": "amp_complete_task",
+        "arguments": {"task_id": KNOWN}}]});
+    let script = json!({
+        "boss": [
+            {"tool_calls": [run]},
+            {"text": "Dispatched #2085; it runs in the background."},
+            {"text": "Still here while the worker runs."},
+            {"text": "Next turn saw: {{last_user_message}}"},
+            {"text": "Then saw: {{last_user_message}}"}
+        ],
+        "wf": [nap, complete, {"text": "done"}]
+    });
+    std::fs::write(dir.join("script.json"), script.to_string()).unwrap();
+    let mut chat = Chat::start(&dir, &amp.url, 120, 40);
+    chat.wait("the editor", |s| s.text().contains("/ for commands"))
+        .await;
+
+    // 1. The dispatch turn ends while its worker is still running.
+    chat.send(b"run ticket 2085\r");
+    let s = chat
+        .wait("the manager's reply with the worker still running", |s| {
+            s.text()
+                .contains("Dispatched #2085; it runs in the background.")
+                && chip(s, KNOWN).is_some_and(|l| l.contains("running"))
+        })
+        .await;
+    dump("dispatch turn ended, worker running", &s);
+
+    // 2. A new prompt is taken and answered while the worker runs.
+    chat.send(b"are you still there?\r");
+    let s = chat
+        .wait("an answer while the worker runs", |s| {
+            s.text().contains("Still here while the worker runs.")
+        })
+        .await;
+    dump("second turn answered, worker running", &s);
+    let t = s.text();
+    assert!(!t.contains("still working"), "the prompt was refused: {t}");
+    assert!(
+        chip(&s, KNOWN).is_some_and(|l| l.contains("running")),
+        "the worker is still running: {t}"
+    );
+    assert!(!t.contains("worker ended"), "{t}");
+
+    // 3. The worker's end shows as a notice, with nobody typing.
+    let s = chat
+        .wait("the worker's end notice", |s| {
+            s.text()
+                .contains(&format!("worker ended: #{KNOWN} completed"))
+        })
+        .await;
+    dump("worker ended", &s);
+
+    // 4. With nobody typing, the chat starts the next turn (AMP #2891), marked as automatic,
+    //    and it receives the end at its top.
+    let s = chat
+        .wait("the automatic turn's echo", |s| {
+            // The echo streams: wait for the summary's entry too, not only its start.
+            let t = s.text();
+            t.find("Next turn saw: [worker summaries")
+                .is_some_and(|at| {
+                    t[at..].contains(&format!("#{KNOWN} completed"))
+                        && t[at..].contains("[amp-harness] Workers you launched")
+                })
+        })
+        .await;
+    dump("the automatic turn saw the worker's end", &s);
+    let t = s.text();
+    assert!(
+        t.contains("a worker you launched ended while the chat was idle"),
+        "the transcript says what started the turn: {t}"
+    );
+    let echo = t.find("Next turn saw:").unwrap();
+    assert!(
+        t[echo..].contains(&format!("#{KNOWN} completed")),
+        "the summary names the ticket: {t}"
+    );
+    assert!(
+        t[echo..].contains("[amp-harness] Workers you launched"),
+        "{t}"
+    );
+    assert_eq!(amp.mock.calls_to("amp_complete_task").len(), 1);
+
+    // 5. The person's next prompt goes as typed: the end was delivered once.
+    chat.send(b"what happened?\r");
+    let s = chat
+        .wait("the person's turn's echo", |s| {
+            s.text().contains("Then saw: ")
+        })
+        .await;
+    let t = s.text();
+    let echo = t.find("Then saw: ").unwrap();
+    assert!(t[echo..].contains("what happened?"), "{t}");
+    assert!(!t[echo..].contains("[worker summaries"), "{t}");
+
+    for _ in 0..3 {
+        chat.send(b"\x03");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// AMP #2858 end to end, on a real pty with the chat's default (Launch) dispatch: Esc during a
+/// later reply stops only that reply. The note says the launched worker keeps running (never
+/// "stopping the worker ... too"), the worker goes on to complete its ticket, and nothing hands
+/// the ticket back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn esc_in_launch_mode_stops_the_reply_and_leaves_the_worker_running() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = workdir("chat-launch-esc", Some(2));
+    let config = dir.join("home/.config/amp-harness");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("config.toml"), CONFIG).unwrap();
+    let run = json!({"name": "amp_run_ticket",
+        "arguments": {"task_id": KNOWN, "agent_id": "amp:amp-worker-backend", "worktree": false}});
+    let nap = json!({"text": "Working.",
+        "tool_calls": [{"name": "bash", "arguments": {"command": "sleep 12"}}]});
+    let complete = json!({"tool_calls": [{"name": "amp_complete_task",
+        "arguments": {"task_id": KNOWN}}]});
+    // At 40 tokens (160 characters) a second, this reply takes well over a minute to stream.
+    let long = "A long answer that is still streaming. ".repeat(300);
+    let script = json!({
+        "boss": [
+            {"tool_calls": [run]},
+            {"text": "Dispatched."},
+            {"text": long},
+            // AMP #2891: the automatic turn once the worker ends.
+            {"text": "Carried on."}
+        ],
+        "wf": [nap, complete, {"text": "done"}]
+    });
+    std::fs::write(dir.join("script.json"), script.to_string()).unwrap();
+    let path = std::env::var("PATH").unwrap_or_default();
+    let mut chat = Chat::start_with_env(
+        &dir,
+        &amp.url,
+        120,
+        40,
+        &path,
+        &[("AMP_HARNESS_FAUX_TOKENS_PER_SECOND", "40")],
+    );
+    chat.wait("the editor", |s| s.text().contains("/ for commands"))
+        .await;
+
+    chat.send(b"run ticket 2085\r");
+    chat.wait("the dispatch turn ended with the worker running", |s| {
+        s.text().contains("Dispatched.") && chip(s, KNOWN).is_some_and(|l| l.contains("running"))
+    })
+    .await;
+
+    // A later reply, stopped with Esc while it streams.
+    chat.send(b"tell me a long story\r");
+    chat.wait("the long reply streaming", |s| {
+        s.text().contains("A long answer that is still streaming.")
+    })
+    .await;
+    chat.send(b"\x1b");
+    let s = chat
+        .wait("the reply-only stop note", |s| {
+            s.text().contains(&format!(
+                "stopping the reply; the worker on #{KNOWN} keeps running (/workers to stop it)"
+            ))
+        })
+        .await;
+    dump("esc stopped the reply, worker still running", &s);
+    let t = s.text();
+    assert!(!t.contains("too; its ticket goes back to ready"), "{t}");
+    assert!(
+        chip(&s, KNOWN).is_some_and(|l| l.contains("running")),
+        "the worker is still running: {t}"
+    );
+
+    // The worker carries on and closes its ticket; nothing returned it to ready.
+    let s = chat
+        .wait("the worker's end notice", |s| {
+            s.text()
+                .contains(&format!("worker ended: #{KNOWN} completed"))
+        })
+        .await;
+    dump("worker completed after the reply was stopped", &s);
+    assert!(s.text().contains("Stopped."), "{}", s.text());
+    assert_eq!(amp.mock.calls_to("amp_complete_task").len(), 1);
+    assert!(handed_back(&amp).is_empty(), "{:?}", handed_back(&amp));
 
     for _ in 0..3 {
         chat.send(b"\x03");

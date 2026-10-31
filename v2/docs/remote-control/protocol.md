@@ -237,7 +237,7 @@ Example (a prompt as the wire may carry it; member order on the wire doesn't mat
 | `op` | `body` (exactly these members) | Harness action | `ack.result` |
 |---|---|---|---|
 | `prompt` | `text`: string, 1..49152 UTF-8 bytes, not whitespace-only. `client_msg_id`: string per section 2. | **Idle:** starts a run with `text` as the user turn. **Busy:** appends it to the follow-up queue (section 5.4). The text is **always literal**: a leading `/` is never a slash command (R-M6, T-H-2). The harness tags the turn `[remote: <device name>]` in its local transcript and in the model context (R-M16). | `started` or `queued` |
-| `stop` | `{}` | Aborts the running turn and its workers, as Esc / `/abort` do, and **clears the follow-up queue**. Always allowed while the session is live, never rate limited below 120/min. | `done` |
+| `stop` | `{}` | Aborts the running turn, as Esc / `/abort` do, and **clears the follow-up queue**. Background (launched) workers keep running (AMP #2858); in await mode the turn's workers stop with it. Always allowed while the session is live, never rate limited below 120/min. | `done` |
 | `detach` | `{}` | Ends remote control for this session, as `/remote off` does. The local session keeps running. The harness sends `bye {reason: "detached"}` and `DELETE`s the relay session. | `done` |
 
 **Reserved names.** A v1 M1 harness MUST refuse these with `unknown_op`. They are listed so that nobody reuses
@@ -275,7 +275,12 @@ laptop" if neither arrives within 10 s.
 - Every change sends a `chat_event` of type `queue` (section 6.4), so every viewer can show "queued (2)".
 - A queued prompt is announced as `user_message` only when it starts, so the transcript order is the order of
   execution.
-- Typing on the laptop while a run is busy keeps today's TUI behaviour in M1. The queue is for remote prompts.
+- A prompt typed on the laptop while a run is busy is queued too (AMP #2889), in the TUI's own queue with the
+  same rules: at most 5, one new run per run end, in order, and cleared by `stop` / Esc. The TUI shows it as
+  "queued #N · runs after this reply" and counts it on the spinner line; it is not part of the `queue` event.
+  At a run end the laptop's queue goes first, then this one, one prompt per run end.
+- A run ends when the manager's reply ends. Since AMP #2837 the chat launches workers in the background, so a
+  turn that dispatched workers ends (and the queue moves on) without waiting for them.
 
 ### 5.5 Nonce cache and timestamps
 
@@ -1417,7 +1422,7 @@ sequenceDiagram
   participant H as Harness
   B->>R: POST commands {op: stop, body: {}}
   R->>H: event: command
-  H->>H: verify, harness.abort() (manager + workers), clear the queue
+  H->>H: verify, abort the manager reply (launched workers keep running, AMP #2858), clear the queue
   H->>R: events [ack done, chat_event queue{items: []}, notice "Stopped.", run_end aborted, status busy=false]
   R-->>B: event: envelope ...
   Note over B,H: A local Esc / /abort sends the same events, so every viewer sees the stop.

@@ -37,7 +37,7 @@ use amp_core::{
     project::{ENV_CEILING_DIR, ProjectMarker},
     providers::SystemKeys,
     run_report::{RunReporter, SessionUsageTool},
-    supervisor::{ManagerContext, Supervisor, SupervisorConfig, WorkerHooks},
+    supervisor::{DispatchMode, ManagerContext, Supervisor, SupervisorConfig, WorkerHooks},
 };
 use rpi_agent::AgentEvent;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -61,7 +61,32 @@ pub struct SessionRequest<'a> {
     /// Ask the person whether to trust this repo's untrusted MCP servers before they start (the
     /// chat, #2241). Headless runs never ask: untrusted repo servers are skipped.
     pub ask_trust: bool,
+    /// How `amp_run_ticket` picks its [`DispatchMode`]: [`HEADLESS_DISPATCH`] for `run -p`,
+    /// [`CHAT_DISPATCH`] for the interactive chat.
+    pub dispatch: Dispatch,
 }
+
+/// How a front end chooses the manager's [`DispatchMode`] against `[workers] dispatch` and
+/// `AMP_HARNESS_WORKER_DISPATCH`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatch {
+    /// This mode, whatever config.toml or the environment says (AMP #2884).
+    Force(DispatchMode),
+    /// This mode unless config.toml or the environment names one (AMP #2837).
+    Default(DispatchMode),
+}
+
+/// `run -p` (AMP #2884): a headless run exits when the manager's reply ends, so a launched worker
+/// would be left mid-run with its ticket in progress, and its callers read the worker's report
+/// from the tool result. Always `await`.
+pub const HEADLESS_DISPATCH: Dispatch = Dispatch::Force(DispatchMode::Await);
+
+/// The interactive chat (AMP #2837): `launch` by default, so the manager's turn ends once its
+/// workers are dispatched and the person can keep talking while they run; each worker's end
+/// arrives as a notice (#2861) and in the next turn's context (#2857). An explicit
+/// `dispatch = "await"` in config.toml or `AMP_HARNESS_WORKER_DISPATCH=await` still wins, as the
+/// way back to foreground dispatch if launch misbehaves somewhere.
+pub const CHAT_DISPATCH: Dispatch = Dispatch::Default(DispatchMode::Launch);
 
 pub struct Session {
     pub rt: Arc<Runtime>,
@@ -77,12 +102,47 @@ pub struct Session {
     pub cwd: PathBuf,
     /// The manager's worker supervisor (`None` for a worker role).
     pub supervisor: Option<Arc<Supervisor>>,
+    /// Automatic run reporting (D8), kept so a chat can give it its notifier (AMP #2802: a
+    /// returned ticket is told to the person, not only to the manager's tool result).
+    pub reporter: Option<Arc<RunReporter>>,
     /// Why AMP could not be reached, when the session started offline (`allow_offline`).
     pub offline: Option<amp_mcp::McpError>,
     /// MCP hub changes from before the hub started (a server ready, failed, its tools changed).
     pub mcp_events: tokio::sync::broadcast::Receiver<amp_core::mcp_hub::HubEvent>,
     /// MCP servers still on their first attempt when the session was built.
     pub mcp_starting: Vec<String>,
+}
+
+/// The manager's `[workers]` settings for this front end: `dispatch` decides the mode (see
+/// [`Dispatch`]); everything else comes from config.toml and the environment as usual. A forced
+/// mode that replaces a configured `launch` says so on stderr with `--verbose` / `RUST_LOG`.
+fn supervisor_config(
+    env: &dyn Fn(&str) -> Option<String>,
+    config_path: Option<PathBuf>,
+    dispatch: Dispatch,
+) -> Result<SupervisorConfig, String> {
+    let base = match dispatch {
+        Dispatch::Default(mode) => SupervisorConfig {
+            dispatch: mode,
+            ..SupervisorConfig::default()
+        },
+        Dispatch::Force(_) => SupervisorConfig::default(),
+    };
+    let mut config = SupervisorConfig::load_with(env, config_path, base)?;
+    if let Dispatch::Force(mode) = dispatch {
+        if config.dispatch == DispatchMode::Launch
+            && mode != DispatchMode::Launch
+            && conn::verbose()
+        {
+            eprintln!(
+                "debug: [workers] dispatch = \"{}\" ignored here; this run uses \"{}\"",
+                config.dispatch.as_str(),
+                mode.as_str()
+            );
+        }
+        config.dispatch = mode;
+    }
+    Ok(config)
 }
 
 pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
@@ -167,11 +227,17 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         .role(&role_name)
         .map_err(|e| CliError::usage(e.to_string()))?;
     let role_id = role.id.clone();
+    // AMP #2802: the tickets this machine dispatched, shared by the supervisor (which records
+    // them) and the reporter (which forgets them once a ticket is closed or handed back).
+    let ledger = Arc::new(amp_core::dispatch_ledger::Ledger::open(&rt.state_dir));
+    let mut reporter_slot: Option<Arc<RunReporter>> = None;
     let supervisor = if role.primary {
         // #2232: [workers] from the same config.toml the runtime loaded (not the default path).
-        let config =
-            SupervisorConfig::load(&env, rt.paths.user_file.clone()).map_err(CliError::new)?;
-        Some(Supervisor::with_hooks(
+        let config = supervisor_config(&env, rt.paths.user_file.clone(), req.dispatch)
+            .map_err(CliError::new)?;
+        let reporter = RunReporter::new(Arc::clone(&client)).with_ledger(Arc::clone(&ledger));
+        reporter_slot = Some(Arc::clone(&reporter));
+        Some(Supervisor::with_hooks_and_ledger(
             Arc::clone(&rt),
             ManagerContext {
                 role: role_id.clone(),
@@ -179,7 +245,8 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
                 project: project.clone(),
             },
             config,
-            Some(RunReporter::new(Arc::clone(&client)) as Arc<dyn WorkerHooks>),
+            Some(reporter as Arc<dyn WorkerHooks>),
+            Arc::clone(&ledger),
         ))
     } else {
         None
@@ -235,8 +302,90 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         project,
         cwd,
         supervisor,
+        reporter: reporter_slot,
         offline,
         mcp_events,
         mcp_starting,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use amp_core::supervisor::ENV_WORKER_DISPATCH;
+
+    /// A config.toml holding `text`, under the build's target dir (never the person's config).
+    fn config_file(name: &str, text: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/unit-tmp")
+            .join(format!("session-dispatch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// The mode `dispatch` ends up with for this config.toml (none when `None`) and
+    /// `AMP_HARNESS_WORKER_DISPATCH` value.
+    fn mode(
+        dispatch: Dispatch,
+        config: Option<&str>,
+        var: Option<&str>,
+        name: &str,
+    ) -> DispatchMode {
+        // No config: a path that doesn't exist, so the default location is never read either.
+        let path = match config {
+            Some(text) => config_file(name, text),
+            None => config_file(name, "").with_extension("missing"),
+        };
+        let env = |k: &str| var.filter(|_| k == ENV_WORKER_DISPATCH).map(str::to_owned);
+        supervisor_config(&env, Some(path), dispatch)
+            .unwrap()
+            .dispatch
+    }
+
+    /// AMP #2837: the interactive chat launches its workers unless the person explicitly asked
+    /// for `await`; headless `run -p` always awaits (AMP #2884), whatever is configured.
+    #[test]
+    fn the_chat_launches_by_default_and_headless_always_awaits() {
+        use DispatchMode::{Await, Launch};
+        let launch = Some("[workers]\ndispatch = \"launch\"\n");
+        let await_ = Some("[workers]\ndispatch = \"await\"\n");
+        let other = Some("[workers]\nmax_parallel = 2\n");
+
+        // What chat.rs and run.rs pass.
+        assert_eq!(CHAT_DISPATCH, Dispatch::Default(Launch));
+        assert_eq!(HEADLESS_DISPATCH, Dispatch::Force(Await));
+
+        // Chat: launch, unless config.toml or the environment says await.
+        assert_eq!(mode(CHAT_DISPATCH, None, None, "c0"), Launch);
+        assert_eq!(mode(CHAT_DISPATCH, other, None, "c1"), Launch);
+        assert_eq!(mode(CHAT_DISPATCH, launch, None, "c2"), Launch);
+        assert_eq!(mode(CHAT_DISPATCH, await_, None, "c3"), Await);
+        assert_eq!(mode(CHAT_DISPATCH, None, Some("await"), "c4"), Await);
+        // The environment beats config.toml, as for every worker setting; blank is unset.
+        assert_eq!(mode(CHAT_DISPATCH, await_, Some("launch"), "c5"), Launch);
+        assert_eq!(mode(CHAT_DISPATCH, None, Some(" "), "c6"), Launch);
+
+        // Headless: await, whatever is configured.
+        assert_eq!(mode(HEADLESS_DISPATCH, None, None, "h0"), Await);
+        assert_eq!(mode(HEADLESS_DISPATCH, launch, None, "h1"), Await);
+        assert_eq!(mode(HEADLESS_DISPATCH, None, Some("launch"), "h2"), Await);
+        assert_eq!(mode(HEADLESS_DISPATCH, launch, Some("launch"), "h3"), Await);
+    }
+
+    /// The rest of `[workers]` still loads around the chosen mode, and a bad value still fails.
+    #[test]
+    fn the_dispatch_choice_keeps_the_other_worker_settings() {
+        let none = |_: &str| None;
+        let path = config_file("keep", "[workers]\nmax_parallel = 2\nmax_turns = 7\n");
+        let c = supervisor_config(&none, Some(path), CHAT_DISPATCH).unwrap();
+        assert_eq!((c.max_parallel, c.max_turns), (2, 7));
+        assert_eq!(c.dispatch, DispatchMode::Launch);
+
+        let bad = config_file("bad", "[workers]\ndispatch = \"later\"\n");
+        let e = supervisor_config(&none, Some(bad), CHAT_DISPATCH).unwrap_err();
+        assert!(e.contains("expected `await` or `launch`"), "{e}");
+    }
 }
