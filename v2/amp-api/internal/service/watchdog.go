@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -107,7 +108,10 @@ func (s *Service) SweepNotStarted(ctx context.Context, lock func(context.Context
 		}
 		for _, n := range due {
 			reason := fmt.Sprintf("not started within %d min of dispatch to %s", minutes, n.AgentID)
-			if err := s.returnUnstarted(ctx, projectID, n.ID, reason); err != nil {
+			if err := s.returnUnstarted(ctx, projectID, n.ID, n.DispatchID, reason); err != nil {
+				if errors.Is(err, errDispatchMovedOn) {
+					continue // claimed, or returned and dispatched again, since the read: not ours to return
+				}
 				slog.Warn("dispatch watchdog: return failed", "project_id", projectID, "task_id", n.ID, "err", err)
 				continue
 			}
@@ -117,15 +121,25 @@ func (s *Service) SweepNotStarted(ctx context.Context, lock func(context.Context
 	return returned, nil
 }
 
+// errDispatchMovedOn is a watchdog return that didn't happen because the
+// ticket's dispatch is no longer the one the sweep saw.
+var errDispatchMovedOn = errors.New("dispatch moved on since the sweep read it")
+
 // returnUnstarted returns one ticket through its project's actor, as the
-// watchdog (a system action: no user asked for it).
-func (s *Service) returnUnstarted(ctx context.Context, projectID, taskID int, reason string) error {
+// watchdog (a system action: no user asked for it). It returns only the
+// dispatch the sweep observed (dispatchID, AMP #2949): a ticket returned and
+// dispatched again in between, or claimed, is left alone.
+func (s *Service) returnUnstarted(ctx context.Context, projectID, taskID int, dispatchID, reason string) error {
 	replyCh := make(chan actor.ReplyGetTask, 1)
-	if err := s.Registry.Send(projectID, &actor.MsgReturnTask{TaskID: taskID, Reason: reason, ByName: "system", ReplyCh: replyCh}); err != nil {
+	if err := s.Registry.Send(projectID, &actor.MsgReturnTask{TaskID: taskID, Reason: reason, ByName: "system",
+		IfDispatch: true, ExpectDispatchID: dispatchID, ReplyCh: replyCh}); err != nil {
 		return err
 	}
 	reply := actor.Await(ctx, replyCh)
 	if reply.Err != nil {
+		if cur := reply.Task; cur != nil && (cur.DispatchID != dispatchID || cur.StartedAt != nil || cur.State != domain.TaskStateInProgress) {
+			return fmt.Errorf("%w: %v", errDispatchMovedOn, reply.Err)
+		}
 		return reply.Err
 	}
 	s.RecordSystem(ctx, domain.AuditEntry{

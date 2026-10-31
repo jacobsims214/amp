@@ -83,6 +83,40 @@ func (r *Repo) ReturnTask(ctx context.Context, taskID int, reason string) error 
 	return err
 }
 
+// ReturnTaskIf is ReturnTask as a compare-and-set, for the watchdog: it
+// returns the ticket only while its dispatch is still the one the sweep
+// observed (dispatchID) and nobody has started it, and reports whether it
+// did. A ticket returned and re-dispatched between the sweep's read and this
+// write carries a fresh dispatch_id and is left alone (AMP #2949).
+func (r *Repo) ReturnTaskIf(ctx context.Context, taskID int, dispatchID, reason string) (bool, error) {
+	tag, err := r.db.Exec(ctx,
+		`UPDATE tasks SET returned_at = NOW(), returned_reason = $1, dispatch_id = '',
+		        dispatched_at = NULL, started_at = NULL, started_by = '', updated_at = NOW()
+		 WHERE id = $2 AND state = 'in_progress' AND dispatch_id = $3 AND started_at IS NULL`,
+		reason, taskID, dispatchID,
+	)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// LastDispatcher is the user who made a ticket's latest dispatch, from its
+// history (nil when it was dispatched without a user, e.g. local dev). ok is
+// false when the ticket has no dispatch on record.
+func (r *Repo) LastDispatcher(ctx context.Context, taskID int) (by *int, ok bool, err error) {
+	err = r.db.QueryRow(ctx,
+		`SELECT actor_user_id FROM activity_log WHERE task_id = $1 AND action = 'dispatched'
+		 ORDER BY created_at DESC, id DESC LIMIT 1`, taskID).Scan(&by)
+	if err == pgx.ErrNoRows {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return by, true, nil
+}
+
 // ClearTaskDispatch ends a ticket's current dispatch in the database: the
 // token is no longer current, so a reloaded actor can't revive a revoked one
 // (AMP #2944). With release it also clears the start, for an owner releasing
@@ -124,6 +158,9 @@ type NotStartedTicket struct {
 	Name         string     `json:"name"`
 	AgentID      string     `json:"agent_id"`
 	DispatchedAt *time.Time `json:"dispatched_at,omitempty"`
+	// DispatchID is the dispatch that wasn't started: the watchdog returns
+	// the ticket only while it is still current (AMP #2949).
+	DispatchID string `json:"-"`
 	// Minutes is how long it has been dispatched without a start.
 	Minutes int `json:"minutes"`
 }
@@ -133,7 +170,7 @@ type NotStartedTicket struct {
 // of them (the watchdog's own scan).
 func (r *Repo) NotStarted(ctx context.Context, projectID int, minAge time.Duration) ([]NotStartedTicket, error) {
 	rows, err := r.db.Query(ctx, `
-		SELECT id, project_id, name, COALESCE(agent_id, ''), dispatched_at,
+		SELECT id, project_id, name, COALESCE(agent_id, ''), dispatched_at, dispatch_id,
 		       GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (NOW() - COALESCE(dispatched_at, updated_at))) / 60))::int
 		  FROM tasks
 		 WHERE project_id = $1 AND state = 'in_progress' AND started_at IS NULL
@@ -144,7 +181,7 @@ func (r *Repo) NotStarted(ctx context.Context, projectID int, minAge time.Durati
 	}
 	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (NotStartedTicket, error) {
 		var n NotStartedTicket
-		err := row.Scan(&n.ID, &n.ProjectID, &n.Name, &n.AgentID, &n.DispatchedAt, &n.Minutes)
+		err := row.Scan(&n.ID, &n.ProjectID, &n.Name, &n.AgentID, &n.DispatchedAt, &n.DispatchID, &n.Minutes)
 		return n, err
 	})
 	if out == nil {

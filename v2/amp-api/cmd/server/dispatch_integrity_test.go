@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/service"
@@ -212,6 +213,9 @@ func TestDispatchIntegrity_FirstActivityIsTheFallbackStart(t *testing.T) {
 			s.call(t, "amp_add_task_comment", map[string]interface{}{"task_id": float64(id), "body": "Starting work.", "author": "amp-worker"})
 		}},
 		{"report run", func(t *testing.T, s *mcpStack, id int) {
+			// Unsigned, and the test calls as the dispatcher: the report
+			// counts once the dispatcher's grace has passed (AMP #2949).
+			ageDispatch(t, s, id, 3)
 			s.call(t, "amp_report_run", map[string]interface{}{"task_id": float64(id), "outcome": "progress", "model": "m"})
 		}},
 		{"block", func(t *testing.T, s *mcpStack, id int) {
@@ -1062,5 +1066,143 @@ func TestDispatchIntegrity_CompletionClearsReturned(t *testing.T) {
 	}
 	if inRepoReturned(closed) {
 		t.Fatalf("a completed ticket with a stale return stamp is listed by Repo.Returned")
+	}
+}
+
+// The dispatcher's own activity right after dispatching isn't its worker
+// starting the ticket (AMP #2949): a manager's note or run report leaves it
+// not started, so the watchdog still returns it if no worker ever comes.
+func TestDispatchIntegrity_DispatchersOwnActivityIsNotAStart(t *testing.T) {
+	w := newRBACWorld(t)
+	alice := w.s.as(w.alice) // the manager: dispatches, and calls as herself
+	ctx := context.Background()
+
+	id := mkIn(t, alice, w.s.storyID, "the manager dispatches and stops")
+	dispatchClaims(t, alice, id)
+	alice.call(t, "amp_add_task_comment", map[string]interface{}{"task_id": float64(id), "body": "Dispatched to amp-worker."})
+	alice.call(t, "amp_add_task_comment", map[string]interface{}{"task_id": float64(id), "body": "Context for the worker.", "author": "amp-manager"})
+	alice.call(t, "amp_report_run", map[string]interface{}{"task_id": float64(id), "outcome": "progress", "model": "m"})
+	task, err := w.s.repo.GetTask(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.StartedAt != nil || task.Phase != domain.PhaseNotStarted {
+		t.Fatalf("after the dispatcher's own comments and run report: started_at %v (by %q) phase %q, want not started",
+			task.StartedAt, task.StartedBy, task.Phase)
+	}
+
+	// An abandoned run never starts a ticket, whenever and whoever reports it.
+	ageDispatch(t, w.s, id, 5)
+	alice.call(t, "amp_report_run", map[string]interface{}{"task_id": float64(id), "outcome": "abandoned", "run_note": "worker never launched"})
+	if task, _ = w.s.repo.GetTask(ctx, id); task.StartedAt != nil {
+		t.Fatalf("an abandoned run report started the ticket (by %q)", task.StartedBy)
+	}
+
+	// So the watchdog still applies.
+	ageDispatch(t, w.s, id, 31)
+	svc := service.New(w.s.repo, w.s.reg, w.s.kb)
+	if _, err := svc.SweepNotStarted(ctx, allowAll); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if task, _ = w.s.repo.GetTask(ctx, id); task.State != domain.TaskStateBacklog || task.ReturnedAt == nil {
+		t.Fatalf("after the sweep: state %s returned_at %v, want returned to backlog", task.State, task.ReturnedAt)
+	}
+}
+
+// An old plugin's worker still starts its ticket with its first activity
+// (AMP #2949): a comment from anyone but the dispatcher, a comment signed
+// as the dispatched worker, or the dispatcher's own activity once the grace
+// after the dispatch has passed.
+func TestDispatchIntegrity_LegacyStartStillCountsTheWorker(t *testing.T) {
+	w := newRBACWorld(t)
+	alice, bob, orgadmin := w.s.as(w.alice), w.s.as(w.bob), w.s.as(w.orgadmin)
+	ctx := context.Background()
+	for _, c := range []struct {
+		name string
+		act  func(t *testing.T, id int)
+	}{
+		{"another user's comment", func(t *testing.T, id int) {
+			bob.call(t, "amp_add_task_comment", map[string]interface{}{"task_id": float64(id), "body": "Starting work."})
+		}},
+		{"another user's run report", func(t *testing.T, id int) {
+			// The org owner: a run on alice's ticket needs owner-level access.
+			orgadmin.call(t, "amp_report_run", map[string]interface{}{"task_id": float64(id), "outcome": "progress", "model": "m"})
+		}},
+		{"comment signed as the worker", func(t *testing.T, id int) {
+			alice.call(t, "amp_add_task_comment", map[string]interface{}{"task_id": float64(id), "body": "Starting work.", "author": "amp-worker"})
+		}},
+		{"dispatcher's comment after the grace", func(t *testing.T, id int) {
+			ageDispatch(t, w.s, id, 3)
+			alice.call(t, "amp_add_task_comment", map[string]interface{}{"task_id": float64(id), "body": "Finding: ..."})
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			id := mkIn(t, alice, w.s.storyID, "old plugin worker: "+c.name)
+			dispatchClaims(t, alice, id)
+			c.act(t, id)
+			task, err := w.s.repo.GetTask(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if task.StartedAt == nil || task.StartedBy != domain.StartedByInferred {
+				t.Fatalf("started_at %v started_by %q, want an inferred start", task.StartedAt, task.StartedBy)
+			}
+		})
+	}
+}
+
+// The watchdog returns only the dispatch it observed (AMP #2949): a ticket
+// returned and dispatched again between the sweep's read and its return
+// holds a fresh dispatch, which stays with its new worker.
+func TestDispatchIntegrity_WatchdogLeavesAFreshDispatchAlone(t *testing.T) {
+	s := setupMCP(t)
+	ctx := context.Background()
+
+	id := mkIn(t, s, s.storyID, "returned and dispatched again mid-sweep")
+	stale := dispatchClaims(t, s, id)
+	ageDispatch(t, s, id, 31)
+	due, err := s.repo.NotStarted(ctx, s.projectID, 30*time.Minute)
+	if err != nil || len(due) != 1 || due[0].ID != id || due[0].DispatchID != stale {
+		t.Fatalf("the sweep's read = %+v, err %v; want ticket %d with dispatch %q", due, err, id, stale)
+	}
+
+	// Between the read and the return: handed back and dispatched afresh.
+	s.call(t, "amp_set_task_state", map[string]interface{}{"task_id": float64(id), "state": "backlog", "reason": "not started"})
+	fresh := dispatchClaims(t, s, id)
+	if fresh == stale {
+		t.Fatal("re-dispatch reused the token")
+	}
+
+	// The database refuses the stale compare-and-return...
+	if ok, err := s.repo.ReturnTaskIf(ctx, id, stale, "stale"); err != nil || ok {
+		t.Fatalf("ReturnTaskIf(stale) = %v, %v; want false", ok, err)
+	}
+	// ...and so does the actor, as the watchdog sends it.
+	replyCh := make(chan actor.ReplyGetTask, 1)
+	if err := s.reg.Send(s.projectID, &actor.MsgReturnTask{TaskID: id, Reason: "not started within 30 min of dispatch to amp-worker",
+		ByName: "system", IfDispatch: true, ExpectDispatchID: stale, ReplyCh: replyCh}); err != nil {
+		t.Fatal(err)
+	}
+	if reply := actor.Await(ctx, replyCh); reply.Err == nil {
+		t.Fatal("the watchdog's return of the stale dispatch was accepted")
+	}
+	task, err := s.repo.GetTask(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != domain.TaskStateInProgress || task.DispatchID != fresh || task.ReturnedAt != nil {
+		t.Fatalf("fresh dispatch after the stale return: state %s dispatch %q returned_at %v; want in progress on %q",
+			task.State, task.DispatchID, task.ReturnedAt, fresh)
+	}
+	// The fresh dispatch's worker can still claim it.
+	s.call(t, "amp_claim_task", map[string]interface{}{"task_id": float64(id), "dispatch_id": fresh})
+
+	// A claim between the read and the return is left alone too.
+	other := mkIn(t, s, s.storyID, "claimed mid-sweep")
+	tok := dispatchClaims(t, s, other)
+	ageDispatch(t, s, other, 31)
+	s.call(t, "amp_claim_task", map[string]interface{}{"task_id": float64(other), "dispatch_id": tok})
+	if ok, err := s.repo.ReturnTaskIf(ctx, other, tok, "stale"); err != nil || ok {
+		t.Fatalf("ReturnTaskIf on a claimed ticket = %v, %v; want false", ok, err)
 	}
 }

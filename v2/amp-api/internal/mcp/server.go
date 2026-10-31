@@ -2095,8 +2095,9 @@ func (s *Server) addComment(rctx context.Context, args map[string]interface{}) (
 	}
 	// A comment is the first activity on a dispatched ticket for a plugin
 	// that doesn't claim: it starts the ticket (AMP #2801), so start it and
-	// re-read it, rather than reporting the state it had before.
-	s.svc.InferStart(rctx, taskID)
+	// re-read it, rather than reporting the state it had before. The
+	// dispatcher's own note right after dispatching doesn't (AMP #2949).
+	s.svc.InferStart(rctx, caller(rctx).p, taskID, req.Author)
 	if cur, err := s.repo.GetTask(context.Background(), taskID); err == nil {
 		return jsonResult(map[string]interface{}{"task_id": taskID, "comment_added": true, "next": commentNext(cur)})
 	}

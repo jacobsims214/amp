@@ -138,6 +138,13 @@ type MsgReturnTask struct {
 	// DispatchID, when it is the ticket's current dispatch, lets that run
 	// return its own started ticket (AMP #2909). A stale one is refused.
 	DispatchID string
+	// IfDispatch makes it a compare-and-return, for the watchdog (AMP
+	// #2949): the ticket is returned only while ExpectDispatchID ("" too) is
+	// still its dispatch and nobody has started it. A ticket returned and
+	// dispatched again since the sweep read it holds a fresh dispatch, which
+	// is refused rather than returned.
+	IfDispatch       bool
+	ExpectDispatchID string
 	// By names who returned it in the history ("system" for the watchdog).
 	By      *int
 	ByName  string

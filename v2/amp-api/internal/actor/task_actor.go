@@ -577,6 +577,13 @@ func (a *TaskActor) handleReturn(msg *MsgReturnTask) error {
 	if a.task.State != domain.TaskStateInProgress {
 		return fmt.Errorf("task %d is %s, not in progress: only a dispatched ticket can be returned", a.task.ID, a.task.State)
 	}
+	// The watchdog returns the dispatch it saw, never a newer one (AMP
+	// #2949): between its read and this message the ticket may have been
+	// returned and dispatched again, or claimed.
+	if msg.IfDispatch && (a.task.DispatchID != msg.ExpectDispatchID || a.task.StartedAt != nil) {
+		return fmt.Errorf("task %d: not returned, its dispatch moved on since the watchdog saw it (dispatch %q, started %v)",
+			a.task.ID, a.task.DispatchID, a.task.StartedAt != nil)
+	}
 	// A token that isn't the current one is a run that is already over (the
 	// ticket was returned and dispatched again): it can't hand back a
 	// dispatch that belongs to a newer worker.
@@ -601,7 +608,17 @@ func (a *TaskActor) handleReturn(msg *MsgReturnTask) error {
 		return fmt.Errorf("task %d: a reason is required; it's what the manager and the history see", a.task.ID)
 	}
 	from := string(a.task.State)
-	if err := a.repo.ReturnTask(context.Background(), a.task.ID, reason); err != nil {
+	if msg.IfDispatch {
+		// The same compare in the database, so a row another writer moved on
+		// (a claim on another replica) isn't returned from stale memory.
+		ok, err := a.repo.ReturnTaskIf(context.Background(), a.task.ID, msg.ExpectDispatchID, reason)
+		if err != nil {
+			return fmt.Errorf("db return: %w", err)
+		}
+		if !ok {
+			return fmt.Errorf("task %d: not returned, its dispatch moved on in the database since the watchdog saw it", a.task.ID)
+		}
+	} else if err := a.repo.ReturnTask(context.Background(), a.task.ID, reason); err != nil {
 		return fmt.Errorf("db return: %w", err)
 	}
 	a.task.DispatchID, a.task.DispatchedAt = "", nil

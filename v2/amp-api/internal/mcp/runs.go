@@ -106,11 +106,18 @@ func (s *Server) reportRun(rctx context.Context, args map[string]interface{}) (*
 		return nil, err
 	}
 	// A run report is the first activity on a dispatched ticket for a plugin
-	// that doesn't claim: it starts the ticket (AMP #2801).
-	s.svc.InferStart(rctx, taskID)
-	run, err := s.svc.RecordRun(rctx, caller(rctx).p, taskID, runFromArgs(args, optStr(args, "outcome", "")))
+	// that doesn't claim: it starts the ticket (AMP #2801). Not an abandoned
+	// run (a run that ended), nor the dispatcher's own report right after
+	// dispatching (AMP #2949).
+	// Started only once the run is recorded, so a caller the run is refused
+	// to doesn't start the ticket either.
+	outcome := optStr(args, "outcome", "")
+	run, err := s.svc.RecordRun(rctx, caller(rctx).p, taskID, runFromArgs(args, outcome))
 	if err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(outcome) != domain.RunAbandoned {
+		s.svc.InferStart(rctx, caller(rctx).p, taskID, "")
 	}
 	// The run's fields as before, plus next: an additive key on the run
 	// object's old shape would be read as a run field by old clients, so the
