@@ -432,11 +432,16 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 			a.task.StartedAt, a.task.StartedBy = &at, by
 		}
 	}
+	// A done ticket has no current dispatch, in the database too: a reload
+	// mustn't make the old token current again (AMP #2944).
+	if err := a.repo.ClearTaskDispatch(context.Background(), a.task.ID, false); err != nil {
+		return false, fmt.Errorf("db clear dispatch: %w", err)
+	}
 	now := time.Now()
 	a.task.State = domain.TaskStateCompleted
 	a.task.CompletedAt = &now
 	a.task.UpdatedAt = now
-	a.task.DispatchID = "" // a done ticket has no current dispatch
+	a.task.DispatchID = ""
 
 	if err := a.saveState(domain.TaskStateCompleted, ""); err != nil {
 		return false, fmt.Errorf("db complete: %w", err)
@@ -769,6 +774,11 @@ func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *in
 			}
 		}
 	}
+	// Any state change ends the current dispatch; persisted so a reload
+	// agrees with memory (AMP #2944).
+	if err := a.repo.ClearTaskDispatch(context.Background(), a.task.ID, false); err != nil {
+		return fmt.Errorf("db clear dispatch: %w", err)
+	}
 	a.task.DispatchID = ""
 	a.task.State = state
 	a.task.UpdatedAt = time.Now()
@@ -903,6 +913,10 @@ func (a *TaskActor) handleAssign(msg *MsgAssignTask, ctx actor.Context) (*domain
 	if msg.NewOwner == nil && a.task.State == domain.TaskStateInProgress {
 		// Released mid-flight: nobody is working it any more, and its
 		// dispatch (if no worker started it) is over with it (AMP #2801).
+		// The token and start are cleared in the database too (AMP #2944).
+		if err := a.repo.ClearTaskDispatch(context.Background(), a.task.ID, true); err != nil {
+			return nil, fmt.Errorf("db release dispatch: %w", err)
+		}
 		a.task.State = domain.TaskStateBacklog
 		a.task.AgentID = ""
 		a.task.DispatchedAt = nil

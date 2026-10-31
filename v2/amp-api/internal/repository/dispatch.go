@@ -83,6 +83,20 @@ func (r *Repo) ReturnTask(ctx context.Context, taskID int, reason string) error 
 	return err
 }
 
+// ClearTaskDispatch ends a ticket's current dispatch in the database: the
+// token is no longer current, so a reloaded actor can't revive a revoked one
+// (AMP #2944). With release it also clears the start, for an owner releasing
+// a ticket mid-flight. The actor makes the same change in memory in the same
+// step.
+func (r *Repo) ClearTaskDispatch(ctx context.Context, taskID int, release bool) error {
+	q := `UPDATE tasks SET dispatch_id = '' WHERE id = $1 AND dispatch_id <> ''`
+	if release {
+		q = `UPDATE tasks SET dispatch_id = '', started_at = NULL, started_by = '', updated_at = NOW() WHERE id = $1`
+	}
+	_, err := r.db.Exec(ctx, q, taskID)
+	return err
+}
+
 // CountRuns is the number of runs recorded on a ticket: the closeout rule
 // lets a never-started ticket be closed out only when it has prior work.
 func (r *Repo) CountRuns(ctx context.Context, taskID int) (int, error) {

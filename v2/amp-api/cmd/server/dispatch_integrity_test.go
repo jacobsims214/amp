@@ -889,3 +889,58 @@ func allTaskIDs(t *testing.T, s *mcpStack) []int {
 func localDevPrincipal() authz.Principal { return authz.Principal{} }
 
 var _ = time.Minute
+
+// The actor's dispatch clears are persisted (AMP #2944): completion, a state
+// change off in_progress, and an owner releasing a ticket mid-flight each
+// leave dispatch_id empty in the database (and the release clears the start),
+// so a reloaded actor can't make a revoked token current again.
+func TestDispatchIntegrity_DispatchClearsArePersisted(t *testing.T) {
+	w := newRBACWorld(t)
+	alice := w.s.as(w.alice)
+	ctx := context.Background()
+	reload := func(id int) *domain.Task {
+		t.Helper()
+		task, err := w.s.repo.GetTask(ctx, id)
+		if err != nil {
+			t.Fatalf("reload %d: %v", id, err)
+		}
+		return task
+	}
+
+	// 1. The worker's own completion.
+	done := mkIn(t, alice, w.s.storyID, "completed by its worker")
+	tok := dispatchClaims(t, alice, done)
+	alice.call(t, "amp_claim_task", map[string]interface{}{"task_id": float64(done), "dispatch_id": tok})
+	if got := reload(done).DispatchID; got != tok {
+		t.Fatalf("dispatch_id before completion = %q, want %q", got, tok)
+	}
+	alice.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(done), "dispatch_id": tok})
+	if got := reload(done); got.DispatchID != "" || got.State != domain.TaskStateCompleted {
+		t.Fatalf("after completion: state %s dispatch_id %q, want completed and empty", got.State, got.DispatchID)
+	}
+
+	// 2. The manager moves a claimed ticket back to backlog: the worker's
+	// token is revoked, and stays revoked after a reload.
+	moved := mkIn(t, alice, w.s.storyID, "moved back by the manager")
+	tok = dispatchClaims(t, alice, moved)
+	alice.call(t, "amp_claim_task", map[string]interface{}{"task_id": float64(moved), "dispatch_id": tok})
+	alice.call(t, "amp_set_task_state", map[string]interface{}{"task_id": float64(moved), "state": "backlog"})
+	if got := reload(moved); got.DispatchID != "" || got.State != domain.TaskStateBacklog {
+		t.Fatalf("after set_state(backlog): state %s dispatch_id %q, want backlog and empty", got.State, got.DispatchID)
+	}
+
+	// 3. The owner releases a claimed ticket mid-flight: no dispatch and no
+	// start left in the database.
+	released := mkIn(t, alice, w.s.storyID, "released by its owner")
+	tok = dispatchClaims(t, alice, released)
+	alice.call(t, "amp_claim_task", map[string]interface{}{"task_id": float64(released), "dispatch_id": tok})
+	if got := reload(released); got.StartedAt == nil {
+		t.Fatalf("claimed ticket has no started_at in the database")
+	}
+	alice.call(t, "amp_assign_task", map[string]interface{}{"task_id": float64(released), "user": "none"})
+	got := reload(released)
+	if got.DispatchID != "" || got.StartedAt != nil || got.StartedBy != "" || got.State != domain.TaskStateBacklog {
+		t.Fatalf("after release: state %s dispatch_id %q started_at %v started_by %q, want backlog with all cleared",
+			got.State, got.DispatchID, got.StartedAt, got.StartedBy)
+	}
+}
