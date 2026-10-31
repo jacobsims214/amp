@@ -21,6 +21,11 @@
 //!   receive it, without calling a model. `--print-tools` prints its tools (name, description,
 //!   parameters) as one JSON array the same way (#2367: measuring what a session's prompt costs).
 //!
+//! - AMP #2910: before the prompt runs, the tickets a dead harness process on this machine
+//!   dispatched (the dispatch ledger under the state dir) are handed back, as the chat does at
+//!   startup. Each is one `amp-harness: ` stderr line and, with `--json`, an `orphan_released`
+//!   event after `session` (`task_id`, `agent_id`, `dispatch_id`, `pid`, `ok`, `error`, `text`).
+//!
 //! The manager gets `amp_run_ticket` (M2-5, see [`crate::session`]); Ctrl-C aborts the manager
 //! and cancels its workers.
 //!
@@ -244,6 +249,32 @@ fn mcp_warnings(rt: &Runtime, starting: &[String]) {
     }
 }
 
+/// One startup orphan release (AMP #2910): always one `amp-harness: ` line on stderr, so a CI
+/// log shows it, and with `--json` an `orphan_released` event on stdout too.
+fn report_orphan(release: &amp_core::supervisor::OrphanRelease, json: bool) {
+    let text = release.notice();
+    match &release.result {
+        Ok(()) => eprintln!("amp-harness: {text}"),
+        Err(_) => eprintln!("amp-harness: error: {text}"),
+    }
+    if json {
+        emit_json(&orphan_json(release));
+    }
+}
+
+fn orphan_json(release: &amp_core::supervisor::OrphanRelease) -> Value {
+    json!({
+        "type": "orphan_released",
+        "task_id": release.record.task_id,
+        "agent_id": release.record.agent_id,
+        "dispatch_id": release.record.dispatch_id,
+        "pid": release.record.pid,
+        "ok": release.result.is_ok(),
+        "error": release.result.as_ref().err(),
+        "text": release.notice(),
+    })
+}
+
 /// Ctrl-C, SIGTERM and SIGHUP, installed once at the start of `run -p` so a signal during
 /// startup is caught too: the default action would end the process without shutting the MCP hub
 /// down, leaving stdio servers (which run in their own session) behind.
@@ -388,8 +419,23 @@ async fn drive(
     }
     let prompt = prompt.expect("clap requires -p unless --print-system-prompt or --print-tools");
 
+    // AMP #2910: a `run -p` killed mid-dispatch (a CI runner killed, OOM, kill -9) leaves its
+    // worker's ticket in progress with nobody on it. Like the chat, hand back what a dead
+    // harness process dispatched (same ledger and state dir; a live process's records are left
+    // alone) before the prompt runs. Bounded, so a slow AMP can't hold the run up.
+    let orphans = match &supervisor {
+        Some(sup) => {
+            sup.release_orphans_within(amp_core::supervisor::ORPHAN_RELEASE_TIMEOUT)
+                .await
+        }
+        None => Vec::new(),
+    };
+
     if args.json {
         emit_json(&session_json(rt, &agent, project.as_ref()));
+    }
+    for release in &orphans {
+        report_orphan(release, args.json);
     }
 
     let harness = Arc::clone(&agent.harness);
