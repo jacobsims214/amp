@@ -449,9 +449,29 @@ fn record_is_stale(err: &Result<(), String>) -> bool {
     // "no longer current": the ticket was returned and dispatched again since (AMP #2909), so
     // this record's run is over and the ticket is another run's.
     e.contains("not in progress")
-        || e.contains("not found")
+        || names_missing_ticket(&e)
         || e.contains("unknown task")
         || e.contains("no longer current")
+}
+
+/// Whether a (lowercased) AMP message says the ticket itself doesn't exist: "task 12 not found",
+/// "ticket 12 not found" or "task not found". A missing *tool* ("tool 'amp_return_task' not
+/// found: tool not found", an older server) is not: the ticket is still in progress there, so
+/// its record must survive for the next startup (AMP #2946).
+fn names_missing_ticket(e: &str) -> bool {
+    ["task", "ticket"].iter().any(|noun| {
+        e.match_indices(noun).any(|(at, _)| {
+            // A word of its own: not the end of "amp_return_task".
+            let whole = e[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+            let rest = e[at + noun.len()..].trim_start();
+            let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit() || c == '#');
+            // "task 12 not found" or "task not found", and nothing else between them.
+            whole && rest.trim_start().starts_with("not found")
+        })
+    })
 }
 
 /// What a worker is, known before it starts (hooks get this).
@@ -2969,6 +2989,35 @@ pub fn live_tickets(sup: &Supervisor) -> BTreeSet<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AMP #2946: only the ticket's own absence spends a ledger record; an older server's missing
+    /// tool (mcp-go's "tool 'X' not found: tool not found") does not.
+    #[test]
+    fn only_a_missing_ticket_spends_a_record_not_a_missing_tool() {
+        let stale = |e: &str| record_is_stale(&Err(e.to_owned()));
+        assert!(stale("task 4047 not found"));
+        assert!(stale("Ticket #12 not found"));
+        assert!(stale("task not found"));
+        assert!(stale("task 12 is not in progress"));
+        assert!(stale(
+            "task 4049: dispatch \"d_x\" is no longer current (current: d_mock4049)"
+        ));
+        // The fallback ran and AMP said the ticket is gone: spent.
+        assert!(stale(
+            "amp_return_task: Mcp error: -32602: tool 'amp_return_task' not found: tool not \
+             found; amp_set_task_state: task 5 not found"
+        ));
+        assert!(!stale(
+            "Mcp error: -32602: tool 'amp_return_task' not found: tool not found"
+        ));
+        assert!(!stale("amp_return_task not found"));
+        assert!(!stale("unknown tool amp_return_task"));
+        assert!(!stale(
+            "amp_return_task: tool 'amp_return_task' not found: tool not found; \
+             amp_set_task_state: AMP did not answer within 10s"
+        ));
+        assert!(!record_is_stale(&Ok(())));
+    }
 
     #[test]
     fn config_layers_defaults_toml_and_env() {

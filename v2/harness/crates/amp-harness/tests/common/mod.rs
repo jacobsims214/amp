@@ -247,6 +247,15 @@ impl ServerHandler for MockAmp {
             .lock()
             .unwrap()
             .push((request.name.to_string(), args.clone()));
+        // A tool this server doesn't list is one it doesn't have: answer the way AMP's mcp-go
+        // does (a JSON-RPC invalid-params error, ErrToolNotFound), e.g. amp_return_task on a
+        // server from before AMP #2801 (#2946).
+        if self.omit.contains(&request.name.as_ref()) {
+            return Err(ErrorData::invalid_params(
+                format!("tool '{}' not found: tool not found", request.name),
+                None,
+            ));
+        }
         match request.name.as_ref() {
             "amp_whoami" => ok_json(whoami_json()),
             "amp_get_project" => match args["project_id"].as_i64() {

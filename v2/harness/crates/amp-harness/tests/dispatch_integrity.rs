@@ -69,6 +69,11 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 async fn fixture(name: &str) -> Fixture {
+    fixture_with(name, MockAmp::new()).await
+}
+
+/// A fixture against `mock` (e.g. one that omits tools, like an older AMP).
+async fn fixture_with(name: &str, mock: MockAmp) -> Fixture {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("amp-harness-dispatch-integrity")
         .join(name);
@@ -88,7 +93,7 @@ async fn fixture(name: &str) -> Fixture {
     git(&repo, &["commit", "-q", "-m", "init"]);
     let repo = std::fs::canonicalize(&repo).unwrap();
 
-    let amp = spawn(MockAmp::new(), None).await;
+    let amp = spawn(mock, None).await;
     let client = Arc::new(
         AmpMcpClient::connect(ClientOptions::new(amp.url.clone()))
             .await
@@ -660,6 +665,121 @@ async fn a_server_without_dispatch_tokens_still_runs_and_returns() {
     );
 }
 
+/// An AMP from before #2801 (or after rolling it back): no amp_return_task in its tool list.
+fn server_without_return_task() -> MockAmp {
+    MockAmp {
+        omit: vec!["amp_return_task"],
+        ..MockAmp::new()
+    }
+}
+
+/// 5a. AMP #2946: against a server that has no amp_return_task, a worker that stops without
+/// closing its ticket still hands it back, by amp_set_task_state(backlog) as #2204 did, and the
+/// run says which path did it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_without_amp_return_task_gets_the_ticket_back_by_set_state() {
+    let f = fixture_with("no-return-tool", server_without_return_task()).await;
+    let (sup, notices) = f.supervisor_with_notices(config());
+    f.script(vec![
+        step(
+            "Nothing to do.",
+            json!([{"name": "bash", "arguments": {"command": "true"}}]),
+        ),
+        step("Stopping here.", json!([])),
+    ]);
+    let r = sup
+        .run_ticket(req(4050, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Stopped, "{r:?}");
+    // The returned path was tried first, and the server didn't have it.
+    assert_eq!(f.calls("amp_return_task").len(), 1);
+    let states = f.calls("amp_set_task_state");
+    assert_eq!(states.len(), 1, "{states:?}");
+    assert_eq!(states[0]["task_id"], 4050);
+    assert_eq!(states[0]["state"], "backlog");
+    assert_eq!(r.returned, Some(Ok(())), "it is in ready: {r:?}");
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.starts_with("returned #4050 to ready")
+                && n.contains("has no amp_return_task")),
+        "{:?}",
+        r.notes
+    );
+    assert!(
+        r.notes.iter().any(|n| n.contains("#4050 was returned"))
+            && !r.notes.iter().any(|n| n.contains("could not be returned")),
+        "{:?}",
+        r.notes
+    );
+    // Nothing left in the ledger: the ticket is back.
+    assert!(f.ledger.records().is_empty(), "{:?}", f.ledger.records());
+    assert!(notices.lines().is_empty(), "{:?}", notices.lines());
+}
+
+/// Writes a ledger record for `task_id` from a process that cannot be running (pid 0).
+fn dead_record(f: &Fixture, task_id: i64) {
+    let dir = f.rt.state_dir.join(LEDGER_DIR);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("t{task_id}.json")),
+        serde_json::to_string(&DispatchRecord {
+            task_id,
+            dispatch_id: format!("d_dead{task_id}"),
+            agent_id: "amp:amp-worker-backend".into(),
+            pid: 0,
+            at_ms: 1,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// 5b. AMP #2946: an orphan on a server without amp_return_task goes back by set_state, and its
+/// record is spent only because that worked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_orphan_on_a_server_without_amp_return_task_is_set_back() {
+    let f = fixture_with("orphan-no-return-tool", server_without_return_task()).await;
+    dead_record(&f, 2150);
+    let (sup, notices) = f.supervisor_with_notices(config());
+    let releases = sup.release_orphans().await;
+    assert_eq!(releases.len(), 1, "{releases:?}");
+    assert!(releases[0].result.is_ok(), "{releases:?}");
+    let states = f.calls("amp_set_task_state");
+    assert_eq!(states.len(), 1, "{states:?}");
+    assert_eq!(states[0]["task_id"], 2150);
+    assert_eq!(states[0]["state"], "backlog");
+    assert!(
+        notices.any("#2150 was returned to ready"),
+        "{:?}",
+        notices.lines()
+    );
+    assert!(f.ledger.records().is_empty(), "{:?}", f.ledger.records());
+}
+
+/// 5c. AMP #2946: an orphan whose hand-back fails with an unknown-tool error keeps its ledger
+/// record — the ticket is still in progress, so the next startup must try again. (Here the
+/// fallback is refused too: 4042's set_state is someone else's ticket in the mock.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_orphan_record_survives_an_unknown_tool_error() {
+    let f = fixture_with("orphan-unknown-tool", server_without_return_task()).await;
+    dead_record(&f, 4042);
+    let (sup, notices) = f.supervisor_with_notices(config());
+    let releases = sup.release_orphans().await;
+    assert_eq!(releases.len(), 1, "{releases:?}");
+    let err = releases[0].result.as_ref().unwrap_err();
+    assert!(err.contains("tool 'amp_return_task' not found"), "{err}");
+    assert_eq!(f.calls("amp_set_task_state").len(), 1);
+    assert!(
+        notices.any("#4042 was dispatched") && notices.any("check the ticket"),
+        "{:?}",
+        notices.lines()
+    );
+    let kept: Vec<i64> = f.ledger.records().iter().map(|r| r.task_id).collect();
+    assert_eq!(kept, vec![4042], "the record is kept for the next startup");
+}
+
 /// 6. A claim AMP refuses ends the run instead of letting the worker work a dispatch that is no
 /// longer current.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -684,6 +804,26 @@ async fn a_refused_claim_ends_the_run_before_the_worker_does_anything() {
     );
     assert_eq!(r.turns, 0, "the model never ran: {r:?}");
     assert!(f.calls("amp_complete_task").is_empty());
+}
+
+/// 7a. AMP #2946: `is_unknown_tool` reads a server's missing-tool answer, and not a missing
+/// ticket or a refusal.
+#[test]
+fn an_unknown_tool_answer_is_read_as_an_older_server() {
+    use amp_core::run_report::is_unknown_tool;
+    let t = "amp_return_task";
+    assert!(is_unknown_tool(
+        "Mcp error: -32602: tool 'amp_return_task' not found: tool not found",
+        t
+    ));
+    assert!(is_unknown_tool("unknown tool amp_return_task", t));
+    assert!(is_unknown_tool("Unknown tool: amp_return_task", t));
+    assert!(!is_unknown_tool("task 4047 not found", t));
+    assert!(!is_unknown_tool("task 4042 is owned by someone else", t));
+    assert!(!is_unknown_tool(
+        "task 4046 was started (by amp:amp-worker-backend): returning it would pull it out",
+        t
+    ));
 }
 
 /// 7. `is_refused_started` reads AMP's own refusal, and nothing else, as the started case.

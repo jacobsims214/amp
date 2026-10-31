@@ -337,9 +337,12 @@ impl RunReporter {
                 self.forget(task_id);
                 Ok(Released::Returned)
             }
-            Err(e) if is_refused_started(&e) => {
+            Err(e) if is_refused_started(&e) || is_unknown_tool(&e, RETURN_TOOL) => {
                 // An older server (before AMP #2909) refuses a started ticket even with its
-                // dispatch_id; so does any server when there is no token to present.
+                // dispatch_id; so does any server when there is no token to present. A server
+                // older still (before AMP #2801, or one that rolled it back) has no
+                // amp_return_task at all: mcp-go answers "tool 'amp_return_task' not found",
+                // and the ticket goes back the way #2204 always sent it (AMP #2946).
                 // Documented fallback, not a workaround: amp_return_task's own refusal says to
                 // "block it with a question, or close it out with closeout_reason"; the harness
                 // does neither (the work didn't finish and it has no question), so it uses the
@@ -363,7 +366,11 @@ impl RunReporter {
                     // not told a ticket they can re-dispatch is stuck in progress.
                     Ok(()) => {
                         self.forget(task_id);
-                        Ok(Released::SetBack)
+                        if is_refused_started(&e) {
+                            Ok(Released::SetBack)
+                        } else {
+                            Ok(Released::SetBackOldServer)
+                        }
                     }
                     Err(fallback) => {
                         Err(format!("{RETURN_TOOL}: {e}; {SET_STATE_TOOL}: {fallback}"))
@@ -446,6 +453,20 @@ pub fn is_refused_started(message: &str) -> bool {
     m.contains("was started") || m.contains("started (by")
 }
 
+/// Whether `message` says the server has no tool named `tool` (AMP #2946): an AMP from before
+/// that tool existed. mcp-go answers an unknown tool with a JSON-RPC error, "tool 'X' not found:
+/// tool not found"; other servers say "unknown tool X". A ticket that isn't found ("task 12 not
+/// found") is not this.
+pub fn is_unknown_tool(message: &str, tool: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    let tool = tool.to_ascii_lowercase();
+    m.contains("tool not found")
+        || m.contains(&format!("unknown tool {tool}"))
+        || m.contains(&format!("unknown tool: {tool}"))
+        || (m.contains(&format!("tool '{tool}'")) && m.contains("not found"))
+        || (m.contains(&format!("tool \"{tool}\"")) && m.contains("not found"))
+}
+
 /// How a ticket got back to ready, when it did (AMP #2802). Both are a success — the ticket is in
 /// ready either way — but the difference is visible, so nobody has to guess which call did it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -456,6 +477,9 @@ pub enum Released {
     /// older than AMP #2909, or no dispatch_id to present), so `amp_set_task_state` put it back. The dispatch token is not cleared and no return is
     /// recorded, so the ticket is re-dispatchable but not listed under AMP's `returned`.
     SetBack,
+    /// The fallback on a server that has no `amp_return_task` at all (before AMP #2801, or after
+    /// rolling it back): `amp_set_task_state` put it back, as #2204 always did (AMP #2946).
+    SetBackOldServer,
 }
 
 impl Released {
@@ -470,6 +494,10 @@ impl Released {
                 "returned #{task_id} to ready in AMP: it was already started, so {RETURN_TOOL} \
                  refused it and {SET_STATE_TOOL} put it back instead (that does not clear the \
                  dispatch or record a return)"
+            ),
+            Self::SetBackOldServer => format!(
+                "returned #{task_id} to ready in AMP: this AMP server has no {RETURN_TOOL}, so \
+                 {SET_STATE_TOOL} put it back instead (that does not record a return)"
             ),
         }
     }
@@ -507,6 +535,11 @@ pub fn returned_notice(
             Released::SetBack => format!(
                 "#{0} was returned: worker {1} {what}. It's back in ready (it had already been \
                  started, so it was set back rather than returned); re-dispatch it or ask your user.",
+                worker.task_id, worker.agent_id
+            ),
+            Released::SetBackOldServer => format!(
+                "#{0} was returned: worker {1} {what}. It's back in ready (this AMP server is too \
+                 old to record a return, so it was set back); re-dispatch it or ask your user.",
                 worker.task_id, worker.agent_id
             ),
         },
