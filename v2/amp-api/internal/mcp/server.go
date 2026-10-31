@@ -581,7 +581,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		withRunProps(props{
 			"task_id":         num("REQUIRED. Task ID."),
 			"dispatch_id":     str("The dispatch_id you were dispatched with. Pass it: it is what makes this the worker's own completion rather than a closeout."),
-			"closeout_reason": str("Closing out a ticket that isn't your own work: why its worker couldn't finish it (connection lost, timed out, approved after the worker blocked). Recorded as a closeout."),
+			"closeout_reason": str("Closing out a ticket that isn't your own work: why its worker couldn't finish it (connection lost, timed out, approved after the worker blocked). Without your current dispatch_id, a completion that gives one is always recorded as a closeout."),
 			"hours_worked":    num("Human tickets: the hours the person says they spent on it."),
 		})), wrap(ctx, s.guard(authz.Member, s.completeTask)))
 	mcp.AddTool(tool("amp_report_run",
@@ -1946,11 +1946,11 @@ func (s *Server) completeTask(rctx context.Context, args map[string]interface{})
 	// was given) or as a closeout (AMP #2801): see Service.CompleteTask.
 	// The run it reports decides whether its work waits on a merge.
 	finish := runFromArgs(args, domain.RunCompleted)
+	// Reason is only the caller's explicit closeout_reason: it decides that a
+	// completion is a closeout (AMP #2908), which a run note must not. The
+	// service falls back to the run note for a closeout's reason itself.
 	claim := service.CompleteClaim{DispatchID: strings.TrimSpace(optStr(args, "dispatch_id", "")),
 		Reason: optStr(args, "closeout_reason", "")}
-	if claim.Reason == "" {
-		claim.Reason = finish.Note
-	}
 	t, closed, err := s.svc.CompleteTaskWithRun(rctx, caller(rctx).p, taskID, &finish, claim)
 	if err != nil {
 		return nil, err

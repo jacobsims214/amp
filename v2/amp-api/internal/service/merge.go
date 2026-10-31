@@ -144,7 +144,10 @@ func (s *Service) CompleteTaskWithRun(ctx context.Context, p authz.Principal, ta
 	if gate {
 		where = mergeWhere(*run)
 	}
-	closeout := t.State != domain.TaskStateCompleted && !p.InUI() && t.CompleteIsCloseout(complete.DispatchID)
+	// An explicit closeout_reason makes it a closeout even on a dispatched
+	// ticket nobody started; a bare completion there stays an old plugin's
+	// own (AMP #2908).
+	closeout := t.State != domain.TaskStateCompleted && !p.InUI() && t.CompletionIsCloseout(complete.DispatchID, complete.Reason)
 	reason := ""
 	if closeout {
 		reason = strings.TrimSpace(complete.Reason)
@@ -162,7 +165,10 @@ func (s *Service) CompleteTaskWithRun(ctx context.Context, p authz.Principal, ta
 
 // CompleteClaim is how a caller presents itself to a completion: the
 // dispatch_id it was dispatched with (the worker's own completion), and for
-// a closeout, why it is closing a ticket that isn't its own work.
+// a closeout, why it is closing a ticket that isn't its own work. Reason is
+// only the caller's explicit closeout_reason, never a run note: a non-empty
+// one makes the completion a closeout without the current dispatch_id
+// (AMP #2908).
 type CompleteClaim struct {
 	DispatchID string
 	Reason     string
