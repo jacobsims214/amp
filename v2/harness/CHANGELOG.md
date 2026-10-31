@@ -5,6 +5,33 @@ from AMP's server images, and follows [Semantic Versioning](https://semver.org/)
 tagged `harness-vX.Y.Z`. The versioning and compatibility policy is D14 in the AMP project 2 KB,
 `decisions/amp-harness-architecture.md`. How to cut a release: [RELEASING.md](RELEASING.md).
 
+## [0.2.0] - 2026-10-31
+
+Interactive chat launches workers in the background, and dispatch is safer end to end.
+
+### Added
+
+- The interactive chat launches workers in the background: a launched dispatch acks the chat
+  at once, and the manager ends its turn after launching (#2834, #2837, #2892).
+- A launched worker's end shows the moment it lands, idle or mid-reply, and starts a manager
+  turn when the chat is idle; the next manager turn opens with the workers that ended since the
+  last one (#2835, #2857, #2861, #2891).
+- Prompts typed while the manager replies are queued and run after it (#2889).
+- Boxed chat layout: Conversation, Workers and Message boxes (#2882).
+
+### Fixed
+
+- The supervisor starts its worker's ticket, returns it on every non-closing outcome, and
+  sweeps orphaned dispatches; `run -p` releases orphans at startup like the chat (#2802, #2910).
+- Dispatch ledger records name their AMP server, so the startup sweep releases only that
+  server's; hand-back falls back to `set_state` when the server has no `amp_return_task`
+  (#2946, #2948).
+- A launched worker that panics still ends and returns its ticket; worker ends tell the
+  manager where the ticket went; headless `run -p` always awaits its workers (#2883, #2884,
+  #2885).
+- Esc in Launch mode stops only the reply; `/workers` follows the supervisor; remote busy is
+  the manager's reply, never its workers (#2838, #2858, #2862).
+
 ## [0.1.0] - 2026-10-28
 
 The first release. AMP Harness is AMP's own coding-agent harness: a single Rust binary, built on
@@ -163,4 +190,5 @@ Not yet supported: Windows, and musl-based Linux such as Alpine.
   is one.
 - No Windows or musl builds.
 
+[0.2.0]: https://github.com/jacobsims214/amp/releases/tag/harness-v0.2.0
 [0.1.0]: https://github.com/jacobsims214/amp/releases/tag/harness-v0.1.0
