@@ -14,7 +14,8 @@ import (
 // A tool result is read by a model on every call, which makes it the one
 // place that steers the flow reliably: the dispatch result tells the manager
 // to launch the worker now (not to stop after marking the ticket), the claim
-// result tells the worker it now owns the ticket and must finish it itself,
+// result tells the worker it now owns the ticket and must finish it itself
+// (and a manager's ownership claim to dispatch it, not work it),
 // and a closeout says plainly that it wasn't the worker's completion. They
 // are short, imperative, and worded for the caller the tool implies.
 
@@ -46,16 +47,23 @@ func workerPrompt(t *domain.Task, agentID string) string {
 		t.ID, t.ProjectID, agentID, t.ID, t.DispatchID, t.ID, t.ID, t.DispatchID, t.ID, t.DispatchID)
 }
 
-// claimNext is the claim result's next: the worker is now the ticket's, and
-// must close it itself.
+// claimNext is the claim result's next. A claim that started the ticket
+// makes the caller its worker, who must close it itself. A claim without a
+// dispatch_id that didn't start it only took ownership (service.ClaimTask ->
+// setOwner): that's what a manager does before dispatching, so it steers to
+// dispatching and launching a worker, never to doing the work itself (AMP
+// #2945); an agent's completion of a never-dispatched ticket is refused anyway.
 func claimNext(t *domain.Task) string {
+	if t.State != domain.TaskStateInProgress {
+		return fmt.Sprintf("Ticket #%d is now yours and ready (%s). Don't work it yourself: dispatch it with "+
+			"amp_dispatch_task(task_id=%d, agent_id=<the specialist>) and, in the same turn, launch the worker with the "+
+			"worker_prompt that call returns (Agent/Task in Claude Code, the task tool in opencode, amp_run_ticket in the AMP harness).",
+			t.ID, t.State, t.ID)
+	}
 	if t.StartedAt == nil {
-		// Started before the claim existed (a plugin that doesn't claim):
-		// the claim still took ownership, so the rest is the same.
-		return fmt.Sprintf("You are the worker on #%d. Read it with amp_get_task(task_id=%d, include=[\"comments\"]), "+
-			"post your \"Starting work\" comment, and do the work. Finish this ticket yourself: amp_complete_task(task_id=%d, ...) "+
-			"when every acceptance criterion is met, or amp_block_task(task_id=%d, reason=<your question>) if you need a person. "+
-			"Don't end your run without one of those two calls.", t.ID, t.ID, t.ID, t.ID)
+		return fmt.Sprintf("Ticket #%d is now yours. It is dispatched but no worker has started it: don't work it yourself, "+
+			"launch the worker now, in this same turn, with the worker_prompt from its dispatch. If you can't, return it with "+
+			"amp_set_task_state(task_id=%d, state=\"backlog\", reason=\"not started\").", t.ID, t.ID)
 	}
 	return fmt.Sprintf("You are now the worker on #%d (started; dispatch %s). Read it with amp_get_task(task_id=%d, include=[\"comments\"]), "+
 		"post your \"Starting work\" comment, and do the work. Finish this ticket yourself: "+
