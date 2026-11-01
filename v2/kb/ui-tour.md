@@ -8,9 +8,9 @@ tags: [ui, onboarding, navigation]
 ## Sidebar
 
 - **My work** — your home page: a summary of what waits on you across every project (Approve,
-  Answer, Merge, Do), one card per project, plus your agents at work and what finished lately.
-  It only informs: each row opens that project's My work with the item in focus. Its badge is
-  your total waiting.
+  Answer, Merge, Start, Do), one card per project, plus your agents at work and what finished
+  lately. It only informs: each row opens that project's My work with the item in focus. Its
+  badge is your total waiting.
 - **Projects** — every project you can see. A project with something waiting on you shows the
   count.
 - **Day reports** — your saved end-of-day reports and your completed tickets.
@@ -39,9 +39,9 @@ otherwise. Every project page takes `?focus=<ticket id>` to open on one ticket.
   - **Waiting on people**: each person with what waits on them, by kind. Rows open the item in
     that person's My work.
 - **My work** — where you act in this project: approve plans, answer questions, record merges,
-  and start and finish your own human tickets, each in place (`working/human-work.md`). Its badge
-  is the number waiting on you here. Approving opens the Approve view
-  (`working/planning-and-approval.md`).
+  return a dispatch no worker started to ready, and start and finish your own human tickets, each
+  in place (`working/human-work.md`). Its badge is the number waiting on you here. Approving opens
+  the Approve view (`working/planning-and-approval.md`).
 - **Board** — tickets by state. Filter by person (**Mine** is the tickets you own; **Unowned**
   finds the rest), epic or text. A done ticket whose PR isn't merged shows **Merge needed**.
   **Hand over …** moves the filtered tickets to someone else with a reason.

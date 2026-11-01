@@ -16,7 +16,7 @@ Merging a pull request is **not** a human ticket. A ticket that finishes with a 
 
 ## Waiting on you
 
-Everything a person has to act on in a project is **waiting on you**. There are four kinds,
+Everything a person has to act on in a project is **waiting on you**. There are five kinds,
 always shown in this order, oldest first:
 
 | Kind | What it is | Where it comes from |
@@ -24,17 +24,27 @@ always shown in this order, oldest first:
 | **Approve** | Tickets that wait for your plan approval, one item per epic | `working/planning-and-approval.md` |
 | **Answer** | A question an agent asked on a ticket you own | `working/questions.md` |
 | **Merge** | A ticket you own is done, but its PR isn't merged (or was closed without merging) | `working/merging-and-ci.md` |
+| **Start** | A ticket you own was dispatched to an agent and no worker has started it, so nothing is happening on it | `working/running-work.md` |
 | **Do** | A human ticket you own that is ready or in progress | this page |
+
+**Start** is the odd one: there's nothing wrong with the ticket, its worker was simply never
+launched (a dispatch whose run died, or was never started). It shows an agent's ticket in
+in-progress, and it appears once the project's flag time has passed (10 minutes by default), so
+an ordinary slow start doesn't bother you. Nothing you click is required: leave it and AMP
+returns the ticket to ready by itself after the project's return timeout (30 minutes by
+default). **Return to ready** on the item does the same thing now, and clears the dispatch so
+the ticket can be dispatched again.
 
 **Coming up** lists your human tickets that can't start yet: they wait on other work, a
 schedule, or plan approval. They're shown but not counted, and move into Do when they're ready.
 
-Questions on other people's tickets wait on their owner, not on you.
+Questions on other people's tickets, and dispatches of them nobody started, wait on their
+owner, not on you.
 
 AMP works this out in one place, so every count agrees: the project's **My work** tab, the
 badges in the sidebar, the top-level My work page, Mission, and what your manager agent sees
-(`amp_list_tasks` → `waiting_on_people`, each item with a `kind`: `approve`, `answer`, `merge`
-or `do`, plus a separate `coming_up` list).
+(`amp_list_tasks` → `waiting_on_people`, each item with a `kind`: `approve`, `answer`, `merge`,
+`start` or `do`, plus a separate `coming_up` list).
 
 ## The My work tab: where you act
 
@@ -47,6 +57,8 @@ project, and every action happens in place:
   **Send answer**.
 - **Merge**: the PR and how many tickets wait on it, **Review PR ↗**, **Mark merged** and **Not
   needed**. A PR closed without merging offers **Reopen ticket** and **Not needed**.
+- **Start**: the ticket, the agent it went to and how long ago, and **Return to ready** to clear
+  the dispatch and dispatch it again. Leaving it alone returns it by itself.
 - **Do**: **Start**, then **Mark done…**, which takes a note, a link and the hours you spent.
 
 Next to the list: **Coming up** (with what each ticket waits on), **Your agents here** (counts,
@@ -64,8 +76,8 @@ holding that ticket and outlines it; the Board and Flight plan open the ticket. 
 own messages link this way, so a link always opens the thing it's about.
 
 The same actions appear in the ticket panel when you open a ticket anywhere (the Board, Flight
-plan): Answer, Mark merged, Start and Mark done. Approval is the exception; the panel says
-**Awaiting your approval → My work**.
+plan): Answer, Mark merged, Return to ready, Start and Mark done. Approval is the exception; the
+panel says **Awaiting your approval → My work**.
 
 A lead can open a teammate's list (it's read-only: the actions are theirs) to see what's waiting
 on them.
