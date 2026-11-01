@@ -80,6 +80,19 @@ section { padding-block: 96px; }
 .flow { stroke-dasharray: 6 8; animation: flow 1.4s linear infinite; }
 @keyframes flow { to { stroke-dashoffset: -28; } }
 
+/* ---- AMP Harness (the section above; its page is /home/harness/) ---- */
+.own { border-top: 1px solid var(--line); }
+.own .split { align-items: start; }
+.own .panel { background: var(--void); border-color: var(--void-line); min-width: 0; }
+.own .panel .ph { background: var(--void-2); border-color: var(--void-line); align-items: center; }
+.own .pre { font-size: 14px; color: var(--ink-2); margin: 0; }
+.own .ctas { display: flex; gap: 12px; flex-wrap: wrap; }
+.feats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--line); border-left: 1px solid var(--line); }
+.feat { padding: 20px 18px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); display: grid; gap: 8px; align-content: start; position: relative; min-width: 0; }
+.feat .tick { position: absolute; top: -1px; left: -1px; width: 30px; height: 4px; }
+.feat h3 { font: 700 19px/1.05 var(--font-label); text-transform: uppercase; letter-spacing: .03em; margin: 0; }
+.feat p { margin: 0; color: var(--ink-2); font-size: 14.5px; }
+
 /* ---- Flight loop ---- */
 .loop { background: var(--void); color: var(--star); position: relative; overflow: hidden; }
 .loop .head .label { color: var(--star-3); }
@@ -216,12 +229,15 @@ section.hero { padding-block: 0; }
 .hero .kicker .plain { letter-spacing: 0; text-transform: none; }
 .flow.d1 { animation-delay: -.3s; } .flow.d2 { animation-delay: -.6s; } .flow.d3 { animation-delay: -.9s; }
 .c-ink-3 { color: var(--ink-3); }
+.c-star-2 { color: var(--star-2); }
 .c-star-3 { color: var(--star-3); }
 .bt { border-top: 1px solid var(--line); }
 .band-surface { background: var(--surface); border-block: 1px solid var(--line); }
 .split.top { align-items: start; }
 .stack { display: grid; gap: 18px; }
 .viewer .vbar .t .ver { color: var(--ink-3); font-size: 12px; }
+.code.w { white-space: pre-wrap; overflow-wrap: anywhere; }
+.mono.sm { font-size: 13px; }
 .panel.dark { background: var(--void); border-color: var(--void-line); }
 .panel.dark .ph { background: var(--void-2); border-color: var(--void-line); }
 .launch .head .label { color: var(--star-3); }
@@ -234,6 +250,7 @@ section.hero { padding-block: 0; }
   .phase { border-right: 0; border-bottom: 1px solid var(--void-line); padding: 18px 0 18px !important; }
   .phase .lamp { left: 0 !important; }
   .crew-grid, .installs { grid-template-columns: minmax(0, 1fr); }
+  .own .split { gap: 40px; }
   .viewer .vfoot { grid-template-columns: minmax(0, 1fr); }
   .cell { border-right: 0; border-bottom: 1px solid var(--line); }
   .cell:last-child { border-bottom: 0; }
@@ -241,6 +258,9 @@ section.hero { padding-block: 0; }
   .board .side { border-right: 0; border-bottom: 1px solid var(--line); }
   .nav-links a:not(.btn) { display: none; }
   section { padding-block: 72px; }
+}
+@media (max-width: 560px) {
+  .feats { grid-template-columns: minmax(0, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; }

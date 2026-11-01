@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { BASELINE_CSP, cspFor, SESSION_CSP } from './csp'
@@ -139,5 +139,46 @@ describe('no inline script or style in served HTML (#2471)', () => {
     expect(inlineCode('<script src="/home/home.js" defer></script><script type="module" src="/src/main.tsx"></script>')).toEqual([])
     expect(inlineCode('<script type="application/ld+json">{}</script>')).toEqual([])
     expect(inlineCode('<link rel="stylesheet" href="/home/home.css"><p>in style</p><!-- <style> -->')).toEqual([])
+  })
+})
+
+/**
+ * Each public home page's CSS and JS live next to it and are linked by URL (#2471, #2968).
+ * A page whose <link>/<script> points at a file that isn't there, or whose <pre> shares an
+ * id with its <section>, fails silently in the browser: no styles, or a Copy button that
+ * copies the whole section. Catch both here.
+ */
+describe('public home pages wire up their own assets (#2968)', () => {
+  const root = process.cwd()
+  const pages = [
+    { html: 'public/home/index.html', bare: 'public/home' },
+    { html: 'public/home/harness/index.html', bare: 'public/home/harness' },
+  ]
+
+  it.each(pages)('$html loads its stylesheet and script from files that exist', ({ html: file, bare }) => {
+    const doc = readFileSync(resolve(root, file), 'utf8')
+    const refs = [...doc.matchAll(/<(?:link[^>]*\shref|script[^>]*\ssrc)="([^"]+)"/g)].map(m => m[1])
+    const local = refs.filter(href => href.startsWith('/') && !href.startsWith('//'))
+    const sheets = local.filter(href => href.endsWith('.css'))
+    const scripts = local.filter(href => href.endsWith('.js'))
+    expect(sheets).toHaveLength(1)
+    expect(scripts).toHaveLength(1)
+    for (const href of [...sheets, ...scripts]) {
+      expect(existsSync(resolve(root, bare, href.slice(href.lastIndexOf('/') + 1))), `${file} → ${href}`).toBe(true)
+    }
+  })
+
+  it.each(pages)('$html has no id twice', ({ html: file }) => {
+    const ids = [...readFileSync(resolve(root, file), 'utf8').matchAll(/\sid="([^"]+)"/g)].map(m => m[1])
+    const dupes = ids.filter((id, i) => ids.indexOf(id) !== i)
+    expect(dupes).toEqual([])
+  })
+
+  it.each(pages)('$html has a copy button for every data-copy target, and each target exists', ({ html: file }) => {
+    const doc = readFileSync(resolve(root, file), 'utf8')
+    const targets = [...doc.matchAll(/data-copy="([^"]+)"/g)].map(m => m[1])
+    const ids = new Set([...doc.matchAll(/\sid="([^"]+)"/g)].map(m => m[1]))
+    expect(targets.length).toBeGreaterThan(0)
+    expect(targets.filter(t => !ids.has(t))).toEqual([])
   })
 })
