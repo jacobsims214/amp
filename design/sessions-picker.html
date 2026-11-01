@@ -1,0 +1,548 @@
+<!doctype html>
+<!--
+  AMP #2999 — /sessions directory-scoped picker for the AMP harness chat TUI (amp-tui). Design only.
+  For the builder:
+  - The picker is a Panel (overlay.rs: PanelKind::Sessions) drawn in the panel slot between the
+    Conversation box and the Message box, inside a box of its own — same chrome as the /workers
+    box in the approved boxed layout (artifact #26).
+  - Row model: two lines per session. Line 1: `▸/›/• ` cursor/marker + short id + relative age +
+    role + `· current` tag. Line 2 (indented to the id column): bounded one-line preview of the
+    last user/assistant text, ellipsized to the box width; problem rows put the reason here
+    instead (unreadable / older format / locked), dimmed, and are skipped by ↑↓.
+  - Sort: newest first by file mtime (JsonlSessionMetadata.modified_at; KB discoveries/harness-local-session-tui.md §1).
+  - Scope: exact canonical-cwd match on the header's cwd (KB §1; JsonlSessionListOptions{cwd}).
+    The box title says "this directory" so the scope is visible. Worktree sessions record the
+    worktree path as cwd, so they don't appear in the repo root's list — this is intentional.
+  - Stages follow the /questions Stage pattern (browse → confirm → done):
+    browse  : ↑↓ move (skips non-selectable rows), Enter/click → confirm, Esc/q close (no changes).
+    confirm : Enter resume · Esc back. Text says where the current transcript goes and which
+              file the resumed session continues in.
+    resumed : picker closes; restored transcript renders display-only (worker_session::replay
+              precedent, KB §4) and one `✓ resumed` line carries id · age · message count · file.
+  - Busy refusal: /sessions while a turn runs never opens the picker — one flag-coloured notice
+    in the transcript (`Shell::settled` guard, same shape as the /server switching guard).
+  - Resume mechanism behind the mock: AgentHarness::set_session hot-swap over
+    JsonlSessionStorage::load (KB §6.5); no cross-directory restore, no auto-continuation of an
+    interrupted request — the confirm copy says so.
+  - Theme: reuses artifact #26 tokens (amp-dark / amp-light / NO_COLOR). The selected row's
+    background is the same surface the user-message band used (#161D26 dark / #EFEFEC light);
+    the cursor is `acc` and bold. `borderMuted` stays too faint for boxes: focused box border
+    is `muted`, unfocused `border` — unchanged from #2881.
+  Not based on an org design system (none published); tokens from
+  research/harness-tui-theme-and-metadata.md via artifact #26.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>/sessions picker — mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@500;600&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  /* page (AMP web UI tokens, light) */
+  --bg: #F2F2F0; --surface: #FFFFFF; --surface-2: #FAFAF9; --surface-3: #EFEFEC;
+  --line: #DCDDDA; --line-str: #C3C5C1; --ink: #16181B; --ink-2: #50555C; --ink-3: #8E939A;
+  --accent: #D9482B; --link: #2C66B8; --ok: #2A6E45; --warn: #9A5E0A; --violet: #7A5BB5;
+  --radius: 2px;
+  --font-body: "Barlow", ui-sans-serif, system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --font-label: "Barlow Condensed", "Arial Narrow", "Barlow", sans-serif;
+  --font-data: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /* terminal: amp-dark */
+  --t-bg: #060A0C; --t-ink: #E8ECF2; --t-mut: #9AA4B2; --t-dim: #7C8796; --t-acc: #7FA9E8;
+  --t-ok: #6CC68F; --t-done: #E8ECF2; --t-flag: #CF4426; --t-chipfg: #FFFFFF;
+  --t-bd: #5E6876; --t-sep: #2C3542; --t-box: #5E6876; --t-boxf: #9AA4B2; --t-usr: #161D26;
+  --b1: #D9482B; --b2: #EB8A2E; --b3: #EBC34B; --b4: #2C66B8;
+}
+body[data-theme="dark"], body[data-theme="mono"] {
+  --bg: #0B1015; --surface: #0F151C; --surface-2: #121A22; --surface-3: #161D26;
+  --line: #222B36; --line-str: #2C3542; --ink: #E8ECF2; --ink-2: #9AA4B2; --ink-3: #5E6876;
+  --link: #7FA9E8; --ok: #6CC68F; --warn: #E8B25A; --violet: #A68BDB;
+}
+body[data-theme="light"] {
+  --t-bg: #FFFFFF; --t-ink: #16181B; --t-mut: #50555C; --t-dim: #676C74; --t-acc: #2C66B8;
+  --t-ok: #2A6E45; --t-done: #16181B; --t-flag: #CF4426;
+  --t-bd: #83888F; --t-sep: #C3C5C1; --t-box: #83888F; --t-boxf: #50555C; --t-usr: #EFEFEC;
+}
+body[data-theme="mono"] {
+  --t-bg: #0C0C0C; --t-ink: #D4D4D4; --t-mut: #D4D4D4; --t-dim: #D4D4D4; --t-acc: #D4D4D4;
+  --t-ok: #D4D4D4; --t-done: #D4D4D4; --t-flag: #D4D4D4; --t-chipfg: #0C0C0C;
+  --t-bd: #D4D4D4; --t-sep: #D4D4D4; --t-box: #D4D4D4; --t-boxf: #D4D4D4; --t-usr: #1C1C1C;
+  --b1: #D4D4D4; --b2: #D4D4D4; --b3: #D4D4D4; --b4: #D4D4D4;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 400 16px/1.5 var(--font-body); }
+a { color: var(--link); }
+.wrap { max-width: 1400px; margin: 0 auto; padding: 0 24px 64px; }
+
+/* header */
+.top { padding: 28px 0 18px; display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: baseline; justify-content: space-between; }
+.eyebrow { font: 600 13px/1 var(--font-label); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-2); margin: 0 0 8px; }
+h1 { font: 600 30px/1.15 var(--font-body); margin: 0; letter-spacing: -.01em; }
+.lede { margin: 8px 0 0; color: var(--ink-2); max-width: 62ch; }
+.review { font: 600 13px/1 var(--font-label); letter-spacing: .06em; text-transform: uppercase; padding: 7px 10px; border: 1px solid var(--accent); color: var(--accent); border-radius: var(--radius); white-space: nowrap; }
+
+/* switcher */
+.controls { position: sticky; top: 0; z-index: 5; background: var(--bg); border-bottom: 1px solid var(--line); padding: 10px 0; display: flex; flex-wrap: wrap; gap: 10px 22px; }
+.group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.group > span { font: 600 12px/1 var(--font-label); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-2); }
+.seg { display: inline-flex; border: 1px solid var(--line-str); border-radius: var(--radius); overflow: hidden; background: var(--surface); }
+.seg button { font: 500 14px/1 var(--font-body); color: var(--ink-2); background: transparent; border: 0; padding: 8px 11px; min-height: 34px; cursor: pointer; border-right: 1px solid var(--line); }
+.seg button:last-child { border-right: 0; }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--surface); }
+.seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* screen */
+.screens { margin-top: 20px; }
+.pane { margin: 0; min-width: 0; display: none; }
+body[data-state="list"] .pane[data-show-state="list"],
+body[data-state="confirm"] .pane[data-show-state="confirm"],
+body[data-state="resumed"] .pane[data-show-state="resumed"],
+body[data-state="busy"] .pane[data-show-state="busy"],
+body[data-state="empty"] .pane[data-show-state="empty"],
+body[data-state="loading"] .pane[data-show-state="loading"],
+body[data-state="problems"] .pane[data-show-state="problems"] { display: block; }
+figcaption { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+.pane-name { font: 600 18px/1 var(--font-body); }
+.prov { font: 600 12px/1 var(--font-label); letter-spacing: .06em; text-transform: uppercase; padding: 4px 7px; border-radius: var(--radius); border: 1px solid var(--line-str); color: var(--ink-2); }
+.prov-new { border-color: var(--ink); color: var(--ink); }
+.dims { margin-left: auto; font: 400 13px/1 var(--font-data); color: var(--ink-2); }
+.frame { background: var(--t-bg); border: 1px solid var(--line-str); border-radius: var(--radius); padding: 14px 16px; overflow-x: auto; }
+.term { margin: 0; font: 400 12.5px/1.22 var(--font-data); color: var(--t-ink); white-space: pre; font-variant-ligatures: none; }
+.term.sel span.selrow { background: var(--t-usr); display: inline; box-decoration-break: clone; }
+
+/* terminal roles */
+.ink { color: var(--t-ink); } .inkb { color: var(--t-ink); font-weight: 700; }
+.mut { color: var(--t-mut); } .dim { color: var(--t-dim); } .acc { color: var(--t-acc); }
+.ok { color: var(--t-ok); } .done { color: var(--t-done); } .flag { color: var(--t-flag); }
+.chip { background: var(--t-flag); color: var(--t-chipfg); }
+body[data-theme="mono"] .chip { background: var(--t-ink); color: var(--t-bg); }
+.bd { color: var(--t-bd); } .sep { color: var(--t-sep); }
+.boxed .bd { color: var(--t-box); } .focused .bd { color: var(--t-boxf); }
+.usr { background: var(--t-usr); }
+.b1 { color: var(--b1); } .b2 { color: var(--b2); } .b3 { color: var(--b3); } .b4 { color: var(--b4); }
+
+/* captions */
+.caption { display: none; margin-top: 16px; max-width: 90ch; }
+body[data-state="list"] .caption[data-show-state="list"],
+body[data-state="confirm"] .caption[data-show-state="confirm"],
+body[data-state="resumed"] .caption[data-show-state="resumed"],
+body[data-state="busy"] .caption[data-show-state="busy"],
+body[data-state="empty"] .caption[data-show-state="empty"],
+body[data-state="loading"] .caption[data-show-state="loading"],
+body[data-state="problems"] .caption[data-show-state="problems"] { display: block; }
+.caption ul { margin: 6px 0 0; padding-left: 20px; }
+.caption li { margin: 3px 0; }
+.prov-line { margin: 0; color: var(--ink-2); font-size: 15px; }
+
+/* notes */
+h2 { font: 600 22px/1.2 var(--font-body); margin: 48px 0 6px; }
+.sub { margin: 0 0 18px; color: var(--ink-2); max-width: 70ch; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px 20px; }
+.card h3 { font: 600 13px/1 var(--font-label); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-2); margin: 0 0 12px; }
+.card p, .card li { font-size: 15px; }
+.card p { margin: 0 0 10px; }
+.card ul, .card ol { margin: 0; padding-left: 18px; }
+.card li { margin: 4px 0; }
+code, .k { font: 400 13.5px/1.4 var(--font-data); background: var(--surface-3); padding: 1px 4px; border-radius: var(--radius); }
+table { border-collapse: collapse; width: 100%; font-size: 15px; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+thead th { font: 600 12px/1.2 var(--font-label); letter-spacing: .06em; text-transform: uppercase; color: var(--ink-2); }
+.ask { border-left: 3px solid var(--accent); }
+.ask ol { margin: 0; padding-left: 20px; }
+.ask li { margin: 6px 0; font-size: 16px; }
+
+@media (max-width: 600px) {
+  .wrap { padding: 0 16px 48px; }
+  h1 { font-size: 25px; }
+  .controls { gap: 8px 14px; }
+  .seg button { padding: 8px 9px; font-size: 13.5px; }
+  .cards { grid-template-columns: minmax(0, 1fr); }
+  .term { font-size: 10.5px; }
+}
+</style>
+</head>
+<body data-state="list" data-theme="dark" data-glyphs="box">
+<div class="wrap">
+  <header class="top">
+    <div>
+      <p class="eyebrow">AMP harness · chat TUI · #2999</p>
+      <h1>/sessions — pick up a chat from this directory</h1>
+      <p class="lede">The directory-scoped session picker, inside the boxed chat layout approved in #2881. One panel, three stages (browse → confirm → resumed), and every failure it can hit: nothing here, still scanning, damaged files, another process holding a session, and the manager mid-reply.</p>
+    </div>
+    <span class="review">For your approval</span>
+  </header>
+
+  <nav class="controls" aria-label="Mockup controls">
+    <div class="group" role="group" aria-label="State"><span>State</span>
+      <div class="seg">
+        <button data-setstate="list">List</button>
+        <button data-setstate="confirm">Confirm resume</button>
+        <button data-setstate="resumed">Resumed</button>
+        <button data-setstate="busy">Busy refusal</button>
+        <button data-setstate="empty">Empty</button>
+        <button data-setstate="loading">Loading</button>
+        <button data-setstate="problems">Problem rows</button>
+      </div></div>
+    <div class="group" role="group" aria-label="Theme"><span>Theme</span>
+      <div class="seg">
+        <button data-settheme="dark">Dark</button>
+        <button data-settheme="light">Light</button>
+        <button data-settheme="mono">NO_COLOR</button>
+      </div></div>
+    <div class="group" role="group" aria-label="Box glyphs"><span>Glyphs</span>
+      <div class="seg">
+        <button data-setglyphs="box">Box ┌─┐</button>
+        <button data-setglyphs="ascii">ASCII +-+</button>
+      </div></div>
+  </nav>
+
+  <div class="screens" id="screens"></div>
+
+  <div class="caption" data-show-state="list"><p class="prov-line"><b>Browse stage.</b> Opened with <code>/sessions</code> while idle. The Sessions box takes the panel slot and the focus (brighter border, keys in the bottom border); Message steps back.</p><ul>
+    <li>Cursor starts on the most recent session that isn't the current one. The current session stays in the list, marked, so “did it save?” has an answer.</li>
+    <li>The <code>· current</code> tag is the surface; selecting it resumes nothing (it's a no-op row, skipped by ↑↓ — Enter on it is impossible).</li>
+    <li>Title carries the scope (“this directory”) and the count; the footer shows the full scope path when it matters.</li>
+  </ul></div>
+  <div class="caption" data-show-state="confirm"><p class="prov-line"><b>Confirm stage.</b> Enter on a row asks once, in place of the list: what you're resuming, what happens to the chat you're in, and what does <em>not</em> happen.</p><ul>
+    <li>“The current chat stays saved as <code>b2c4…</code>” — the resume never destroys the session you're leaving.</li>
+    <li>“continues in the original file” — no copy, no fork: <code>JsonlSessionStorage::load</code> on the same path, hot-swapped (KB §6.5).</li>
+    <li>“does not re-run its tool calls or re-dispatch its workers” — display-only restore plus <code>ToolReplay::Never</code> (KB §4).</li>
+    <li>Esc steps back to the list with the cursor where it was.</li>
+  </ul></div>
+  <div class="caption" data-show-state="resumed"><p class="prov-line"><b>Resumed.</b> The picker is gone, the restored transcript is in the Conversation box, and one line records what happened.</p><ul>
+    <li>The <code>✓ resumed</code> line carries the short id, age, message count and the file it continues in — the same facts <code>chat.rs::exit_line</code> gives on quit.</li>
+    <li>The restored history renders through the same read-only blocks as a watched worker session (KB §4): the model was not called, nothing re-ran.</li>
+    <li>The next prompt continues the conversation from its own context; run numbering keeps the chat's numbering (process-scoped, KB §6.3).</li>
+  </ul></div>
+  <div class="caption" data-show-state="busy"><p class="prov-line"><b>Busy refusal.</b> <code>/sessions</code> while the manager is replying (or prompts are queued) does not open the picker.</p><ul>
+    <li>One flag-coloured notice in the transcript says why and when to retry; the spinner keeps running.</li>
+    <li>Same guard shape as <code>/server</code>'s switching lock and quit's <code>Shell::settled()</code> predicate (KB §3): switching sessions is refused, not queued, so no selection state can collide with an in-flight turn.</li>
+  </ul></div>
+  <div class="caption" data-show-state="empty"><p class="prov-line"><b>Empty.</b> First chat in this directory, or every stored session belongs to another cwd.</p><ul>
+    <li>Says the scope plainly (“this directory”, and the path in dim), and that starting a chat creates one.</li>
+    <li>No cross-directory restore (plan assumption): the picker never offers sessions from other directories, so the empty state is where that boundary is stated.</li>
+    <li>Esc closes; the box is as short as the message needs.</li>
+  </ul></div>
+  <div class="caption" data-show-state="loading"><p class="prov-line"><b>Loading.</b> The scan of <code>~/.local/state/amp-harness/sessions/*/*.jsonl</code> filtered by header cwd is fast, but a first-open on a cold disk can take a beat.</p><ul>
+    <li>Same spinner glyph and placement as the Message box's “manager replying” — the panel keeps its height so nothing jumps when rows arrive.</li>
+    <li>Esc cancels the scan and closes; a scan that fails lands on the problems layout with one row for the error.</li>
+  </ul></div>
+  <div class="caption" data-show-state="problems"><p class="prov-line"><b>Problem rows.</b> Files the scanner found for this directory but can't offer, kept visible with the reason — the alternative is silently missing sessions.</p><ul>
+    <li><b>unreadable</b> — permissions or I/O error reading the file. Reason names the OS error; the row is dimmed and skipped by ↑↓.</li>
+    <li><b>older format</b> — header parsed but the version predates the loader (<code>JsonlSessionStorage::load</code> can't replay it). The only two-line problem row: its file name rides under the id, because that's the row where someone goes to the file by hand.</li>
+    <li><b>locked · running elsewhere</b> — another live harness holds it (the <code>remote-live/</code> lock record, KB §3). Resuming it would fork the file, so it's refused in the list, not after a failed swap.</li>
+    <li>Good rows still work normally; problems never block the rest of the list.</li>
+  </ul></div>
+
+  <h2>What to decide</h2>
+  <div class="card ask">
+    <ol>
+      <li><b>Two-line rows with a preview</b> (proposed — picking is the job, and the last message is what jogs memory) or one-line rows (id · age only), which fits 9+ sessions but makes “which one was that?” guesswork.</li>
+      <li><b>Confirm stage on Enter</b> (proposed, follows /questions) or Enter resumes immediately and Esc-undo via a notice. The confirm is one extra keystroke against resuming the wrong chat with no undo.</li>
+    </ol>
+  </div>
+
+  <h2>Keyboard flow</h2>
+  <div class="cards">
+    <div class="card">
+      <h3>Keys by stage</h3>
+      <table>
+        <thead><tr><th>Stage</th><th>Key</th><th>Does</th></tr></thead>
+        <tbody>
+          <tr><th scope=row>browse</th><td><code>↑</code> <code>↓</code> / <code>ctrl+p</code> <code>ctrl+n</code></td><td>move cursor; skips <code>current</code> and problem rows</td></tr>
+          <tr><th scope=row></th><td><code>enter</code> / click row</td><td>confirm stage for that session</td></tr>
+          <tr><th scope=row></th><td><code>esc</code> / <code>q</code></td><td>close the picker; nothing changes</td></tr>
+          <tr><th scope=row>confirm</th><td><code>enter</code></td><td>resume: hot-swap to the selected file, render its transcript, close</td></tr>
+          <tr><th scope=row></th><td><code>esc</code></td><td>back to browse, cursor unchanged</td></tr>
+          <tr><th scope=row>any</th><td><code>/</code> typed</td><td>refused while the picker is open (it owns the keys, as /workers does)</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h3>Guards (when /sessions does nothing)</h3>
+      <ul>
+        <li><b>Manager replying or prompts queued</b> → one transcript notice (<code>Shell::settled()</code>, the quit predicate; same as the /server switching guard, KB §3).</li>
+        <li><b>Another device driving via remote</b> → same refusal: the remote link's feed would cross two sessions (KB §6.3.3).</li>
+        <li><b>Live workers</b> → not a refusal: workers survive the switch (project-scoped, not session-bound, KB §6.3.8). The confirm copy doesn't mention them.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Where each fact comes from</h2>
+  <div class="cards">
+    <div class="card">
+      <h3>Row content → code</h3>
+      <ul>
+        <li><b>short id</b> — first/last 4 of the session id, as <code>chat.rs::session_id</code> already displays.</li>
+        <li><b>age</b> — file mtime (<code>JsonlSessionMetadata.modified_at</code>), relative (“2h ago”); the sort key too.</li>
+        <li><b>role</b> — the directory name under <code>sessions/</code> (<code>manager/</code>, a ticket number); shown only when it isn't <code>manager</code>, the default.</li>
+        <li><b>preview</b> — last user or assistant text from a tail read, one line, ellipsized at the box width; skipped for problem rows.</li>
+        <li><b>scope</b> — header <code>cwd</code> exact canonical match (KB §1); worktree sessions stay in their worktree's list.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>States → mechanisms</h3>
+      <ul>
+        <li><b>resume</b> — <code>AgentHarness::set_session</code> over <code>JsonlSessionStorage::load</code> (KB §6.5); rejects <code>LaneBusy</code> itself, the busy refusal is belt-and-braces UI.</li>
+        <li><b>unreadable / torn</b> — the scanner's skip policy surfaces as a row instead of a skip (<code>list_typed</code> skips unparseable headers, KB §1).</li>
+        <li><b>locked</b> — <code>&lt;state&gt;/remote-live/</code> record exists for that session file (KB §3.3).</li>
+        <li><b>older format</b> — header <code>v</code> below what <code>JsonlSessionStorage::load</code> accepts.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+<script>
+/* Screens rendered from data. A screen is an array of lines; a line is a string with ¦x
+   role markers (as in artifact #26) and ¤N<ch> run-length padding, plus {N} fill-to-width
+   markers: {N} pads with spaces so the line reaches column N. Renderer emits one <pre> per
+   screen inside its own figure. Box-drawing is authored as glyphs; the ASCII switch maps
+   them, as in #26. */
+var C = { _: "", i: "ink", I: "inkb", m: "mut", d: "dim", a: "acc", o: "ok", D: "done",
+        f: "flag", c: "chip", B: "bd", S: "sep", u: "usr", s: "selrow",
+        1: "b1", 2: "b2", 3: "b3", 4: "b4" };
+var W = 78; /* interior width of an 80-col terminal: 1 col margin each side */
+
+/* ---- shared chrome fragments (boxed layout, 80 cols) ---- */
+var HEADER =
+  "¦B┌─¦_ ¦1▀▀¦2▀▀¦3▀▀¦4▀▀¦I AMP¦d #2 · ¦msimstech¦d · ¦mjacob@simstech.cloud¦B¤17─¦_ ¦o● ¦mconnected¦_ ¦B─┐{80}";
+var BANNER =
+  "¦B│¦_ ¦dAMP harness 0.9.0 · manager · session saved · /help for commands{B}¦B│";
+var CONV_BOT = "¦B└¤78─┘";
+var MSG_IDLE = [
+  "¦B┌─¦_ ¦IMessage¦_ ¦B¤68─┐",
+  "¦B│¦_ ¦d/ for commands · Ctrl+J new line{B}¦B│",
+  "¦B└¤78─┘"];
+var MSG_DIM = [
+  "¦B┌─¦_ ¦dMessage¦_ ¦B¤68─┐",
+  "¦B│¦_ ¦d/ for commands · Ctrl+J new line{B}¦B│",
+  "¦B└¤78─┘"];
+var MSG_BUSY = [
+  "¦B┌─¦_ ¦dMessage¦_ ¦B¤31─¦_ ¦a⠋ ¦mmanager replying 12s¦d · Esc stops¦_ ¦B─┐",
+  "¦B│¦_ ¦dwhile they run, draft the tickets for M5 remote pairing{B}¦B│",
+  "¦B└¤78─┘"];
+var STATUS = " ¦f■ ¦c 1 QUESTION ¦S │ ¦p■ ¦a3 In progress¦d · ¦i□ 5 Ready{80}";
+var FOOTER = " ¦m~/dev/amp (main)¦d • ¦mmanager{F}¦dctx 9% · ¦mdeepseek-v4.1¦d • thinking off{80}";
+var CONV_EMPTY = "¦B│{B}¦B│";
+
+/* Conversation history shown above the picker (same in list/confirm/empty/loading/problems) */
+var CONV = [
+  "¦B│¦_ ¦d› ¦uwhat's ready in M4?{B}¦B│",
+  "¦B│¦_ ¦iChecking the board first.{B}¦B│",
+  "¦B│¦_ ¦o✓ ¦Ilist_tasks¦m · 11 tickets: 2 ready, 3 in progress, 1 question · 38 ms{B}¦B│",
+  "¦B│¦_ ¦iTwo tickets in AMP Harness › M4 are ready: ¦I#2142¦i and ¦I#2143¦i. Say go and{B}¦B│",
+  "¦B│¦_ ¦iI'll start a worker on each.{B}¦B│"];
+
+function conv(extra) {
+  var rows = [HEADER, BANNER, CONV_EMPTY].concat(CONV);
+  if (extra) rows = rows.concat(extra);
+  return rows;
+}
+
+/* ---- session rows: [cursor, id, age, role|'', tag|'', preview] ---- */
+var SESS_LIST = [
+  [" ", "8f3d…a1c2", "2h ago", "", "", "…so the changelog groups the tickets by epic, newest first"],
+  [" ", "b2c4…7f09", "now", "", "· current", "Two tickets in AMP Harness › M4 are ready: #2142 and…"],
+  [" ", "5e21…9b77", "yesterday", "", "", "…the publish ticket stays blocked until every phase is approved"],
+  [" ", "01aa…c795", "3d ago", "", "", "…run the two ready tickets in M4"],
+  [" ", "77b0…e442", "last week", "worker #2987", "", "…added the snapshot test for the quiet-ticket flag"]];
+
+function sessRow(r, selected) {
+  var cur = selected ? "¦a▸" : "¦d·";
+  if (r[4]) cur = "¦o•"; /* current session marker */
+  var role = r[3] ? "¦d · ¦m" + r[3] : "";
+  var tag = r[4] ? "¦d " + r[4] : "";
+  var ageCls = selected ? "¦i" : "¦m";
+  var l1txt = cur + " ¦I" + r[1] + "¦d · " + ageCls + r[2] + role + tag;
+  var l2txt = "  ¦d" + r[5];
+  if (selected) {
+    /* one full-width selected band: pad before the closing │ stays inside the band */
+    return ["¦B│¦_ ¦s" + l1txt + "{B}¦B│", "¦B│¦_ ¦s" + l2txt + "{B}¦B│"];
+  }
+  return ["¦B│¦_ " + l1txt + "{B}¦B│", "¦B│¦_ " + l2txt + "{B}¦B│"];
+}
+
+var SESS_BOX_TOP = "¦B┌─¦_ ¦ISessions¦d · this directory · 5¦_ ¦B¤40─┐";
+var SESS_BOX_BOT_BROWSE = "¦B└─¦_ ¦a↑↓ select · Enter resume · Esc close¦_ ¦B¤38─┘";
+var SCOPE_LINE = "¦B│¦_ ¦dscope ~/dev/amp · exact match on the session's directory{B}¦B│";
+
+function sessBox(rowsHtml) {
+  return [SESS_BOX_TOP].concat(rowsHtml, [SESS_BOX_BOT_BROWSE]);
+}
+
+/* ---------------- screens ---------------- */
+var SCREENS = {
+  list: { name: "List — browse stage", prov: "Proposed", body: [] },
+  confirm: { name: "Confirm resume", prov: "Proposed", body: [] },
+  resumed: { name: "Back in the chat, resumed", prov: "Proposed", body: [] },
+  busy: { name: "Busy refusal", prov: "Proposed", body: [] },
+  empty: { name: "Empty — no sessions here", prov: "Proposed", body: [] },
+  loading: { name: "Loading — scanning", prov: "Proposed", body: [] },
+  problems: { name: "Problem rows", prov: "Proposed", body: [] }
+};
+
+(function build() {
+  /* list: cursor on 8f3d (2h ago, most recent non-current) */
+  var rows = [];
+  SESS_LIST.forEach(function (r, ix) {
+    rows = rows.concat(sessRow(r, ix === 0));
+  });
+  SCREENS.list.body = conv().concat([CONV_BOT], sessBox([SCOPE_LINE].concat(rows)), MSG_DIM, [STATUS, FOOTER]);
+
+  /* confirm: same list replaced by the confirm text for 8f3d */
+  var CONF = sessBox([
+    "¦B│¦_ ¦IResume ¦i8f3d…a1c2¦d · manager · 2h ago?{B}¦B│",
+    "¦B│¦_ ¦d…so the changelog groups the tickets by epic, newest first{B}¦B│",
+    CONV_EMPTY,
+    "¦B│¦_ ¦iThe current chat stays saved as ¦mb2c4…7f09¦i. The resumed session{B}¦B│",
+    "¦B│¦_ ¦icontinues in the original file; it does not re-run its tool calls{B}¦B│",
+    "¦B│¦_ ¦ior re-dispatch its workers.{B}¦B│"
+  ]).slice(0, -1).concat(["¦B└─¦_ ¦aEnter resume · Esc back¦_ ¦B¤53─┘"]);
+  SCREENS.confirm.body = conv().concat([CONV_BOT], CONF, MSG_DIM, [STATUS, FOOTER]);
+
+  /* resumed: picker closed, restored transcript + ✓ line */
+  var RESTORED = [
+    "¦B│¦_ ¦d› ¦udraft the changelog entry for this week's merges{B}¦B│",
+    "¦B│¦_ ¦iPulling the merged tickets since Monday.{B}¦B│",
+    "¦B│¦_ ¦o✓ ¦Ilist_day_reports¦m · 5 days · 41 ms{B}¦B│",
+    "¦B│¦_ ¦i…so the changelog groups the tickets by epic, newest first.{B}¦B│",
+    "¦B│¦_ ¦o✓ ¦mresumed ¦I8f3d…a1c2¦m · 2h ago · 38 messages · continues in the original file{B}¦B│"];
+  SCREENS.resumed.body = [HEADER, BANNER, CONV_EMPTY].concat(RESTORED, [CONV_BOT], MSG_IDLE, [STATUS, FOOTER]);
+
+  /* busy: refusal notice in the transcript, picker never opened, spinner running */
+  var BUSY_NOTE = [
+    "¦B│¦_ ¦f■ ¦m/sessions is unavailable while the manager is replying — try again{B}¦B│",
+    "¦B│¦_ ¦m   when it finishes. Your chat is unchanged.{B}¦B│"];
+  SCREENS.busy.body = conv(BUSY_NOTE).concat([CONV_BOT], MSG_BUSY, [STATUS, FOOTER]);
+
+  /* empty */
+  var EMPTY_BOX = [
+    "¦B┌─¦_ ¦ISessions¦d · this directory¦_ ¦B¤46─┐",
+    "¦B│¦_ ¦dscope ~/dev/amp · exact match on the session's directory{B}¦B│",
+    CONV_EMPTY,
+    "¦B│¦_ ¦iNo sessions here yet.{B}¦B│",
+    "¦B│¦_ ¦dSessions are saved as you chat in this directory; sessions from{B}¦B│",
+    "¦B│¦_ ¦dother directories don't appear here.{B}¦B│",
+    "¦B└─¦_ ¦aEsc close¦_ ¦B¤64─┘"];
+  SCREENS.empty.body = conv().concat([CONV_BOT], EMPTY_BOX, MSG_DIM, [STATUS, FOOTER]);
+
+  /* loading */
+  var LOAD_BOX = [
+    "¦B┌─¦_ ¦ISessions¦d · this directory¦_ ¦B¤46─┐",
+    "¦B│¦_ ¦dscope ~/dev/amp · exact match on the session's directory{B}¦B│",
+    CONV_EMPTY,
+    "¦B│¦_ ¦a⠋ ¦mscanning saved sessions…{B}¦B│",
+    "¦B└─¦_ ¦aEsc cancel¦_ ¦B¤62─┘"];
+  SCREENS.loading.body = conv().concat([CONV_BOT], LOAD_BOX, MSG_DIM, [STATUS, FOOTER]);
+
+  /* problems: two good rows + unreadable + older format + locked */
+  var PROB = [
+    sessRow([" ", "8f3d…a1c2", "2h ago", "", "", "…so the changelog groups the tickets by epic, newest first"], true),
+    sessRow([" ", "5e21…9b77", "yesterday", "", "", "…the publish ticket stays blocked until every phase is approved"], false),
+    ["¦B│¦_ ¦d  4d2e…b310 · 4d ago · ¦funreadable · permission denied{B}¦B│"],
+    ["¦B│¦_ ¦d  9c1a…55de · 1761234567-9c1a55de….jsonl{B}¦B│",
+     "¦B│¦_ ¦f  older format · v3 file; this harness reads v4{B}¦B│"],
+    ["¦B│¦_ ¦d  3ff9…08ac · 2w ago · ¦flocked · running elsewhere{B}¦B│"]];
+  var probRows = [SCOPE_LINE];
+  PROB.forEach(function (r) { probRows = probRows.concat(r); });
+  probRows.push("¦B│¦_ ¦d3 files can't be resumed; see the reason on each row{B}¦B│");
+  var PROB_TOP = "¦B┌─¦_ ¦ISessions¦d · this directory · 2 of 5 resumable¦_ ¦B¤29─┐";
+  SCREENS.problems.body = conv().concat([CONV_BOT], [PROB_TOP].concat(probRows, [SESS_BOX_BOT_BROWSE]), MSG_DIM, [STATUS, FOOTER]);
+})();
+
+/* ---------------- renderer ---------------- */
+/* First expand everything to plain text (roles stripped, runs expanded, fills resolved
+   against the VISIBLE width), then wrap role spans. Fills: {B} = pad so the line's visible
+   width is W-2 (the box interior, before the closing │); {80} = pad to W; {F} = 20 spaces
+   (fixed gap in the footer). */
+function plainText(line) {
+  /* build the fully-resolved visible text: runs expanded, role markers dropped, fills
+     resolved against the visible length so far (F = leave a 20-space gap). */
+  var expanded = line.replace(/¤(\d+)(.)/g, function (_, n, ch) { return ch.repeat(+n); });
+  var segs = expanded.split("¦"), out = "";
+  segs.forEach(function (p, i) {
+    var raw = i === 0 ? p : p.slice(1);
+    var pieces = raw.split(/(\{[A-Z0-9]+\})/);
+    pieces.forEach(function (pc) {
+      var fm = /^\{([A-Z0-9]+)\}$/.exec(pc);
+      if (fm) {
+        var target = fm[1] === "B" ? W - 2 : fm[1] === "F" ? out.length + 20 : W;
+        out += " ".repeat(Math.max(0, target - out.length));
+      } else out += pc;
+    });
+  });
+  return out;
+}
+function esc(t) { return t.replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
+function rowHtml(line) {
+  var expanded = line.replace(/¤(\d+)(.)/g, function (_, n, ch) { return ch.repeat(+n); });
+  var plain = plainText(line); /* fully resolved visible text */
+  var segs = expanded.split("¦");
+  var pos = 0, out = "";
+  segs.forEach(function (p, i) {
+    var c = i === 0 ? "_" : p.charAt(0);
+    var raw = i === 0 ? p : p.slice(1);
+    var pieces = raw.split(/(\{[A-Z0-9]+\})/), segOut = "";
+    pieces.forEach(function (pc) {
+      var fm = /^\{([A-Z0-9]+)\}$/.exec(pc);
+      if (fm) {
+        var target = fm[1] === "B" ? W - 2 : fm[1] === "F" ? pos + 20 : W;
+        var pad = Math.max(0, target - pos);
+        segOut += esc(plain.slice(pos, pos + pad)); pos += pad;
+      } else if (pc) {
+        segOut += esc(plain.slice(pos, pos + pc.length)); pos += pc.length;
+      }
+    });
+    if (segOut) out += C[c] ? '<span class="' + C[c] + '">' + segOut + "</span>" : segOut;
+  });
+  if (pos < plain.length) out += esc(plain.slice(pos));
+  return out;
+}
+
+var host = document.getElementById("screens");
+Object.keys(SCREENS).forEach(function (key) {
+  var s = SCREENS[key];
+  var fig = document.createElement("figure");
+  fig.className = "pane"; fig.dataset.showState = key;
+  fig.innerHTML = '<figcaption><span class="pane-name">' + s.name +
+    '</span><span class="prov prov-new">' + s.prov + '</span><span class="dims">80×24 terminal</span></figcaption>' +
+    '<div class="frame"><pre class="term sel" aria-label="' + s.name + '">' +
+    s.body.map(rowHtml).join("\n") + "</pre></div>";
+  host.appendChild(fig);
+});
+
+/* ASCII glyph fallback (as #26) */
+var ASCII = { "┌": "+", "┐": "+", "└": "+", "┘": "+", "─": "-", "│": "|", "■": "#", "□": "o",
+              "▸": ">", "›": ">", "●": "*", "⠋": "-", "▀": "=", "▶": ">", "✓": "+", "…": "~",
+              "•": "*", "·": ".", "↑": "^", "↓": "v", "×": "x" };
+var termSpans = [];
+document.querySelectorAll(".term").forEach(function (pre) {
+  var walker = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT);
+  var n; while ((n = walker.nextNode())) termSpans.push([n, n.nodeValue]);
+});
+function sync() {
+  var b = document.body;
+  document.querySelectorAll("[data-setstate]").forEach(function (x) { x.setAttribute("aria-pressed", x.dataset.setstate === b.dataset.state); });
+  document.querySelectorAll("[data-settheme]").forEach(function (x) { x.setAttribute("aria-pressed", x.dataset.settheme === b.dataset.theme); });
+  document.querySelectorAll("[data-setglyphs]").forEach(function (x) { x.setAttribute("aria-pressed", x.dataset.setglyphs === b.dataset.glyphs); });
+  var ascii = b.dataset.glyphs === "ascii";
+  termSpans.forEach(function (p) {
+    p[0].nodeValue = ascii ? p[1].replace(/[┌┐└┘─│■□▸›●⠋▀▶✓…•·↑↓×]/g, function (c) { return ASCII[c]; }) : p[1];
+  });
+}
+document.addEventListener("click", function (e) {
+  var t = e.target.closest("button"); if (!t) return;
+  if (t.dataset.setstate) document.body.dataset.state = t.dataset.setstate;
+  if (t.dataset.settheme) document.body.dataset.theme = t.dataset.settheme;
+  if (t.dataset.setglyphs) document.body.dataset.glyphs = t.dataset.setglyphs;
+  sync();
+});
+var h = new URLSearchParams(location.hash.slice(1));
+["state", "theme", "glyphs"].forEach(function (k) { if (h.get(k)) document.body.dataset[k] = h.get(k); });
+sync();
+</script>
+</body>
+</html>
