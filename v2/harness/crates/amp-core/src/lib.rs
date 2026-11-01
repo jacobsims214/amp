@@ -79,6 +79,13 @@
 //!   refused rather than allowed to append concurrently, the OS lock alone decides ownership
 //!   (never a timestamp or a pid), a crashed run's leftover sidecar is simply claimable, and any
 //!   failure to take the lock fails closed.
+//! - [`session_store`] (#3006): the one way a session file is opened for writing. A
+//!   [`session_store::LockedStorage`] carries its [`session_lock::SessionLock`] inside the
+//!   `SessionStorage`, so the file is owned for the whole storage-writing lifetime — not just a
+//!   `Runtime`'s — and every append goes through it. `create` claims before the first byte;
+//!   `load` validates without repairing, refuses a live writer before reading, and only then runs
+//!   `JsonlSessionStorage::load` under the guard. [`agent::resume_session`] switches a live harness
+//!   onto a loaded session, leaving it untouched if anything fails.
 //!
 //! #2364:
 //! - [`workspace`]: `[workers] isolation` (auto | worktree | folder | shared) and what git offers
@@ -132,6 +139,7 @@ pub mod roles;
 pub mod run_report;
 pub mod session_index;
 pub mod session_lock;
+pub mod session_store;
 pub mod supervisor;
 pub mod templates;
 pub mod text_tool_calls;
