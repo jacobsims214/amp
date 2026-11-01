@@ -1,0 +1,529 @@
+<!doctype html>
+<!--
+  AMP #3001 — Mockup: one actionable merge journey per PR.
+  Spec: discoveries/merge-actions-user-journey.md (#2978, reviewed #2979).
+
+  FOR THE BUILDER:
+  - Tokens are copied 1:1 from v2/ui/src/index.css (theme "Stripe"). The merge kind
+    colour is --teal (--k-merge in projectMyWork.css).
+  - Card anatomy matches .pmw-item (3px left kind bar, surface, line border, radius 2px)
+    from v2/ui/src/pages/projectMyWork.css; buttons match .amp-btn / .amp-btn-primary /
+    .amp-btn-ghost; labels match .amp-label; numbers .amp-num / --font-data.
+  - New data the cards assume (backend work in later tickets, per #2979's sequence):
+    * MergeRef gains base_branch / PR target (repository/waiting.go LatestMergeRefs).
+    * holding_up filters waits_for_merge:false dependents (repository/waiting.go OpenDependents).
+    * WaitItem gains tracked_by (the human merge ticket id, from a `merge_for` metadata key)
+      and that ticket's unmet prerequisites (its open dependencies).
+    * Two-way bridge: Mark merged on a tracked card completes the human ticket with the PR
+      link; CompleteHumanTask with the PR link records the merge (bridgeHumanMerge exists).
+    * GitHub-webhook / CI merge records reconcile the same tracked step (card clears itself).
+    * No-change runs emit no git fields (per #2982) so UnmergedWork never lists them.
+  - Behaviour not visible in the static states:
+    * "Mark merged" on a tracked-ready card completes BOTH the merge record and the tracked
+      human ticket in one call (idempotent; first report wins).
+    * "Not needed" stays a quiet ghost on every needed card (unchanged behaviour).
+    * Explanations (states 4/6/7) render as sentences, never as disabled buttons.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My work — one merge journey per PR (mockup, AMP #3001)</title>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:ital,wght@0,400;0,500;0,600;1,400&family=Barlow+Condensed:wght@500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* ── Tokens: copied from v2/ui/src/index.css (theme "Stripe") ─────────────── */
+:root {
+  --bg:          #F2F2F0;
+  --surface:     #FFFFFF;
+  --surface-2:   #FAFAF9;
+  --surface-3:   #EFEFEC;
+  --line-sub:    #E9E9E6;
+  --line:        #DCDDDA;
+  --line-str:    #C3C5C1;
+  --ink:         #16181B;
+  --ink-2:       #50555C;
+  --ink-3:       #8E939A;
+  --on-ink:      #FFFFFF;
+  --primary:     #16181B;
+  --accent:      #D9482B;
+  --link:        #2C66B8;
+  --st-wait:     #8E939A;
+  --danger-ink:  #B23A20;
+  --success:     #2F7D4E;
+  --success-ink: #2A6E45;
+  --violet:      #7A5BB5;
+  --teal:        #1F8A7E;
+  --warning:     #D08A1C;
+  --warning-ink: #9A5E0A;
+  --font-body:   "Barlow", ui-sans-serif, system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --font-label:  "Barlow Condensed", "Arial Narrow", "Barlow", sans-serif;
+  --font-data:   "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --radius:      2px;
+  --k-merge:     var(--teal);
+}
+*, *::before, *::after { box-sizing: border-box; }
+html, body { background: var(--bg); margin: 0; }
+body {
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Product primitives (index.css shared pieces) ─────────────────────────── */
+.amp-label {
+  font-family: var(--font-label);
+  font-weight: 600;
+  font-size: 10.5px;
+  line-height: 1;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.amp-num { font-family: var(--font-data); font-variant-numeric: tabular-nums; }
+.amp-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--font-body); font-size: 12.5px; font-weight: 500;
+  color: var(--ink); background: var(--surface);
+  border: 1px solid var(--line-str); border-radius: var(--radius);
+  padding: 5px 10px; cursor: pointer; text-decoration: none; line-height: 1.4;
+}
+.amp-btn:hover { border-color: var(--ink); }
+.amp-btn-primary { background: var(--primary); color: var(--on-ink); border-color: var(--primary); }
+.amp-btn-primary:hover { background: #000; border-color: #000; }
+.amp-btn-ghost { background: transparent; border-color: transparent; color: var(--ink-2); }
+.amp-btn-ghost:hover { color: var(--ink); border-color: var(--line); }
+.amp-btn-sm { font-size: 12.5px; padding: 4px 9px; }
+.amp-btn:disabled { opacity: .55; cursor: default; }
+.amp-btn-quiet {
+  background: transparent; border-color: var(--line); color: var(--ink-3);
+}
+.amp-btn-quiet:hover { color: var(--ink-2); border-color: var(--line-str); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ── My work card anatomy (projectMyWork.css .pmw-item) ───────────────────── */
+.pmw-kind { display: inline-flex; align-items: center; gap: 6px; color: var(--ink); }
+.pmw-kind i { width: 8px; height: 8px; border-radius: 1px; display: inline-block; flex-shrink: 0; }
+.pmw-kind.k-merge i { background: var(--k-merge); }
+
+.pmw-item {
+  position: relative; background: var(--surface);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 14px 16px 14px 19px;
+}
+.pmw-item::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; }
+.pmw-item.k-merge::before { background: var(--k-merge); }
+.pmw-item .it-title { font-size: 15px; font-weight: 600; line-height: 1.3; color: var(--ink); }
+.pmw-item .it-id { font-family: var(--font-data); font-size: 12px; color: var(--ink-3); white-space: nowrap; }
+.pmw-item.inert { background: var(--surface-2); }
+.pmw-item.inert::before { background: var(--line-str); }
+
+.merge-head { display: grid; gap: 3px; margin-bottom: 10px; }
+.merge-route {
+  display: inline-flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  font-family: var(--font-data); font-size: 12.5px; color: var(--ink-2);
+}
+.merge-route .pr { color: var(--ink); font-weight: 500; }
+.merge-route .arrow { color: var(--ink-3); font-family: var(--font-body); }
+.merge-route .target { color: var(--ink); }
+
+/* prerequisite chips (sequenced gate) */
+.prereqs { display: grid; gap: 6px; margin: 10px 0 12px; }
+.prereq {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 13px; color: var(--ink-2); line-height: 1.4;
+}
+.prereq .box {
+  width: 10px; height: 10px; border: 1.5px solid var(--st-wait); border-radius: 1px;
+  flex-shrink: 0; position: relative; top: 1px;
+}
+.prereq.done { color: var(--ink-3); }
+.prereq.done .box { border-color: var(--success); background: var(--success); }
+.prereq.done .box::after {
+  content: ""; position: absolute; left: 2px; top: 0px; width: 3px; height: 6px;
+  border: solid #fff; border-width: 0 1.5px 1.5px 0; transform: rotate(42deg);
+}
+.prereq .rid { font-family: var(--font-data); font-size: 12px; color: var(--ink-3); }
+.prereq.done .rid { text-decoration: line-through; }
+
+.note { font-size: 12.5px; color: var(--ink-2); line-height: 1.5; margin: 0; }
+.note b { color: var(--ink); font-weight: 600; }
+.note .quiet { color: var(--ink-3); }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
+.actions .right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+.guard.full { max-width: none; flex-basis: 100%; }
+.guard { font-size: 11.5px; color: var(--ink-3); line-height: 1.4; margin-top: 8px; max-width: 52ch; }
+.tracked-by {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--ink-2);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--surface); padding: 3px 8px;
+}
+.tracked-by .rid { font-family: var(--font-data); font-size: 11.5px; color: var(--link); }
+
+/* Done today rows (side panel readout) */
+.done-row {
+  display: grid; grid-template-columns: auto minmax(0,1fr); gap: 2px 10px;
+  padding: 10px 16px; border-top: 1px solid var(--line-sub); align-items: baseline;
+}
+.done-row:first-child { border-top: 0; }
+.done-row .t { font-size: 13.5px; color: var(--ink); }
+.done-row .s { grid-column: 2; font-size: 12px; color: var(--ink-2); }
+.pmw-dot { display: inline-block; width: 8px; height: 8px; border-radius: 1px; background: var(--k-merge); position: relative; top: 0; }
+
+/* ── Mockup scaffolding (reviewer-only) ───────────────────────────────────── */
+.states {
+  position: sticky; top: 0; z-index: 20;
+  background: var(--ink); color: #fff;
+  display: flex; flex-wrap: wrap; gap: 2px; align-items: center;
+  padding: 6px 10px; font-family: var(--font-body);
+}
+.states .lbl {
+  font-family: var(--font-label); font-weight: 600; font-size: 10px;
+  letter-spacing: .18em; text-transform: uppercase; color: #9a9fa6; margin-right: 6px;
+}
+.states button {
+  background: transparent; color: #c9ccd1; border: 1px solid transparent;
+  font: 500 12px/1 var(--font-body); padding: 6px 9px; cursor: pointer; border-radius: 2px;
+}
+.states button:hover { color: #fff; }
+.states button[aria-pressed="true"] { background: #fff; color: var(--ink); }
+.states .sep { width: 1px; height: 16px; background: #3a3d42; margin: 0 6px; }
+
+.wrap { max-width: 880px; margin: 0 auto; padding: 28px 20px 80px; }
+.scenario { margin-bottom: 8px; }
+.scenario h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.01em; }
+.scenario .sub { color: var(--ink-2); font-size: 13.5px; margin: 0 0 22px; max-width: 64ch; line-height: 1.55; }
+.section-label { margin: 26px 0 8px; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+.panel .ph { padding: 10px 16px; border-bottom: 1px solid var(--line-sub); display: flex; justify-content: space-between; align-items: baseline; }
+.panel .ph .amp-label { color: var(--ink-2); }
+
+[data-state] [data-show] { display: none; }
+[data-state="actionable"] [data-show~="actionable"],
+[data-state="seq-waiting"] [data-show~="seq-waiting"],
+[data-state="seq-ready"] [data-show~="seq-ready"],
+[data-state="nothing-waits"] [data-show~="nothing-waits"],
+[data-state="external"] [data-show~="external"],
+[data-state="integration"] [data-show~="integration"],
+[data-state="no-change"] [data-show~="no-change"] { display: block; }
+
+.compare { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+.compare .col-h { margin-bottom: 6px; }
+.old-card { opacity: .92; border-top: 1px dashed var(--line-str); padding-top: 12px; margin-top: 12px; }
+.old-card.first { border-top: 0; padding-top: 0; margin-top: 0; }
+.old-card .strike { position: relative; }
+.old-badge {
+  display: inline-block; font-family: var(--font-label); font-weight: 600; font-size: 10px;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--danger-ink);
+  border: 1px solid currentColor; border-radius: 1px; padding: 2px 5px; margin-left: 8px;
+}
+.new-badge {
+  display: inline-block; font-family: var(--font-label); font-weight: 600; font-size: 10px;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--success-ink);
+  border: 1px solid currentColor; border-radius: 1px; padding: 2px 5px; margin-left: 8px;
+}
+@media (max-width: 760px) {
+  .compare { grid-template-columns: 1fr; }
+  .wrap { padding: 20px 12px 64px; }
+  .actions .right { margin-left: 0; }
+}
+</style>
+</head>
+<body data-state="actionable">
+
+<!-- Reviewer state switcher -->
+<div class="states" role="toolbar" aria-label="Mockup state">
+  <span class="lbl">Journey states</span>
+  <button data-setstate="actionable" aria-pressed="true">1 · Actionable merge</button>
+  <button data-setstate="seq-waiting" aria-pressed="false">2 · Sequenced, waiting</button>
+  <button data-setstate="seq-ready" aria-pressed="false">3 · Sequenced, ready</button>
+  <button data-setstate="nothing-waits" aria-pressed="false">4 · Nothing waits</button>
+  <button data-setstate="external" aria-pressed="false">5 · Merged externally</button>
+  <button data-setstate="integration" aria-pressed="false">6 · Integration-landed</button>
+  <button data-setstate="no-change" aria-pressed="false">7 · No-change run</button>
+</div>
+
+<div class="wrap">
+
+  <!-- ════════════════════════ STATE 1 · ACTIONABLE MERGE ════════════════════ -->
+  <div data-show="actionable">
+    <div class="scenario">
+      <h1>One card per PR — and this one genuinely needs you</h1>
+      <p class="sub">#2897 finished with a PR to <b>main</b> and two tickets really wait on the merge
+        (neither opted out with <span class="amp-num">waits_for_merge: false</span>).
+        The card names the PR <em>and its target</em>, counts only the true waiters, and keeps one primary action.</p>
+    </div>
+
+    <div class="section-label amp-label">My work · Merge</div>
+    <div class="pmw-item k-merge" role="group" aria-label="Merge PR #94">
+      <div class="merge-head">
+        <span class="pmw-kind k-merge amp-label"><i aria-hidden="true"></i>Merge</span>
+        <span class="it-title">Open PR: usage caps on the public pricing page</span>
+        <span class="merge-route">
+          <span class="pr">PR #94</span>
+          <span>feat/usage-caps</span>
+          <span class="arrow">→</span>
+          <span class="target">main</span>
+          <span class="it-id">· from #2897</span>
+        </span>
+      </div>
+      <p class="note">Done · <b>2 tickets wait on this merge</b>: #2901 Pricing page smoke test and #2904 Announce in changelog.</p>
+      <div class="actions">
+        <a class="amp-btn amp-btn-sm" href="#" onclick="return false">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+          Review PR #94</a>
+        <button type="button" class="amp-btn amp-btn-ghost amp-btn-sm" title="The work won't be merged: release what waits on it">Not needed</button>
+        <span class="right">
+          <button type="button" class="amp-btn amp-btn-primary amp-btn-sm">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></svg>
+            Mark merged</button>
+        </span>
+      </div>
+      <p class="guard full">Use <b>Mark merged</b> only after you merged it on GitHub — when GitHub or CI records the merge first, this card clears itself and no click is owed.</p>
+    </div>
+  </div>
+
+  <!-- ════════════════════ STATE 2 · SEQUENCED GATE, WAITING ═════════════════ -->
+  <div data-show="seq-waiting">
+    <div class="scenario">
+      <h1>A planned merge gate is the card's face — not a second card</h1>
+      <p class="sub">The plan says PR #88 merges only after the review (#2303) and the release (#2131), tracked by the human
+        ticket #2304 (linked at plan time with <span class="amp-num">merge_for: 2302</span>). Today that would be two cards —
+        a Merge item and a Do item. Here it is one card, inert until its prerequisites are met. No Mark merged yet.</p>
+    </div>
+
+    <div class="compare">
+      <div>
+        <div class="col-h amp-label">Today — two cards, one merge <span class="old-badge">duplicate</span></div>
+        <div class="pmw-item k-merge old-card first">
+          <div class="merge-head">
+            <span class="pmw-kind k-merge amp-label"><i aria-hidden="true"></i>Merge</span>
+            <span class="it-title">Open PR: harness on the public home page</span>
+            <span class="merge-route"><span class="pr">PR #88</span><span>feat/harness-home-page</span><span class="it-id">· from #2302</span></span>
+          </div>
+          <p class="note">Done · Merge needed. <span class="quiet">Says "1 ticket waits" — but #2303 doesn't wait at all.</span></p>
+          <div class="actions">
+            <span class="amp-btn amp-btn-sm">Review PR #88</span>
+            <span class="right"><span class="amp-btn amp-btn-primary amp-btn-sm">Mark merged</span></span>
+          </div>
+          <p class="guard">Invites Mark merged <b>before</b> the review and release the plan demands.</p>
+        </div>
+        <div class="pmw-item old-card" style="margin-top:10px">
+          <div class="merge-head">
+            <span class="pmw-kind amp-label" style="--k-do:var(--ink)"><i aria-hidden="true" style="background:var(--ink)"></i>Do</span>
+            <span class="it-title">Merge PR: harness public page (harness-v0.2.0 is published)</span>
+            <span class="it-id">#2304 · your ticket</span>
+          </div>
+          <p class="note">Waiting on #2303 and #2131. Never mentions the Merge card above; needs the exact PR URL pasted in a Link field to record anything.</p>
+        </div>
+      </div>
+
+      <div>
+        <div class="col-h amp-label">Proposed — one card, inert until due <span class="new-badge">one journey</span></div>
+        <div class="pmw-item k-merge inert" role="group" aria-label="Merge PR #88, waiting on prerequisites">
+          <div class="merge-head">
+            <span class="pmw-kind k-merge amp-label"><i aria-hidden="true"></i>Merge · waiting</span>
+            <span class="it-title">Merge PR #88 · harness on the public home page</span>
+            <span class="merge-route">
+              <span class="pr">PR #88</span>
+              <span>feat/harness-home-page</span>
+              <span class="arrow">→</span>
+              <span class="target">main</span>
+              <span class="it-id">· from #2302</span>
+            </span>
+          </div>
+          <div class="prereqs" role="list" aria-label="Merge prerequisites">
+            <div class="prereq done" role="listitem"><span class="box" aria-hidden="true"></span><span><span class="rid">#2303</span> Code review: harness public page PR — done</span></div>
+            <div class="prereq" role="listitem"><span class="box" aria-hidden="true"></span><span><span class="rid">#2131</span> Tag and publish harness-v0.1.0 — <b>waiting on you</b></span></div>
+          </div>
+          <p class="note">Merge after the release exists. The plan's acceptance criterion stays on the card, not in a second ticket's text.</p>
+          <div class="actions">
+            <a class="amp-btn amp-btn-sm" href="#" onclick="return false">Review PR #88</a>
+            <span class="tracked-by">tracked by <span class="rid">#2304</span></span>
+          </div>
+          <p class="guard full">No Mark merged while prerequisites are open — an early click can't record a merge the plan says must wait.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═════════════════════ STATE 3 · SEQUENCED GATE, READY ══════════════════ -->
+  <div data-show="seq-ready">
+    <div class="scenario">
+      <h1>When the gate opens, one click does both jobs</h1>
+      <p class="sub">#2131 is done; every prerequisite is met. The same card now offers <b>Mark merged</b> once:
+        it records the merge for #2302's dependents <em>and</em> completes the tracked ticket #2304 with the PR link —
+        the two-way bridge. Acknowledging one system never leaves the other dangling.</p>
+    </div>
+
+    <div class="section-label amp-label">My work · Merge</div>
+    <div class="pmw-item k-merge" role="group" aria-label="Merge PR #88, ready">
+      <div class="merge-head">
+        <span class="pmw-kind k-merge amp-label"><i aria-hidden="true"></i>Merge · ready</span>
+        <span class="it-title">Merge PR #88 · harness on the public home page</span>
+        <span class="merge-route">
+          <span class="pr">PR #88</span>
+          <span>feat/harness-home-page</span>
+          <span class="arrow">→</span>
+          <span class="target">main</span>
+          <span class="it-id">· from #2302</span>
+        </span>
+      </div>
+      <div class="prereqs" role="list" aria-label="Merge prerequisites">
+        <div class="prereq done" role="listitem"><span class="box" aria-hidden="true"></span><span><span class="rid">#2303</span> Code review: harness public page PR — done</span></div>
+        <div class="prereq done" role="listitem"><span class="box" aria-hidden="true"></span><span><span class="rid">#2131</span> Tag and publish harness-v0.1.0 — done</span></div>
+      </div>
+      <p class="note">All conditions met. <b>Mark merged</b> records the merge and completes <span class="amp-num">#2304</span> in one step.</p>
+      <div class="actions">
+        <a class="amp-btn amp-btn-sm" href="#" onclick="return false">Review PR #88</a>
+        <span class="tracked-by">tracked by <span class="rid">#2304</span></span>
+        <span class="right">
+          <button type="button" class="amp-btn amp-btn-primary amp-btn-sm">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></svg>
+            Mark merged</button>
+        </span>
+      </div>
+      <p class="guard full">Use it only after you merged PR #88 on GitHub. If the GitHub webhook or CI records the merge first, this card clears itself and #2304 is completed by the same record — nothing left to acknowledge.</p>
+    </div>
+  </div>
+
+  <!-- ══════════════════════ STATE 4 · NOTHING WAITS ═════════════════════════ -->
+  <div data-show="nothing-waits">
+    <div class="scenario">
+      <h1>Nothing waits on it? Then nothing is asked of you</h1>
+      <p class="sub">#2302's only dependent (#2303, the review) has <span class="amp-num">waits_for_merge: false</span> — it started
+        when the PR opened. The card is honest about that and demotes Mark merged to a quiet secondary:
+        GitHub or CI will record this merge; a click here is optional bookkeeping, never a gate.</p>
+    </div>
+
+    <div class="section-label amp-label">My work · Merge</div>
+    <div class="pmw-item k-merge" role="group" aria-label="Merge PR #88, nothing waits">
+      <div class="merge-head">
+        <span class="pmw-kind k-merge amp-label"><i aria-hidden="true"></i>Merge</span>
+        <span class="it-title">Open PR: harness on the public home page</span>
+        <span class="merge-route">
+          <span class="pr">PR #88</span>
+          <span>feat/harness-home-page</span>
+          <span class="arrow">→</span>
+          <span class="target">main</span>
+          <span class="it-id">· from #2302</span>
+        </span>
+      </div>
+      <p class="note"><b>Nothing waits on this merge</b> — #2303 reviews the open PR and does not wait for it. GitHub or CI will record the merge when it happens.</p>
+      <div class="actions">
+        <a class="amp-btn amp-btn-sm" href="#" onclick="return false">Review PR #88</a>
+        <span class="right">
+          <button type="button" class="amp-btn amp-btn-quiet amp-btn-sm" title="Optional: record a merge you already made on GitHub">Mark merged…</button>
+        </span>
+      </div>
+      <p class="guard full">Mark merged is demoted because it releases nothing. A merge recorded on GitHub clears this card by itself — no acknowledgement owed.</p>
+    </div>
+  </div>
+
+  <!-- ════════════════════ STATE 5 · MERGED EXTERNALLY ═══════════════════════ -->
+  <div data-show="external">
+    <div class="scenario">
+      <h1>Merged on GitHub? The card clears itself — and reconciles the same step</h1>
+      <p class="sub">The webhook (or CI's <span class="amp-num">amp_report_merged</span>) recorded the merge of PR #88.
+        The Merge item leaves the list with no click, lands in Done today with its source, and — because the card was
+        tracked by #2304 — the same record completes the tracked human ticket. One Git event, one outcome, no fake Mark done.</p>
+    </div>
+
+    <div class="section-label amp-label">My work · Merge</div>
+    <div class="panel">
+      <div class="pmw-clear" style="padding:24px 20px">
+        <h2 style="font-size:17px">No merges waiting on you.</h2>
+        <p style="margin:0">PR #88 was recorded by GitHub 12 min ago. What waited on it can start.</p>
+      </div>
+    </div>
+
+    <div class="section-label amp-label">Done today</div>
+    <div class="panel">
+      <div class="done-row">
+        <span class="pmw-dot" aria-hidden="true"></span>
+        <span class="t">Merged #2302: Open PR: harness on the public home page</span>
+        <span class="s">PR #88 · feat/harness-home-page → main · Recorded by GitHub · 12:04</span>
+      </div>
+      <div class="done-row">
+        <span class="pmw-dot" aria-hidden="true" style="background:var(--ink)"></span>
+        <span class="t">Done #2304: Merge PR: harness public page</span>
+        <span class="s">Completed by the same GitHub merge record — no separate Mark done owed · 12:04</span>
+      </div>
+    </div>
+    <p class="guard" style="margin-top:10px">An external merge reconciles the tracked step instead of leaving a pure-acknowledgement click behind (today: the webhook clears the Merge item but #2304 still demands a Mark done).</p>
+  </div>
+
+  <!-- ═══════════════════ STATE 6 · INTEGRATION-LANDED ═══════════════════════ -->
+  <div data-show="integration">
+    <div class="scenario">
+      <h1>Landed on the integration branch? An explanation, never a button</h1>
+      <p class="sub">#2968's work merged into <span class="amp-num">feat/harness-home-page</span>, the story's integration branch.
+        By design nothing is asked here — the final PR to main is its own card (#2302). The sentence says why, and points
+        to where the real action lives. Mark merged is never offered for integration work.</p>
+    </div>
+
+    <div class="section-label amp-label">My work · Merge</div>
+    <div class="pmw-item k-merge inert" role="group" aria-label="Integration branch explanation">
+      <div class="merge-head">
+        <span class="pmw-kind k-merge amp-label"><i aria-hidden="true"></i>Merge · nothing to do</span>
+        <span class="it-title">Public page: harness hero section</span>
+        <span class="merge-route">
+          <span>amp-2968</span>
+          <span class="arrow">→</span>
+          <span class="target">feat/harness-home-page</span>
+          <span class="it-id">· integration branch · from #2968</span>
+        </span>
+      </div>
+      <p class="note">Merged into <b>feat/harness-home-page</b> — nothing to do here. The final PR to main is tracked by
+        <span class="amp-num">#2302</span> (PR #88), whose card appears above when it's your turn.</p>
+      <div class="actions">
+        <a class="amp-btn amp-btn-sm" href="#" onclick="return false">See PR #88 card</a>
+      </div>
+      <p class="guard full">Integration work never requires Mark merged: its merge to main is recorded by the integration PR's own card.</p>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════ STATE 7 · NO-CHANGE RUN ════════════════════════ -->
+  <div data-show="no-change">
+    <div class="scenario">
+      <h1>A run that changed nothing opens no merge — and never appears here</h1>
+      <p class="sub">#2966's worktree was unchanged (HEAD equals the fork point, per the #2982 detection). The harness emits
+        no git fields for it, so <span class="amp-num">UnmergedWork</span> never lists it and My work shows no card at all.
+        This state exists only to show the exclusion: the absence is the design, and the ticket says why in its drawer.</p>
+    </div>
+
+    <div class="section-label amp-label">My work · Merge — empty</div>
+    <div class="panel">
+      <div class="pmw-clear" style="padding:24px 20px">
+        <h2 style="font-size:17px">No merges waiting on you.</h2>
+        <p style="margin:0">Two runs finished today with nothing to merge: #2966 (no changes in its worktree) and #2971 (docs-only, pushed to the integration branch). Neither opens a merge, so neither asks you for one.</p>
+      </div>
+    </div>
+
+    <div class="section-label amp-label">On the ticket — why no card exists</div>
+    <div class="panel">
+      <div class="done-row">
+        <span class="pmw-dot" aria-hidden="true" style="background:var(--st-wait)"></span>
+        <span class="t">#2966 · Research: harness onboarding paths — completed</span>
+        <span class="s">No changes in its worktree; no merge to record. Nothing was ever asked of you for this run.</span>
+      </div>
+    </div>
+    <p class="guard" style="margin-top:10px">The old failure mode: provenance guesses marked the run "pushed" and a Merge item appeared for a commit already on main — a gate gating nothing, needing a fake Mark merged. With no git fields emitted, the card simply never exists.</p>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  var btns = document.querySelectorAll('[data-setstate]');
+  function set(state) {
+    document.body.dataset.state = state;
+    btns.forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.setstate === state)); });
+  }
+  btns.forEach(function (b) { b.addEventListener('click', function () { set(b.dataset.setstate); }); });
+})();
+</script>
+</body>
+</html>
