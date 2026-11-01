@@ -100,6 +100,24 @@ code { font: 500 13px var(--font-data); background: var(--surface); border: 1px 
 .shots .shot figcaption { margin-top: auto; }
 .shot figcaption { padding: 10px 14px; font-size: 14px; color: var(--star-2); border-top: 1px solid var(--void-line); }
 
+/* A capture is a link to its own full-size file (#2969): at 1440 the three-up renders at
+   ~355px wide, where the terminal text is ~5px and only reads as texture. The whole image is
+   the target, so click and tap both work. The chip fades in on hover and on keyboard focus
+   instead of sitting on the capture, whose every pixel is terminal text; cursor: zoom-in is
+   the standing cue. CSS only: the site CSP allows no inline style or script. */
+.shot-link { display: block; position: relative; text-decoration: none; cursor: zoom-in; }
+.shot-link::after {
+  content: "Open full size";
+  position: absolute; right: 8px; bottom: 8px;
+  padding: 5px 8px 5px 7px;
+  font: 600 10px/1 var(--font-label); letter-spacing: .14em; text-transform: uppercase;
+  color: var(--void); background: var(--band-3); border: 1px solid var(--band-3);
+  pointer-events: none;
+  opacity: 0; transition: opacity .12s linear;
+}
+.shot-link:hover::after, .shot-link:focus-visible::after { opacity: 1; }
+.shot-link:focus-visible { outline: 2px solid var(--band-3); outline-offset: 3px; }
+
 /* ---- What it is ---- */
 .list { display: grid; gap: 0; border-top: 1px solid var(--line); }
 .list div { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 16px; padding: 14px 0; border-bottom: 1px solid var(--line); }
