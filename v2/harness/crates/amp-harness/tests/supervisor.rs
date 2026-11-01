@@ -196,6 +196,16 @@ impl Recorder {
             .map(|(_, r)| r.clone())
             .collect()
     }
+
+    /// The `WorkerInfo` hooks saw, in the order the runs finished (AMP #3003).
+    fn workers(&self) -> Vec<WorkerInfo> {
+        self.finished
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(w, _)| w.clone())
+            .collect()
+    }
 }
 
 fn config() -> SupervisorConfig {
@@ -332,6 +342,14 @@ async fn manager_dispatches_a_worker_on_its_own_model_in_its_own_worktree() {
     assert_eq!(r.worktree.as_deref(), Some(worktree.as_path()));
     assert_eq!(r.cwd, worktree);
     assert_eq!(r.branch.as_deref(), Some("amp-2085"));
+    // AMP #3003: the handover captured the commit the run started from — the repo's `HEAD` when
+    // the worktree was made on a new `amp-2085` branch.
+    let start = hooks.workers()[0]
+        .worktree_start
+        .clone()
+        .expect("a captured start commit");
+    assert_eq!(start, git(&f.repo, &["rev-parse", "HEAD"]));
+    assert_eq!(start, git(&worktree, &["merge-base", "HEAD", "amp-2085"]));
     assert_eq!(r.final_message, "Finished #2085.");
     assert_eq!(r.turns, 3);
     assert_eq!(r.tool_calls, 2);
@@ -349,6 +367,10 @@ async fn manager_dispatches_a_worker_on_its_own_model_in_its_own_worktree() {
         "{transcript}"
     );
     assert!(transcript.contains("wf-1"), "the worker's own model");
+    assert!(
+        !transcript.contains(&start),
+        "the start commit stays the harness's bookkeeping: never in the worker's context"
+    );
 
     // The manager ran on its model and got the worker's report as the tool result.
     assert!(text.contains("\"outcome\": \"completed\""), "{text}");
@@ -375,6 +397,9 @@ async fn manager_dispatches_a_worker_on_its_own_model_in_its_own_worktree() {
         again.notes.iter().any(|n| n.contains("reused")),
         "{again:?}"
     );
+    // The reuse captured `HEAD` at reuse, which is the same commit the first run started from
+    // (that run committed nothing). A second run's comparison is therefore still its own start.
+    assert_eq!(hooks.workers()[1].worktree_start.as_deref(), Some(&*start));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

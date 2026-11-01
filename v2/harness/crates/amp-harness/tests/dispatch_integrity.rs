@@ -989,6 +989,7 @@ fn the_notice_names_the_ticket_the_worker_the_outcome_and_the_next_step() {
         cwd: PathBuf::from("."),
         worktree: None,
         branch: None,
+        worktree_start: None,
         workspace: Placement::Shared,
         git: false,
         edits: false,
