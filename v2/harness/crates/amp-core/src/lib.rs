@@ -74,6 +74,11 @@
 //!   (`/sessions`). It scans the existing per-role JSONL directories, matches the header's
 //!   canonical `cwd` exactly, skips worker (ticket id) directories, and reads only a bounded head
 //!   and tail of each file — never repairing, rewriting or locking one.
+//! - [`session_lock`] (#3004): who owns a session file (local session storage §10). One live
+//!   writer per session, through a per-file sidecar and a non-blocking OS lock: a second writer is
+//!   refused rather than allowed to append concurrently, the OS lock alone decides ownership
+//!   (never a timestamp or a pid), a crashed run's leftover sidecar is simply claimable, and any
+//!   failure to take the lock fails closed.
 //!
 //! #2364:
 //! - [`workspace`]: `[workers] isolation` (auto | worktree | folder | shared) and what git offers
@@ -126,6 +131,7 @@ pub mod request_time;
 pub mod roles;
 pub mod run_report;
 pub mod session_index;
+pub mod session_lock;
 pub mod supervisor;
 pub mod templates;
 pub mod text_tool_calls;
