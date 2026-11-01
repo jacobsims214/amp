@@ -18,8 +18,8 @@ use std::{path::PathBuf, time::Duration};
 use oauth2::TokenResponse as _;
 
 use rmcp::transport::auth::{
-    AuthClient, AuthError, AuthorizationManager, AuthorizationMetadataSource, AuthorizationRequest,
-    AuthorizationSession, OAuthTokenResponse,
+    AuthClient, AuthError, AuthorizationManager, AuthorizationMetadata,
+    AuthorizationMetadataSource, AuthorizationRequest, AuthorizationSession, OAuthTokenResponse,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -28,7 +28,7 @@ use tokio::{
 
 use crate::{
     AmpMcpClient, Auth, ClientOptions, CredentialBackend, McpError,
-    credentials::credential_key,
+    external::Secret,
     http::{DEFAULT_OAUTH_REQUEST_TIMEOUT, build_http_client, build_oauth_http_client},
 };
 
@@ -51,6 +51,46 @@ pub struct LoginOptions {
     /// Upper bound on each HTTP request of the flow (the 401 probe, discovery, client
     /// registration, token exchange).
     pub request_timeout: Duration,
+    /// A pre-registered client, scopes, a fixed callback port or a metadata URL (`[mcp.<name>]
+    /// oauth = {..}`). The default (AMP's case) registers dynamically and lets rmcp pick scopes.
+    pub client: OAuthClientSettings,
+    /// The login's scope ([`crate::scoped_credential_key`]): `None` for AMP and the person's own
+    /// servers; a repo server's own scope otherwise (#2308).
+    pub credential_scope: Option<String>,
+    /// The `[mcp.<name>]` server this login is for; `None` is AMP's own login. Names the server
+    /// on the browser page and in keychain repair hints (#2352).
+    pub mcp_server: Option<String>,
+}
+
+/// OAuth settings beyond discovery + dynamic registration, for third-party servers (D2).
+#[derive(Clone, Default)]
+pub struct OAuthClientSettings {
+    /// A client registered out of band: no dynamic registration.
+    pub client_id: Option<String>,
+    /// That client's secret (a confidential client), from the keychain. Needs `client_id`.
+    pub client_secret: Option<Secret>,
+    /// Scopes to request; empty lets rmcp choose from the server's metadata and challenge.
+    pub scopes: Vec<String>,
+    /// The loopback redirect port; 0 picks a free one. A pre-registered client usually needs a
+    /// fixed one, since its redirect URI is registered.
+    pub callback_port: u16,
+    /// Authorization server metadata (RFC 8414) to use instead of discovery.
+    pub auth_server_metadata_url: Option<String>,
+}
+
+impl std::fmt::Debug for OAuthClientSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthClientSettings")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("scopes", &self.scopes)
+            .field("callback_port", &self.callback_port)
+            .field("auth_server_metadata_url", &self.auth_server_metadata_url)
+            .finish()
+    }
 }
 
 impl LoginOptions {
@@ -62,7 +102,40 @@ impl LoginOptions {
             client_name: DEFAULT_CLIENT_NAME.to_owned(),
             timeout: DEFAULT_LOGIN_TIMEOUT,
             request_timeout: DEFAULT_OAUTH_REQUEST_TIMEOUT,
+            client: OAuthClientSettings::default(),
+            credential_scope: None,
+            mcp_server: None,
         }
+    }
+
+    /// A login to the `[mcp.<name>]` server `name` rather than to AMP.
+    pub fn with_mcp_server(mut self, name: impl Into<String>) -> Self {
+        self.mcp_server = Some(name.into());
+        self
+    }
+
+    /// The store this login is kept in, with the right repair hint for its keychain item.
+    pub(crate) fn store(&self) -> crate::AmpCredentialStore {
+        let store = self.backend.store_for_key(self.credential_key());
+        match &self.mcp_server {
+            Some(name) => store.for_mcp_server(name),
+            None => store,
+        }
+    }
+
+    pub fn with_credential_scope(mut self, scope: Option<String>) -> Self {
+        self.credential_scope = scope;
+        self
+    }
+
+    /// The key the login is stored under.
+    pub fn credential_key(&self) -> String {
+        crate::scoped_credential_key(&self.url, self.credential_scope.as_deref())
+    }
+
+    pub fn with_client(mut self, client: OAuthClientSettings) -> Self {
+        self.client = client;
+        self
     }
 
     pub fn with_ca_file(mut self, ca_file: Option<PathBuf>) -> Self {
@@ -129,11 +202,36 @@ where
         Err(McpError::AuthRequired { challenge }) => challenge,
         Err(e) => return Err(e),
     };
+    login_from_challenge(&options, challenge, prompt).await
+}
 
-    // 2. Loopback redirect listener on a random port (RFC 8252 §7.3).
-    let listener = TcpListener::bind(("127.0.0.1", 0))
+/// Steps 2-5 of [`login`], after a probe got the server's 401 (`challenge` is its
+/// `WWW-Authenticate` header, if any). [`crate::external::http::login`] probes a third-party
+/// server its own way (with its headers) and continues here.
+pub(crate) async fn login_from_challenge<F>(
+    options: &LoginOptions,
+    challenge: Option<String>,
+    prompt: F,
+) -> Result<LoginOutcome, McpError>
+where
+    F: FnOnce(&LoginPrompt),
+{
+    let client = &options.client;
+    if client.client_secret.is_some() && client.client_id.is_none() {
+        return Err(McpError::Config(
+            "an OAuth client secret needs a client_id".to_owned(),
+        ));
+    }
+
+    // 2. Loopback redirect listener (RFC 8252 §7.3), on a random port unless one is configured.
+    let listener = TcpListener::bind(("127.0.0.1", client.callback_port))
         .await
-        .map_err(|e| McpError::OAuth(format!("bind the loopback redirect listener: {e}")))?;
+        .map_err(|e| {
+            McpError::OAuth(format!(
+                "bind the loopback redirect listener on 127.0.0.1:{}: {e}",
+                client.callback_port
+            ))
+        })?;
     let port = listener
         .local_addr()
         .map_err(|e| McpError::OAuth(format!("loopback listener: {e}")))?
@@ -141,7 +239,7 @@ where
     let redirect_uri = format!("http://127.0.0.1:{port}{CALLBACK_PATH}");
 
     // 3. Discovery + dynamic client registration + the PKCE authorization URL.
-    let store = options.backend.store_for(&options.url);
+    let store = options.store();
     let mut manager = new_manager(
         &options.url,
         options.ca_file.as_deref(),
@@ -149,19 +247,38 @@ where
     )
     .await?;
     manager.set_credential_store(store.clone());
-    let resolution = manager
-        .resolve_metadata_from_challenge(challenge.as_deref())
-        .await
-        .map_err(oauth_error)?;
-    if resolution.source == AuthorizationMetadataSource::LegacyEndpointFallback {
-        return Err(McpError::OAuth(format!(
-            "{} publishes no OAuth metadata (RFC 9728 / RFC 8414); use AMP_TOKEN instead",
-            options.url
-        )));
+    if let Some(metadata_url) = &client.auth_server_metadata_url {
+        let metadata = fetch_metadata(
+            metadata_url,
+            options.ca_file.as_deref(),
+            options.request_timeout,
+        )
+        .await?;
+        manager.set_metadata(metadata);
+    } else {
+        let resolution = manager
+            .resolve_metadata_from_challenge(challenge.as_deref())
+            .await
+            .map_err(oauth_error)?;
+        if resolution.source == AuthorizationMetadataSource::LegacyEndpointFallback {
+            return Err(McpError::OAuth(format!(
+                "{} publishes no OAuth metadata (RFC 9728 / RFC 8414); use AMP_TOKEN instead                  (for an [mcp] server: bearer_env, secret_headers or oauth.auth_server_metadata_url)",
+                options.url
+            )));
+        }
+        manager.set_metadata(resolution.metadata);
     }
-    manager.set_metadata(resolution.metadata);
-    let request = AuthorizationRequest::new(redirect_uri.clone())
+    let mut request = AuthorizationRequest::new(redirect_uri.clone())
         .with_client_name(options.client_name.clone());
+    if let Some(client_id) = &client.client_id {
+        request = request.with_preregistered_client(client_id.clone());
+    }
+    if let Some(secret) = &client.client_secret {
+        request = request.with_client_secret(secret.expose().to_owned());
+    }
+    if !client.scopes.is_empty() {
+        request = request.with_scopes(client.scopes.iter().cloned());
+    }
     let session = AuthorizationSession::new(manager, request)
         .await
         .map_err(|(_, e)| oauth_error(e))?;
@@ -181,7 +298,12 @@ where
     // 5. Wait for the redirect, then exchange the code (rmcp saves the tokens to the store).
     let callback = tokio::time::timeout(
         options.timeout,
-        wait_for_callback(&listener, port, &expected_state),
+        wait_for_callback(
+            &listener,
+            port,
+            &expected_state,
+            &CallbackText::new(options.mcp_server.as_deref()),
+        ),
     )
     .await
     .map_err(|_| {
@@ -197,12 +319,41 @@ where
         .map_err(oauth_error)?;
     let (client_id, _) = session.get_credentials().await.map_err(oauth_error)?;
 
-    Ok(outcome(&options, client_id, &token))
+    Ok(outcome(options, client_id, &token))
+}
+
+/// Reads RFC 8414 authorization server metadata from `url` (`oauth.auth_server_metadata_url`),
+/// with the OAuth client's roots, redirect policy and timeouts.
+pub(crate) async fn fetch_metadata(
+    url: &str,
+    ca_file: Option<&std::path::Path>,
+    request_timeout: Duration,
+) -> Result<AuthorizationMetadata, McpError> {
+    let http = build_oauth_http_client(ca_file, request_timeout)?;
+    let fail = |reason: String| {
+        McpError::OAuth(format!(
+            "authorization server metadata at {}: {reason}",
+            crate::url_origin(url)
+        ))
+    };
+    let response = http
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|e| fail(e.without_url().to_string()))?;
+    if !response.status().is_success() {
+        return Err(fail(format!("HTTP {}", response.status())));
+    }
+    response
+        .json::<AuthorizationMetadata>()
+        .await
+        .map_err(|e| fail(format!("not OAuth metadata: {}", e.without_url())))
 }
 
 fn outcome(options: &LoginOptions, client_id: String, token: &OAuthTokenResponse) -> LoginOutcome {
     LoginOutcome {
-        key: credential_key(&options.url),
+        key: options.credential_key(),
         client_id,
         scopes: token_scopes(token),
         expires_in: token_expires_in(token),
@@ -217,6 +368,50 @@ pub async fn logout(url: &str, backend: &CredentialBackend) -> Result<bool, McpE
     backend.store_for(url).clear_credentials().await
 }
 
+/// Removes the login stored under `key` ([`crate::scoped_credential_key`]). `Ok(true)` if there
+/// was one.
+pub async fn logout_key(key: &str, backend: &CredentialBackend) -> Result<bool, McpError> {
+    backend
+        .store_for_key(key.to_owned())
+        .clear_credentials()
+        .await
+}
+
+/// Copies the login stored under `from` to `to` (keys from [`crate::scoped_credential_key`]),
+/// keeping `from`. `Ok(false)` when there is none under `from`, or `to` already has one. For
+/// `amp-harness mcp secret --adopt` (#2308): a person giving a repo server the login that every
+/// server of that URL shared before logins were scoped.
+pub async fn copy_login(
+    from: &str,
+    to: &str,
+    backend: &CredentialBackend,
+) -> Result<bool, McpError> {
+    let target = backend.store_for_key(to.to_owned());
+    if target.load_credentials().await?.is_some() {
+        return Ok(false);
+    }
+    match backend
+        .store_for_key(from.to_owned())
+        .load_credentials()
+        .await?
+    {
+        Some(creds) if creds.token_response.is_some() => {
+            target.save_credentials(creds).await?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Whether a login with a token is stored under `key` ([`crate::scoped_credential_key`]).
+pub async fn has_login_key(key: &str, backend: &CredentialBackend) -> Result<bool, McpError> {
+    Ok(backend
+        .store_for_key(key.to_owned())
+        .load_credentials()
+        .await?
+        .is_some_and(|c| c.token_response.is_some()))
+}
+
 /// Whether a login with a token is stored for `url`.
 pub async fn has_login(url: &str, backend: &CredentialBackend) -> Result<bool, McpError> {
     Ok(backend
@@ -224,6 +419,26 @@ pub async fn has_login(url: &str, backend: &CredentialBackend) -> Result<bool, M
         .load_credentials()
         .await?
         .is_some_and(|c| c.token_response.is_some()))
+}
+
+/// A fresh OAuth access token for the login stored for `url` (refreshed when it is about to
+/// expire), for the remote control relay (#2373). Never logged or formatted. Fails with
+/// [`McpError::AuthRequired`] when there is no stored login.
+pub async fn access_token(
+    url: &str,
+    ca_file: Option<&std::path::Path>,
+    backend: &CredentialBackend,
+) -> Result<String, McpError> {
+    let store = backend.store_for(url);
+    if !has_login(url, backend).await? {
+        return Err(McpError::AuthRequired { challenge: None });
+    }
+    let mut manager = new_manager(url, ca_file, DEFAULT_OAUTH_REQUEST_TIMEOUT).await?;
+    manager.set_credential_store(store);
+    if !manager.initialize_from_store().await.map_err(oauth_error)? {
+        return Err(McpError::AuthRequired { challenge: None });
+    }
+    manager.get_access_token().await.map_err(oauth_error)
 }
 
 /// Connects with the best credentials available, in D3's order:
@@ -265,7 +480,7 @@ pub async fn connect(
     let manager = tokio::time::timeout(options.connect_timeout, prepare)
         .await
         .map_err(|_| McpError::Timeout {
-            operation: format!("OAuth discovery for {}", options.url),
+            operation: format!("OAuth discovery for {}", crate::redact_url(&options.url)),
             after: options.connect_timeout,
         })??;
     let auth = format!("oauth ({})", backend.describe());
@@ -275,7 +490,7 @@ pub async fn connect(
     Ok(client)
 }
 
-async fn new_manager(
+pub(crate) async fn new_manager(
     url: &str,
     ca_file: Option<&std::path::Path>,
     request_timeout: Duration,
@@ -360,10 +575,65 @@ const PER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 /// Serves the loopback listener until the browser arrives at [`CALLBACK_PATH`] with our `state`.
 /// Anything else (favicon, a stale tab, a request with another state) gets an error page and the
 /// wait goes on. Returns the full callback URL.
+/// What the loopback callback page says: AMP's sign-in, or a login to one MCP server (#2352).
+struct CallbackText {
+    /// The page title.
+    title: String,
+    /// Done: "… complete. You can close this tab …".
+    done: String,
+    /// The authorization server said no.
+    failed: String,
+    /// Not the redirect this login waits for.
+    wrong_state: String,
+}
+
+impl CallbackText {
+    fn new(mcp_server: Option<&str>) -> Self {
+        match mcp_server {
+            None => Self {
+                title: "AMP sign-in".to_owned(),
+                done: "AMP sign-in complete. You can close this tab and return to the terminal."
+                    .to_owned(),
+                failed: "AMP sign-in failed. Return to the terminal for details.".to_owned(),
+                wrong_state: "This sign-in link is not the one amp-harness is waiting for. Run \
+                              `amp-harness login` again if needed."
+                    .to_owned(),
+            },
+            // Server names are `[a-z0-9-]` (checked when the config loads); escape anyway.
+            Some(name) => {
+                let name = html_escape(name);
+                Self {
+                    title: format!("MCP server {name}: login"),
+                    done: format!(
+                        "Logged in to MCP server <code>{name}</code>. You can close this tab and \
+                         return to the terminal."
+                    ),
+                    failed: format!(
+                        "Login to MCP server <code>{name}</code> failed. Return to the terminal \
+                         for details."
+                    ),
+                    wrong_state: format!(
+                        "This login link is not the one amp-harness is waiting for. Run \
+                         <code>amp-harness mcp login {name}</code> again if needed."
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 async fn wait_for_callback(
     listener: &TcpListener,
     port: u16,
     expected_state: &str,
+    text: &CallbackText,
 ) -> Result<String, McpError> {
     loop {
         let (mut stream, _) = listener
@@ -377,11 +647,11 @@ async fn wait_for_callback(
             };
         let url = format!("http://127.0.0.1:{port}{target}");
         let Ok(parsed) = reqwest::Url::parse(&url) else {
-            respond(&mut stream, 400, "Bad request.").await;
+            respond(&mut stream, 400, &text.title, "Bad request.").await;
             continue;
         };
         if parsed.path() != CALLBACK_PATH {
-            respond(&mut stream, 404, "Not found.").await;
+            respond(&mut stream, 404, &text.title, "Not found.").await;
             continue;
         }
         let param = |name: &str| {
@@ -391,36 +661,27 @@ async fn wait_for_callback(
                 .map(|(_, v)| v.into_owned())
         };
         if param("state").as_deref() != Some(expected_state) {
-            respond(
-                &mut stream,
-                400,
-                "This sign-in link is not the one amp-harness is waiting for. Run `amp-harness login` again if needed.",
-            )
-            .await;
+            respond(&mut stream, 400, &text.title, &text.wrong_state).await;
             continue;
         }
         if let Some(error) = param("error") {
             let description = param("error_description").unwrap_or_default();
-            respond(
-                &mut stream,
-                400,
-                "AMP sign-in failed. Return to the terminal for details.",
-            )
-            .await;
+            respond(&mut stream, 400, &text.title, &text.failed).await;
             return Err(McpError::OAuth(format!(
                 "authorization failed: {error} {description}"
             )));
         }
         if param("code").is_none() {
-            respond(&mut stream, 400, "The sign-in response has no code.").await;
+            respond(
+                &mut stream,
+                400,
+                &text.title,
+                "The sign-in response has no code.",
+            )
+            .await;
             continue;
         }
-        respond(
-            &mut stream,
-            200,
-            "AMP sign-in complete. You can close this tab and return to the terminal.",
-        )
-        .await;
+        respond(&mut stream, 200, &text.title, &text.done).await;
         return Ok(url);
     }
 }
@@ -446,14 +707,14 @@ async fn read_target(stream: &mut TcpStream) -> Option<String> {
     (method == "GET" && target.starts_with('/')).then(|| target.to_owned())
 }
 
-async fn respond(stream: &mut TcpStream, status: u16, message: &str) {
+async fn respond(stream: &mut TcpStream, status: u16, title: &str, message: &str) {
     let reason = match status {
         200 => "OK",
         404 => "Not Found",
         _ => "Bad Request",
     };
     let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>AMP sign-in</title></head>\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head>\
          <body style=\"font-family:system-ui,sans-serif;margin:3rem\"><p>{message}</p></body></html>"
     );
     let response = format!(
@@ -502,6 +763,54 @@ pub fn open_browser(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GETs `target` from a callback listener waiting with `text`; returns the whole response.
+    async fn callback_page(text: CallbackText, target: &str) -> (Result<String, McpError>, String) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let waiting =
+            tokio::spawn(async move { wait_for_callback(&listener, port, "st", &text).await });
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream
+            .write_all(format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut page = String::new();
+        stream.read_to_string(&mut page).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("callback returned")
+            .unwrap();
+        (result, page)
+    }
+
+    /// #2352: an MCP server's login names the server on the browser page; AMP's says AMP.
+    #[tokio::test]
+    async fn callback_page_names_the_mcp_server() {
+        let (result, page) = callback_page(
+            CallbackText::new(Some("oauthy")),
+            "/callback?state=st&code=c",
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            page.contains("Logged in to MCP server <code>oauthy</code>")
+                && !page.contains("AMP sign-in"),
+            "{page}"
+        );
+        let (result, page) = callback_page(
+            CallbackText::new(Some("oauthy")),
+            "/callback?state=st&error=access_denied",
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            page.contains("Login to MCP server <code>oauthy</code> failed"),
+            "{page}"
+        );
+        let (_, page) = callback_page(CallbackText::new(None), "/callback?state=st&code=c").await;
+        assert!(page.contains("AMP sign-in complete"), "{page}");
+    }
 
     #[test]
     fn authorization_url_must_be_https_or_loopback_http() {

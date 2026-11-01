@@ -76,3 +76,44 @@ func (m Metadata) Merge(over Metadata) Metadata {
 	}
 	return out
 }
+
+// Merge-gate metadata keys (AMP #2596), inherited like any metadata
+// (project → epic → story → ticket).
+const (
+	// MetaIntegrationBranch names the branch an epic's or story's work is
+	// merged into before one integration PR takes it to main. A run whose
+	// branch is that branch doesn't hold its ticket's dependents: the work
+	// is where it belongs. The ticket stays unmerged (merge_state none) until
+	// the integration branch's merge is reported.
+	MetaIntegrationBranch = "integration_branch"
+	// MetaWaitsForMerge false, on a dependent, means it waits only for its
+	// dependencies to complete, not for their merges (a review of an open
+	// PR). Any other value, or none, keeps the merge gate.
+	MetaWaitsForMerge = "waits_for_merge"
+)
+
+// IntegrationBranch is m's integration branch, or "".
+func (m Metadata) IntegrationBranch() string {
+	s, _ := m[MetaIntegrationBranch].(string)
+	return strings.TrimSpace(s)
+}
+
+// WaitsForMerge reports whether a ticket with effective metadata m waits on
+// its dependencies' merges: yes unless waits_for_merge is false.
+func (m Metadata) WaitsForMerge() bool {
+	switch v := m[MetaWaitsForMerge].(type) {
+	case bool:
+		return v
+	case string:
+		return !strings.EqualFold(strings.TrimSpace(v), "false")
+	}
+	return true
+}
+
+// TouchesMergeGate reports whether a metadata change sets or removes a key
+// that decides who waits on a merge.
+func (p MetadataPatch) TouchesMergeGate() bool {
+	_, ib := p[MetaIntegrationBranch]
+	_, wm := p[MetaWaitsForMerge]
+	return ib || wm
+}

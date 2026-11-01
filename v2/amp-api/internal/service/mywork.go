@@ -17,17 +17,42 @@ type MyAgent struct {
 }
 
 // MyWork is the caller's home page: their open tickets, the flags in
-// projects they can see, and their agents.
+// projects they can see, and their agents. Since AMP #2478 it also carries
+// the "waiting on you" summary grouped by project (MyWorkSummary, inlined:
+// counts, projects, clear_projects, ...); the older fields stay for UI
+// builds that read them.
 type MyWork struct {
 	Owned   []repository.WorkTask `json:"owned"`
 	Flags   []repository.WorkTask `json:"flags"`
 	Agents  []MyAgent             `json:"agents"`
 	Done24h int                   `json:"done_24h"` // tickets I own, finished in the last day
+	// OwnedTruncated / FlagsTruncated: Owned and Flags hit their caps
+	// (200 and 100) and there are more. The summary has no such cap.
+	OwnedTruncated bool `json:"owned_truncated"`
+	FlagsTruncated bool `json:"flags_truncated"`
+	*MyWorkSummary
 }
 
+// Caps on MyWork's older lists.
+const (
+	myWorkOwnedCap = 200
+	myWorkFlagsCap = 100
+)
+
+// MyWork is MyWorkPage with the summary's default paging.
 func (s *Service) MyWork(ctx context.Context, p authz.Principal) (*MyWork, error) {
+	return s.MyWorkPage(ctx, p, MyWorkPageOptions{})
+}
+
+// MyWorkPage is GET /api/my-work: the older home-page lists plus the
+// "waiting on you" summary, paged by opt.
+func (s *Service) MyWorkPage(ctx context.Context, p authz.Principal, opt MyWorkPageOptions) (*MyWork, error) {
 	if !p.HasUser() {
-		return &MyWork{Owned: []repository.WorkTask{}, Flags: []repository.WorkTask{}, Agents: []MyAgent{}}, nil
+		sum, err := s.MyWorkSummaryFor(ctx, p, opt)
+		if err != nil {
+			return nil, err
+		}
+		return &MyWork{Owned: []repository.WorkTask{}, Flags: []repository.WorkTask{}, Agents: []MyAgent{}, MyWorkSummary: sum}, nil
 	}
 	visible, err := s.Authz.VisibleProjects(ctx, p)
 	if err != nil {
@@ -46,8 +71,11 @@ func (s *Service) MyWork(ctx context.Context, p authz.Principal) (*MyWork, error
 		return out
 	}
 	w := &MyWork{Agents: []MyAgent{}}
-	if w.Owned, err = s.Repo.OpenTasksOwnedBy(ctx, []int{p.UserID}, 200); err != nil {
+	if w.Owned, err = s.Repo.OpenTasksOwnedBy(ctx, []int{p.UserID}, myWorkOwnedCap+1); err != nil {
 		return nil, err
+	}
+	if len(w.Owned) > myWorkOwnedCap {
+		w.Owned, w.OwnedTruncated = w.Owned[:myWorkOwnedCap], true
 	}
 	w.Owned = keep(w.Owned)
 	var visibleIDs []int
@@ -57,8 +85,11 @@ func (s *Service) MyWork(ctx context.Context, p authz.Principal) (*MyWork, error
 			visibleIDs = append(visibleIDs, id)
 		}
 	}
-	if w.Flags, err = s.Repo.FlaggedTasks(ctx, visibleIDs, 100); err != nil {
+	if w.Flags, err = s.Repo.FlaggedTasks(ctx, visibleIDs, myWorkFlagsCap+1); err != nil {
 		return nil, err
+	}
+	if len(w.Flags) > myWorkFlagsCap {
+		w.Flags, w.FlagsTruncated = w.Flags[:myWorkFlagsCap], true
 	}
 	w.Flags = keep(w.Flags)
 
@@ -95,6 +126,9 @@ func (s *Service) MyWork(ctx context.Context, p authz.Principal) (*MyWork, error
 			}
 		}
 		w.Agents = append(w.Agents, ma)
+	}
+	if w.MyWorkSummary, err = s.MyWorkSummaryFor(ctx, p, opt); err != nil {
+		return nil, err
 	}
 	return w, nil
 }

@@ -32,6 +32,52 @@ global:
     oauth2ProxyClientSecret: ""
     oauth2ProxyCookieSecret: ""
     valkeyPassword: ""
+    # amp-relay's database role password and its cluster token (relay.enabled
+    # only; see relay.database and relay.clusterToken).
+    relayDbPassword: ""
+    relayClusterToken: ""
+
+# Client IP in the audit log (KB decisions/audit-log-v2.md; #2430, #2469).
+#
+# AMP's boundary is its own Envoy. Envoy decides who the client is
+# (envoy.clientIP, below under envoy:) and passes that one address to the
+# services in X-Amp-Client-Ip, replacing anything a client sent. What sits in
+# front of Envoy is your deployment's business, not this chart's: configure
+# how many trusted hops, or which CIDRs, sit in front of Envoy for your
+# environment.
+#
+# clientIP.trustedProxies (AMP_TRUSTED_PROXIES for amp-api, authadmin,
+# mcpoauth and amp-relay): the addresses Envoy reaches the services from.
+# Only from these is X-Amp-Client-Ip believed. Typically your pod CIDR (keep
+# networkPolicy.enabled so only Envoy reaches the services); add 127.0.0.6
+# when a mesh sidecar (Istio) sits in front of each service, because the
+# services then see the sidecar as their TCP peer. Empty (the default):
+# nothing is trusted and each row records its TCP peer, Envoy's address.
+# Never list an address a client can connect to the services from.
+# Example: --set 'clientIP.trustedProxies={10.244.0.0/16}'.
+clientIP:
+  trustedProxies: []
+
+# NetworkPolicies (templates/networkpolicy.yaml). They need a CNI that
+# enforces them; without one they are inert.
+networkPolicy:
+  # Only Envoy may open the public ports of amp-api, authadmin and mcpoauth
+  # (these select this chart's own pods, nothing outside it).
+  enabled: true
+  # Who may open Envoy's listeners (8080, 8443). Off by default: what reaches
+  # Envoy is your ingress design. Turn it on to admit only the proxies in
+  # front of Envoy, listed as NetworkPolicyPeers. Worth it whenever
+  # envoy.clientIP.xffNumTrustedHops > 0, because anything that reaches Envoy
+  # directly can then choose its recorded address. Examples (pick yours):
+  #   from:                            # an ingress controller in the cluster
+  #     - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: ingress } }
+  #       podSelector: { matchLabels: { app.kubernetes.io/name: my-ingress } }
+  #   from:                            # a load balancer's subnets
+  #     - ipBlock: { cidr: 192.0.2.0/24 }
+  # Enabled with an empty list admits no pod or address at all.
+  envoyIngress:
+    enabled: false
+    from: []
 
 image:
   pullPolicy: IfNotPresent
@@ -65,9 +111,126 @@ ampApi:
   # n8n on your LAN). Off: a project owner's webhook URL can't be used to
   # reach services inside the cluster.
   webhookAllowPrivateNetworks: false
+  # Audit log integrity and retention (KB decisions/audit-log-v2.md).
+  audit:
+    # Entries older than this are deleted daily, through a signed anchor
+    # checkpoint so the rest still verifies. 0 keeps them forever.
+    retentionDays: 365
+    # Ed25519 key that signs the hourly audit checkpoints. It lives only in
+    # this Secret, never in the database. Make one with
+    #   amp-api audit keygen -out signing-key
+    #   kubectl -n amp create secret generic amp-audit-signing --from-file=signing-key=signing-key
+    # Unset: checkpoints are written unsigned (amp-api logs a warning, and
+    # `audit verify` reports them as unsigned): the hash chain still shows
+    # edits, but can't prove them against someone with database access.
+    signingKey:
+      existingSecret: ""
+      key: signing-key
+    # Public keys (base64, comma-separated) of retired signing keys, so
+    # checkpoints signed before a rotation still verify. Not secret.
+    retiredPublicKeys: ""
+  # Encryption at rest for webhook auth headers and signing secrets (#2441):
+  # AES-256-GCM under a key that lives only in this Secret, never in the
+  # database or in git. Make one with
+  #   openssl rand -base64 32 | tr -d '\n' > encryption-key
+  #   kubectl -n amp create secret generic amp-secrets-encryption --from-file=encryption-key=encryption-key
+  #   rm encryption-key        # keep a copy somewhere safe first
+  # Unset (or the Secret missing): auth headers can't be added (the API
+  # says why), signing secrets are stored in plaintext as before, and
+  # existing plaintext values keep working. amp-api encrypts plaintext
+  # values at startup once a key is set. To rotate, put the new key in
+  # `key` and the old one(s) in `retiredKeysKey` (comma-separated), restart,
+  # then remove the retired entry: startup re-encrypts under the new key.
+  secretsEncryption:
+    existingSecret: ""
+    key: encryption-key
+    retiredKeysKey: retired-keys
+  # The web app's origin as browsers see it ("https://amp.example" or
+  # "https://amp.local:8443"), no trailing slash. Links in MCP replies and the
+  # remote control relay's Origin check use it. Empty: https://<global.domain>
+  # (derived from MCP_PUBLIC_URL).
+  appPublicUrl: ""
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: 500m, memory: 512Mi }
+
+# Remote control of a harness session from the web app (epic 165). Off by
+# default. relay.enabled deploys amp-relay, the relay's own service (#2387),
+# adds Envoy's routes to it (/relay/ without ext_authz, /api/sessions behind
+# the cookie session, unbounded timeouts on the streams), and tells amp-api a
+# relay exists (RELAY_ENABLED: the /api/me capability). amp-api serves no relay
+# route, so scaling amp-relay to 0 turns remote control off for everyone.
+# When on, an org admin still has to turn it on for their org (org settings),
+# and each person turns it on per session with /remote in the harness. Needs
+# auth (amp-relay refuses to start without Dex).
+#
+# Org default: always off. Each org's switch (and its idle timeout, 5-240 min,
+# default 30, and device pin days) is an org setting in the database, edited by
+# org admins in the web app (PUT /api/orgs/:id/remote-control), not here.
+# amp-relay only accepts browser POSTs whose Origin is exactly the web address
+# (ampApi.appPublicUrl, else https://<global.domain>), so set
+# ampApi.appPublicUrl when people reach AMP on another origin (a port-forward
+# such as :8443, or a different public host).
+# Anything in front of Envoy (an ingress controller, a cloud LB) must not cut long SSE
+# streams either: see KB how-to/remote-control-local-test.md.
+relay:
+  enabled: false
+  image: amp-relay
+  tag: local
+  # 2+ keeps remote control up through a pod or node failure: a session lives
+  # on one replica, the others forward to it, and take it over if it dies.
+  replicas: 2
+  # Envoy's cap on one relay stream (the harness's command stream and a
+  # browser's event stream). Per stream, not per session: a session has no
+  # time limit by default (#2424), and the harness and the browser reopen a
+  # stream Envoy cuts at once, so this only bounds how long one connection
+  # is held.
+  maxStreamDuration: 43200s
+  # A relay stream with no bytes for this long is cut (the relay sends a
+  # keepalive every 20 s and the harness a heartbeat every 20 s, so only a
+  # dead peer gets there).
+  streamIdleTimeout: 120s
+  # Every other relay call (register, token refresh, event batches,
+  # heartbeats, pairing, end, the browser's commands) is a short request.
+  requestTimeout: 30s
+  # Refuse to render with relay.enabled unless the relay's database password
+  # and cluster token are pinned (database.existingSecret or
+  # global.secretOverrides.relayDbPassword, clusterToken.existingSecret or
+  # global.secretOverrides.relayClusterToken). values-production.yaml turns it
+  # on: under ArgoCD the generated values change on every sync.
+  requirePinnedSecrets: false
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+  # Least privilege (#2392): amp-relay connects to Postgres as its own role,
+  # never amp-api's. The chart declares it as a CloudNativePG managed role
+  # (cnpg-cluster.yaml) with the password in a basic-auth Secret, and amp-api
+  # grants it only the tables and columns the relay uses (RELAY_DB_ROLE) after
+  # every migration run.
+  database:
+    role: amp_relay
+    # A kubernetes.io/basic-auth Secret you manage (username = role,
+    # password). Empty: the chart makes amp-relay-db (password from
+    # global.secretOverrides.relayDbPassword, else the existing Secret's,
+    # else random). Under ArgoCD use this or the override: a password
+    # regenerated on a sync changes the role's password under running pods.
+    existingSecret: ""
+  # The relay's own cluster token: relay replicas use it with each other and
+  # amp-api uses it to call them (/internal/relay/ only). Never amp-api's own
+  # cluster token, which stays in the database where the relay's role can't
+  # read it. Mounted in amp-relay and amp-api as RELAY_CLUSTER_TOKEN.
+  clusterToken:
+    # A Secret you manage with the token (32+ random characters) under key.
+    # Empty: the chart makes amp-relay-cluster-token (value from
+    # global.secretOverrides.relayClusterToken, else the existing Secret's,
+    # else random).
+    existingSecret: ""
+    key: token
+  # NetworkPolicy for amp-relay's pods: :3002 (the relay) only from Envoy,
+  # :3003 (internal: forwarding and control calls) only from amp-relay and
+  # amp-api. Needs a CNI that enforces NetworkPolicy; without one it's inert.
+  networkPolicy:
+    enabled: true
 
 ui:
   image: amp-ui
@@ -120,6 +283,41 @@ dex:
   #   connectorSecret: amp-dex-connectors   # keys GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
   connectors: []
   connectorSecret: ""
+  # Dex's Postgres connection pool and session settings. These apply to Dex's
+  # own connections (database "dex") only; amp-api is not affected.
+  #
+  # Why (incident 2026-10-26, KB discoveries/dex-frozen-replica-incident.md):
+  # Dex v2.42 refreshes a token inside a SERIALIZABLE transaction and, while
+  # that transaction holds a pooled connection, asks the password connector to
+  # re-read the user, which needs a second connection. With the default pool
+  # of 5, five concurrent refreshes on one replica deadlock the pool for good:
+  # five sessions sit "idle in transaction" holding row locks, the replica
+  # stops answering anything that touches storage, and /dex/healthz stays
+  # green. A bigger pool makes that much less likely; the timeout below ends
+  # the stuck sessions so they stop blocking the other replica; the storage
+  # probe further down restarts the frozen replica.
+  storage:
+    maxOpenConns: 20        # Dex default 5. Per replica; Postgres max_connections is 100.
+    maxIdleConns: 5
+    connMaxLifetime: 1800   # seconds
+    connectionTimeout: 10   # seconds to open a connection (Dex default: wait forever)
+    # Sent by lib/pq as the startup "options" (PGOPTIONS env on the Dex
+    # container), so it is a session setting of Dex's connections only.
+    # Empty disables it.
+    pgOptions: "-c idle_in_transaction_session_timeout=60s"
+  # Probe that goes through storage on every call. Dex's /dex/healthz can't be
+  # trusted for this: its storage check has no timeout and keeps reporting its
+  # last result while blocked, and /dex/keys is cached until key rotation.
+  # The probe POSTs an unknown client_id to /dex/token, which makes Dex look
+  # the client up in Postgres (a read, nothing is written) and answer 401.
+  # Any other answer, or none within timeoutSeconds, is a failure.
+  # Set enabled: false to go back to the plain /dex/healthz probes.
+  storageProbe:
+    enabled: true
+    clientID: amp-storage-probe   # must NOT be a real client
+    timeoutSeconds: 5
+    readiness: { periodSeconds: 10, failureThreshold: 2 }   # out of the Service in ~20s
+    liveness: { periodSeconds: 15, failureThreshold: 4 }    # restarted after ~60s
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 300m, memory: 256Mi }
@@ -147,8 +345,44 @@ envoy:
   image: envoyproxy/envoy
   tag: v1.31-latest
   replicas: 1
+  # How Envoy decides the client address for the audit log (see the
+  # clientIP comment above and templates/_clientip.tpl). Set one of:
+  #   xffNumTrustedHops: how many proxies in front of Envoy append to
+  #     X-Forwarded-For. 0 (default): the client is Envoy's TCP peer and any
+  #     X-Forwarded-For a client sends is ignored. N: the client is the Nth
+  #     entry from the right.
+  #   trustedCIDRs (needs envoy.tag 1.32 or later): the addresses of the
+  #     proxies in front of Envoy. Envoy
+  #     reads X-Forwarded-For only when its peer is one of them, skipping
+  #     every trusted entry from the right.
+  # Examples only, not features of this chart:
+  #   - Clients connect straight to Envoy (a LoadBalancer Service that keeps
+  #     the source address, e.g. externalTrafficPolicy: Local, or a TCP/NLB
+  #     pass-through): leave the default.
+  #   - One HTTP proxy in front (an ingress controller, a cloud application
+  #     load balancer) that appends the client to X-Forwarded-For:
+  #     xffNumTrustedHops: 1, or trustedCIDRs: [<its pod CIDR or subnets>].
+  #     A CDN or WAF in front of that proxy adds a hop only if the proxy
+  #     trusts its X-Forwarded-For; count the hops that end up in the header.
+  #   - A service mesh with a sidecar on Envoy's pod: the sidecar is Envoy's
+  #     TCP peer (127.0.0.6 in Istio's default mode), so use trustedCIDRs:
+  #     [127.0.0.6/32, <the mesh ingress gateway's pod CIDR>]. mTLS and the
+  #     mesh itself are configured outside this chart.
+  clientIP:
+    xffNumTrustedHops: 0
+    trustedCIDRs: []
+  # Inbound webhooks (/api/hooks/, e.g. a project's GitHub merge webhook):
+  # senders like GitHub have no AMP session, so this prefix skips the
+  # oauth2-proxy check and amp-api authenticates each delivery by its HMAC
+  # signature (per-project secret) instead. false keeps the prefix behind
+  # the login session, which turns the webhooks off. Whatever sits in front
+  # of Envoy only has to pass /api/hooks/ through; the chart configures
+  # nothing there.
+  inboundHooks:
+    enabled: true
+    timeout: 15s
   service:
-    type: ClusterIP   # Traefik handles external ingress now
+    type: ClusterIP   # put whatever ingress you use in front of it
     httpsPort: 443
     httpPort: 80          # kept open only for ACME HTTP-01 + local convenience redirect to https
   resources:

@@ -1,0 +1,24 @@
+                                                                                |
+┌─ ▀▀▀▀▀▀▀▀ AMP #2 · simstech · ada@example.com ───────────────── ● connected ─┐|
+│ ✓ list_tasks · [] · # ms                                                     │|
+│ Two tickets in AMP Harness › M4 are ready, and nothing they wait on is       │|
+│ open: #2142 Fix installer setup hand-off, and #2143 Thinking toggle in the   │|
+│ transcript.                                                                  │|
+│                                                                              │|
+│ ▶ worker started  #2142 Fix installer setu… · worker-backend (deepseek-v4.1) │|
+│ ▶ worker started  #2143 Thinking toggle i… · worker-frontend (deepseek-v4.1) │|
+│                                                                              │|
+│ while they run, draft the tickets for M5 remote pairing                      │|
+│ M5 · Remote pairing has three acceptance criteria and no tickets yet. I'll   │|
+│ draft one ticket per criterion: pairing from the phone, the device list in   │|
+│ /remote, and                                                                 │|
+└──────────────────────────────────────────────────────────────────────────────┘|
+┌─ Workers · 2 running ────────────────────────── Ctrl+W watch · /workers all ─┐|
+│ ▸ #2142 Fix installer setup ha… · worker-backend · running 3m12s · 48.0k tok │|
+│ ▸ #2143 Thinking toggle in th… · worker-frontend · running 3m10s · 22.4k tok │|
+└──────────────────────────────────────────────────────────────────────────────┘|
+┌─ Message ───────────────────── ⠿ manager replying #s · 2 queued · Esc stops ─┐|
+│ / for commands                                                               │|
+└──────────────────────────────────────────────────────────────────────────────┘|
+ ■  2 QUESTIONS  │ plan: 2 waiting for your approval │ ■ 3 In progress          |
+ ~/dev/amp (main) • manager                        deepseek-v4.1 • thinking off |

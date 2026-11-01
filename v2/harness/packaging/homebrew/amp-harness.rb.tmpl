@@ -1,0 +1,47 @@
+# Homebrew formula TEMPLATE for amp-harness (#2115, D12). Not published yet: the tap repo is open
+# question Q4 in AMP KB decisions/amp-harness-architecture.md. scripts/render-formula.sh fills the
+# @VERSION@ and @SHA256_*@ placeholders from a release's .sha256 files; the release workflow (M5-1)
+# commits the result to the tap as Formula/amp-harness.rb.
+class AmpHarness < Formula
+  desc "AMP agent harness: chat with the AMP manager and run tickets from the terminal"
+  homepage "https://github.com/jacobsims214/amp/tree/main/v2/harness"
+  version "@VERSION@"
+  license "Apache-2.0"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/jacobsims214/amp/releases/download/harness-v@VERSION@/amp-harness-@VERSION@-aarch64-apple-darwin.tar.gz"
+      sha256 "@SHA256_AARCH64_APPLE_DARWIN@"
+    end
+    on_intel do
+      url "https://github.com/jacobsims214/amp/releases/download/harness-v@VERSION@/amp-harness-@VERSION@-x86_64-apple-darwin.tar.gz"
+      sha256 "@SHA256_X86_64_APPLE_DARWIN@"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/jacobsims214/amp/releases/download/harness-v@VERSION@/amp-harness-@VERSION@-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "@SHA256_AARCH64_UNKNOWN_LINUX_GNU@"
+    end
+    on_intel do
+      url "https://github.com/jacobsims214/amp/releases/download/harness-v@VERSION@/amp-harness-@VERSION@-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "@SHA256_X86_64_UNKNOWN_LINUX_GNU@"
+    end
+  end
+
+  def install
+    bin.install "amp-harness"
+  end
+
+  def caveats
+    <<~EOS
+      Run `amp-harness` in a project directory. The first run signs you in to AMP, picks or creates
+      a project and stores a model provider key. `amp-harness doctor` checks the setup.
+    EOS
+  end
+
+  test do
+    assert_match "amp-harness #{version}", shell_output("#{bin}/amp-harness --version")
+  end
+end

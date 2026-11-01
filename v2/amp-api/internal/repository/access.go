@@ -619,18 +619,25 @@ func (r *Repo) DeleteInvite(ctx context.Context, id int) error {
 // membership (never downgrading an existing role) and team membership.
 // Called on every sign-in; a no-op once nothing is pending.
 func (r *Repo) AcceptInvites(ctx context.Context, userID int, email string) (int, error) {
+	accepted, err := r.AcceptInvitesList(ctx, userID, email)
+	return len(accepted), err
+}
+
+// AcceptInvitesList is AcceptInvites returning the invites it accepted
+// (each grants its org role, and its team role when it names a team).
+func (r *Repo) AcceptInvitesList(ctx context.Context, userID int, email string) ([]domain.Invite, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	rows, err := tx.Query(ctx, `SELECT `+inviteCols+` FROM invites WHERE lower(email) = lower($1) AND accepted_at IS NULL FOR UPDATE`, email)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	pending, err := collect(rows, scanInvite)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	for _, inv := range pending {
 		if _, err := tx.Exec(ctx, `
@@ -639,7 +646,7 @@ func (r *Repo) AcceptInvites(ctx context.Context, userID int, email string) (int
 			  WHEN org_members.role = 'owner' OR EXCLUDED.role = 'owner' THEN 'owner'
 			  WHEN org_members.role = 'admin' OR EXCLUDED.role = 'admin' THEN 'admin'
 			  ELSE 'member' END`, inv.OrgID, userID, inv.OrgRole); err != nil {
-			return 0, err
+			return nil, err
 		}
 		if inv.TeamID != nil {
 			if _, err := tx.Exec(ctx, `
@@ -647,14 +654,17 @@ func (r *Repo) AcceptInvites(ctx context.Context, userID int, email string) (int
 				ON CONFLICT (team_id, user_id) DO UPDATE SET role = CASE
 				  WHEN team_members.role = 'lead' OR EXCLUDED.role = 'lead' THEN 'lead' ELSE 'member' END`,
 				*inv.TeamID, userID, inv.TeamRole); err != nil {
-				return 0, err
+				return nil, err
 			}
 		}
 		if _, err := tx.Exec(ctx, `UPDATE invites SET accepted_at = NOW(), accepted_user_id = $2 WHERE id = $1`, inv.ID, userID); err != nil {
-			return 0, err
+			return nil, err
 		}
 	}
-	return len(pending), tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return pending, nil
 }
 
 // MoveProjectToOrg sets a project's org. Team links to teams outside the new

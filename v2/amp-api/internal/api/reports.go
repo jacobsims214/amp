@@ -2,11 +2,13 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/simstech/amp-api/internal/authz"
+	"github.com/simstech/amp-api/internal/service"
 )
 
 // ---- Daily reports, velocity, and metadata (rules in internal/service) ----
@@ -82,18 +84,99 @@ func (h *RestHandler) velocity(w http.ResponseWriter, r *http.Request) {
 }
 
 // myWork is the home page: my open tickets, flags in projects I can see,
-// and my agents. GET /api/my-work
+// my agents, and (AMP #2478) what waits on me grouped by project.
+// GET /api/my-work?rows=&projects_offset=&projects_limit=&tz=
+// GET /api/my-work/counts: the sidebar badge, in total and per project.
 func (h *RestHandler) myWork(w http.ResponseWriter, r *http.Request) {
 	pr, ok := h.principal(w, r)
 	if !ok {
 		return
 	}
-	work, err := h.svc.MyWork(r.Context(), pr)
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET required", 405)
+		return
+	}
+	switch strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/my-work"), "/") {
+	case "":
+	case "counts":
+		counts, err := h.svc.MyWorkCounts(r.Context(), pr)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, counts)
+		return
+	default:
+		http.NotFound(w, r)
+		return
+	}
+	q := r.URL.Query()
+	opt := service.MyWorkPageOptions{TZ: q.Get("tz")}
+	for name, dst := range map[string]*int{"rows": &opt.Rows, "projects_offset": &opt.ProjectsOffset, "projects_limit": &opt.ProjectsLimit} {
+		if v := q.Get(name); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				jsonErr(w, fmt.Errorf("%s must be a non-negative integer", name), 400)
+				return
+			}
+			*dst = n
+		}
+	}
+	work, err := h.svc.MyWorkPage(r.Context(), pr, opt)
 	if err != nil {
 		fail(w, err, 500)
 		return
 	}
 	jsonOK(w, work)
+}
+
+// projectMyWork is the project's My work tab: GET /api/projects/{id}/my-work
+// ?user=<id|email> (a lead reading someone's list) &tz= &plan_offset=
+// &plan_limit=, or with &approve=<epic id>[,<epic id>…] (or all) just the
+// approval plan of those epics, together.
+func (h *RestHandler) projectMyWork(w http.ResponseWriter, r *http.Request, pr authz.Principal, projectID int) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET required", 405)
+		return
+	}
+	q := r.URL.Query()
+	opt := service.ProjectMyWorkOptions{User: q.Get("user"), TZ: q.Get("tz")}
+	for name, dst := range map[string]*int{"plan_offset": &opt.PlanOffset, "plan_limit": &opt.PlanLimit} {
+		if v := q.Get(name); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				jsonErr(w, fmt.Errorf("%s must be a non-negative integer", name), 400)
+				return
+			}
+			*dst = n
+		}
+	}
+	if v := q.Get("approve"); v != "" {
+		var epicIDs []int
+		if !strings.EqualFold(strings.TrimSpace(v), "all") {
+			for _, part := range strings.Split(v, ",") {
+				epicID, err := strconv.Atoi(strings.TrimSpace(part))
+				if err != nil || epicID <= 0 {
+					jsonErr(w, errorf("approve must be an epic id, a comma-separated list of epic ids, or all"), 400)
+					return
+				}
+				epicIDs = append(epicIDs, epicID)
+			}
+		}
+		plan, err := h.svc.ApprovalPlanFor(r.Context(), pr, projectID, epicIDs, opt)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]any{"plan": plan})
+		return
+	}
+	mw, err := h.svc.ProjectMyWork(r.Context(), pr, projectID, opt)
+	if err != nil {
+		fail(w, err, 500)
+		return
+	}
+	jsonOK(w, mw)
 }
 
 func (h *RestHandler) metadata(w http.ResponseWriter, r *http.Request) {

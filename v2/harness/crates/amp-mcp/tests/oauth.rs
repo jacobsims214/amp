@@ -587,6 +587,77 @@ async fn refresh_rejected_mid_session_means_relogin() {
     client.close().await;
 }
 
+/// #2159: `amp-harness login` registers a new OAuth client, which an open connection can't refresh
+/// for. Without a reconnector the open client stays "re-login needed" for good (the bug); with one,
+/// the next call after the login reconnects from the store and runs, on the same shared client.
+#[tokio::test(flavor = "multi_thread")]
+async fn relogin_heals_an_open_client_with_a_reconnector() {
+    let mock = spawn_mock_as(3600).await;
+    let backend = file_backend("relogin-heals");
+    login(&mock, &backend).await.expect("login");
+    let client = Arc::new(
+        oauth::connect(options(&mock.url), &backend)
+            .await
+            .expect("connect"),
+    );
+    client
+        .call_tool("amp_whoami", None)
+        .await
+        .expect("first call");
+
+    // The session ends: the access token is revoked and the refresh token rejected.
+    mock.state.revoke_access_tokens();
+    mock.state.reject_refresh.store(true, Ordering::SeqCst);
+    let err = client.call_tool("amp_whoami", None).await.unwrap_err();
+    assert!(err.is_auth_required(), "{err:?}");
+
+    // `amp-harness login` in another terminal: a new client id and new tokens in the store.
+    let registrations = mock.state.registrations.load(Ordering::SeqCst);
+    login(&mock, &backend).await.expect("re-login");
+    assert_eq!(
+        mock.state.registrations.load(Ordering::SeqCst),
+        registrations + 1,
+        "login registers a new client"
+    );
+    // The open client could borrow the new access token from the store, but not refresh it (its
+    // client id is the old one), so once that token expires it is stuck for good.
+    mock.state.reject_refresh.store(false, Ordering::SeqCst);
+    mock.state.revoke_access_tokens();
+    let err = client.call_tool("amp_whoami", None).await.unwrap_err();
+    assert!(
+        err.is_auth_required(),
+        "without a reconnector the open client can't use the new login: {err:?}"
+    );
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let reconnector: amp_mcp::Reconnector = {
+        let (url, backend, attempts) = (mock.url.clone(), backend.clone(), attempts.clone());
+        Arc::new(move || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let (url, backend) = (url.clone(), backend.clone());
+            Box::pin(async move { oauth::connect(options(&url), &backend).await })
+        })
+    };
+    client.set_reconnector(Some(reconnector));
+    let result = client
+        .call_tool("amp_whoami", None)
+        .await
+        .expect("healed by reconnecting with the new login");
+    assert_eq!(result.is_error, Some(false));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(client.generation(), 1);
+    assert_eq!(client.health(), Health::Connected);
+    assert!(
+        client.session().auth.starts_with("oauth (file "),
+        "{}",
+        client.session().auth
+    );
+    // Later calls use the new connection without reconnecting again.
+    client.call_tool("amp_whoami", None).await.expect("again");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_no_token_values(&format!("{client:?}"));
+}
+
 #[tokio::test]
 async fn amp_token_takes_precedence_over_a_stored_login() {
     let mock = spawn_mock_as(5).await; // a stored login would refresh on use
@@ -863,12 +934,13 @@ async fn a_loosened_credentials_file_is_put_back_to_0600() {
 }
 
 /// The real OS keychain, under a test-only service name; the entry is deleted afterwards even if
-/// the test fails. Skipped (with a note) where there is no keychain, e.g. Linux CI without a
-/// Secret Service, or when AMP_TEST_SKIP_KEYCHAIN is set.
+/// the test fails. Opt-in (#2309): it runs only with `AMP_TEST_KEYCHAIN=1`, because it writes to
+/// the developer's login keychain and can raise a GUI prompt; also skipped where there is no
+/// keychain.
 #[tokio::test]
 async fn keychain_store_round_trip_and_login() {
-    if std::env::var_os("AMP_TEST_SKIP_KEYCHAIN").is_some() {
-        eprintln!("skipped: AMP_TEST_SKIP_KEYCHAIN is set");
+    if std::env::var("AMP_TEST_KEYCHAIN").as_deref() != Ok("1") {
+        eprintln!("skipped: set AMP_TEST_KEYCHAIN=1 to run the real-keychain case");
         return;
     }
     let service = format!("amp-harness-test-{}", std::process::id());

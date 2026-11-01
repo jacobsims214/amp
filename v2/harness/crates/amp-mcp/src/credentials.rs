@@ -30,6 +30,19 @@ use crate::McpError;
 
 /// The keychain service every real login is stored under.
 pub const KEYCHAIN_SERVICE: &str = "amp-harness";
+/// Test hook: store everything under this keychain service instead of [`KEYCHAIN_SERVICE`], so a
+/// test can use the real keychain without touching the user's entries.
+pub const ENV_KEYCHAIN_SERVICE: &str = "AMP_HARNESS_KEYCHAIN_SERVICE";
+
+/// The keychain service in use: `AMP_HARNESS_KEYCHAIN_SERVICE` (tests), else [`KEYCHAIN_SERVICE`].
+pub fn keychain_service() -> String {
+    std::env::var(ENV_KEYCHAIN_SERVICE)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| KEYCHAIN_SERVICE.to_owned())
+}
+
 /// Picks the backend: `keychain`, `file` or `auto` (default).
 pub const ENV_CREDENTIAL_STORE: &str = "AMP_CREDENTIAL_STORE";
 /// The file fallback's name inside the `amp-harness` config dir.
@@ -45,6 +58,17 @@ pub fn credential_key(url: &str) -> String {
             parsed.as_str().trim_end_matches('/').to_owned()
         }
         Err(_) => url.trim().trim_end_matches('/').to_owned(),
+    }
+}
+
+/// [`credential_key`] in a scope (#2308): `None` is the URL alone (AMP's server and the person's
+/// own MCP servers, as before); `Some(scope)` (a repo server's, `mcp-repo:<repo id>:<name>`) is
+/// `<scope>|<credential_key>`, so a server from a cloned repo never reads or overwrites the
+/// person's own login for the same URL.
+pub fn scoped_credential_key(url: &str, scope: Option<&str>) -> String {
+    match scope {
+        None => credential_key(url),
+        Some(scope) => format!("{scope}|{}", credential_key(url)),
     }
 }
 
@@ -68,15 +92,20 @@ impl CredentialBackend {
         Self::File { path: path.into() }
     }
 
-    /// `$XDG_CONFIG_HOME/amp-harness/credentials.json`, else `~/.config/amp-harness/credentials.json`.
+    /// `credentials.json` in the user config directory: `--config-dir` / `AMP_HARNESS_CONFIG_DIR`,
+    /// else `$XDG_CONFIG_HOME/amp-harness`, else `~/.config/amp-harness`. `--config` (the file
+    /// alone) does not move it.
     pub fn default_file_path(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-        crate::settings::default_config_path(env).map(|p| p.with_file_name(CREDENTIALS_FILE_NAME))
+        crate::config_paths::current(env)
+            .user_dir
+            .map(|d| d.join(CREDENTIALS_FILE_NAME))
     }
 
     /// Resolves against the real environment and keychain.
     pub fn resolve() -> Result<Self, McpError> {
-        Self::resolve_with(&|key| std::env::var(key).ok(), &|| {
-            keychain_available(KEYCHAIN_SERVICE)
+        let service = keychain_service();
+        Self::resolve_with_service(&|key| std::env::var(key).ok(), &service, &|| {
+            keychain_available(&service)
         })
     }
 
@@ -84,6 +113,15 @@ impl CredentialBackend {
     /// keychain works; `auto` falls back to the file when it doesn't.
     pub fn resolve_with(
         env: &dyn Fn(&str) -> Option<String>,
+        keychain_check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Self, McpError> {
+        Self::resolve_with_service(env, KEYCHAIN_SERVICE, keychain_check)
+    }
+
+    /// [`Self::resolve_with`] with the keychain service to use.
+    pub fn resolve_with_service(
+        env: &dyn Fn(&str) -> Option<String>,
+        service: &str,
         keychain_check: &dyn Fn() -> Result<(), String>,
     ) -> Result<Self, McpError> {
         let file = || {
@@ -98,10 +136,10 @@ impl CredentialBackend {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "auto".to_owned());
         match choice.as_str() {
-            "keychain" => Ok(Self::keychain(KEYCHAIN_SERVICE)),
+            "keychain" => Ok(Self::keychain(service)),
             "file" => file(),
             "auto" => match keychain_check() {
-                Ok(()) => Ok(Self::keychain(KEYCHAIN_SERVICE)),
+                Ok(()) => Ok(Self::keychain(service)),
                 Err(reason) => {
                     tracing::debug!(%reason, "no usable keychain; using the credentials file");
                     file()
@@ -125,11 +163,27 @@ impl CredentialBackend {
         matches!(self, Self::Keychain { .. })
     }
 
+    /// Drops this process's cached copy of a server's login (keychain only; the file is read every
+    /// time), so the next load reads the keychain again. Keychain reads are cached per process
+    /// (#2165); call this when the login may have changed in another process, e.g. before a
+    /// reconnect after "login required" (#2159), so `amp-harness login` in another terminal is seen.
+    pub fn forget_cached(&self, url: &str) {
+        if let Self::Keychain { service } = self {
+            crate::keychain_forget(service, &credential_key(url));
+        }
+    }
+
     /// The store for one server's login.
     pub fn store_for(&self, url: &str) -> AmpCredentialStore {
+        self.store_for_key(credential_key(url))
+    }
+
+    /// The store for the login kept under `key` ([`scoped_credential_key`]).
+    pub fn store_for_key(&self, key: String) -> AmpCredentialStore {
         AmpCredentialStore {
             backend: self.clone(),
-            key: credential_key(url),
+            key,
+            repair_hint: None,
         }
     }
 }
@@ -145,17 +199,19 @@ fn keychain_name() -> &'static str {
 }
 
 /// Whether the OS keychain can be used: the platform store initialises and a lookup of a probe
-/// entry answers (found or not found). Headless Linux without a Secret Service fails here.
+/// entry answers (found or not found). Headless Linux without a Secret Service fails here. The probe
+/// is read at most once per process ([`crate::keychain_get`]).
 pub fn keychain_available(service: &str) -> Result<(), String> {
     if let Err(e) = keyring::Entry::store_status() {
         return Err(e.to_string());
     }
-    let entry = keyring::Entry::new(service, "amp-harness-probe").map_err(|e| e.to_string())?;
-    match entry.get_password() {
-        Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
+    crate::keychain_get(service, KEYCHAIN_PROBE_ACCOUNT)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
+
+/// The account [`keychain_available`] looks up (never stored).
+const KEYCHAIN_PROBE_ACCOUNT: &str = "amp-harness-probe";
 
 /// One server's login in a [`CredentialBackend`]. Implements rmcp's [`CredentialStore`], so the
 /// OAuth state machine loads, saves (after login and every refresh) and clears through it.
@@ -163,9 +219,27 @@ pub fn keychain_available(service: &str) -> Result<(), String> {
 pub struct AmpCredentialStore {
     backend: CredentialBackend,
     key: String,
+    /// What to tell a person whose keychain item cannot be read, when the key alone says the
+    /// wrong thing: an MCP server's login is stored under its URL, like AMP's (#2352).
+    repair_hint: Option<String>,
 }
 
 impl AmpCredentialStore {
+    /// The same store, saying "run `amp-harness mcp login <server>`" when its keychain item can't
+    /// be read (by default a URL key is AMP's login: "run `amp-harness login`").
+    pub fn for_mcp_server(mut self, server: &str) -> Self {
+        self.repair_hint = Some(crate::mcp_login_repair_hint(server));
+        self
+    }
+
+    fn store_error(&self, e: crate::KeychainError) -> McpError {
+        let e = match &self.repair_hint {
+            Some(hint) => e.with_repair_hint(&self.key, hint),
+            None => e,
+        };
+        McpError::CredentialStore(e.message)
+    }
+
     pub fn backend(&self) -> &CredentialBackend {
         &self.backend
     }
@@ -193,13 +267,10 @@ impl AmpCredentialStore {
 
     fn load_sync(&self) -> Result<Option<StoredCredentials>, McpError> {
         match &self.backend {
-            CredentialBackend::Keychain { service } => {
-                match keychain_entry(service, &self.key)?.get_password() {
-                    Ok(json) => parse_entry(&json).map(Some),
-                    Err(keyring::Error::NoEntry) => Ok(None),
-                    Err(e) => Err(store_error("keychain read", e)),
-                }
-            }
+            CredentialBackend::Keychain { service } => crate::keychain_get(service, &self.key)
+                .map_err(|e| self.store_error(e))?
+                .map(|json| parse_entry(&json))
+                .transpose(),
             CredentialBackend::File { path } => {
                 let _lock = file_lock();
                 Ok(read_file(path)?.servers.remove(&self.key))
@@ -212,9 +283,7 @@ impl AmpCredentialStore {
             CredentialBackend::Keychain { service } => {
                 let json = serde_json::to_string(credentials)
                     .map_err(|e| McpError::CredentialStore(format!("encode credentials: {e}")))?;
-                keychain_entry(service, &self.key)?
-                    .set_password(&json)
-                    .map_err(|e| store_error("keychain write", e))
+                crate::keychain_set(service, &self.key, &json).map_err(|e| self.store_error(e))
             }
             CredentialBackend::File { path } => {
                 let _lock = file_lock();
@@ -228,11 +297,7 @@ impl AmpCredentialStore {
     fn clear_sync(&self) -> Result<bool, McpError> {
         match &self.backend {
             CredentialBackend::Keychain { service } => {
-                match keychain_entry(service, &self.key)?.delete_credential() {
-                    Ok(()) => Ok(true),
-                    Err(keyring::Error::NoEntry) => Ok(false),
-                    Err(e) => Err(store_error("keychain delete", e)),
-                }
+                crate::keychain_delete(service, &self.key).map_err(|e| self.store_error(e))
             }
             CredentialBackend::File { path } => {
                 let _lock = file_lock();
@@ -276,7 +341,14 @@ impl CredentialStore for AmpCredentialStore {
                 .or_default()
                 .clone()
         };
-        Ok(Some(CredentialRefreshGuard::new(lock.lock_owned().await)))
+        let guard = lock.lock_owned().await;
+        // rmcp loads the login again right after this, to refresh it. Read the keychain afresh
+        // for that one load: another process (a second harness) may have rotated the refresh
+        // token since this process cached it. Once per refresh, not per request (#2165).
+        if let CredentialBackend::Keychain { service } = &self.backend {
+            crate::keychain_forget(service, &self.key);
+        }
+        Ok(Some(CredentialRefreshGuard::new(guard)))
     }
 }
 
@@ -285,14 +357,6 @@ static REFRESH_LOCKS: LazyLock<StdMutex<RefreshLocks>> = LazyLock::new(Default::
 
 fn auth_store_error(e: McpError) -> AuthError {
     AuthError::CredentialStoreError(e.to_string())
-}
-
-fn store_error(operation: &str, e: keyring::Error) -> McpError {
-    McpError::CredentialStore(format!("{operation}: {e}"))
-}
-
-fn keychain_entry(service: &str, key: &str) -> Result<keyring::Entry, McpError> {
-    keyring::Entry::new(service, key).map_err(|e| store_error("keychain", e))
 }
 
 fn parse_entry(json: &str) -> Result<StoredCredentials, McpError> {
@@ -431,6 +495,32 @@ fn tighten_permissions(_path: &Path) -> Result<(), McpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2352: an MCP server's login is kept under its URL like AMP's, so its store says which
+    /// command fixes an unreadable item; AMP's store still says `amp-harness login`.
+    #[test]
+    fn an_mcp_servers_store_names_mcp_login_in_keychain_errors() {
+        let url = "https://mcp.oauthy.example/mcp";
+        let backend = CredentialBackend::keychain("amp-harness-test");
+        let failed = || {
+            crate::KeychainError::new(
+                crate::KeychainErrorKind::NeedsApproval,
+                format!("Not asking (OSStatus -25308): {}", crate::repair_hint(url)),
+            )
+        };
+        let mcp = backend.store_for(url).for_mcp_server("oauthy");
+        let msg = mcp.store_error(failed()).to_string();
+        assert!(
+            msg.contains("`amp-harness mcp login oauthy`") && !msg.contains("`amp-harness login`"),
+            "{msg}"
+        );
+        let msg = backend.store_for(url).store_error(failed()).to_string();
+        assert!(msg.contains("`amp-harness login`"), "{msg}");
+        // The login options of an MCP server give that store.
+        let options = crate::oauth::LoginOptions::new(url, backend).with_mcp_server("oauthy");
+        let msg = options.store().store_error(failed()).to_string();
+        assert!(msg.contains("`amp-harness mcp login oauthy`"), "{msg}");
+    }
 
     #[test]
     fn keys_are_normalised_urls() {

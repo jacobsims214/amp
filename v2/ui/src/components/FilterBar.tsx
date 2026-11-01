@@ -1,5 +1,5 @@
 import { Search, X, SlidersHorizontal, UserRound } from 'lucide-react'
-import type { OwnerFilter } from '../lib/people'
+import { parseOwnerFilter } from '../lib/people'
 import { DEFAULT_FILTER, type FilterState } from '../lib/boardFilter'
 
 export type { FilterState }
@@ -20,10 +20,6 @@ const STATE_OPTIONS = [
   { value: 'completed',   label: 'Done',         dot: 'bg-st-done' },
   { value: 'blocked',     label: 'Waiting & questions', dot: 'bg-st-flag' },
 ] as const
-
-function parseOwner(v: string): OwnerFilter {
-  return v === 'mine' || v === 'unassigned' || v === 'everyone' ? v : Number(v)
-}
 
 export function FilterBar({ filter, onChange, epicOptions, memberOptions, counts }: Props) {
   const hasActiveFilter = filter.query || filter.state || filter.epicId !== null || filter.owner !== DEFAULT_FILTER.owner
@@ -83,12 +79,12 @@ export function FilterBar({ filter, onChange, epicOptions, memberOptions, counts
         <UserRound size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-3 pointer-events-none" />
         <select
           value={String(filter.owner)}
-          onChange={e => onChange({ ...filter, owner: parseOwner(e.target.value) })}
+          onChange={e => onChange({ ...filter, owner: parseOwnerFilter(e.target.value) })}
           title="Whose tickets to show"
           className="bg-surface border border-line  pl-8 pr-3 py-2 text-sm text-ink focus:outline-none focus:border-ink appearance-none cursor-pointer transition-all"
         >
           <option value="mine">Mine</option>
-          <option value="unassigned">Unassigned</option>
+          <option value="unowned">Unowned</option>
           <option value="everyone">Everyone</option>
           {memberOptions.length > 0 && (
             <optgroup label="Members">

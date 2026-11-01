@@ -30,16 +30,24 @@ import (
 type TaskActor struct {
 	task          domain.Task
 	completedDeps map[int]bool // which of task.DependencyIDs are already done
-	detached      bool         // stopped for a move: don't deregister from routing
-	storyPID      *actor.PID   // parent StoryActor — receives upward notifications
-	projectPID    *actor.PID   // ProjectActor — receives MsgRegisterTask on start
-	projectID     int
-	repo          *repository.Repo
-	hub           *hub.Hub
-	log           *slog.Logger
-	scheduleTimer *time.Timer        // non-nil if task is waiting for start_at
-	selfPID       *actor.PID         // this actor's PID — used to send messages to self
-	actorSystem   *actor.ActorSystem // actor system reference for sending messages from goroutines
+	// mergeWaits: dependencies that are done but whose merge isn't recorded
+	// (they still hold this task), with why (repository.MergeWaitDetail).
+	mergeWaits map[int]string
+	detached   bool       // stopped for a move: don't deregister from routing
+	storyPID   *actor.PID // parent StoryActor — receives upward notifications
+	projectPID *actor.PID // ProjectActor — receives MsgRegisterTask on start
+	projectID  int
+	repo       *repository.Repo
+	hub        *hub.Hub
+	log        *slog.Logger
+	// stateDispatchID is the dispatch token that MsgSetTaskState presented
+	// ("" when it presented none), and stateInUI whether a person set it in
+	// the web UI (never a closeout).
+	stateDispatchID string
+	stateInUI       bool
+	scheduleTimer   *time.Timer        // non-nil if task is waiting for start_at
+	selfPID         *actor.PID         // this actor's PID — used to send messages to self
+	actorSystem     *actor.ActorSystem // actor system reference for sending messages from goroutines
 }
 
 // NewTaskActorFromTask constructs a TaskActor from an already-loaded task.
@@ -119,8 +127,19 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgCompleteTask:
-		err := a.handleComplete(ctx, msg)
-		msg.ReplyCh <- ReplySimple{Err: err}
+		closeout, err := a.handleComplete(ctx, msg)
+		msg.ReplyCh <- ReplyComplete{Task: ptrTask(a.withBlockedBy()), Closeout: closeout, Err: err}
+
+	case *MsgClaimStart:
+		started, err := a.handleClaimStart(msg)
+		t := a.withBlockedBy()
+		msg.ReplyCh <- ReplyStart{Task: &t, Started: started, DispatchID: a.task.DispatchID,
+			AlreadyStarted: !started && a.task.StartedAt != nil, Err: err}
+
+	case *MsgReturnTask:
+		err := a.handleReturn(msg)
+		t := a.withBlockedBy()
+		msg.ReplyCh <- ReplyGetTask{Task: &t, Err: err}
 
 	case *MsgBlockTask:
 		err := a.handleBlock(msg.Reason, msg.By)
@@ -135,6 +154,9 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgSetTaskState:
+		// A caller that presents the current dispatch is the worker; a
+		// caller that doesn't is closing out somebody else's ticket.
+		a.stateDispatchID, a.stateInUI = msg.DispatchID, msg.InUI
 		if msg.RequireStarted && a.task.State != domain.TaskStateInProgress {
 			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("task %d is %s, not in progress: it wasn't dispatched, so it can't be set to %s off the web UI",
 				a.task.ID, a.task.State, msg.State)}
@@ -197,9 +219,32 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgDepCompleted:
+		if msg.MergeWait != "" {
+			// A dependency is done but waits on its merge: it still holds
+			// this task. Re-derive from the database (it may have been
+			// released before, if the merge was reported after completion).
+			if a.dependsOn(msg.CompletedTaskID) {
+				if err := a.reconcileDeps("a dependency waits on its merge"); err != nil {
+					a.log.Error("failed to reconcile on a merge wait", "err", err)
+				}
+				// The sender knows the PR even before its run is recorded.
+				if !a.completedDeps[msg.CompletedTaskID] {
+					if a.mergeWaits == nil {
+						a.mergeWaits = map[int]string{}
+					}
+					a.mergeWaits[msg.CompletedTaskID] = msg.MergeWait
+					a.publish(domain.EventTaskUpdated, a.withBlockedBy())
+				}
+			}
+			return
+		}
 		// A dependency finished — check if we are now unblocked.
 		a.completedDeps[msg.CompletedTaskID] = true
+		delete(a.mergeWaits, msg.CompletedTaskID)
 		a.checkUnblock(ctx)
+
+	case *MsgSetMergeState:
+		msg.ReplyCh <- a.handleSetMergeState(ctx, msg)
 
 	case *MsgScheduledUnblock:
 		// Timer fired — transition task from blocked to backlog
@@ -285,8 +330,39 @@ func (a *TaskActor) handleDispatch(msg *MsgDispatchTask, ctx actor.Context) erro
 	if err := a.saveState(domain.TaskStateInProgress, ""); err != nil {
 		return fmt.Errorf("db dispatch: %w", err)
 	}
-	if err := a.repo.SetTaskAgent(context.Background(), a.task.ID, agentID, &now); err != nil {
-		return fmt.Errorf("db set agent: %w", err)
+
+	// Dispatch only marks the ticket dispatched (AMP #2801): its worker
+	// starts it with a claim, and until then started_at stays NULL, which is
+	// what the watchdog flags and returns. A person starting their own human
+	// ticket is the exception: they are working it now, so it starts here.
+	if msg.Human {
+		startedAt := now
+		if err := a.repo.SetTaskDispatch(context.Background(), a.task.ID, agentID, "", now); err != nil {
+			return fmt.Errorf("db dispatch: %w", err)
+		}
+		if at, err := a.repo.StartTask(context.Background(), a.task.ID, agentID); err != nil {
+			return fmt.Errorf("db start: %w", err)
+		} else {
+			startedAt = at
+		}
+		a.task.DispatchID = ""
+		a.task.StartedAt, a.task.StartedBy = &startedAt, agentID
+		a.task.ReturnedAt, a.task.ReturnedReason = nil, ""
+	} else {
+		dispatchID := msg.DispatchID
+		if dispatchID == "" {
+			id, err := repository.NewDispatchID()
+			if err != nil {
+				return fmt.Errorf("dispatch id: %w", err)
+			}
+			dispatchID = id
+		}
+		if err := a.repo.SetTaskDispatch(context.Background(), a.task.ID, agentID, dispatchID, now); err != nil {
+			return fmt.Errorf("db dispatch: %w", err)
+		}
+		a.task.DispatchID = dispatchID
+		a.task.StartedAt, a.task.StartedBy = nil, ""
+		a.task.ReturnedAt, a.task.ReturnedReason = nil, ""
 	}
 
 	a.publish(domain.EventTaskDispatched, a.withBlockedBy())
@@ -296,66 +372,277 @@ func (a *TaskActor) handleDispatch(msg *MsgDispatchTask, ctx actor.Context) erro
 		a.logActivityBy(agentID, msg.By, "dispatched", "backlog", "in_progress",
 			fmt.Sprintf("Dispatched to agent %q", agentID))
 	}
-	a.log.Info("dispatched", "agent", agentID)
+	a.log.Info("dispatched", "agent", agentID, "started", a.task.StartedAt != nil)
 
 	// Notify parent StoryActor so it can roll up to in_progress.
 	ctx.Send(a.storyPID, &MsgTaskDispatched{TaskID: a.task.ID})
 	return nil
 }
 
-func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) error {
+// handleComplete completes the ticket. It returns whether the completion was
+// recorded as a closeout: a caller that isn't the ticket's worker (no
+// dispatch_id, or not the current one), or a ticket no worker ever started
+// (AMP #2801).
+func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (bool, error) {
 	by := msg.By
 	if a.task.State == domain.TaskStateCompleted {
-		return nil // idempotent
+		// Idempotent. A repeat is the worker's only if it presents the
+		// dispatch that completed it, which the ticket no longer carries.
+		return !a.task.IsHuman(), nil
 	}
-	if msg.RequireStarted && a.task.State != domain.TaskStateInProgress {
-		return fmt.Errorf("task %d is %s: it was never dispatched, so it can't be completed off the web UI; dispatch it first",
-			a.task.ID, a.task.State)
+	if a.task.State != domain.TaskStateInProgress && !msg.CloseoutOK {
+		if msg.RequireStarted {
+			return false, fmt.Errorf("task %d is %s: it was never dispatched, so it can't be completed off the web UI; dispatch it first, "+
+				"or close it out with closeout_reason if its worker already finished it", a.task.ID, a.task.State)
+		}
 	}
 	if msg.RequireDeps {
 		if err := a.refuseOpenDeps("completed"); err != nil {
-			return err
+			return false, err
 		}
+	}
+	// Closeout: the caller isn't the worker that was dispatched. A worker's
+	// own completion presents the current dispatch token; anything else is
+	// somebody closing the ticket out for it, which is allowed but labelled.
+	//
+	// A ticket whose start was inferred (or backfilled) is the exception: no
+	// worker ever presented a token there, because its plugin doesn't claim.
+	// Its first activity was the start and this completion is that same
+	// run's end, so labelling it a closeout would be false for every older
+	// plugin (AMP #2801, backward compatibility). An explicit closeout reason
+	// overrides that reading: the caller has said it isn't the worker
+	// (AMP #2908).
+	closeout := !msg.InUI && a.task.CompletionIsCloseout(msg.DispatchID, msg.CloseoutReason)
+	if msg.DispatchID != "" && !a.task.CurrentDispatch(msg.DispatchID) && a.task.DispatchID != "" {
+		return false, fmt.Errorf("task %d: dispatch %q is no longer current (the ticket was returned and re-dispatched as %q); "+
+			"re-read the ticket and use the dispatch_id in your prompt, or close it out with closeout_reason if you aren't its worker",
+			a.task.ID, msg.DispatchID, a.task.DispatchID)
 	}
 
 	prevState := a.task.State // capture before mutation for accurate activity log
+	if a.task.State == domain.TaskStateInProgress && a.task.StartedAt == nil {
+		// Completion is one of the fallback start signals (AMP #2801): a
+		// plugin that doesn't claim still counts as started, so the record
+		// says when. The worker's own, or a closeout's by the closer.
+		by := domain.StartedByInferred
+		if closeout {
+			by = domain.StartedByCloseout
+		}
+		if at, err := a.repo.StartTask(context.Background(), a.task.ID, by); err == nil {
+			a.task.StartedAt, a.task.StartedBy = &at, by
+		}
+	}
+	// A done ticket has no current dispatch, in the database too: a reload
+	// mustn't make the old token current again (AMP #2944).
+	if err := a.repo.ClearTaskDispatch(context.Background(), a.task.ID, false); err != nil {
+		return false, fmt.Errorf("db clear dispatch: %w", err)
+	}
+	// Nor is it returned any more: a returned ticket closed out directly (or
+	// completed in the UI) leaves the returned list and loses its tag (AMP #2947).
+	if err := a.repo.ClearTaskReturn(context.Background(), a.task.ID); err != nil {
+		return false, fmt.Errorf("db clear return: %w", err)
+	}
+	a.task.ReturnedAt, a.task.ReturnedReason = nil, ""
 	now := time.Now()
 	a.task.State = domain.TaskStateCompleted
 	a.task.CompletedAt = &now
 	a.task.UpdatedAt = now
+	a.task.DispatchID = ""
 
 	if err := a.saveState(domain.TaskStateCompleted, ""); err != nil {
-		return fmt.Errorf("db complete: %w", err)
+		return false, fmt.Errorf("db complete: %w", err)
+	}
+	mergeWait := ""
+	if msg.MergeRequired {
+		// Done, but its work waits on a merge: the tickets after it keep
+		// waiting until the merge is recorded (AMP #2475).
+		yes := true
+		if err := a.repo.SetTaskMerge(context.Background(), a.task.ID, &yes, domain.MergeNeeded, nil, ""); err != nil {
+			return closeout, fmt.Errorf("db merge needed: %w", err)
+		}
+		a.task.MergeRequired, a.task.MergeState, a.task.MergedAt, a.task.MergeSource = true, domain.MergeNeeded, nil, ""
+		mergeWait = repository.MergeWaitDetail(a.task.ID, domain.MergeNeeded, msg.MergeWhere)
+	} else if domain.MergeGates(a.task.MergeState) {
+		// Reopened and done again while its earlier work still waits on a
+		// merge: it keeps holding its dependents.
+		mergeWait = repository.MergeWaitDetail(a.task.ID, a.task.MergeState, "")
 	}
 
 	a.publish(domain.EventTaskCompleted, a.withBlockedBy())
-	if a.task.IsHuman() {
+	who := nameOr(msg.ByName, "agent (no dispatch)")
+	switch {
+	case a.task.IsHuman():
 		a.logActivityBy(domain.HumanAgentID, by, "completed", string(prevState), "completed", "Done by its owner (human work)")
-	} else if a.task.AgentID != "" {
+	case closeout:
+		// Not the worker's own completion: labelled, with why if the caller
+		// said (AMP #2801). Never dressed up as the worker's work.
+		detail := fmt.Sprintf("Closed out by %s (not the worker)", who)
+		if reason := strings.TrimSpace(msg.CloseoutReason); reason != "" {
+			detail += ": " + reason
+		}
+		a.logActivityBy(who, by, "closed_out", string(prevState), "completed", detail)
+	case a.task.AgentID != "":
 		a.logActivityBy(a.task.AgentID, by, "completed", string(prevState), "completed",
 			fmt.Sprintf("Task completed by agent %q", a.task.AgentID))
-	} else {
-		// Never dispatched, so no agent to name: name the caller, never "".
-		who := msg.ByName
-		if who == "" {
-			who = "agent (no dispatch)"
-		}
+	default:
 		a.logActivityBy(who, by, "completed", string(prevState), "completed",
 			fmt.Sprintf("Task completed by %s without a dispatch", who))
 	}
-	a.log.Info("completed")
+	a.log.Info("completed", "closeout", closeout)
 
 	// Synchronously ask ProjectActor to fan MsgDepCompleted to ALL epics/stories/tasks.
 	// We WAIT for this to complete before returning, so that any caller who reads
 	// task state after MsgCompleteTask returns will see the unblocked state immediately.
+	// With a merge needed the fan-out tells dependents why they still wait.
 	fanReplyCh := make(chan ReplySimple, 1)
-	ctx.Send(a.projectPID, &MsgFanDepCompleted{CompletedTaskID: a.task.ID, ReplyCh: fanReplyCh})
+	ctx.Send(a.projectPID, &MsgFanDepCompleted{CompletedTaskID: a.task.ID, MergeWait: mergeWait, ReplyCh: fanReplyCh})
 	<-fanReplyCh
+	if msg.MergeRequired {
+		a.logActivity("system", "merge_needed", "", "", "Done; its work waits on a merge ("+nameOr(msg.MergeWhere, "pushed work")+
+			"), so the tickets that depend on it wait until the merge is recorded")
+	}
 
 	// Then notify parent StoryActor for state rollup (async is fine for rollup).
 	ctx.Send(a.storyPID, &MsgTaskCompleted{TaskID: a.task.ID})
+	return closeout, nil
+}
+
+// handleClaimStart starts the ticket its worker was dispatched for
+// (amp_claim_task with a dispatch_id), or starts it for an older plugin
+// whose first activity counts as the start (Inferred). It returns whether
+// this call started it; starting an already-started ticket is a no-op, not
+// an error (a retried claim is idempotent).
+func (a *TaskActor) handleClaimStart(msg *MsgClaimStart) (bool, error) {
+	// An inferred start never refuses: it is the old plugins' path, and a
+	// refusal there would break work that used to succeed.
+	if a.task.State != domain.TaskStateInProgress {
+		if msg.Inferred {
+			return false, nil
+		}
+		return false, fmt.Errorf("task %d is %s, not dispatched: a claim starts the ticket you were dispatched for, and this one isn't running; "+
+			"re-read it with amp_get_task and ask your manager to dispatch it", a.task.ID, a.task.State)
+	}
+	// A token that isn't the current one: the ticket was returned and
+	// dispatched again, so this caller is a worker from an earlier run.
+	if msg.DispatchID != "" && !a.task.CurrentDispatch(msg.DispatchID) {
+		current := "none (the ticket was returned to ready)"
+		if a.task.DispatchID != "" {
+			current = a.task.DispatchID
+		}
+		return false, fmt.Errorf("task %d: dispatch %q is no longer current (current: %s). The ticket was returned and dispatched again, "+
+			"so this run is over: stop, and tell your manager what you found instead of working it", a.task.ID, msg.DispatchID, current)
+	}
+	if a.task.StartedAt != nil {
+		return false, nil // already started: idempotent
+	}
+	// started_by says how it started: the agent that claimed it, or
+	// "inferred" for a plugin whose first activity is the start (its agent
+	// is already the ticket's agent_id).
+	by := msg.By
+	if msg.Inferred || by == "" {
+		by = domain.StartedByInferred
+	}
+	at, err := a.repo.StartTask(context.Background(), a.task.ID, by)
+	if err != nil {
+		return false, fmt.Errorf("db start: %w", err)
+	}
+	a.task.StartedAt, a.task.StartedBy = &at, by
+	a.task.UpdatedAt = time.Now()
+	a.publish(domain.EventTaskUpdated, a.withBlockedBy())
+	// The first activity of an old plugin starts the ticket silently: there
+	// is no claim to show, and its own comment is already the record.
+	if !msg.Inferred {
+		a.logActivityBy(by, msg.ByUser, "started", "", "", "picked this up")
+		if msg.Post != "" {
+			if _, err := a.handleAddComment(domain.AddCommentRequest{
+				TaskID: a.task.ID, Body: msg.Post, Author: by, AuthorUserID: msg.ByUser,
+			}); err != nil {
+				a.log.Error("claim comment failed", "err", err)
+			}
+		}
+		a.log.Info("started by claim", "agent", by)
+	}
+	return true, nil
+}
+
+// handleReturn sends a dispatched ticket back to ready because no worker
+// started it, or because the run holding its current dispatch ended without
+// closing it: the watchdog's automatic return, or a harness releasing its
+// worker's ticket (amp_return_task, with the dispatch_id when the worker
+// had started it). It clears the dispatch and any start, stamps the return,
+// and leaves the state ready (or blocked when a dependency is open, as any
+// ticket moved back is). A started ticket without its current dispatch_id
+// is refused, as is a stale dispatch_id.
+func (a *TaskActor) handleReturn(msg *MsgReturnTask) error {
+	if a.task.State != domain.TaskStateInProgress {
+		return fmt.Errorf("task %d is %s, not in progress: only a dispatched ticket can be returned", a.task.ID, a.task.State)
+	}
+	// The watchdog returns the dispatch it saw, never a newer one (AMP
+	// #2949): between its read and this message the ticket may have been
+	// returned and dispatched again, or claimed.
+	if msg.IfDispatch && (a.task.DispatchID != msg.ExpectDispatchID || a.task.StartedAt != nil) {
+		return fmt.Errorf("task %d: not returned, its dispatch moved on since the watchdog saw it (dispatch %q, started %v)",
+			a.task.ID, a.task.DispatchID, a.task.StartedAt != nil)
+	}
+	// A token that isn't the current one is a run that is already over (the
+	// ticket was returned and dispatched again): it can't hand back a
+	// dispatch that belongs to a newer worker.
+	if msg.DispatchID != "" && !a.task.CurrentDispatch(msg.DispatchID) {
+		current := "none (the ticket was already returned to ready)"
+		if a.task.DispatchID != "" {
+			current = a.task.DispatchID
+		}
+		return fmt.Errorf("task %d: dispatch %q is no longer current (current: %s): this run is over and the ticket isn't its to return",
+			a.task.ID, msg.DispatchID, current)
+	}
+	// The holder of the current dispatch may return its own started ticket
+	// (AMP #2909): it is the run giving up, not someone pulling a live run.
+	if a.task.StartedAt != nil && !a.task.CurrentDispatch(msg.DispatchID) {
+		// A started ticket is somebody's work: returning it would cancel a
+		// live run behind its back. The caller blocks it or completes it.
+		return fmt.Errorf("task %d was started (by %s): returning it would pull it out from under a worker that is running. "+
+			"Block it with a question, or close it out with closeout_reason", a.task.ID, a.task.StartedBy)
+	}
+	reason := strings.TrimSpace(msg.Reason)
+	if reason == "" {
+		return fmt.Errorf("task %d: a reason is required; it's what the manager and the history see", a.task.ID)
+	}
+	from := string(a.task.State)
+	if msg.IfDispatch {
+		// The same compare in the database, so a row another writer moved on
+		// (a claim on another replica) isn't returned from stale memory.
+		ok, err := a.repo.ReturnTaskIf(context.Background(), a.task.ID, msg.ExpectDispatchID, reason)
+		if err != nil {
+			return fmt.Errorf("db return: %w", err)
+		}
+		if !ok {
+			return fmt.Errorf("task %d: not returned, its dispatch moved on in the database since the watchdog saw it", a.task.ID)
+		}
+	} else if err := a.repo.ReturnTask(context.Background(), a.task.ID, reason); err != nil {
+		return fmt.Errorf("db return: %w", err)
+	}
+	a.task.DispatchID, a.task.DispatchedAt = "", nil
+	now := time.Now()
+	a.task.ReturnedAt, a.task.ReturnedReason = &now, reason
+	a.task.StartedAt, a.task.StartedBy = nil, ""
+
+	state := domain.TaskStateBacklog
+	if open, err := a.openDeps(); err == nil && len(open) > 0 {
+		state = domain.TaskStateBlocked
+	}
+	if err := a.handleSetState(state, "", msg.By, nameOr(msg.ByName, "system")); err != nil {
+		return err
+	}
+	byName := nameOr(msg.ByName, "system")
+	if byName != "" {
+		a.logActivityBy(byName, msg.By, "returned", from, string(state), "Returned to ready: "+reason)
+	}
+	a.log.Info("returned", "reason", reason)
 	return nil
 }
+
+// ptrTask returns a pointer to a copy of t, for replies.
+func ptrTask(t domain.Task) *domain.Task { return &t }
 
 // ownerPhrase names who does a human ticket, for refusals.
 func (a *TaskActor) ownerPhrase() string {
@@ -366,6 +653,14 @@ func (a *TaskActor) ownerPhrase() string {
 }
 
 func (a *TaskActor) handleBlock(reason string, by *int) error {
+	if a.task.State == domain.TaskStateInProgress && a.task.StartedAt == nil {
+		// A block is one of the fallback start signals (AMP #2801): a worker
+		// whose plugin doesn't claim is still visibly working the ticket.
+		by := domain.StartedByInferred
+		if at, err := a.repo.StartTask(context.Background(), a.task.ID, by); err == nil {
+			a.task.StartedAt, a.task.StartedBy = &at, by
+		}
+	}
 	a.task.State = domain.TaskStateBlocked
 	a.task.BlockReason = reason
 	a.task.UpdatedAt = time.Now()
@@ -478,6 +773,43 @@ func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *in
 		byName = "manager"
 	}
 	from := string(a.task.State)
+	action, detail := "state_change", reason
+	if state == domain.TaskStateCompleted && a.task.State != domain.TaskStateCompleted && !a.task.IsHuman() {
+		// A completion made this way is the worker's only when it presented
+		// the current dispatch; anything else is a closeout (AMP #2801).
+		// Completion is also a fallback start signal.
+		closeout := !a.stateInUI && a.task.CompleteIsCloseout(a.stateDispatchID)
+		if a.task.StartedAt == nil && a.task.State == domain.TaskStateInProgress {
+			startBy := domain.StartedByInferred
+			if closeout {
+				startBy = domain.StartedByCloseout
+			}
+			if at, err := a.repo.StartTask(context.Background(), a.task.ID, startBy); err == nil {
+				a.task.StartedAt, a.task.StartedBy = &at, startBy
+			}
+		}
+		if closeout {
+			// Labelled, so history never reads as the worker's own work.
+			action = "closed_out"
+			detail = fmt.Sprintf("Closed out by %s (not the worker)", byName)
+			if why := strings.TrimSpace(reason); why != "" {
+				detail += ": " + why
+			}
+		}
+	}
+	// Any state change ends the current dispatch; persisted so a reload
+	// agrees with memory (AMP #2944).
+	if err := a.repo.ClearTaskDispatch(context.Background(), a.task.ID, false); err != nil {
+		return fmt.Errorf("db clear dispatch: %w", err)
+	}
+	a.task.DispatchID = ""
+	if state == domain.TaskStateCompleted {
+		// A done ticket isn't returned any more (AMP #2947).
+		if err := a.repo.ClearTaskReturn(context.Background(), a.task.ID); err != nil {
+			return fmt.Errorf("db clear return: %w", err)
+		}
+		a.task.ReturnedAt, a.task.ReturnedReason = nil, ""
+	}
 	a.task.State = state
 	a.task.UpdatedAt = time.Now()
 	// A block reason only means something while blocked; leaving the old
@@ -495,14 +827,14 @@ func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *in
 		TaskID:    a.task.ID,
 		ProjectID: a.projectID,
 		Actor:     byName,
-		Action:    "state_change",
+		Action:    action,
 		FromState: from,
 		ToState:   string(state),
-		Detail:    reason,
+		Detail:    detail,
 		// Who overrode the state, when known.
 		ActorUserID: by,
 	}); err != nil {
-		a.log.Error("failed to log state_change activity", "err", err)
+		a.log.Error("failed to log "+action+" activity", "err", err)
 	}
 
 	a.publish(domain.EventTaskUpdated, a.withBlockedBy())
@@ -609,10 +941,17 @@ func (a *TaskActor) handleAssign(msg *MsgAssignTask, ctx actor.Context) (*domain
 
 	detail := fmt.Sprintf("Owner %s → %s", from, ownerString(msg.NewOwner))
 	if msg.NewOwner == nil && a.task.State == domain.TaskStateInProgress {
-		// Released mid-flight: nobody is working it any more.
+		// Released mid-flight: nobody is working it any more, and its
+		// dispatch (if no worker started it) is over with it (AMP #2801).
+		// The token and start are cleared in the database too (AMP #2944).
+		if err := a.repo.ClearTaskDispatch(context.Background(), a.task.ID, true); err != nil {
+			return nil, fmt.Errorf("db release dispatch: %w", err)
+		}
 		a.task.State = domain.TaskStateBacklog
 		a.task.AgentID = ""
 		a.task.DispatchedAt = nil
+		a.task.DispatchID = ""
+		a.task.StartedAt, a.task.StartedBy = nil, ""
 		if err := a.saveState(domain.TaskStateBacklog, ""); err != nil {
 			return nil, fmt.Errorf("db release state: %w", err)
 		}
@@ -698,11 +1037,10 @@ func (a *TaskActor) checkUnblock(ctx actor.Context) {
 // dependencies becomes ready once none are left. Tasks in progress,
 // completed, or blocked for another reason keep their state.
 func (a *TaskActor) reconcileDeps(why string) error {
-	done, err := a.repo.CompletedAmong(context.Background(), a.task.DependencyIDs)
+	done, err := a.readDeps()
 	if err != nil {
 		return fmt.Errorf("read dependency states: %w", err)
 	}
-	a.completedDeps = done
 	waiting := false
 	for _, d := range a.task.DependencyIDs {
 		if !done[d] {
@@ -742,11 +1080,10 @@ func (a *TaskActor) openDeps() ([]int, error) {
 	if len(a.task.DependencyIDs) == 0 {
 		return nil, nil
 	}
-	done, err := a.repo.CompletedAmong(context.Background(), a.task.DependencyIDs)
+	done, err := a.readDeps()
 	if err != nil {
 		return nil, err
 	}
-	a.completedDeps = done
 	var open []int
 	for _, d := range a.task.DependencyIDs {
 		if !done[d] {
@@ -797,16 +1134,130 @@ func (a *TaskActor) holdForDeps(want domain.TaskState) (domain.TaskState, error)
 	return want, a.refuseOpenDeps(doing)
 }
 
-// withBlockedBy returns a copy of the task with BlockedByIDs computed from completedDeps.
+// withBlockedBy returns a copy of the task with BlockedByIDs computed from
+// completedDeps, and WaitingDetail naming the dependencies among them that
+// are done but wait on their merge.
 func (a *TaskActor) withBlockedBy() domain.Task {
 	t := a.task
 	t.BlockedByIDs = nil
+	t.WaitingDetail = ""
+	var waits []string
 	for _, depID := range a.task.DependencyIDs {
 		if !a.completedDeps[depID] {
 			t.BlockedByIDs = append(t.BlockedByIDs, depID)
+			if w := a.mergeWaits[depID]; w != "" {
+				waits = append(waits, w)
+			}
+		}
+	}
+	t.WaitingDetail = strings.Join(waits, "; ")
+	t.Phase = domain.PhaseOf(t.State, t.StartedAt)
+	// How long it has waited for a worker, so no client has to work it out
+	// from the timestamps (AMP #2801).
+	t.NotStartedMinutes = 0
+	if t.Phase == domain.PhaseNotStarted {
+		from := t.UpdatedAt
+		if t.DispatchedAt != nil {
+			from = *t.DispatchedAt
+		}
+		if m := int(time.Since(from).Minutes()); m > 0 {
+			t.NotStartedMinutes = m
 		}
 	}
 	return t
+}
+
+// readDeps re-reads which dependencies are satisfied, and which of the
+// rest are done but wait on their merge, into completedDeps/mergeWaits. A
+// task whose effective metadata says waits_for_merge: false waits only for
+// its dependencies to complete (AMP #2596).
+func (a *TaskActor) readDeps() (map[int]bool, error) {
+	done, waits, err := a.repo.DepStatesFor(context.Background(), a.task.ID, a.task.DependencyIDs)
+	if err != nil {
+		return nil, err
+	}
+	a.completedDeps, a.mergeWaits = done, waits
+	return done, nil
+}
+
+// dependsOn reports whether id is one of the task's dependencies.
+func (a *TaskActor) dependsOn(id int) bool {
+	for _, d := range a.task.DependencyIDs {
+		if d == id {
+			return true
+		}
+	}
+	return false
+}
+
+// handleSetMergeState applies MsgSetMergeState. A change that stops the
+// ticket holding its dependents (merged, or not needed) releases them the
+// way completion does; one that starts holding them (a PR reported after
+// completion, an abandoned PR) makes them wait again.
+func (a *TaskActor) handleSetMergeState(ctx actor.Context, msg *MsgSetMergeState) ReplyMergeState {
+	cur := a.task.MergeState
+	if cur == "" {
+		cur = domain.MergeNone
+	}
+	if len(msg.From) > 0 {
+		ok := false
+		for _, f := range msg.From {
+			ok = ok || f == cur
+		}
+		if !ok {
+			t := a.withBlockedBy()
+			return ReplyMergeState{Task: &t}
+		}
+	}
+	required := a.task.MergeRequired
+	if msg.Required != nil {
+		required = *msg.Required
+	}
+	if cur == msg.State && required == a.task.MergeRequired {
+		t := a.withBlockedBy()
+		return ReplyMergeState{Task: &t}
+	}
+	at, source := a.task.MergedAt, a.task.MergeSource
+	if msg.State == domain.MergeMerged {
+		at, source = msg.At, msg.Source
+		if at == nil {
+			now := time.Now()
+			at = &now
+		}
+	} else if msg.State != cur {
+		at, source = nil, ""
+	}
+	if err := a.repo.SetTaskMerge(context.Background(), a.task.ID, &required, msg.State, at, source); err != nil {
+		return ReplyMergeState{Err: fmt.Errorf("db merge state: %w", err)}
+	}
+	done := a.task.State == domain.TaskStateCompleted
+	heldBefore := done && domain.MergeGates(cur)
+	heldAfter := done && domain.MergeGates(msg.State)
+	a.task.MergeRequired, a.task.MergeState, a.task.MergedAt, a.task.MergeSource = required, msg.State, at, source
+	a.task.UpdatedAt = time.Now()
+
+	detail := msg.Detail
+	if detail == "" {
+		detail = "Merge state " + cur + " → " + msg.State
+	}
+	a.logActivityBy(nameOr(msg.ByName, "system"), msg.By, "merge_"+msg.State, "", "", detail)
+	t := a.withBlockedBy()
+	a.publish(domain.EventTaskUpdated, t)
+
+	switch {
+	case heldBefore && !heldAfter:
+		fan := make(chan ReplySimple, 1)
+		ctx.Send(a.projectPID, &MsgFanDepCompleted{CompletedTaskID: a.task.ID, ReplyCh: fan})
+		<-fan
+	case heldAfter:
+		// Newly held, or held for a new reason (an abandoned PR): dependents
+		// wait (again) and say why.
+		fan := make(chan ReplySimple, 1)
+		ctx.Send(a.projectPID, &MsgFanDepCompleted{CompletedTaskID: a.task.ID,
+			MergeWait: repository.MergeWaitDetail(a.task.ID, msg.State, msg.Where), ReplyCh: fan})
+		<-fan
+	}
+	return ReplyMergeState{Task: &t, Changed: true}
 }
 
 func (a *TaskActor) publish(evtType domain.EventType, payload interface{}) {
@@ -974,11 +1425,10 @@ func (a *TaskActor) handleScheduledUnblock(ctx actor.Context) {
 // reason — "waiting on its dependencies" — which checkUnblock/reconcileDeps
 // release once the last dependency completes. Publishes and logs the change.
 func (a *TaskActor) releaseFromSchedule(why string) error {
-	done, err := a.repo.CompletedAmong(context.Background(), a.task.DependencyIDs)
+	done, err := a.readDeps()
 	if err != nil {
 		return fmt.Errorf("read dependency states: %w", err)
 	}
-	a.completedDeps = done
 	waiting := 0
 	for _, d := range a.task.DependencyIDs {
 		if !done[d] {

@@ -3,6 +3,9 @@ package repository
 import (
 	"context"
 	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // namedLockSpace is the first key of the two-key pg_try_advisory_lock form
@@ -12,28 +15,36 @@ const namedLockSpace = 0x616d70 // "amp"
 
 // TryNamedLock takes a session-level Postgres advisory lock named key,
 // without waiting, so that only one replica at a time does the work it
-// guards. ok is false when another session holds it. While held, the lock
-// keeps one pool connection; release unlocks and returns it, and must be
-// called exactly once when ok is true.
+// guards. ok is false when another session holds it. release unlocks it
+// and must be called exactly once when ok is true.
+//
+// The lock lives on a connection of its own, opened for it outside the
+// pool and closed on release. It must not hold a pooled connection: the
+// work it guards runs through the pool, and the lock holders (audit
+// checkpoints, audit retention, the KB backfill with a per-KB lock inside
+// its run lock, the KB reconciler, KB reindexes) can outnumber a small
+// pool. When they held pooled connections, four of them at pgxpool's
+// default size on a 4-CPU host (4) left none for their own work or for
+// the cluster heartbeat, and amp-api hung at startup (#2598).
 func (r *Repo) TryNamedLock(ctx context.Context, key string) (release func(), ok bool, err error) {
-	conn, err := r.db.Acquire(ctx)
+	conn, err := pgx.ConnectConfig(ctx, r.db.Config().ConnConfig.Copy())
 	if err != nil {
-		return nil, false, fmt.Errorf("acquire connection: %w", err)
+		return nil, false, fmt.Errorf("connect for advisory lock %q: %w", key, err)
 	}
 	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1, hashtext($2))`, namedLockSpace, key).Scan(&ok); err != nil {
-		conn.Release()
+		_ = conn.Close(context.Background())
 		return nil, false, fmt.Errorf("advisory lock %q: %w", key, err)
 	}
 	if !ok {
-		conn.Release()
+		_ = conn.Close(context.Background())
 		return nil, false, nil
 	}
 	return func() {
-		if _, err := conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1, hashtext($2))`, namedLockSpace, key); err != nil {
-			// Unlocking failed, so the session may still hold the lock:
-			// close the connection rather than hand it back to the pool.
-			_ = conn.Conn().Close(context.Background())
-		}
-		conn.Release()
+		// Closing the session releases its advisory locks even if the
+		// unlock fails or times out.
+		uctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = conn.Exec(uctx, `SELECT pg_advisory_unlock($1, hashtext($2))`, namedLockSpace, key)
+		_ = conn.Close(uctx)
 	}, true, nil
 }

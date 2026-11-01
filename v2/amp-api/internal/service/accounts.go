@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -154,6 +155,16 @@ func (s *Service) SetUserDisabled(ctx context.Context, p authz.Principal, userID
 		action, verb = "user.deactivate", "deactivated "
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: action, TargetType: "user", TargetID: idStr(userID), Summary: verb + u.Email})
+	if disabled {
+		// A deactivated person's remote sessions end now (#2390), which also
+		// voids their connect tokens; the relay is told to close the streams.
+		ended, err := s.Repo.EndOwnerRemoteSessions(ctx, userID, domain.RemoteEndDeactivated)
+		if err != nil {
+			slog.Warn("ending a deactivated account's remote sessions failed", "user_id", userID, "err", err)
+		} else {
+			s.remoteEnded(ctx, p, ended, domain.AuditRemoteDisable)
+		}
+	}
 	// The account's tokens were revoked with it, so a reactivated account
 	// needs new ones. Each is audited like a normal revoke.
 	for _, tok := range revoked {
@@ -176,15 +187,21 @@ func (s *Service) SetUserRole(ctx context.Context, p authz.Principal, userID int
 	if grant && role == domain.RoleAdmin && u.IsAgent() {
 		return authz.BadRequest("agent accounts can't be global admins")
 	}
+	before, _ := s.Repo.UserRoles(ctx, userID)
 	if err := s.Repo.SetUserRole(ctx, userID, role, grant); err != nil {
 		return err
 	}
+	after, _ := s.Repo.UserRoles(ctx, userID)
 	verb := "revoked "
 	if grant {
 		verb = "granted "
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "user.role", TargetType: "user", TargetID: idStr(userID),
-		Summary: verb + role + " for " + u.Email, Details: map[string]any{"role": role, "grant": grant}})
+		TargetName: u.Email, Summary: verb + role + " for " + u.Email, Details: map[string]any{"role": role, "grant": grant},
+		Before: map[string]any{"roles": rolesValue(before)}, After: map[string]any{"roles": rolesValue(after)}})
+	if !grant {
+		s.endRemoteAfterAccessChange(ctx, p, userID) // a global admin who reached projects only as one
+	}
 	return nil
 }
 
@@ -274,4 +291,13 @@ func (s *Service) RevokeToken(ctx context.Context, p authz.Principal, tokenID in
 	s.audit(ctx, p, domain.AuditEntry{Action: "token.revoke", TargetType: "user", TargetID: idStr(tok.UserID),
 		Summary: "revoked API token " + tok.Prefix + "… (" + tok.Name + ") of " + u.Email, Details: map[string]any{"token_id": tokenID}})
 	return nil
+}
+
+// rolesValue is a user's global roles as an audit before/after value.
+func rolesValue(roles []string) []any {
+	out := make([]any, 0, len(roles))
+	for _, r := range roles {
+		out = append(out, r)
+	}
+	return out
 }

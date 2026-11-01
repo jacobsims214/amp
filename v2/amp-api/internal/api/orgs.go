@@ -29,6 +29,8 @@ import (
 //	GET    /api/orgs/:id/invites                                       org admin
 //	POST   /api/orgs/:id/invites           {email, org_role?, team_id?, team_role?}
 //	DELETE /api/orgs/:id/invites/:inviteId                             org admin
+//	GET    /api/orgs/:id/remote-control                                org admin (remote.go)
+//	PUT    /api/orgs/:id/remote-control  {enabled, idle_timeout_min, max_lifetime_hours, device_pin_days}  org admin, web UI
 //	GET    /api/teams/:id                  team + members
 //	PATCH  /api/teams/:id                  {name}                      org admin
 //	DELETE /api/teams/:id                                              org admin
@@ -91,6 +93,11 @@ func (h *RestHandler) orgSub(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+
+	if len(parts) == 2 && parts[1] == "remote-control" {
+		h.orgRemoteControl(w, r, pr, orgID)
+		return
+	}
 
 	if len(parts) == 2 && parts[1] == "webhooks" {
 		h.webhookCollection(w, r, pr, &orgID, nil)

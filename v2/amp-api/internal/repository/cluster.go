@@ -2,8 +2,6 @@ package repository
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -13,11 +11,13 @@ import (
 
 // ---- Replicas and project ownership (see internal/cluster) ----
 
-// NodeHeartbeat records that node id, reachable at addr, is alive.
+// NodeHeartbeat records that node id, reachable at addr, is alive. The row
+// is registered by this connection's role (registered_by, #2398): amp-api
+// trusts only its own role's rows, and amp-relay's role can write only its.
 func (r *Repo) NodeHeartbeat(ctx context.Context, id, addr string) error {
 	_, err := r.db.Exec(ctx, `
 		INSERT INTO api_nodes (id, addr) VALUES ($1, $2)
-		ON CONFLICT (id) DO UPDATE SET addr = EXCLUDED.addr, heartbeat_at = NOW()`, id, addr)
+		ON CONFLICT (id) DO UPDATE SET addr = EXCLUDED.addr, heartbeat_at = NOW(), registered_by = current_user`, id, addr)
 	return err
 }
 
@@ -57,6 +57,10 @@ type ProjectOwner struct {
 // ClaimProject makes node the owner of a project unless another node that
 // heartbeated within ttl already owns it. It returns the owner either way:
 // node itself when the claim succeeded (or it already owned the project).
+//
+// Only nodes registered by this connection's role count (#2398): the owner's
+// address gets amp-api's cluster token, so a row another role wrote (the
+// relay's) is never alive for a claim and never gives an address.
 func (r *Repo) ClaimProject(ctx context.Context, projectID int, node string, ttl time.Duration) (ProjectOwner, error) {
 	var o ProjectOwner
 	err := r.db.QueryRow(ctx, `
@@ -67,7 +71,8 @@ func (r *Repo) ClaimProject(ctx context.Context, projectID int, node string, ttl
 		       acquired_at = CASE WHEN project_owners.node_id = EXCLUDED.node_id THEN project_owners.acquired_at ELSE NOW() END
 		 WHERE project_owners.node_id = EXCLUDED.node_id
 		    OR NOT EXISTS (SELECT 1 FROM api_nodes n
-		                    WHERE n.id = project_owners.node_id AND n.heartbeat_at > NOW() - $3::float8 * interval '1 second')
+		                    WHERE n.id = project_owners.node_id AND n.registered_by = current_user
+		                      AND n.heartbeat_at > NOW() - $3::float8 * interval '1 second')
 		RETURNING node_id, epoch`, projectID, node, ttl.Seconds()).Scan(&o.NodeID, &o.Epoch)
 	if err == nil {
 		return o, nil
@@ -78,7 +83,7 @@ func (r *Repo) ClaimProject(ctx context.Context, projectID int, node string, ttl
 	// Someone alive owns it.
 	err = r.db.QueryRow(ctx, `
 		SELECT o.node_id, COALESCE(n.addr, ''), o.epoch
-		  FROM project_owners o LEFT JOIN api_nodes n ON n.id = o.node_id
+		  FROM project_owners o LEFT JOIN api_nodes n ON n.id = o.node_id AND n.registered_by = current_user
 		 WHERE o.project_id = $1`, projectID).Scan(&o.NodeID, &o.Addr, &o.Epoch)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Released between the two statements; the caller tries again.
@@ -91,18 +96,7 @@ func (r *Repo) ClaimProject(ctx context.Context, projectID int, node string, ttl
 // it the first time. Anything that can read the database is already
 // trusted with everything the token protects.
 func (r *Repo) ClusterToken(ctx context.Context) (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	if _, err := r.db.Exec(ctx, `
-		INSERT INTO cluster_settings (key, value) VALUES ('internal_token', $1)
-		ON CONFLICT (key) DO NOTHING`, hex.EncodeToString(b)); err != nil {
-		return "", err
-	}
-	var tok string
-	err := r.db.QueryRow(ctx, `SELECT value FROM cluster_settings WHERE key = 'internal_token'`).Scan(&tok)
-	return tok, err
+	return r.settingToken(ctx, "internal_token")
 }
 
 // ProjectsWithDueSchedules lists projects with a ticket waiting on a start

@@ -27,6 +27,11 @@ State follows from dependencies: a ticket is `backlog` (ready once its dependenc
 `blocked` (waiting on dependencies, or on a person's answer), `in_progress` or `completed`.
 Don't set state by hand to work around a missing dependency; add the dependency.
 
+Those four states are the whole state machine. Two things you see in the UI are *within*
+`in_progress`: **dispatched · not started** (sent to an agent, but no worker has claimed it yet;
+AMP returns it to ready if nobody does) and **quiet** (started, then silent for 15 minutes). Both
+are derived on read, so nothing about a ticket's state means something new to an old client.
+
 ## People and agents
 
 - Every ticket has an **owner**: a person. The ticket is theirs whichever agent works it.
@@ -39,8 +44,9 @@ Don't set state by hand to work around a missing dependency; add the dependency.
 - **Agent accounts** are separate AMP users for unattended agents (CI, bots). They can do work
   but can't approve plans. No agent can, whoever it runs as: plans and artifacts are approved,
   and human tickets marked done, by a person in the web UI.
-- **Human tickets** are done by their owner, not an agent: a review and merge, a sign-off, a
-  step that needs access agents don't have. They sit in the same dependency graph, so the agent
+- **Human tickets** are done by their owner, not an agent: a sign-off, a decision, a
+  step that needs access agents don't have. (Merging a PR isn't one: the ticket shows **Merge
+  needed** and the work after it waits for the merge; see `working/merging-and-ci.md`.) They sit in the same dependency graph, so the agent
   work after them waits for the person. Agents never dispatch them. See `working/human-work.md`.
 
 ## Access levels on a project

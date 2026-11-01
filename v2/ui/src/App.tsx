@@ -3,6 +3,8 @@ import { Projects } from './pages/Projects'
 import { MyWork } from './pages/MyWork'
 import { Board } from './pages/Board'
 import { Mission } from './pages/Mission'
+import { ProjectMyWork } from './pages/ProjectMyWork'
+import { ProjectLanding } from './pages/ProjectLanding'
 import { FlightPlan } from './pages/FlightPlan'
 import { DAGView } from './pages/DAG'
 import { Report } from './pages/Report'
@@ -11,16 +13,20 @@ import { ProjectSettings } from './pages/ProjectSettings'
 import { DayReports } from './pages/DayReports'
 import { Users } from './pages/Users'
 import { Orgs } from './pages/Orgs'
+import { AdminAudit } from './pages/AdminAudit'
 import { Access } from './pages/Access'
 import { Trace } from './pages/Trace'
 import { Portfolio } from './pages/Portfolio'
 import { Artifacts } from './pages/Artifacts'
 import { ArtifactView } from './pages/ArtifactView'
+import { Session } from './pages/Session'
+import { Sessions } from './pages/Sessions'
+import { RemoteProvider } from './remote/RemoteProvider'
 import { AuthProvider } from './contexts/AuthContext'
 import { AppShell } from './components/shell/AppShell'
 import { LaunchSequence } from './components/brand/LaunchSequence'
 
-/** An unknown view under a project lands on its Mission page. */
+/** An unknown view under a project opens the project (My work or Mission, by the landing rule). */
 function ProjectFallback() {
   const { projectId } = useParams()
   return <Navigate to={`/project/${projectId}`} replace />
@@ -39,13 +45,21 @@ function NotFound() {
 export default function App() {
   return (
     <AuthProvider>
-      <LaunchSequence />
+      <RemoteProvider>
+      {/* The remote session page skips the launch animation: on a phone you want the chat now. */}
+      {!window.location.pathname.startsWith('/sessions/') && <LaunchSequence />}
       <BrowserRouter>
         <Routes>
+          {/* Standalone (no sidebar) so it works on a phone; served with a strict CSP. */}
+          <Route path="/sessions/:sessionId" element={<Session />} />
           <Route element={<AppShell />}>
             <Route path="/" element={<MyWork />} />
+            <Route path="/sessions" element={<Sessions />} />
             <Route path="/projects" element={<Projects />} />
-            <Route path="/project/:projectId" element={<Mission />} />
+            {/* No tab: My work when something waits on you here, else Mission (lib/landing.ts). */}
+            <Route path="/project/:projectId" element={<ProjectLanding />} />
+            <Route path="/project/:projectId/mission" element={<Mission />} />
+            <Route path="/project/:projectId/my-work" element={<ProjectMyWork />} />
             <Route path="/project/:projectId/board" element={<Board />} />
             <Route path="/project/:projectId/plan" element={<FlightPlan />} />
             <Route path="/project/:projectId/dag" element={<DAGView />} />
@@ -59,6 +73,7 @@ export default function App() {
             <Route path="/reports" element={<DayReports />} />
             <Route path="/admin/users" element={<Users />} />
             <Route path="/admin/orgs" element={<Orgs />} />
+            <Route path="/admin/audit" element={<AdminAudit />} />
             <Route path="/access" element={<Access />} />
             <Route path="/guide" element={<KB />} />
             <Route path="/trace" element={<Trace />} />
@@ -68,6 +83,7 @@ export default function App() {
           </Route>
         </Routes>
       </BrowserRouter>
+      </RemoteProvider>
     </AuthProvider>
   )
 }

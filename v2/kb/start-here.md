@@ -38,17 +38,24 @@ Explain the shape using *their* data, not an abstract example. Open one of their
 - **Dependencies.** AMP runs every ticket whose dependencies are done, in parallel. The graph is
   the plan. (`concepts.md`)
 - **The buckets** in `amp_list_tasks`: `ready_to_dispatch`, `in_progress`, `questions`,
-  `scheduled`, `quiet`, `blocked`, `completed`.
+  `scheduled`, `quiet`, `blocked`, `completed`, plus two lists for dispatched work:
+  `not_started` (sent to an agent, no worker started it) and `returned` (AMP sent it back to ready
+  because nobody started it in time).
 
 Point them at the UI as you go: **My work** (home), **Projects**, and inside a project
-**Mission**, **Board**, **Flight plan**, **Graph**, **Reports**, **Library**, **Settings**
-(`ui-tour.md`).
+**Mission**, **My work** (where they approve, answer, merge and do their own steps), **Board**,
+**Flight plan**, **Graph**, **Reports**, **Library**, **Settings** (`ui-tour.md`).
 
 ## Step 2: make sure their agent is set up right
 
 Most early trouble is harness setup, not AMP. Check `setup/connect-your-agent.md` with them:
 the AMP MCP server is connected with *their* token, the manager agent and skills are installed,
 and workers can't get stuck on permission prompts.
+
+If they use **AMP Harness** (`amp-harness`, AMP's own harness), start from `harness/start-here.md`
+instead: run `amp-harness doctor` with them and fix what it reports. Its pages cover install,
+servers, model providers and models per role, agents, skills, MCP servers and configuration. A
+company with its own model endpoint follows `harness/enterprise-provider.md`.
 
 ## Step 3: plan something real, together
 

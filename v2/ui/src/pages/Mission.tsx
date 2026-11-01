@@ -1,16 +1,21 @@
 /**
- * Mission — a project while agents work it. Built for hundreds of tickets:
- *   - Six readouts: in progress, ready, waiting, flagged (an alarm), scheduled, done.
+ * Mission — the project for everyone, informational (KB decisions/human-work-ux.md §3).
+ * Built for hundreds of tickets:
+ *   - A "Waiting on you" strip that leads to My work, where every action lives.
+ *   - Six readouts: in progress, ready, waiting, questions (N · M for you),
+ *     merge needed (N · M yours), done.
  *   - Every epic is a panel; every ticket in it is one square, colored by
- *     state, in rows by story. Epics that need a person sort first; finished
- *     epics fold into a list at the bottom.
- *   - Beside them: agent flags you can answer in place, who is working what,
- *     and the latest activity.
- * Clicking any ticket opens it in the drawer.
+ *     state, in rows by story, outlined when it waits on you. Epics that need
+ *     a person sort first; finished epics fold into a list at the bottom.
+ *   - Beside them: Waiting on people (each person's counts by kind, linking
+ *     into their My work), who is working what, and the latest activity.
+ * Nothing here is an action: clicking a ticket opens it in the drawer, and
+ * answering, merging, approving and doing happen in My work.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { useParams, useSearchParams } from 'react-router-dom'
-import { Loader2 } from 'lucide-react'
+import { Link, useParams } from 'react-router-dom'
+import { useFocusParam } from '../hooks/useFocusParam'
+import { ChevronRight } from 'lucide-react'
 import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
 import { useAuth } from '../hooks/useAuth'
@@ -23,9 +28,13 @@ import { Avatar } from '../components/ui/Avatar'
 import { PriorityMark } from '../components/ui/PriorityMark'
 import { countStates, displayState, QUIET_MS, silentFor, STATE_LABEL, STATE_VAR, type DisplayState } from '../lib/ticketState'
 import { activityActor, lookupPerson } from '../lib/people'
-import type { ActivityLog, AuditEntry, Epic, Story, Task } from '../types'
-import { MergeQueue } from '../components/MergeQueue'
+import type { ActivityLog, AuditEntry, Epic, PersonWaiting, Story, Task, WaitCounts } from '../types'
 import { isHuman, reasonLabel } from '../lib/human'
+import { canApproveOnBehalf } from '../lib/approval'
+import { projectLink } from '../lib/projectLink'
+import { projectCounts, refreshWaitCounts, useWaitCounts } from '../lib/waitCounts'
+import { needsMerge } from '../lib/merge'
+import { countsSummary, kindSummary, panelOrder, personLink, ticketsWaitingOn } from '../lib/waitingPanel'
 import { BandLoader } from '../components/brand/BandLoader'
 
 function ago(iso?: string | null): string {
@@ -43,30 +52,33 @@ function clock(iso: string): string {
   return day + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false })
 }
 
-/** One square per ticket. */
-function Squares({ tasks, onOpen }: { tasks: Task[]; onOpen: (id: number) => void }) {
+/** One square per ticket; a ticket waiting on you is outlined in the link color. */
+function Squares({ tasks, mine, onOpen }: { tasks: Task[]; mine: Set<number>; onOpen: (id: number) => void }) {
   return (
     <div className="flex flex-wrap gap-[3px]">
       {tasks.map(t => {
         const s = displayState(t)
         const hollow = s === 'wait' || s === 'ready'
+        const forYou = mine.has(t.id)
         return (
-          <button key={t.id} type="button" onClick={() => onOpen(t.id)}
-            title={`#${t.id} ${t.name} · ${STATE_LABEL[s]}${t.agent_id ? ' · ' + t.agent_id : ''}`}
-            aria-label={`Ticket ${t.id}: ${t.name}, ${STATE_LABEL[s]}`}
+          <button key={t.id} type="button" onClick={() => onOpen(t.id)} data-for-you={forYou || undefined}
+            title={`#${t.id} ${t.name} · ${STATE_LABEL[s]}${t.agent_id ? ' · ' + t.agent_id : ''}${forYou ? ' · waits on you' : ''}`}
+            aria-label={`Ticket ${t.id}: ${t.name}, ${STATE_LABEL[s]}${forYou ? ', waits on you' : ''}`}
             className="w-[11px] h-[11px] cursor-pointer hover:scale-125 transition-transform focus-visible:outline-2 focus-visible:outline-offset-1"
             style={{ borderRadius: 1, background: hollow ? 'transparent' : STATE_VAR[s],
-              boxShadow: hollow ? `inset 0 0 0 ${s === 'wait' ? 1 : 1.5}px ${STATE_VAR[s]}` : undefined }} />
+              boxShadow: hollow ? `inset 0 0 0 ${s === 'wait' ? 1 : 1.5}px ${STATE_VAR[s]}` : undefined,
+              outline: forYou ? '2px solid var(--link)' : undefined, outlineOffset: forYou ? 1 : undefined }} />
         )
       })}
     </div>
   )
 }
 
-function EpicPanel({ epic, stories, tasks, owners, onOpen }: {
-  epic: Epic; stories: Story[]; tasks: Task[]; owners: string; onOpen: (id: number) => void
+function EpicPanel({ epic, stories, tasks, owners, mine, onOpen }: {
+  epic: Epic; stories: Story[]; tasks: Task[]; owners: string; mine: Set<number>; onOpen: (id: number) => void
 }) {
   const counts = countStates(tasks)
+  const forYou = tasks.filter(t => mine.has(t.id)).length
   const byStory = (sid: number) => tasks.filter(t => t.story_id === sid).sort((a, b) => a.id - b.id)
   return (
     <section className="amp-panel flex flex-col" aria-label={`Epic ${epic.name}`}>
@@ -76,7 +88,10 @@ function EpicPanel({ epic, stories, tasks, owners, onOpen }: {
           <span className="amp-label flex items-center gap-2">Epic <PriorityMark priority={epic.priority} />{owners && <span className="normal-case tracking-normal font-body font-normal text-[11px] truncate">{owners}</span>}</span>
           <h3 className="m-0 text-[14.5px] font-semibold leading-tight text-ink">{epic.name}</h3>
         </div>
-        <div className="amp-num text-[20px] leading-none text-right text-ink whitespace-nowrap">{counts.done}<span className="text-[12px] text-ink-3">/{tasks.length}</span></div>
+        <div className="grid gap-1 justify-items-end">
+          <div className="amp-num text-[20px] leading-none text-right text-ink whitespace-nowrap">{counts.done}<span className="text-[12px] text-ink-3">/{tasks.length}</span></div>
+          {forYou > 0 && <span className="amp-num text-[11px] text-link whitespace-nowrap">{forYou} for you</span>}
+        </div>
       </div>
       <div className="px-3.5 pb-2.5"><StateBar counts={counts} /></div>
       {stories.map(s => {
@@ -84,7 +99,7 @@ function EpicPanel({ epic, stories, tasks, owners, onOpen }: {
         return (
           <div key={s.id} className="grid grid-cols-[112px_1fr] gap-2 items-center px-3.5 py-1.5 border-t border-line">
             <span className="text-[12px] text-ink-2 truncate" title={s.name}>{s.name}</span>
-            {list.length ? <Squares tasks={list} onOpen={onOpen} />
+            {list.length ? <Squares tasks={list} mine={mine} onOpen={onOpen} />
               : <span className="font-label text-[10.5px] font-semibold uppercase tracking-[0.12em] text-danger-ink">No tickets</span>}
           </div>
         )
@@ -93,45 +108,42 @@ function EpicPanel({ epic, stories, tasks, owners, onOpen }: {
   )
 }
 
-function FlagCard({ task, blocks, onOpen, onAnswered }: { task: Task; blocks: number; onOpen: () => void; onAnswered: (t: Task) => void }) {
-  const [answering, setAnswering] = useState(false)
-  const [answer, setAnswer] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const submit = async () => {
-    setBusy(true); setError(null)
-    try { onAnswered(await api.answerFlag(task.id, answer)) }
-    catch (e) { setError(e instanceof Error ? e.message : 'Could not answer') }
-    finally { setBusy(false) }
+/**
+ * "Waiting on you": the viewer's counts in this project (the same numbers as
+ * the My work tab's badge), leading to My work. Quiet when nothing waits.
+ */
+function WaitingStrip({ projectId, counts }: { projectId: number; counts: WaitCounts }) {
+  if (counts.waiting > 0) {
+    return (
+      <Link to={projectLink(projectId, 'my-work')} aria-label={`Waiting on you: ${counts.waiting}. ${countsSummary(counts)}. Open My work`}
+        className="amp-panel flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-3 hover:bg-surface-2 no-underline" style={{ borderColor: 'var(--ink)' }}>
+        <span className="inline-flex items-center gap-2 amp-label" style={{ color: 'var(--ink)' }}><i className="w-2 h-2 bg-accent" aria-hidden="true" />Waiting on you</span>
+        <span className="amp-num text-[22px] leading-none text-ink">{counts.waiting}</span>
+        <span className="text-[13px] text-ink-2">{countsSummary(counts)}</span>
+        <span className="ml-auto amp-label inline-flex items-center gap-1" style={{ color: 'var(--link)' }}>Open My work<ChevronRight size={14} aria-hidden="true" /></span>
+      </Link>
+    )
   }
   return (
-    <div className="grid grid-cols-[22px_1fr] gap-x-3 gap-y-1 px-4 py-3 border-t border-line first:border-t-0">
-      <span className="row-span-3 w-[22px] h-[20px] bg-st-flag text-white grid place-items-center text-[11px] font-bold pt-1"
-        style={{ clipPath: 'polygon(50% 0, 100% 100%, 0 100%)' }} aria-hidden="true">!</span>
-      <p className="m-0 text-[13px] leading-snug text-ink">{task.block_reason}</p>
-      <span className="amp-num text-[11px] text-ink-3">
-        <button type="button" onClick={onOpen} className="underline underline-offset-2 hover:text-ink cursor-pointer">#{task.id}</button>
-        {' '}· {task.agent_id || task.assigned_to || 'unassigned'} · {ago(task.updated_at)} · blocks {blocks}
-      </span>
-      {answering ? (
-        <div className="grid gap-2 pt-1">
-          <label htmlFor={`answer-${task.id}`} className="sr-only">Answer for ticket {task.id}</label>
-          <textarea id={`answer-${task.id}`} className="amp-input min-h-[64px] resize-y" autoFocus value={answer}
-            onChange={e => setAnswer(e.target.value)} placeholder="Your answer. It's posted on the ticket and the ticket goes back to ready." />
-          {error && <span className="text-[12px] text-danger-ink">{error}</span>}
-          <div className="flex gap-2">
-            <button type="button" className="amp-btn amp-btn-accent amp-btn-sm" disabled={busy || !answer.trim()} onClick={submit}>
-              {busy && <Loader2 size={11} className="animate-spin" />}Answer and unblock</button>
-            <button type="button" className="amp-btn amp-btn-ghost amp-btn-sm" onClick={() => setAnswering(false)}>Cancel</button>
-          </div>
-        </div>
-      ) : (
-        <div className="flex gap-2 pt-1">
-          <button type="button" className="amp-btn amp-btn-accent amp-btn-sm" onClick={() => setAnswering(true)}>Answer</button>
-          <button type="button" className="amp-btn amp-btn-sm" onClick={onOpen}>Open</button>
-        </div>
-      )}
-    </div>
+    <Link to={projectLink(projectId, 'my-work')} className="amp-panel flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-3 hover:bg-surface-2 no-underline">
+      <span className="amp-label" style={{ color: 'var(--success-ink)' }}>Nothing waits on you here</span>
+      {counts.coming_up > 0 && <span className="text-[13px] text-ink-2">{counts.coming_up} coming up</span>}
+      <span className="ml-auto amp-label inline-flex items-center gap-1" style={{ color: 'var(--link)' }}>My work<ChevronRight size={14} aria-hidden="true" /></span>
+    </Link>
+  )
+}
+
+/** One person in Waiting on people: their counts by kind, linking into their My work. */
+function PersonRow({ p, name, mine, href }: { p: PersonWaiting; name: string; mine: boolean; href: string }) {
+  const summary = kindSummary(p)
+  return (
+    <Link to={href} className="grid grid-cols-[auto_1fr_auto] gap-x-2.5 gap-y-0.5 items-center px-4 py-2.5 border-t border-line first:border-t-0 hover:bg-surface-2 no-underline"
+      aria-label={`${mine ? 'You' : name}: ${p.counts.waiting} waiting${summary ? `. ${summary}` : ''}`}>
+      <Avatar name={name} kind="human" />
+      <span className="text-[12.5px] text-ink truncate"><b className="font-semibold">{mine ? 'You' : name}</b>: <span className="amp-num">{p.counts.waiting}</span></span>
+      <ChevronRight size={15} className="text-ink-3" aria-hidden="true" />
+      {summary && <span className="col-start-2 col-span-2 text-[11.5px] text-ink-2 truncate">{summary}</span>}
+    </Link>
   )
 }
 
@@ -164,13 +176,21 @@ export function Mission() {
   const { epics, stories, tasks, loading, error, refresh, applyTask } = useBoardData(pid)
   const { members, myAccess, openReassign, people } = useProjectPeople(pid)
   const { me } = useAuth()
-  // ?ticket=ID opens a ticket on arrival (links from My work and elsewhere).
-  const [params, setParams] = useSearchParams()
-  const [selectedId, setSelected] = useState<number | null>(() => Number(params.get('ticket')) || null)
-  const setSelectedId = (id: number | null) => {
-    setSelected(id)
-    if (params.has('ticket')) { params.delete('ticket'); setParams(params, { replace: true }) }
-  }
+  const waitCounts = useWaitCounts()
+  const yours = projectCounts(waitCounts, pid)
+  // Waiting on people: every person's items, from the server's one definition
+  // (GET /projects/:id/waiting-on-people), refetched shortly after tickets change.
+  // Kept with its project id so another project's people never show here.
+  const [waitingFor, setWaitingFor] = useState<{ pid: number; people: PersonWaiting[] } | null>(null)
+  const waiting = useMemo(() => (waitingFor?.pid === pid ? waitingFor.people : []), [waitingFor, pid])
+  const loadWaiting = useCallback(() => {
+    let live = true
+    api.waitingOnPeople(pid).then(r => { if (live) setWaitingFor({ pid, people: r.people ?? [] }) }).catch(() => {})
+    return () => { live = false }
+  }, [pid])
+  useEffect(() => loadWaiting(), [loadWaiting])
+  // ?focus=ID (or the old ?ticket=) opens a ticket; it stays in the URL until closed.
+  const [selectedId, setSelectedId] = useFocusParam()
   const [showDone, setShowDone] = useState(false)
   const [activity, setActivity] = useState<FeedItem[]>([])
   // Last sign of life per ticket (any activity), and a clock that moves on
@@ -209,13 +229,16 @@ export function Mission() {
   const quietFor = (t: Task) => silentFor([lastSeen.get(t.id), t.dispatched_at, t.updated_at], now)
 
   const counts = useMemo(() => countStates(tasks), [tasks])
-  const dependents = useMemo(() => {
-    const m = new Map<number, number>()
-    for (const t of tasks) for (const d of t.dependency_ids ?? []) m.set(d, (m.get(d) ?? 0) + 1)
-    return m
-  }, [tasks])
-  const flagged = useMemo(() => tasks.filter(t => displayState(t) === 'flag')
-    .sort((a, b) => (dependents.get(b.id) ?? 0) - (dependents.get(a.id) ?? 0)), [tasks, dependents])
+  // Keep the strip's numbers in step when tickets change under us (an answer, a merge).
+  useEffect(() => {
+    if (!tasks.length) return
+    let stop: (() => void) | undefined
+    const t = setTimeout(() => { refreshWaitCounts(); stop = loadWaiting() }, 1200)
+    return () => { clearTimeout(t); stop?.() }
+  }, [tasks, loadWaiting])
+  const mergeNeeded = useMemo(() => tasks.filter(needsMerge).length, [tasks])
+  const mine = useMemo(() => ticketsWaitingOn(waiting.find(p => p.user_id === me?.user_id)), [waiting, me?.user_id])
+  const waitingPeople = useMemo(() => panelOrder(waiting, me?.user_id), [waiting, me?.user_id])
   const flying = useMemo(() => tasks.filter(t => t.state === 'in_progress')
     .sort((a, b) => (a.dispatched_at ?? '').localeCompare(b.dispatched_at ?? '')), [tasks])
   const nextStart = useMemo(() => tasks.filter(t => displayState(t) === 'sched' && t.start_at)
@@ -254,12 +277,16 @@ export function Mission() {
       <ProjectNav projectId={pid} currentView="mission" />
       <div className="p-7 pt-5 grid gap-4">
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
-        <Readouts items={[
+        {yours && <WaitingStrip projectId={pid} counts={yours} />}
+        <Readouts wrap items={[
           { label: 'In progress', value: counts.prog, sub: quiet ? `${quiet} quiet · may have stalled` : runningSub, alarm: quiet > 0, color: 'var(--st-prog)' },
           { label: 'Ready', value: counts.ready, sub: 'can dispatch now' },
-          { label: 'Waiting', value: counts.wait, sub: 'on dependencies', color: 'var(--ink-3)' },
-          { label: 'Questions', value: counts.flag, sub: counts.flag ? 'agents waiting on an answer' : 'nothing needs you', alarm: counts.flag > 0 },
-          { label: 'Scheduled', value: counts.sched, sub: nextStart ? `next ${new Date(nextStart).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' })}` : 'none', color: 'var(--st-sched)' },
+          { label: 'Waiting', value: counts.wait + counts.sched, color: 'var(--ink-3)',
+            sub: counts.sched ? `${counts.sched} scheduled${nextStart ? `, next ${new Date(nextStart).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' })}` : ''}` : 'on other tickets' },
+          { label: 'Questions', value: counts.flag, color: counts.flag ? 'var(--st-flag)' : undefined,
+            sub: yours ? `${yours.answer} for you` : counts.flag ? 'waiting on an answer' : 'none' },
+          { label: 'Merge needed', value: mergeNeeded, color: mergeNeeded ? 'var(--teal)' : undefined,
+            sub: yours ? `${yours.merge} yours` : mergeNeeded ? 'dependents wait on them' : 'none' },
           { label: 'Done', value: <>{counts.done}<span className="text-[13px] text-ink-3">/{tasks.length}</span></>,
             sub: tasks.length ? `${Math.round(counts.done / tasks.length * 100)}% of the plan` : 'no tickets yet' },
         ]} />
@@ -272,7 +299,7 @@ export function Mission() {
               </div>
             )}
             <div className="grid gap-3 grid-cols-[repeat(auto-fill,minmax(310px,1fr))] items-start">
-              {open.map(r => <EpicPanel key={r.epic.id} epic={r.epic} stories={r.stories} tasks={r.list} owners={ownersOf(r.epic.owner_ids)} onOpen={setSelectedId} />)}
+              {open.map(r => <EpicPanel key={r.epic.id} epic={r.epic} stories={r.stories} tasks={r.list} owners={ownersOf(r.epic.owner_ids)} mine={mine} onOpen={setSelectedId} />)}
             </div>
             {finished.length > 0 && (
               <section className="amp-panel">
@@ -284,7 +311,7 @@ export function Mission() {
                 </button>
                 {showDone && (
                   <div className="grid gap-3 p-3 pt-0 grid-cols-[repeat(auto-fill,minmax(310px,1fr))] items-start">
-                    {finished.map(r => <EpicPanel key={r.epic.id} epic={r.epic} stories={r.stories} tasks={r.list} owners={ownersOf(r.epic.owner_ids)} onOpen={setSelectedId} />)}
+                    {finished.map(r => <EpicPanel key={r.epic.id} epic={r.epic} stories={r.stories} tasks={r.list} owners={ownersOf(r.epic.owner_ids)} mine={mine} onOpen={setSelectedId} />)}
                   </div>
                 )}
               </section>
@@ -298,11 +325,19 @@ export function Mission() {
           </div>
 
           <div className="grid grid-cols-1 gap-4 min-w-0">
-            <Panel label="Questions" title={flagged.length ? `${flagged.length} waiting on an answer` : 'None'}
-              right={<span>blocked with a reason</span>}>
-              {flagged.length === 0
-                ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">When an agent stops on a question, it shows up here. Answer it here, or have your orchestrator answer it with amp_answer_question.</p>
-                : flagged.map(t => <FlagCard key={t.id} task={t} blocks={dependents.get(t.id) ?? 0} onOpen={() => setSelectedId(t.id)} onAnswered={applyTask} />)}
+            <Panel label="Waiting on people" right={<span>informational</span>}>
+              {waitingPeople.length === 0
+                ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">Nothing waits on anyone here.</p>
+                : waitingPeople.map(p => (
+                  <PersonRow key={p.user_id} p={p} mine={p.user_id === me?.user_id}
+                    name={lookupPerson(people, p.user_id)?.name ?? `User #${p.user_id}`}
+                    href={personLink(pid, p, { meId: me?.user_id, canReadOthers: canApproveOnBehalf(myAccess) })} />
+                ))}
+              <p className="m-0 px-4 pt-2 pb-3 border-t border-line text-[12px] text-ink-3 leading-snug">
+                {canApproveOnBehalf(myAccess)
+                  ? 'Each person acts in their own My work. Rows open theirs with the ticket focused, read-only unless you can act for them.'
+                  : 'Each person acts in their own My work. Your row opens yours; others open their ticket on the Board.'}
+              </p>
             </Panel>
 
             <Panel label="Crew" title="Who's working what">
@@ -323,8 +358,6 @@ export function Mission() {
                   </button>
                 ))}
             </Panel>
-
-            <MergeQueue projectId={pid} tasks={tasks} onOpen={setSelectedId} refreshKey={tasks} />
 
             <Panel label="Activity" title="Latest" right={<span className="inline-flex items-center gap-1.5"><i className="w-1.5 h-1.5 rounded-full bg-success" />live</span>}>
               {activity.length === 0

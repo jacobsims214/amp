@@ -35,7 +35,11 @@ async fn connect_and_exercise(
 
     let session = client.session();
     assert_eq!(session.mode, mode);
-    assert_eq!(client.instructions(), Some(INSTRUCTIONS), "{kind:?} {mode}");
+    assert_eq!(
+        client.instructions().as_deref(),
+        Some(INSTRUCTIONS),
+        "{kind:?} {mode}"
+    );
     assert_eq!(session.server_name.as_deref(), Some("amp-test"));
     assert_eq!(session.server_version.as_deref(), Some("9.9.9"));
 
@@ -70,7 +74,7 @@ async fn forced_2026_07_28_on_a_dual_server() {
     let (client, _server) = connect_and_exercise(ServerKind::Dual, ProtocolMode::Modern)
         .await
         .unwrap();
-    assert_eq!(client.protocol_version(), &ProtocolVersion::V_2026_07_28);
+    assert_eq!(client.protocol_version(), ProtocolVersion::V_2026_07_28);
     assert_eq!(client.session().era, Era::Stateless);
     client.close().await;
 }

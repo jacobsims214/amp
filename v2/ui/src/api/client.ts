@@ -4,9 +4,10 @@ import type {
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
-  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, Webhook, WebhookChange, WebhookDelivery, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
-  ApproveRequest, ApproveResponse, ApproveResult,
+  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
+  ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork, MyWorkCounts, PeopleWaiting,
 } from '../types'
+import { auditQuery, auditVerifyUrl, type AuditScope } from '../lib/audit'
 
 const BASE = '/api'
 
@@ -76,8 +77,9 @@ async function del<T = void>(path: string): Promise<T> {
   return res.json().catch(() => undefined) as Promise<T>
 }
 
+// Org, project, or (neither) instance webhooks.
 const webhookBase = (scope: { orgId?: number; projectId?: number }) =>
-  scope.orgId ? `/orgs/${scope.orgId}/webhooks` : `/projects/${scope.projectId}/webhooks`
+  scope.orgId ? `/orgs/${scope.orgId}/webhooks` : scope.projectId ? `/projects/${scope.projectId}/webhooks` : '/webhooks'
 
 // The API accepts users as an email or numeric id, always sent as a string.
 const userRef = (user: string | number) => String(user)
@@ -86,7 +88,7 @@ const userRef = (user: string | number) => String(user)
 export const api = {
   listProjects: () => get<{ projects: Project[] }>('/projects').then(r => r.projects),
   getProject: (id: number) => get<{ project: Project }>(`/projects/${id}`).then(r => r.project),
-  updateProjectSettings: (id: number, settings: { name?: string; description?: string; open_reassign?: boolean; require_plan_approval?: boolean; metadata?: Record<string, string | number | boolean | null> }) =>
+  updateProjectSettings: (id: number, settings: { name?: string; description?: string; open_reassign?: boolean; require_plan_approval?: boolean; require_merge?: boolean; not_started_flag_minutes?: number; not_started_return_minutes?: number; metadata?: Record<string, string | number | boolean | null> }) =>
     patch<{ project: Project }>(`/projects/${id}`, settings).then(r => r.project),
   createProject: (req: CreateProjectRequest) => post<Project>('/projects', req),
   archiveProject: (id: number) => post<Project>(`/projects/${id}/archive`),
@@ -306,6 +308,11 @@ export const api = {
   // Actions
   dispatchTask: (taskId: number, agentId = 'amp-worker') =>
     post(`/tasks/${taskId}/dispatch`, { agent_id: agentId }),
+  /** A person sends a dispatched ticket no worker has started back to ready
+   *  (AMP #2801). The watchdog does it by itself at the project's return
+   *  timeout; this is the earlier, knowing version. */
+  returnTask: (taskId: number, reason: string) =>
+    post<{ task: Task }>(`/tasks/${taskId}/return`, { reason }).then(r => r.task),
   completeTask: (taskId: number) =>
     post(`/tasks/${taskId}/complete`),
   /** A person starts their own human ticket. */
@@ -358,6 +365,35 @@ export const api = {
 
   // Agent accounts and API tokens ("me" is the caller)
   myWork: () => get<MyWork>('/my-work'),
+  /** The sidebar and tab badges: what waits on the caller, in total and per project (only projects with something). */
+  myWorkCounts: () => get<MyWorkCounts>('/my-work/counts'),
+  /** Mission's Waiting on people: each person's counts by kind and ticket ids (any member). */
+  waitingOnPeople: (projectId: number) => get<PeopleWaiting>(`/projects/${projectId}/waiting-on-people`),
+  /** The project's My work tab: what waits on the caller (or `user`, for a lead), each approve item with its plan. */
+  projectMyWork: (projectId: number, opts: { user?: string; tz?: string } = {}) => {
+    const q = new URLSearchParams()
+    if (opts.user) q.set('user', opts.user)
+    q.set('tz', opts.tz ?? Intl.DateTimeFormat().resolvedOptions().timeZone)
+    return get<ProjectMyWork>(`/projects/${projectId}/my-work?${q}`)
+  },
+  /**
+   * The Approve view's plan: one or more epics together (one as_of), or
+   * 'all' = every epic awaiting the caller's approval, oldest first.
+   */
+  approvalPlan: (projectId: number, epics: number[] | 'all', opts: { user?: string; offset?: number; limit?: number } = {}) => {
+    const q = new URLSearchParams({ approve: epics === 'all' ? 'all' : epics.join(',') })
+    if (opts.user) q.set('user', opts.user)
+    if (opts.offset) q.set('plan_offset', String(opts.offset))
+    if (opts.limit) q.set('plan_limit', String(opts.limit))
+    return get<{ plan: ApprovalPlan }>(`/projects/${projectId}/my-work?${q}`).then(r => r.plan)
+  },
+  /** Mark merged: recorded once; a repeat answers already_recorded with the first record. */
+  markMerged: (taskId: number, mergeCommit?: string) =>
+    post<MergeRecord>(`/tasks/${taskId}/merge`, mergeCommit ? { merge_commit: mergeCommit } : undefined),
+  /** Not needed: the work won't be merged; what waits on it is released. */
+  mergeNotNeeded: (taskId: number) => post<MergeRecord>(`/tasks/${taskId}/merge/not-needed`),
+  /** Reopen a done ticket (a PR closed without merging): back to ready, or waiting on its dependencies. */
+  reopenTask: (taskId: number) => post<{ task: Task }>(`/tasks/${taskId}/reopen`).then(r => r.task),
   listAgents: () => get<{ agents: AmpUser[] }>('/agents').then(r => r.agents),
   createAgent: (name: string, teamIds: number[]) =>
     post<{ agent: AmpUser }>('/agents', { name, team_ids: teamIds }).then(r => r.agent),
@@ -367,16 +403,14 @@ export const api = {
   revokeToken: (tokenId: number) => del(`/tokens/${tokenId}`),
 
   // Audit log: global admins any; org admins pass orgId; project owners projectId
-  audit: (q: { orgId?: number; projectId?: number; actorId?: number; action?: string; before?: number; limit?: number }) => {
-    const p = new URLSearchParams()
-    if (q.orgId) p.set('org_id', String(q.orgId))
-    if (q.projectId) p.set('project_id', String(q.projectId))
-    if (q.actorId) p.set('actor_id', String(q.actorId))
-    if (q.action) p.set('action', q.action)
-    if (q.before) p.set('before', String(q.before))
-    if (q.limit) p.set('limit', String(q.limit))
+  audit: (q: AuditScope & { filter?: AuditFilter; action?: string; before?: number; limit?: number }) => {
+    const f: AuditFilter = { ...q.filter }
+    if (q.action && !f.action) f.action = q.action
+    const p = auditQuery(q, f, { before: q.before, limit: q.limit })
     return get<{ entries: AuditEntry[] | null }>(`/audit?${p}`).then(r => r.entries ?? [])
   },
+  // The hash chain check: org admins pass orgId; global admins may omit it (every chain)
+  auditVerify: (orgId?: number) => get<AuditVerifyReport>(auditVerifyUrl(orgId).slice(BASE.length)),
 
   // Webhooks
   listWebhooks: (scope: { orgId?: number; projectId?: number }) =>
@@ -389,6 +423,12 @@ export const api = {
   testWebhook: (id: number) => post<{ delivery_id: number }>(`/webhooks/${id}/test`),
   listDeliveries: (id: number, limit = 30) =>
     get<{ deliveries: WebhookDelivery[] | null }>(`/webhooks/${id}/deliveries?limit=${limit}`).then(r => r.deliveries ?? []),
+
+  // The project's inbound GitHub merge webhook (project owners). The secret
+  // comes back only from rotateGitHubHookSecret, once.
+  getGitHubHook: (projectId: number) => get<GitHubHookInfo>(`/projects/${projectId}/github-hook`),
+  rotateGitHubHookSecret: (projectId: number) => post<GitHubHookInfo>(`/projects/${projectId}/github-hook/secret`),
+  deleteGitHubHook: (projectId: number) => del<{ deleted: boolean }>(`/projects/${projectId}/github-hook`),
 
   // Orgs
   listOrgs: () => get<{ orgs: Org[] | null }>('/orgs').then(r => r.orgs ?? []),

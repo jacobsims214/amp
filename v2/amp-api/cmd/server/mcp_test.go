@@ -88,6 +88,9 @@ func setupMCP(t *testing.T) *mcpStack {
 	if err := repo.RunMigrations(ctx, migrations); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
+	// Every test server encrypts webhook secrets with the same key, so a
+	// webhook another test left behind can still be delivered (#2441).
+	repo.SetSecretsKeys(defaultTestSecretsKeys(t))
 
 	sseHub := hub.New()
 	system := protoactor.NewActorSystem()

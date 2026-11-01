@@ -33,6 +33,7 @@ import (
 	"github.com/simstech/amp-api/internal/dexclient"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/repository"
+	"github.com/simstech/amp-api/internal/reqctx"
 	"github.com/simstech/amp-api/internal/service"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -156,6 +157,9 @@ func main() {
 
 	var handler http.Handler = mux
 	handler = requireAuthExceptHealth(verifier, handler)
+	// The audit rows this writes carry the trusted client IP, user agent
+	// and request id (AMP_TRUSTED_PROXIES; see internal/reqctx).
+	handler = reqctx.Middleware(reqctx.ListenerAuthAdmin, reqctx.FromEnv())(handler)
 
 	addr := envOrDefault("ADDR", ":8090")
 	httpSrv := &http.Server{Addr: addr, Handler: handler}

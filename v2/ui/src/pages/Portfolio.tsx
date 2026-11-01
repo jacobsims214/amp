@@ -110,7 +110,7 @@ export function Portfolio() {
           <Readouts items={[
             { label: 'Projects', value: pf.projects.length, sub: `${pf.total.tickets} tickets` },
             { label: 'Done', value: pf.total.completed, sub: `in the last ${RANGES[range]} days` },
-            { label: 'Questions', value: pf.total.states.flagged, sub: 'waiting on a person', alarm: pf.total.states.flagged > 0 },
+            { label: 'Questions', value: pf.total.states.flagged, sub: 'waiting on an answer', alarm: pf.total.states.flagged > 0 },
             { label: 'Agent spend', value: usd(pf.total.usage.cost_usd), sub: `${tokens(tk(pf.total.usage))} tokens · ${pf.total.usage.runs} runs${pf.total.usage.abandoned ? ` · ${pf.total.usage.abandoned} abandoned` : ''}` },
             ...vals.slice(0, 2).map(v => ({ label: `${pf.split_by}: ${v}`, value: usd(pf.total.split[v]?.usage.cost_usd ?? 0),
               sub: `${tokens(tk(pf.total.split[v]?.usage))} tokens · ${pf.total.split[v]?.tickets ?? 0} tickets` })),

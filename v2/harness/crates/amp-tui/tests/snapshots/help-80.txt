@@ -1,0 +1,47 @@
+
+ AMP
+   /amp                     the AMP connection: server, user, MCP health
+   /ticket [id|none]        the current ticket; switch it, or clear it
+   /workers                 workers here, and tickets in progress elsewhere
+   /worker [id]             watch a worker: Esc back, Tab, x stop, o AMP
+   /questions               tickets waiting on an answer; answer them here
+   /plan                    plan approval and the epics and stories
+   /project [id]            the project and its board; switch to another
+   /open [id|plan]          open the ticket (or the plan) in the browser
+   /server [name|address]   the AMP servers; switch to another
+   /remote [on|off|pair]    chat from a phone; /remote copy, open, devices
+ Config
+   /model [p/m|roles|role]  this chat's model; /model roles: every role's
+   /connect [provider]      model providers and their keys; add a key
+   /mcp [name|action name]  MCP servers: health, restart, enable, trust
+   /agents [id]             agents: model, skills, which file they're from
+   /skills [name]           skills: what each does, where it's from
+   /config [thinking]       every setting, where it's from; thinking mode
+   /reload                  reload agents, skills, models, MCP servers
+ Chat
+   /usage                   tokens and cost this session
+   /abort                   stop the reply
+   /stop                    stop the reply, or the wait for plan approval
+   /close                   close the open panel
+   /help                    this list
+   /quit                    leave the chat
+ Keys
+   Enter                    send
+   Shift+Enter              new line
+   Ctrl+J                   new line, in every terminal
+   Alt+Enter                new line (on a Mac, with ⌥ as Esc+ or Meta)
+   \ Enter                  new line: Enter right after a \
+   ↑/↓                      earlier prompts (empty or one-line editor)
+   /                        commands: ↑↓ choose, Tab complete, Enter run
+   Esc                      stop the reply, or close a panel or session
+   Ctrl+C                   stop the reply, clear the editor; twice quits
+   Ctrl+D                   quit (empty editor, at the latest output)
+   Ctrl+T                   open or close the thinking in sight, or click it
+   Ctrl+O                   show or hide tool call details
+   PgUp/PgDn                scroll the transcript a page
+   Ctrl+U/D                 scroll half a page (with an empty editor)
+   End                      jump to the latest output (with an empty editor)
+   Ctrl+W                   pick a running worker: ←/→, Enter watch
+   Ctrl+X/G                 in /workers: stop the worker / open it in AMP
+   click                    a worker or its #ticket: watch its session
+   Fn/⌥-drag                select text (Fn in Terminal.app, ⌥ in iTerm2)

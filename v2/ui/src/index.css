@@ -193,6 +193,12 @@ body {
 
 .amp-panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
 .amp-panel-top { box-shadow: inset 0 3px 0 var(--ink); }
+/* Readouts with wrap: three per row on a phone (Mission's six). */
+@media (max-width: 767px) {
+  .amp-readouts-wrap { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; }
+  .amp-readouts-wrap > .amp-readout:nth-child(3n+1) { border-left: 0; }
+  .amp-readouts-wrap > .amp-readout:nth-child(n+4) { border-top: 1px solid var(--line); }
+}
 
 /* ---- Launch flavor (see components/brand) ----
    The bands relight bottom to top, like rocket stages. */

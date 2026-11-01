@@ -27,10 +27,18 @@ describe('ApprovalLine (ticket drawer)', () => {
   it('credits the upgrade when no person is recorded', () => {
     expect(text(task({ approved_at: '2026-10-22T11:00:00Z', approved_by: null }))).toContain('Approved by the AMP upgrade')
   })
-  it('says an open ticket is not approved, or changed since, with a Flight plan link', () => {
-    expect(text(task())).toContain('Plan not approved yet.Approve in Flight plan')
-    expect(text(task({ approved_at: '2026-10-22T09:00:00Z', approved_by: 9 }))).toContain('Plan not approved yet (changed since it was approved).')
-    expect(renderToStaticMarkup(<MemoryRouter><ApprovalLine task={task()} people={people} /></MemoryRouter>)).toContain('href="/project/3/plan#approve"')
+  it('links your own awaiting ticket to My work and never approves in the drawer', () => {
+    expect(text(task(), 9)).toContain('Plan not approved yet.Awaiting your approval')
+    expect(text(task({ approved_at: '2026-10-22T09:00:00Z', approved_by: 9 }), 9)).toContain('Plan not approved yet (changed since it was approved).')
+    const html = renderToStaticMarkup(<MemoryRouter><ApprovalLine task={task()} people={people} meId={9} /></MemoryRouter>)
+    expect(html).toContain('href="/project/3/my-work?focus=5"')
+    expect(html).not.toContain('Flight plan')
+    expect(html).not.toMatch(/<button/)
+  })
+  it("says whose approval someone else's ticket awaits, without a link", () => {
+    const html = renderToStaticMarkup(<MemoryRouter><ApprovalLine task={task()} people={people} meId={7} /></MemoryRouter>)
+    expect(html).not.toContain('<a ')
+    expect(text(task(), 7)).toContain("Awaits Bob Builder's approval")
   })
   it('says nothing for a done ticket nobody approved', () => {
     expect(text(task({ state: 'completed' }))).toBe('')

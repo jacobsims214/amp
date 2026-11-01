@@ -3,12 +3,16 @@ package repository
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"slices"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/simstech/amp-api/internal/domain"
+	"github.com/simstech/amp-api/internal/secretbox"
 )
 
 // Repo is a thin wrapper around pgxpool.
@@ -17,10 +21,30 @@ type Repo struct {
 	db *pgxpool.Pool
 	// signupDomains limits first sign-ins (see SetSignupDomains).
 	signupDomains []string
+	// secretsKeys seals the secrets stored in the database (webhook auth
+	// headers and signing secrets, #2441); see SetSecretsKeys. Atomic: the
+	// webhook dispatcher reads it while a key change (startup, tests) sets
+	// it.
+	secretsKeys atomic.Pointer[secretbox.Keyring]
 }
 
+// MinDefaultPoolConns is the smallest pool New makes when DATABASE_URL
+// doesn't set pool_max_conns. pgxpool's own default is max(4, NumCPU):
+// only 4 on a small host, which the background jobs (audit checkpoints and
+// retention, KB backfill and reconciler, webhook dispatcher, scheduled
+// tickets, cluster heartbeat and relay) can fill on their own and leave
+// requests waiting (#2598). An explicit pool_max_conns always wins.
+const MinDefaultPoolConns = 16
+
 func New(ctx context.Context, dsn string) (*Repo, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse database url: %w", err)
+	}
+	if !hasPoolMaxConns(dsn) && cfg.MaxConns < MinDefaultPoolConns {
+		cfg.MaxConns = MinDefaultPoolConns
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}
@@ -28,6 +52,20 @@ func New(ctx context.Context, dsn string) (*Repo, error) {
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
 	return &Repo{db: pool}, nil
+}
+
+// hasPoolMaxConns reports whether dsn (URL or keyword/value form) sets
+// pool_max_conns.
+func hasPoolMaxConns(dsn string) bool {
+	if u, err := url.Parse(dsn); err == nil && (u.Scheme == "postgres" || u.Scheme == "postgresql") {
+		return u.Query().Has("pool_max_conns")
+	}
+	for _, f := range strings.Fields(dsn) {
+		if k, _, ok := strings.Cut(f, "="); ok && strings.TrimSpace(k) == "pool_max_conns" {
+			return true
+		}
+	}
+	return false
 }
 
 // Migration is one versioned schema change, applied at most once.
@@ -102,11 +140,13 @@ func (r *Repo) Close() { r.db.Close() }
 
 type rowScanner interface{ Scan(dest ...any) error }
 
-const projectCols = `id, name, code, description, state, org_id, created_by, open_reassign, plan_approved_at, plan_approved_by, require_plan_approval, metadata, created_at, updated_at`
+const projectCols = `id, name, code, description, state, org_id, created_by, open_reassign, plan_approved_at, plan_approved_by, require_plan_approval, metadata, created_at, updated_at,
+	require_merge, require_merge_since, not_started_flag_minutes, not_started_return_minutes`
 
 func scanProject(row rowScanner, p *domain.Project) error {
 	return row.Scan(&p.ID, &p.Name, &p.Code, &p.Description, &p.State, &p.OrgID, &p.CreatedBy, &p.OpenReassign,
-		&p.PlanApprovedAt, &p.PlanApprovedBy, &p.RequirePlanApproval, &p.Metadata, &p.CreatedAt, &p.UpdatedAt)
+		&p.PlanApprovedAt, &p.PlanApprovedBy, &p.RequirePlanApproval, &p.Metadata, &p.CreatedAt, &p.UpdatedAt,
+		&p.RequireMerge, &p.RequireMergeSince, &p.NotStartedFlagMinutes, &p.NotStartedReturnMinutes)
 }
 
 const epicCols = `e.id, e.project_id, e.name, e.description, e.state, e.priority, e.created_by,
@@ -127,10 +167,13 @@ func scanStory(row rowScanner, st *domain.Story) error {
 
 const taskCols = `id, project_id, epic_id, story_id, name, description, acceptance_criteria, state, priority,
 	assigned_to, agent_id, dispatched_at, completed_at, block_reason, start_at, created_by, owner_user_id, metadata, created_at, updated_at,
-	performer, human_reason, ready_at, planned_at, approved_at, approved_by, approved_for`
+	performer, human_reason, ready_at, planned_at, approved_at, approved_by, approved_for,
+	merge_required, merge_state, merged_at, merge_source,
+	dispatch_id, started_at, started_by, returned_at, returned_reason`
 
-func scanTask(row rowScanner, t *domain.Task) error {
-	return row.Scan(
+// taskFields are the scan targets for taskCols, in order.
+func taskFields(t *domain.Task) []any {
+	return []any{
 		&t.ID, &t.ProjectID, &t.EpicID, &t.StoryID,
 		&t.Name, &t.Description, &t.AcceptanceCriteria,
 		&t.State, &t.Priority,
@@ -138,7 +181,30 @@ func scanTask(row rowScanner, t *domain.Task) error {
 		&t.CreatedBy, &t.OwnerUserID, &t.Metadata,
 		&t.CreatedAt, &t.UpdatedAt,
 		&t.Performer, &t.HumanReason, &t.ReadyAt, &t.PlannedAt, &t.ApprovedAt, &t.ApprovedBy, &t.ApprovedFor,
-	)
+		&t.MergeRequired, &t.MergeState, &t.MergedAt, &t.MergeSource,
+		&t.DispatchID, &t.StartedAt, &t.StartedBy, &t.ReturnedAt, &t.ReturnedReason,
+	}
+}
+
+func scanTask(row rowScanner, t *domain.Task) error {
+	if err := row.Scan(taskFields(t)...); err != nil {
+		return err
+	}
+	// Derived on read, never stored (AMP #2801): a ticket in progress with
+	// no started_at is "dispatched, not started", and its age is how long it
+	// has waited for a worker. Both come from the row, so every read gets
+	// them without doing the arithmetic itself.
+	t.Phase = domain.PhaseOf(t.State, t.StartedAt)
+	if t.Phase == domain.PhaseNotStarted {
+		from := t.UpdatedAt
+		if t.DispatchedAt != nil {
+			from = *t.DispatchedAt
+		}
+		if m := int(time.Since(from).Minutes()); m > 0 {
+			t.NotStartedMinutes = m
+		}
+	}
+	return nil
 }
 
 func collect[T any](rows pgx.Rows, scan func(rowScanner, *T) error) ([]T, error) {
@@ -229,9 +295,14 @@ func (r *Repo) UpdateProject(ctx context.Context, id int, u domain.ProjectSettin
 		   open_reassign = COALESCE($4, open_reassign),
 		   metadata = (metadata || $5::jsonb) - $6::text[],
 		   require_plan_approval = COALESCE($7, require_plan_approval),
+		   require_merge_since = CASE WHEN $8::bool AND NOT require_merge THEN NOW() ELSE require_merge_since END,
+		   require_merge = COALESCE($8, require_merge),
+		   not_started_flag_minutes = COALESCE($9, not_started_flag_minutes),
+		   not_started_return_minutes = COALESCE($10, not_started_return_minutes),
 		   updated_at = NOW()
 		 WHERE id = $1 RETURNING `+projectCols,
-		id, u.Name, u.Description, u.OpenReassign, set, removeOrEmpty(remove), u.RequirePlanApproval,
+		id, u.Name, u.Description, u.OpenReassign, set, removeOrEmpty(remove), u.RequirePlanApproval, u.RequireMerge,
+		u.NotStartedFlagMinutes, u.NotStartedReturnMinutes,
 	), p)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("project %d not found", id)
@@ -260,13 +331,19 @@ func (r *Repo) RecordPlanApproval(ctx context.Context, id int, by *int) (*domain
 // or before asOf (the newest planned_at the person saw); it returns nil,
 // nil when that no longer holds. approved_for becomes whose ticket it is
 // at that moment (owner, else creator), returned with it (AMP #2218).
+// approved_snapshot keeps the ticket's text and dependencies as approved,
+// so a later re-plan can be shown as a diff (AMP #2483, ApprovedSnapshots).
 // Callers go through the task actor
 // (MsgApproveTask), which keeps its copy of the ticket in step.
 func (r *Repo) ApproveTask(ctx context.Context, id int, by *int, asOf *time.Time) (*time.Time, *int, error) {
 	var at time.Time
 	var forUser *int
 	err := r.db.QueryRow(ctx, `UPDATE tasks SET approved_at = clock_timestamp(), approved_by = $2,
-		       approved_for = COALESCE(owner_user_id, created_by)
+		       approved_for = COALESCE(owner_user_id, created_by),
+		       approved_snapshot = jsonb_build_object(
+		           'name', name, 'description', description, 'acceptance_criteria', acceptance_criteria,
+		           'dependency_ids', COALESCE((SELECT jsonb_agg(td.depends_on ORDER BY td.depends_on)
+		                                         FROM task_dependencies td WHERE td.task_id = tasks.id), '[]'::jsonb))
 		WHERE id = $1 AND ($3::timestamptz IS NULL OR planned_at <= $3::timestamptz)
 		RETURNING approved_at, approved_for`, id, by, asOf).Scan(&at, &forUser)
 	if err == pgx.ErrNoRows {
@@ -1216,4 +1293,40 @@ func (r *Repo) FindByMetadata(ctx context.Context, kind string, match domain.Met
 	return collect(rows, func(row rowScanner, m *MetadataMatch) error {
 		return row.Scan(&m.Kind, &m.ID, &m.ProjectID, &m.Name, &m.State, &m.Metadata)
 	})
+}
+
+// ApprovedSnapshot is a ticket as it was when last approved (migration
+// 040): its name, description, acceptance criteria and dependency ids.
+type ApprovedSnapshot struct {
+	Name               string `json:"name"`
+	Description        string `json:"description"`
+	AcceptanceCriteria string `json:"acceptance_criteria"`
+	DependencyIDs      []int  `json:"dependency_ids"`
+}
+
+// ApprovedSnapshots returns the stored approval snapshot of each of ids
+// that has one. Tickets approved before migration 040 have none.
+func (r *Repo) ApprovedSnapshots(ctx context.Context, ids []int) (map[int]ApprovedSnapshot, error) {
+	out := map[int]ApprovedSnapshot{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := r.db.Query(ctx, `SELECT id, approved_snapshot FROM tasks
+		WHERE id = ANY($1) AND approved_snapshot IS NOT NULL`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int
+		var snap ApprovedSnapshot
+		if err := rows.Scan(&id, &snap); err != nil {
+			return nil, err
+		}
+		if snap.DependencyIDs == nil {
+			snap.DependencyIDs = []int{}
+		}
+		out[id] = snap
+	}
+	return out, rows.Err()
 }

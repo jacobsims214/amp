@@ -1,0 +1,863 @@
+{
+ "_note": "#2388: recorded from the real harness (amp-harness tests zz_parity_2388.rs / zz_parity_workers_2388.rs in harness-play/rc-m1/ui-parity/tools; not committed). stream = the ManagerFeed; status = the status body the RemoteLink sent the mock relay; workers = the feed's worker_status for two real Supervisor workers; tui = the TUI's lines for the same run.",
+ "status": {
+  "amp_connection": {
+   "latency_ms": 812,
+   "state": "slow"
+  },
+  "board": {
+   "in_progress": 3,
+   "question": 2,
+   "ready": 5,
+   "scheduled": 1
+  },
+  "branch": "remote-m1-2388",
+  "busy": false,
+  "context_pct": 0,
+  "cost_usd_micros": 0,
+  "cwd": "amp",
+  "devices": [],
+  "epic": "AMP Harness",
+  "model": "faux/faux-1",
+  "plan_approval": {
+   "others": 0,
+   "yours": 2
+  },
+  "project": {
+   "id": 2,
+   "name": "AMP"
+  },
+  "queue_len": 0,
+  "role": "manager",
+  "story": "M3 theme + metadata",
+  "thinking": "high",
+  "ticket_id": 2106,
+  "ticket_name": "M3-3 Header and AMP status line",
+  "ticket_state": "in_progress",
+  "usage": {
+   "cache_read_tokens": 0,
+   "cache_write_tokens": 0,
+   "input_tokens": 282,
+   "output_tokens": 513
+  },
+  "workers_running": 0
+ },
+ "stream": [
+  {
+   "at_ms": 1792961449453,
+   "event": {
+    "type": "user_message",
+    "prompt_id": "p_1",
+    "text": "approve the plan",
+    "origin": "local",
+    "device_id": null,
+    "device_name": null
+   }
+  },
+  {
+   "at_ms": 1792961449453,
+   "event": {
+    "type": "run_start",
+    "run_id": "run_1",
+    "prompt_id": "p_1"
+   }
+  },
+  {
+   "at_ms": 1792961449454,
+   "event": {
+    "type": "message_start",
+    "message_id": "msg_1",
+    "model": "faux-1",
+    "provider": "faux"
+   }
+  },
+  {
+   "at_ms": 1792961449627,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_1",
+    "delta": "Approving the plan now."
+   }
+  },
+  {
+   "at_ms": 1792961449627,
+   "event": {
+    "type": "message_end",
+    "message_id": "msg_1",
+    "stop_reason": "tool_use",
+    "error": null,
+    "model": "faux-1",
+    "provider": "faux",
+    "usage": {
+     "input_tokens": 6,
+     "output_tokens": 15,
+     "cache_read_tokens": 0,
+     "cache_write_tokens": 0,
+     "cost_usd_micros": 0
+    },
+    "error_summary": null
+   }
+  },
+  {
+   "at_ms": 1792961449627,
+   "event": {
+    "type": "tool_start",
+    "message_id": "msg_1",
+    "tool_call_id": "tool-0",
+    "name": "amp_approve_plan",
+    "arguments_json": "{\"project_id\":2}",
+    "truncated": false
+   }
+  },
+  {
+   "at_ms": 1792961449647,
+   "event": {
+    "type": "tool_end",
+    "tool_call_id": "tool-0",
+    "name": "amp_approve_plan",
+    "is_error": true,
+    "text": "tool error: tool error: amp_approve_plan: tools/call amp_approve_plan: Mcp error: -32603: Approving a plan is done by a person in the AMP web UI. Open the Flight plan page to approve it.",
+    "truncated": false,
+    "full_bytes": 186,
+    "refused_line": "AMP refused: this needs a person in the AMP web UI (below)"
+   }
+  },
+  {
+   "at_ms": 1792961449647,
+   "event": {
+    "type": "message_start",
+    "message_id": "msg_2",
+    "model": "faux-1",
+    "provider": "faux"
+   }
+  },
+  {
+   "at_ms": 1792961449658,
+   "event": {
+    "type": "notice",
+    "level": "warn",
+    "code": "approval_refused",
+    "text": "Approving a plan is done by a person in the AMP web UI. Open the Flight plan page to approve it."
+   }
+  },
+  {
+   "at_ms": 1792961449855,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_2",
+    "delta": "The plan needs your approval in the "
+   }
+  },
+  {
+   "at_ms": 1792961449855,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_2",
+    "delta": "AMP web UI."
+   }
+  },
+  {
+   "at_ms": 1792961449855,
+   "event": {
+    "type": "message_end",
+    "message_id": "msg_2",
+    "stop_reason": "stop",
+    "error": null,
+    "model": "faux-1",
+    "provider": "faux",
+    "usage": {
+     "input_tokens": 77,
+     "output_tokens": 12,
+     "cache_read_tokens": 0,
+     "cache_write_tokens": 0,
+     "cost_usd_micros": 0
+    },
+    "error_summary": null
+   }
+  },
+  {
+   "at_ms": 1792961449877,
+   "event": {
+    "type": "run_end",
+    "run_id": "run_1",
+    "outcome": "completed",
+    "error": null
+   }
+  },
+  {
+   "at_ms": 1792961450180,
+   "event": {
+    "type": "user_message",
+    "prompt_id": "p_2",
+    "text": "try again",
+    "origin": "local",
+    "device_id": null,
+    "device_name": null
+   }
+  },
+  {
+   "at_ms": 1792961450180,
+   "event": {
+    "type": "run_start",
+    "run_id": "run_2",
+    "prompt_id": "p_2"
+   }
+  },
+  {
+   "at_ms": 1792961450180,
+   "event": {
+    "type": "message_start",
+    "message_id": "msg_3",
+    "model": "faux-1",
+    "provider": "faux"
+   }
+  },
+  {
+   "at_ms": 1792961450180,
+   "event": {
+    "type": "message_end",
+    "message_id": "msg_3",
+    "stop_reason": "error",
+    "error": "http error 429: {\"error\":{\"message\":\"Rate limit exceeded: free-models-per-day\",\"code\":429}}",
+    "model": "faux-1",
+    "provider": "faux",
+    "usage": {
+     "input_tokens": 96,
+     "output_tokens": 0,
+     "cache_read_tokens": 0,
+     "cache_write_tokens": 0,
+     "cost_usd_micros": 0
+    },
+    "error_summary": "faux rate-limited the request (429): Rate limit exceeded: free-models-per-day. Wait a minute and try again, or pick another model."
+   }
+  },
+  {
+   "at_ms": 1792961450202,
+   "event": {
+    "type": "run_end",
+    "run_id": "run_2",
+    "outcome": "failed",
+    "error": "faux rate-limited the request (429): Rate limit exceeded: free-models-per-day. Wait a minute and try again, or pick another model."
+   }
+  },
+  {
+   "at_ms": 1792961450203,
+   "event": {
+    "type": "user_message",
+    "prompt_id": "p_3",
+    "text": "summarise",
+    "origin": "local",
+    "device_id": null,
+    "device_name": null
+   }
+  },
+  {
+   "at_ms": 1792961450203,
+   "event": {
+    "type": "run_start",
+    "run_id": "run_3",
+    "prompt_id": "p_3"
+   }
+  },
+  {
+   "at_ms": 1792961450204,
+   "event": {
+    "type": "message_start",
+    "message_id": "msg_4",
+    "model": "faux-1",
+    "provider": "faux"
+   }
+  },
+  {
+   "at_ms": 1792961450420,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "Summarising the session and more det"
+   }
+  },
+  {
+   "at_ms": 1792961450432,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "ail and more det"
+   }
+  },
+  {
+   "at_ms": 1792961450432,
+   "event": {
+    "type": "compaction",
+    "active": true,
+    "manual": false
+   }
+  },
+  {
+   "at_ms": 1792961450620,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "ail and more detail and more det"
+   }
+  },
+  {
+   "at_ms": 1792961450768,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "ail and more detail and more det"
+   }
+  },
+  {
+   "at_ms": 1792961450920,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "ail and more detail and more det"
+   }
+  },
+  {
+   "at_ms": 1792961451093,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "ail and more detail and more detail and "
+   }
+  },
+  {
+   "at_ms": 1792961451219,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "more detail and more detail and more det"
+   }
+  },
+  {
+   "at_ms": 1792961451420,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "ail and more detail and more detail and "
+   }
+  },
+  {
+   "at_ms": 1792961451588,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "more detail and more detail and more det"
+   }
+  },
+  {
+   "at_ms": 1792961451636,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "ail and more det"
+   }
+  },
+  {
+   "at_ms": 1792961451636,
+   "event": {
+    "type": "compaction",
+    "active": false,
+    "manual": false
+   }
+  },
+  {
+   "at_ms": 1792961451794,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "ail and more detail and more det"
+   }
+  },
+  {
+   "at_ms": 1792961451920,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "ail and more detail and more det"
+   }
+  },
+  {
+   "at_ms": 1792961452065,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "ail and more detail and more det"
+   }
+  },
+  {
+   "at_ms": 1792961452219,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "ail and more detail and more detail "
+   }
+  },
+  {
+   "at_ms": 1792961452406,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "and more detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961452520,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more detail "
+   }
+  },
+  {
+   "at_ms": 1792961452720,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "and more detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961452915,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more detail "
+   }
+  },
+  {
+   "at_ms": 1792961453020,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "and more detail and more detail and "
+   }
+  },
+  {
+   "at_ms": 1792961453219,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "more detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961453357,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more det"
+   }
+  },
+  {
+   "at_ms": 1792961453464,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "ail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961453619,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961453738,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961453910,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961454019,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961454168,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more det"
+   }
+  },
+  {
+   "at_ms": 1792961454286,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "ail and more detail and "
+   }
+  },
+  {
+   "at_ms": 1792961454420,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "more detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961454576,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and "
+   }
+  },
+  {
+   "at_ms": 1792961454697,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "more detail and more detail and "
+   }
+  },
+  {
+   "at_ms": 1792961454818,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "more detail and more detail and "
+   }
+  },
+  {
+   "at_ms": 1792961454970,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "more detail and more detail and "
+   }
+  },
+  {
+   "at_ms": 1792961455120,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "more detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961455243,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961455397,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961455517,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961455618,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail "
+   }
+  },
+  {
+   "at_ms": 1792961455809,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "and more detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961455920,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and "
+   }
+  },
+  {
+   "at_ms": 1792961456102,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "more detail and more detail and more det"
+   }
+  },
+  {
+   "at_ms": 1792961456206,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "ail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961456319,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961456482,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961456620,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961456787,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more det"
+   }
+  },
+  {
+   "at_ms": 1792961456889,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "ail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961457020,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and "
+   }
+  },
+  {
+   "at_ms": 1792961457128,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "more detail and more detail "
+   }
+  },
+  {
+   "at_ms": 1792961457233,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961457403,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961457509,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961457620,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961457818,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more det"
+   }
+  },
+  {
+   "at_ms": 1792961457922,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "ail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961458023,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and "
+   }
+  },
+  {
+   "at_ms": 1792961458161,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "more detail and more detail "
+   }
+  },
+  {
+   "at_ms": 1792961458267,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": "and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961458427,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more"
+   }
+  },
+  {
+   "at_ms": 1792961458523,
+   "event": {
+    "type": "text_delta",
+    "message_id": "msg_4",
+    "delta": " detail and more detail and more detail "
+   }
+  },
+  {
+   "at_ms": 1792961458523,
+   "event": {
+    "type": "message_end",
+    "message_id": "msg_4",
+    "stop_reason": "stop",
+    "error": null,
+    "model": "faux-1",
+    "provider": "faux",
+    "usage": {
+     "input_tokens": 103,
+     "output_tokens": 486,
+     "cache_read_tokens": 0,
+     "cache_write_tokens": 0,
+     "cost_usd_micros": 0
+    },
+    "error_summary": null
+   }
+  },
+  {
+   "at_ms": 1792961458537,
+   "event": {
+    "type": "run_end",
+    "run_id": "run_3",
+    "outcome": "completed",
+    "error": null
+   }
+  }
+ ],
+ "workers": {
+  "at_ms": 1792961489681,
+  "event": {
+   "type": "worker_status",
+   "workers": [
+    {
+     "task_id": 9001,
+     "name": "Add the clamp helper",
+     "role": "amp-worker-backend",
+     "state": "running",
+     "model": "wf/wf-1",
+     "started_at_ms": 1792961489660,
+     "ended_at_ms": null,
+     "usage": {
+      "input_tokens": 7412,
+      "output_tokens": 18,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "cost_usd_micros": 0
+     },
+     "context_tokens": 7430,
+     "context_window": 128000,
+     "epic": "QA3d epic",
+     "story": "Watch workers",
+     "ticket_state": "in_progress"
+    },
+    {
+     "task_id": 9002,
+     "name": "Write the README line",
+     "role": "amp-worker-backend",
+     "state": "running",
+     "model": "wf/wf-1",
+     "started_at_ms": 1792961489660,
+     "ended_at_ms": null,
+     "usage": {
+      "input_tokens": 7412,
+      "output_tokens": 18,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "cost_usd_micros": 0
+     },
+     "context_tokens": 7430,
+     "context_window": 128000,
+     "epic": "QA3d epic",
+     "story": "Watch workers",
+     "ticket_state": "in_progress"
+    }
+   ]
+  }
+ },
+ "tui": {
+  "refused_row": "✗ approve_plan · AMP refused: this needs a person in the AMP web UI (below) · 23 ms",
+  "error_line": "✗ Error: faux rate-limited the request (429): Rate limit exceeded: free-models-per-day. Wait a minute and try again, or pick another model.",
+  "compaction": "⠙ 1s Auto-compacting... (Ctrl+C to cancel)",
+  "chips": [
+   "▸ #9001 Add the clamp helper · QA3d epic › Watch workers · worker-backend (wf-1) · running 2s · 7.4k tok · ctx 6%",
+   "▸ #9002 Write the README line · QA3d epic › Watch workers · worker-backend (wf-1) · running 2s · 7.4k tok · ctx 6%"
+  ],
+  "header": [
+   "  ▀▀▀▀▀▀▀▀ amp.simstech.cloud · ada@example.com · simstech › AMP #2       ● slow 812 ms 2026-07-28",
+   "  ■ In progress #2106 M3-3 Header and AMP status line          ▌ AMP Harness › M3 theme + metadata"
+  ],
+  "footer": [
+   "  ■  2 QUESTIONS  │ workers 0 │ plan: 2 waiting for your approval │ □ 5 Ready     unreported #2106",
+   "  /Users/ada/dev/amp (remote-m1-2388) • manager · #2106                              faux-1 • high"
+  ]
+ }
+}

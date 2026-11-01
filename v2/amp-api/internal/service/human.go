@@ -76,7 +76,9 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 		return nil, nil, authz.BadRequest("ticket %d is agent work, not a person's", taskID)
 	}
 	if viaAgent || !p.InUI() {
-		return nil, nil, authz.UIOnly(fmt.Sprintf("Marking ticket %d (a person's ticket) done", taskID), s.TaskURL(t.ProjectID, taskID))
+		err := authz.UIOnly(fmt.Sprintf("Marking ticket %d (a person's ticket) done", taskID), s.TaskURL(t.ProjectID, taskID))
+		s.auditTaskDenied(ctx, p, "task.human.complete", t, err, map[string]any{"via_agent": viaAgent})
+		return nil, nil, err
 	}
 	if h := done.HoursWorked; h != nil && (*h < 0 || *h > 1000) {
 		return nil, nil, authz.BadRequest("hours_worked must be between 0 and 1000")
@@ -85,8 +87,8 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 	if err != nil {
 		return nil, nil, err
 	}
-	replyCh := make(chan actor.ReplySimple, 1)
-	s.Registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: taskID, By: p.UserRef(), ByName: p.Label(), ReplyCh: replyCh})
+	replyCh := make(chan actor.ReplyComplete, 1)
+	s.Registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: taskID, By: p.UserRef(), ByName: p.Label(), InUI: p.InUI(), ReplyCh: replyCh})
 	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 		return nil, nil, reply.Err
 	}
@@ -98,6 +100,23 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 	if err != nil {
 		return nil, nil, err
 	}
+	// A person's ticket is their gate (a merge, a deploy, a sign-off): who
+	// marked it done, and from where, belongs in the audit log.
+	details := map[string]any{"run_id": run.ID, "note_length": len(note)}
+	if run.PRURL != "" {
+		details["pr_url"] = run.PRURL
+	}
+	if done.HoursWorked != nil {
+		details["hours_worked"] = *done.HoursWorked
+	}
+	// Bridge (AMP #2475): a person's ticket done with a PR link (a legacy
+	// merge ticket) records that PR merged on the agent tickets that
+	// produced it, so one acknowledgement clears both.
+	if ids := s.bridgeHumanMerge(ctx, p, t, run.PRURL); len(ids) > 0 {
+		details["merged_task_ids"] = ids
+	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "task.human.complete", ProjectID: intRef(t.ProjectID), TargetType: "task", TargetID: idStr(taskID),
+		TargetName: t.Name, Summary: fmt.Sprintf("%s marked their ticket %d done", p.Label(), taskID), Details: details})
 	updated, err := s.Repo.GetTask(ctx, taskID)
 	if err != nil {
 		return nil, nil, err

@@ -1,9 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
-import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, Check, UserRound, Play, ShieldCheck, ShieldAlert } from 'lucide-react'
+import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, UserRound, ShieldCheck, ShieldAlert, ArrowRight, GitMerge, Check, RotateCcw } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { HUMAN_REASONS, isHuman, reasonHint, reasonLabel } from '../lib/human'
-import { approvalOf, formatWhen, isRelayed, planPath, relayedFor } from '../lib/approval'
+import { approvalOf, approvalOwner, formatWhen, isRelayed, isYours, relayedFor } from '../lib/approval'
+import { projectLink } from '../lib/projectLink'
+import { HumanActions } from './human/HumanActions'
+import { mergeStatusText } from '../lib/humanActions'
+import { effectiveMetadata, integrationBranch, mergedIntoIntegration, waitsForMerge } from '../lib/merge'
 import { api } from '../api/client'
+import { NotStartedTag, ReturnedLine, ReturnedTag } from './DispatchTags'
+import { isNotStarted, wasReturned } from '../lib/dispatchState'
 import { TicketArtifacts } from './artifacts/ArtifactBits'
 import { withClears } from '../lib/clear'
 import { StatusBadge } from './StatusBadge'
@@ -12,7 +18,7 @@ import { displayState } from '../lib/ticketState'
 import { ConfirmDeleteModal } from './ConfirmDeleteModal'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
 import { activityActor, canPlanTask, canTakeOverTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
-import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata, Epic, Story, HumanReason } from '../types'
+import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata, Epic, Story, HumanReason, Run } from '../types'
 import { DependencyPicker } from './DependencyPicker'
 import { MetadataEditor } from './MetadataEditor'
 import { metadataPatch } from '../lib/metadata'
@@ -33,6 +39,8 @@ interface Props {
   openReassign?: boolean
   /** called with the updated task after claim/assign/release */
   onTaskUpdated?: (task: Task) => void
+  /** the project's not_started_flag_minutes: past it the amber badge is filled (0 = flag off) */
+  notStartedFlagMinutes?: number
 }
 
 function relativeTime(iso: string) {
@@ -61,17 +69,29 @@ const ACTION_DOT: Record<string, string> = {
   dispatched: 'bg-link',
   started:    'bg-link',
   completed:  'bg-success',
+  // A completion that wasn't the worker's (AMP #2801): the work ended, but
+  // not with the agent that was dispatched to it.
+  closed_out: 'bg-warning',
+  // The watchdog (or amp_return_task) sent a ticket no worker started back to
+  // ready (AMP #2801).
+  returned:   'bg-warning',
   blocked:    'bg-danger',
   unblocked:  'bg-warning-ink',
   comment:    'bg-line-str ring-1 ring-ink-2/40',
   plan_approved: 'bg-success',
 }
 
+/** The history action in words: closed_out and returned read as the tags beside them say. */
+const ACTION_LABEL: Record<string, string> = {
+  closed_out: 'closed out',
+  returned: 'returned to ready',
+}
+
 const inputCls =
   'w-full bg-bg border border-line rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-3 ' +
   'focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-all font-[inherit]'
 
-export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAccess = null, openReassign = false, onTaskUpdated }: Props) {
+export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAccess = null, openReassign = false, onTaskUpdated, notStartedFlagMinutes }: Props) {
   const [history, setHistory] = useState<ActivityLog[]>([])
   const [comments, setComments] = useState<Comment[]>([])
   const [tab, setTab] = useState<'history' | 'details'>('details')
@@ -179,6 +199,8 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
             <div className="flex items-center gap-2.5 mb-2.5 flex-wrap">
               <span className="amp-num text-[13px] text-ink-3">#{task.id}</span>
               <StatusBadge state={task.state} blockReason={task.block_reason} />
+              <NotStartedTag task={task} flagMinutes={notStartedFlagMinutes} />
+              <ReturnedTag task={task} />
               <PriorityMark priority={task.priority} showLabel={task.priority === '2' || task.priority === '3'} />
             </div>
             <h2 className="text-[17px] font-semibold text-ink leading-snug m-0">{task.name}</h2>
@@ -244,7 +266,14 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
           {task.dispatched_at && (
             <div className="flex items-center gap-1.5 text-xs text-ink-2">
               <Clock size={11} />
-              <span>Started {relativeTime(task.dispatched_at)}</span>
+              <span>{isNotStarted(task) ? 'Dispatched' : 'Started'} {relativeTime(task.dispatched_at)}</span>
+            </div>
+          )}
+          {/* A ticket the watchdog sent back to ready, with the server's reason (AMP #2801). */}
+          {wasReturned(task) && (
+            <div className="flex items-center gap-1.5 text-xs text-warning-ink">
+              <RotateCcw size={11} aria-hidden="true" />
+              <ReturnedLine task={task} />
             </div>
           )}
           {task.start_at && (
@@ -262,7 +291,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
           {task.blocked_by_ids?.length ? (
             <div className="flex items-center gap-1.5 text-xs text-danger-ink">
               <AlertCircle size={11} />
-              <span>Blocked by #{task.blocked_by_ids.join(', #')}</span>
+              <span>Waiting on #{task.blocked_by_ids.join(', #')}</span>
             </div>
           ) : null}
           {task.state === 'completed' && task.completed_at && (
@@ -271,12 +300,45 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
               <span>Done {relativeTime(task.completed_at)}</span>
             </div>
           )}
+          {mergeStatusText(task) && (
+            <div className="flex items-center gap-1.5 text-xs" data-testid="merge-status"
+              style={{ color: task.merge_state === 'merged' ? 'var(--success-ink)' : 'var(--teal)' }}>
+              <GitMerge size={11} aria-hidden="true" />
+              <span>{mergeStatusText(task)}</span>
+            </div>
+          )}
+          <MergeGateNote task={task} />
         </div>
 
-        {/* An agent's question, answered in place */}
+        {/* Dispatched to an agent that hasn't started it (AMP #2801) */}
+        {isNotStarted(task) && (
+          <div className="px-6 py-4 border-b border-line" data-testid="not-started-note"
+            style={{ background: 'color-mix(in srgb, var(--warning) 7%, var(--surface))', boxShadow: 'inset 3px 0 0 var(--warning)' }}>
+            <span className="amp-label flex items-center gap-1.5" style={{ color: 'var(--warning-ink)' }}>
+              <Clock size={12} aria-hidden="true" />Dispatched · not started
+            </span>
+            <p className="m-0 mt-1.5 text-[13px] leading-relaxed text-ink-2">
+              Its worker starts it with a claim. If none does, AMP returns it to ready by itself, and the ticket shows that here.
+            </p>
+            <div className="mt-2.5">
+              <HumanActions key={`start-${task.id}`} task={task} kind="start" canAct={canWork}
+                minutes={task.not_started_minutes}
+                onChanged={t => { if (t) { if (onTaskUpdated) onTaskUpdated(t); else onRefresh?.() } else onRefresh?.() }} />
+            </div>
+          </div>
+        )}
+        {/* An agent's question, answered in place (the same HumanActions as My work) */}
         {displayState(task) === 'flag' && (
-          <FlagAnswer key={`flag-${task.id}`} task={task} canWork={canWork}
-            onAnswered={t => { if (onTaskUpdated) onTaskUpdated(t); else onRefresh?.(); api.getComments(t.id).then(setComments).catch(() => {}) }} />
+          <div className="px-6 py-4 border-b border-line" style={{ background: 'color-mix(in srgb, var(--st-flag) 6%, var(--surface))', boxShadow: 'inset 3px 0 0 var(--st-flag)' }}>
+            <HumanActions key={`flag-${task.id}`} task={task} kind="answer" canAct={canWork}
+              onChanged={t => { if (t) { if (onTaskUpdated) onTaskUpdated(t); else onRefresh?.() } else onRefresh?.(); api.getComments(task.id).then(setComments).catch(() => {}) }} />
+          </div>
+        )}
+
+        {/* Done with an unmerged PR: Mark merged / Not needed (or Reopen when the PR was closed) */}
+        {task.state === 'completed' && (task.merge_state === 'needed' || task.merge_state === 'abandoned') && (
+          <MergePanel key={`merge-${task.id}`} task={task} canWork={canWork}
+            onChanged={t => { if (t && onTaskUpdated) onTaskUpdated(t); else onRefresh?.() }} />
         )}
 
         {/* A person's own ticket: they start and finish it here */}
@@ -532,18 +594,24 @@ function OwnerSection({ task, people, members, meId, myAccess, openReassign, can
 /**
  * Who approved this ticket's plan (#2198), and for whom when it wasn't their
  * own: "Approved by Lee on behalf of Bob · Oct 22". An open ticket whose plan
- * nobody approved says so and links to the Flight plan, where people approve.
+ * nobody approved says so. Approval happens only in My work (KB
+ * decisions/human-work-ux.md §2), so the drawer never approves: for the
+ * person's own ticket it links there, "Awaiting your approval → My work".
  */
 export function ApprovalLine({ task, people, meId }: { task: Task; people: Map<number, Person>; meId?: number }) {
   const a = approvalOf(task)
   const name = (id: number) => (lookupPerson(people, id)?.name ?? `User #${id}`) + (id === meId ? ' (you)' : '')
   if (!a) {
     if (task.state === 'completed') return null
+    const owner = approvalOwner(task)
     return (
       <div className="text-xs text-ink-3 flex items-center gap-1.5 flex-wrap">
         <ShieldAlert size={12} className="text-warning-ink" aria-hidden="true" />
         <span>Plan not approved yet{task.approved_at ? ' (changed since it was approved)' : ''}.</span>
-        <Link to={`${planPath(task.project_id)}#approve`} className="text-ink-2 underline underline-offset-2">Approve in Flight plan</Link>
+        {isYours(task, meId)
+          ? <Link to={projectLink(task.project_id, 'my-work', task.id)} className="inline-flex items-center gap-1 font-semibold text-ink underline underline-offset-2">
+              Awaiting your approval<ArrowRight size={11} aria-hidden="true" />My work</Link>
+          : <span>Awaits {owner != null ? name(owner) : 'its owner'}'s approval, in their My work.</span>}
       </div>
     )
   }
@@ -840,7 +908,19 @@ function HistoryTab({ history, comments, people }: { history: ActivityLog[]; com
                   <Bot size={10} aria-hidden="true" />Relayed by agent</span>
               )}
               <span className="text-ink-3 text-xs">·</span>
-              <span className="text-xs text-ink-2 capitalize">{entry.action.replace('_', ' ')}</span>
+              <span className="text-xs text-ink-2 capitalize">{ACTION_LABEL[entry.action] ?? entry.action.replace('_', ' ')}</span>
+              {/* Closeout (AMP #2801): a completion that wasn't the worker's, or the watchdog's return. */}
+              {entry.action === 'closed_out' && (
+                <span className="inline-flex items-center font-label text-[9.5px] font-semibold uppercase tracking-[0.1em] px-1 py-[2px] border"
+                  style={{ borderColor: 'var(--warning)', color: 'var(--warning-ink)' }}
+                  title="Closed out by someone other than the ticket's worker. Its detail names who, and why.">
+                  Closeout</span>
+              )}
+              {entry.action === 'returned' && (
+                <span className="inline-flex items-center font-label text-[9.5px] font-semibold uppercase tracking-[0.1em] px-1 py-[2px] border border-line-str text-ink-2"
+                  title="The ticket went back to ready without a worker starting it.">
+                  Returned to ready (no worker started)</span>
+              )}
               {entry.from_state && entry.to_state && (
                 <span className="text-xs text-ink-3">
                   {entry.from_state} → {entry.to_state}
@@ -874,60 +954,14 @@ function MetaItem({ label, value }: { label: string; value: string }) {
   )
 }
 
-/** An agent's question (a ticket blocked with a reason) and the box to answer it. */
-function FlagAnswer({ task, canWork, onAnswered }: { task: Task; canWork: boolean; onAnswered: (t: Task) => void }) {
-  const [answer, setAnswer] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const submit = async (text: string) => {
-    setBusy(true); setError(null)
-    try { onAnswered(await api.answerFlag(task.id, text)); setAnswer('') }
-    catch (e) { setError(e instanceof Error ? e.message : 'Could not answer') }
-    finally { setBusy(false) }
-  }
-  return (
-    <div className="px-6 py-4 border-b border-line grid gap-2.5" style={{ background: 'color-mix(in srgb, var(--st-flag) 6%, var(--surface))', boxShadow: 'inset 3px 0 0 var(--st-flag)' }}>
-      <span className="amp-label" style={{ color: 'var(--danger-ink)' }}>{task.agent_id || 'An agent'} asked</span>
-      <p className="m-0 text-[14px] leading-relaxed text-ink">{task.block_reason}</p>
-      {canWork ? <>
-        <label htmlFor={`flag-answer-${task.id}`} className="sr-only">Your answer</label>
-        <textarea id={`flag-answer-${task.id}`} className="amp-input min-h-[70px] resize-y" value={answer} onChange={e => setAnswer(e.target.value)}
-          placeholder="Answer the agent. It's posted as a comment and the ticket goes back to ready." />
-        {error && <span className="text-[12px] text-danger-ink">{error}</span>}
-        <div className="flex gap-2">
-          <button type="button" className="amp-btn amp-btn-accent amp-btn-sm" disabled={busy || !answer.trim()} onClick={() => submit(answer)}>
-            {busy && <Loader2 size={11} className="animate-spin" />}Answer and unblock</button>
-          <button type="button" className="amp-btn amp-btn-sm" disabled={busy} onClick={() => submit('')} title="Unblock without a comment">Unblock only</button>
-        </div>
-      </> : <span className="text-[12px] text-ink-2">Only people who can work this ticket can answer it.</span>}
-    </div>
-  )
-}
-
 /** A human ticket's panel: what kind of human work it is, who does it, and
- *  for its owner, Start and Mark done (with a note, a link and the hours they
- *  spent, which reports compare with how long it waited). */
+ *  for its owner the same Start and Mark done… as My work (HumanActions). */
 function HumanWork({ task, meId, people, onChanged }: {
   task: Task; meId?: number; people: Map<number, Person>; onChanged: (t: Task) => void
 }) {
-  const [finishing, setFinishing] = useState(false)
-  const [note, setNote] = useState('')
-  const [link, setLink] = useState('')
-  const [hours, setHours] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
   const owner = task.owner_user_id != null ? lookupPerson(people, task.owner_user_id) : null
   // Its owner does it; an unassigned one is claimed by whoever starts it. Local dev has no ownership.
   const mine = meId === undefined || task.owner_user_id == null || task.owner_user_id === meId
-  const waiting = task.state === 'blocked'
-  const run = async (fn: () => Promise<Task>) => {
-    setBusy(true); setError(null)
-    try { onChanged(await fn()); setFinishing(false) }
-    catch (e) { setError(e instanceof Error ? e.message : 'That did not work') }
-    finally { setBusy(false) }
-  }
-  const hoursNum = hours.trim() === '' ? undefined : Number(hours)
-  const hoursBad = hoursNum !== undefined && (Number.isNaN(hoursNum) || hoursNum < 0 || hoursNum > 1000)
   return (
     <div className="px-6 py-4 border-b border-line grid gap-2.5" style={{ background: 'var(--surface-2)', boxShadow: 'inset 3px 0 0 var(--ink)' }}>
       <span className="amp-label flex items-center gap-1.5"><UserRound size={12} />
@@ -935,49 +969,79 @@ function HumanWork({ task, meId, people, onChanged }: {
       <p className="m-0 text-[13px] leading-relaxed text-ink-2">
         {reasonHint(task.human_reason)}. Agents never pick it up, and they can't mark it done: only {owner ? owner.name : 'its owner'} can, here in AMP. The work that depends on it starts then.
       </p>
-      {waiting ? (
-        <span className="text-[12.5px] text-ink-2">Waiting on #{(task.blocked_by_ids ?? task.dependency_ids).join(', #')} before it can start.</span>
-      ) : !mine ? (
-        <span className="text-[12.5px] text-ink-2">Only {owner ? owner.name : 'its owner'} starts and finishes it.</span>
-      ) : finishing ? (
-        <div className="grid gap-2">
-          <label htmlFor={`done-note-${task.id}`} className="text-xs font-medium text-ink-2">What happened (optional)</label>
-          <textarea id={`done-note-${task.id}`} className="amp-input min-h-[60px] resize-y" value={note} onChange={e => setNote(e.target.value)}
-            placeholder="Merged after one round of changes" />
-          <div className="grid grid-cols-[1fr_120px] gap-2">
-            <div className="grid gap-1">
-              <label htmlFor={`done-link-${task.id}`} className="text-xs font-medium text-ink-2">Link (optional)</label>
-              <input id={`done-link-${task.id}`} className="amp-input" value={link} onChange={e => setLink(e.target.value)} placeholder="PR, doc, or ticket URL" />
-            </div>
-            <div className="grid gap-1">
-              <label htmlFor={`done-hours-${task.id}`} className="text-xs font-medium text-ink-2">Hours spent</label>
-              <input id={`done-hours-${task.id}`} className="amp-input" inputMode="decimal" value={hours} onChange={e => setHours(e.target.value)} placeholder="1.5" />
-            </div>
-          </div>
-          <span className="text-[11.5px] text-ink-3">Hours spent is the work itself, not the waiting. Reports compare the two.</span>
-          {hoursBad && <span className="text-[12px] text-danger-ink">Hours must be a number from 0 to 1000.</span>}
-          {error && <span className="text-[12px] text-danger-ink">{error}</span>}
-          <div className="flex gap-2">
-            <button type="button" className="amp-btn amp-btn-accent amp-btn-sm" disabled={busy || hoursBad}
-              onClick={() => run(() => api.completeHumanTask(task.id, { note: note.trim() || undefined, pr_url: link.trim() || undefined, hours_worked: hoursNum }))}>
-              {busy ? <Loader2 size={11} className="animate-spin" /> : <Check size={12} />}Mark done</button>
-            <button type="button" className="amp-btn amp-btn-sm" disabled={busy} onClick={() => setFinishing(false)}>Cancel</button>
-          </div>
-        </div>
-      ) : (
-        <div className="flex gap-2 flex-wrap items-center">
-          {task.state === 'backlog' && (
-            <button type="button" className="amp-btn amp-btn-accent amp-btn-sm" disabled={busy} onClick={() => run(() => api.startHumanTask(task.id))}>
-              {busy ? <Loader2 size={11} className="animate-spin" /> : <Play size={12} />}Start</button>
-          )}
-          <button type="button" className={`amp-btn amp-btn-sm ${task.state === 'in_progress' ? 'amp-btn-accent' : ''}`} disabled={busy} onClick={() => setFinishing(true)}>
-            <Check size={12} />Mark done…</button>
-          {task.state === 'in_progress' && task.dispatched_at && (
-            <span className="text-[12px] text-ink-3">Started {relativeTime(task.dispatched_at)}</span>
-          )}
-          {error && <span className="text-[12px] text-danger-ink w-full">{error}</span>}
-        </div>
+      {!mine && task.state !== 'blocked'
+        ? <span className="text-[12.5px] text-ink-2">Only {owner ? owner.name : 'its owner'} starts and finishes it.</span>
+        : <HumanActions task={task} kind="do" canAct={mine} onChanged={t => { if (t) onChanged(t) }} />}
+      {task.state === 'in_progress' && task.dispatched_at && (
+        <span className="text-[12px] text-ink-3">Started {relativeTime(task.dispatched_at)}</span>
       )}
     </div>
+  )
+}
+
+/** A done ticket waiting on its merge: the PR from its latest run, Mark merged / Not needed, or Reopen. */
+function MergePanel({ task, canWork, onChanged }: { task: Task; canWork: boolean; onChanged: (t: Task | null) => void }) {
+  const [pr, setPr] = useState<{ url?: string; branch?: string }>({})
+  useEffect(() => {
+    let live = true
+    api.taskRuns(task.id).then(({ runs }) => {
+      const r = [...runs].reverse().find(x => x.pr_url || x.branch)
+      if (live && r) setPr({ url: r.pr_url, branch: r.branch })
+    }).catch(() => {})
+    return () => { live = false }
+  }, [task.id])
+  return (
+    <div className="px-6 py-4 border-b border-line grid gap-2" style={{ background: 'color-mix(in srgb, var(--teal) 6%, var(--surface))', boxShadow: 'inset 3px 0 0 var(--teal)' }}>
+      <span className="amp-label" style={{ color: 'var(--teal)' }}>Merge</span>
+      <HumanActions task={task} kind="merge" canAct={canWork} prUrl={pr.url} branch={pr.branch} onChanged={onChanged} />
+    </div>
+  )
+}
+
+// The merge gate's two exceptions, read from the effective metadata (#2597):
+// a done ticket whose run went to the integration branch (its dependents
+// don't wait; the merge to main comes later), and a ticket that starts when its
+// dependencies are done without waiting for their merge (waits_for_merge: false).
+function MergeGateNote({ task }: { task: Task }) {
+  const [inherited, setInherited] = useState<Metadata | undefined>()
+  const [runs, setRuns] = useState<Run[]>([])
+  const meta = useMemo(() => effectiveMetadata(inherited, task.metadata), [inherited, task.metadata])
+  const branch = integrationBranch(meta)
+  const wantRuns = task.state === 'completed' && !!branch
+
+  useEffect(() => {
+    let live = true
+    api.inheritedMetadata('task', task.id).then(m => { if (live) setInherited(m) }).catch(() => {})
+    return () => { live = false }
+  }, [task.id])
+
+  useEffect(() => {
+    if (!wantRuns) return
+    let live = true
+    api.taskRuns(task.id).then(r => { if (live) setRuns(r.runs) }).catch(() => {})
+    return () => { live = false }
+  }, [task.id, wantRuns, task.merge_state])
+
+  // Runs are only read while they matter; otherwise ignore any stale ones
+  // (derived here rather than reset with setState inside the effect).
+  const into = mergedIntoIntegration(task, meta, wantRuns ? runs : [])
+  const noWait = !waitsForMerge(meta) && task.state !== 'completed' && task.dependency_ids.length > 0
+  if (!into && !noWait) return null
+  return (
+    <>
+      {into && (
+        <div className="flex items-center gap-1.5 text-xs text-ink-2" data-testid="merge-integration"
+          title="Tickets that depend on it don't wait for this merge.">
+          <GitMerge size={11} aria-hidden="true" />
+          <span>Merged into {into}, waiting on the merge to main</span>
+        </div>
+      )}
+      {noWait && (
+        <div className="flex items-center gap-1.5 text-xs text-ink-2" data-testid="merge-no-wait">
+          <GitBranch size={11} aria-hidden="true" />
+          <span>Starts when its dependencies are done; doesn't wait for their merge</span>
+        </div>
+      )}
+    </>
   )
 }

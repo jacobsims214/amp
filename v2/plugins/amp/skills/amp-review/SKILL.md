@@ -22,7 +22,8 @@ reviewer — not an implementer.
 **Code review** (task name starts with "Code Review:"):
 - Your job is a full tiered code review using the `code-reviewer` skill
 - Load it first: the **code-reviewer** skill
-- Run `git diff` to see all changes from the story's implementation tasks
+- Run `git diff` to see all changes from the story's implementation tasks (outside git, read the
+  files the tickets' completion comments list instead)
 - Apply the Blocker / Significant / Suggestion checklist to every changed file
 - Post your findings in the standard format (Overall Verdict → Blockers → Significant → Suggestions)
 - Create a fix task for every Blocker and Significant finding

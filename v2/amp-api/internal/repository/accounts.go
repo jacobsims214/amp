@@ -157,7 +157,14 @@ func (r *Repo) RevokeAPIToken(ctx context.Context, id int) error {
 // which says more than "revoked token" would (deactivation revokes the
 // account's tokens, so otherwise that's all its agents would ever see).
 func (r *Repo) UserForAPIToken(ctx context.Context, hash string) (*domain.User, error) {
-	var tokenID int
+	u, _, err := r.UserAndTokenForAPIToken(ctx, hash)
+	return u, err
+}
+
+// UserAndTokenForAPIToken is UserForAPIToken that also returns the token's
+// api_tokens.id (for the audit log's token_id; never the token itself).
+func (r *Repo) UserAndTokenForAPIToken(ctx context.Context, hash string) (*domain.User, int64, error) {
+	var tokenID int64
 	u := &domain.User{}
 	err := r.db.QueryRow(ctx, `
 		SELECT t.id, `+prefixed("u", userCols)+`
@@ -166,27 +173,27 @@ func (r *Repo) UserForAPIToken(ctx context.Context, hash string) (*domain.User, 
 		      OR (t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > NOW())))`, hash,
 	).Scan(append([]any{&tokenID}, userDest(u)...)...)
 	if err == pgx.ErrNoRows {
-		return nil, ErrNotFound
+		return nil, 0, ErrNotFound
 	}
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if u.DisabledAt != nil {
-		return u, nil
+		return u, tokenID, nil
 	}
 	// At most one write a minute per token, however busy the agent is.
 	if _, err := r.db.Exec(ctx, `UPDATE api_tokens SET last_used_at = NOW()
 		WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < NOW() - interval '1 minute')`, tokenID); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if _, err := r.db.Exec(ctx, `UPDATE users SET last_seen_at = NOW()
 		WHERE id = $1 AND last_seen_at < NOW() - interval '1 minute'`, u.ID); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if u.Roles, err = r.getUserRoles(ctx, u.ID); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return u, nil
+	return u, tokenID, nil
 }
 
 // prefixed qualifies a comma-separated column list with a table alias.

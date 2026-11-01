@@ -70,6 +70,12 @@ spec:
             # alive for the full cookie lifetime with no user-visible
             # re-login prompts.
             - --cookie-refresh=1h
+            # Send a nonce with each sign-in. Dex copies it into every token it
+            # refreshes from that sign-in, so amp-api can tell an hourly
+            # refresh from a new sign-in and writes auth.login once per
+            # sign-in (AMP #2440). Checked against Dex v2.42.0 and
+            # oauth2-proxy v7.7.1: refreshes keep working and keep the nonce.
+            - --insecure-oidc-skip-nonce=false
           env:
             - name: OAUTH2_PROXY_CLIENT_ID
               valueFrom: { secretKeyRef: { name: amp-oauth2-proxy, key: client-id } }

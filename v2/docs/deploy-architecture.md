@@ -58,6 +58,35 @@ select the `ClusterIssuer`:
 - `certManager.issuer=letsencrypt-http01` — real publicly-trusted cert, requires Envoy's `:80` reachable from the internet for the ACME HTTP-01 challenge.
 - `certManager.issuer=letsencrypt-dns01` — real cert via DNS-01 (works even without inbound :80, needed if the Proxmox gateway is the only public entry point and only forwards 443). Requires a DNS provider API token (Helm secret).
 
+## Client IP and the boundary (audit log)
+
+AMP's boundary is its own Envoy. Everything in front of it (a load balancer, an ingress controller, a CDN or WAF,
+a tunnel, a service mesh and its mTLS) belongs to each deployment, and the chart neither configures nor assumes any
+of it. Configure how many trusted hops or which CIDRs sit in front of Envoy for your environment:
+
+- **Envoy decides the client** (`envoy.clientIP`). With `xffNumTrustedHops: 0` (the default) the client is Envoy's
+  TCP peer and any `X-Forwarded-For` a client sends is ignored. With `N`, it is the Nth `X-Forwarded-For` entry from
+  the right, for N proxies in front that append to it. Alternatively, with `trustedCIDRs`, Envoy reads
+  `X-Forwarded-For` only when its peer is in those CIDRs, skipping trusted entries from the right.
+- **Envoy tells the services** in `X-Amp-Client-Ip`, which it always overwrites.
+- **The services trust only Envoy.** `clientIP.trustedProxies` (`AMP_TRUSTED_PROXIES`) lists the addresses Envoy
+  reaches them from. From anyone else the TCP peer is the client. No other forwarding or vendor client-IP header is
+  ever read. The chart's NetworkPolicies let only Envoy reach the services.
+- **Who may reach Envoy** is up to you: `networkPolicy.envoyIngress` (off by default) takes NetworkPolicy peers.
+  Use it, or your own network rules, whenever `xffNumTrustedHops > 0`.
+
+Examples only (not chart features):
+
+| In front of Envoy | `envoy.clientIP` | `clientIP.trustedProxies` |
+|---|---|---|
+| Nothing that rewrites the source (a LoadBalancer Service keeping the client address, an L4 pass-through) | default | your pod CIDR |
+| One HTTP proxy (an ingress controller, a cloud application load balancer), with or without a CDN before it that the proxy doesn't trust | `xffNumTrustedHops: 1`, or `trustedCIDRs: [<the proxy's pod CIDR or subnets>]` | your pod CIDR |
+| A mesh sidecar on every pod (e.g. Istio, default redirect mode) | `trustedCIDRs: [127.0.0.6/32, <the mesh gateway's pod CIDR>]` | your pod CIDR plus `127.0.0.6` |
+
+Under a sidecar every connection reaches the app from the sidecar's local address, so the services' trust rests
+on the NetworkPolicies (or a mesh authorization policy) letting only Envoy in. The design and its trade-offs are in
+the KB doc decisions/audit-log-v2.md.
+
 ## Data model additions (amp-api migrations)
 
 New migration `003_users.sql`:
@@ -117,6 +146,7 @@ These were all real bugs caught by actually deploying and exercising the stack e
 7. **A pre-existing bug in `kb/service.go`'s Ollama reachability check**: the JSON struct for parsing `/api/tags` had a bogus doubly-nested `{"models":{"models":[...]}}` shape, but Ollama's real response is flat (`{"models":[...]}`). The mismatched shape caused `json.Decode` to error out every time, so `ollamaReachable()` **always returned false** — meaning every KB collection was silently created keyword-only regardless of whether Ollama/the embedding model was actually ready. This is why a KB collection created early (e.g. right after the post-install model-pull Job) can get permanently stuck without semantic search. Fixed the struct shape, bumped the health-check timeout from 2s→5s, and taught `Reindex` to detect a keyword-only collection, snapshot its docs, drop+recreate it with the embedding field, and rewrite the docs back in — so `amp_kb_reindex` now actually does what its tool description promises.
 8. **Dex is OIDC-only and rejects any `/auth` request missing the `openid` scope.** Standards-compliant MCP OAuth clients (opencode, Claude Code, etc.) don't request it — per the MCP spec (RFC 8707 resource indicators) they only need a resource-scoped access token, not an ID token. This made every real MCP client fail on first login with `Missing required scope(s) ["openid"]`. Fixed by adding a thin `/authorize` redirect in `amp-mcpoauth` that force-injects `openid` into whatever scope the client requested before handing off to Dex's real `/auth` — Dex still does all actual PKCE/consent/token work.
 9. **`mcp-go` v0.5.0 only implements the legacy 2024-11-05 "HTTP+SSE" transport (separate `GET /sse` + `POST /message` endpoints), and real-world MCP clients don't reliably support it.** OpenCode (and likely other modern clients) first probes with a POST to the base URL — the Streamable HTTP (2025-03-26+) handshake — gets a `405`, falls back to the legacy SSE transport, opens the `GET /sse` connection just long enough to read the initial "endpoint" event, then **closes it** rather than holding it open for the session's lifetime (which the legacy transport requires, since all server→client messages including tool call responses are delivered only over that SSE channel). Subsequent `POST /message` calls then fail with `Invalid session ID` because the session was already torn down when the SSE connection closed — this looks identical to bug #4 above but has a completely different root cause (transport mismatch, not a proxy timeout). Fixed by upgrading to `mcp-go` v0.48.0 and switching to `NewStreamableHTTPServer` — a single endpoint handling POST/GET/DELETE, session-correlated via the `Mcp-Session-Id` header, with the JSON-RPC response returned directly in the POST body. This also simplified `amp-api`'s own plumbing: the internal-loopback-address + reverse-proxy indirection the old SSE transport needed (to add auth middleware without forking mcp-go's baseURL-sensitive internal mux) is gone entirely — `StreamableHTTPServer` is a plain `http.Handler` that mounts directly under `verifier.Middleware`. MCP client configs should point at the bare resource URL (`https://<domain>/mcp`), not a `/sse` suffix — Envoy's existing routing already handled this correctly with zero changes needed, since the exact-path `/mcp` route already existed for RFC 9728 protected-resource-metadata purposes.
+10. **A Dex replica can freeze with its Postgres pool stuck "idle in transaction" while `/dex/healthz` stays green (prod incident 2026-10-26).** Dex v2.42 refreshes a token inside a SERIALIZABLE transaction and, while that transaction holds a pooled connection, the `local` password connector re-reads the user, which needs a second connection. With Dex's default pool of 5, five concurrent refreshes on one replica deadlock the pool for good. `/dex/healthz` can't see it (its storage check has no timeout and keeps its last result) and `/dex/keys` is cached until key rotation. The chart now sets `dex.storage` (pool of 20, and `idle_in_transaction_session_timeout=60s` for Dex's connections only, through `PGOPTIONS`) and `dex.storageProbe` (an exec probe that POSTs an unknown `client_id` to `/dex/token`, which reads Postgres and must answer 401). The timeout releases the row locks the stuck sessions hold, so the other replica keeps working; the probe takes the frozen replica out of the Service and restarts it. Details: KB `discoveries/dex-frozen-replica-incident.md`.
 
 **Sessions across replicas:** with `mcp-go` v1.x the default session ID manager only checks a session ID's format, and AMP's tools keep no per-session state, so a legacy client's `Mcp-Session-Id` works on whichever replica its next request lands on (pinned by `TestCluster_LegacyMCPSessionAcrossReplicas`). No sticky routing is needed.
 
@@ -198,7 +228,7 @@ First attempt was `https://<domain>/asynqmon` (path-based, matching how `/authad
 2. Makes its own internal `/api/queues` calls for live data — which collided with `amp-api`'s own `/api` prefix route, silently sending asynqmon's data requests to the wrong backend.
 
 Both are architectural assumptions baked into asynqmon's build (it assumes it owns 100% of its origin's path space), not something fixable by adjusting Envoy's `prefix_rewrite`. The real fix: asynqmon gets a **dedicated subdomain** (`queues.<domain>` by default, `asynqmon.subdomain` in values) via a second Envoy `virtual_host` matched by `Host` header rather than path — it owns its entire domain's namespace, so neither collision is possible. This needs:
-- A DNS record for `queues.<domain>` pointing at the same place as the main domain (same LoadBalancer IP / same Cloudflare setup).
+- A DNS record for `queues.<domain>` pointing at the same place as the main domain (the same Envoy address, through whatever sits in front of it).
 - `oauth2-proxy --cookie-domain=.<domain>` (leading dot) so the session cookie set on login at the main domain is also sent to the subdomain — without this, you'd have to log in twice.
 - The cert-manager `Certificate` for Envoy's public TLS now carries both hostnames as SANs.
 

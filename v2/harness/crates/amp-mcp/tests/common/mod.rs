@@ -1,6 +1,8 @@
 //! In-process MCP servers for the amp-mcp tests: rmcp's own Streamable HTTP server under axum.
 #![allow(dead_code, reason = "each test binary uses a different subset")]
 
+pub mod legacy_sse;
+
 use std::{
     borrow::Cow,
     sync::{
@@ -41,6 +43,9 @@ pub enum ServerKind {
     /// A server whose SDK knows `server/discover` but supports only versions up to 2025-11-25: it
     /// answers the probe with "unsupported protocol version" (amp-mcp's extra fallback path).
     NoModernVersion,
+    /// A third-party server from the first MCP spec (#2237): only `initialize` at 2024-11-05, and
+    /// `server/discover` is "method not found".
+    Only20241105,
 }
 
 #[derive(Debug, Default)]
@@ -101,6 +106,7 @@ impl ServerHandler for TestServer {
             ServerKind::NoModernVersion => {
                 Cow::Borrowed(ProtocolVersion::known_up_to(&ProtocolVersion::V_2025_11_25))
             }
+            ServerKind::Only20241105 => Cow::Owned(vec![ProtocolVersion::V_2024_11_05]),
         }
     }
 
@@ -113,7 +119,7 @@ impl ServerHandler for TestServer {
                 self.supported_protocol_versions().into_owned(),
                 self.get_info(),
             )),
-            ServerKind::LegacyOnly => Err(ErrorData::new(
+            ServerKind::LegacyOnly | ServerKind::Only20241105 => Err(ErrorData::new(
                 ErrorCode::METHOD_NOT_FOUND,
                 "Method not found",
                 None,
@@ -219,6 +225,70 @@ impl Drop for Running {
 
 pub async fn spawn(server: TestServer) -> Running {
     spawn_with_bearer(server, None).await
+}
+
+/// A server that answers every request with 401 while `unauthorized` is set: a login whose tokens
+/// can no longer be used. `requests` counts every HTTP request it gets, `rejected` every 401.
+///
+/// `release` gates the 401s (#2194): the k-th 401 (1-based) is held until `release` is at least
+/// k, so a test can make calls fail together, or answer some of them only after a reconnect. It
+/// starts at `usize::MAX` (no gate), and a held 401 is answered anyway after 10 s so nothing hangs.
+pub struct Switchable {
+    pub running: Running,
+    pub unauthorized: Arc<std::sync::atomic::AtomicBool>,
+    pub requests: Arc<AtomicUsize>,
+    pub rejected: Arc<AtomicUsize>,
+    pub release: Arc<tokio::sync::watch::Sender<usize>>,
+}
+
+pub async fn spawn_switchable(server: TestServer) -> Switchable {
+    let unauthorized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let rejected = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::watch::Sender::new(usize::MAX));
+    let counters = server.counters.clone();
+    let (flag, seen, refused, gate) = (
+        unauthorized.clone(),
+        requests.clone(),
+        rejected.clone(),
+        release.clone(),
+    );
+    let app = router(server, None).layer(middleware::from_fn(move |req: Request, next: Next| {
+        let (flag, seen, refused, gate) =
+            (flag.clone(), seen.clone(), refused.clone(), gate.clone());
+        async move {
+            seen.fetch_add(1, Ordering::SeqCst);
+            if flag.load(Ordering::SeqCst) {
+                let k = refused.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut open = gate.subscribe();
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(10), open.wait_for(|n| *n >= k)).await;
+                let mut response = (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+                response.headers_mut().insert(
+                    header::WWW_AUTHENTICATE,
+                    HeaderValue::from_static(r#"Bearer error="invalid_token""#),
+                );
+                return response;
+            }
+            next.run(req).await
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Switchable {
+        running: Running {
+            url: format!("http://{addr}/mcp"),
+            counters,
+            task,
+        },
+        unauthorized,
+        requests,
+        rejected,
+        release,
+    }
 }
 
 pub async fn spawn_with_bearer(server: TestServer, bearer: Option<&'static str>) -> Running {

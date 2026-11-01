@@ -8,6 +8,7 @@ import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal'
 import { AccountBadges } from '../components/admin'
 import { AuditLogPanel } from '../components/AuditLogPanel'
 import { WebhooksPanel } from '../components/WebhooksPanel'
+import { OrgRemoteControlSetting } from '../components/remote/OrgRemoteControlSetting'
 import { personName } from '../lib/people'
 import type { AddMemberResult, Invite, Member, Org, OrgRole, Team, TeamRole } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
@@ -203,7 +204,7 @@ export function Orgs() {
 
 /* ─── Org detail ─────────────────────────────────────────────────────────── */
 
-type Tab = 'members' | 'teams' | 'invites' | 'webhooks' | 'audit'
+type Tab = 'members' | 'teams' | 'invites' | 'webhooks' | 'audit' | 'settings'
 
 function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
   org: Org
@@ -273,7 +274,7 @@ function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
       {error && !confirmDelete && <p className="m-0 px-5 pb-3 text-[12.5px] text-danger-ink">{error}</p>}
 
       <div className="flex border-b border-line px-3">
-        {(canManage ? ['members', 'teams', 'invites', 'webhooks', 'audit'] as const : ['members', 'teams', 'invites'] as const).map(t => (
+        {(canManage ? ['members', 'teams', 'invites', 'webhooks', 'audit', 'settings'] as const : ['members', 'teams', 'invites'] as const).map(t => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -293,12 +294,13 @@ function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
       {tab === 'webhooks' && (
         <div className="space-y-3">
           <p className="text-xs text-ink-2 leading-relaxed">
-            Org webhooks fire for every project in {org.name}. Pick "Audit log entries" to stream membership, access, and deletion changes to a SIEM or a Slack channel.
+            Org webhooks fire for every project in {org.name}. Pick "Audit log entries" to stream this org's audit entries to a SIEM or a Slack channel. Sign-ins, accounts and API tokens belong to no org: global admins stream those with an instance webhook (Admin › Audit log).
           </p>
           <WebhooksPanel orgId={org.id} canManage={canManage} />
         </div>
       )}
-      {tab === 'audit' && <AuditLogPanel orgId={org.id} />}
+      {tab === 'audit' && <AuditLogPanel orgId={org.id} verify />}
+      {tab === 'settings' && canManage && <OrgRemoteControlSetting orgId={org.id} />}
       </div>
 
       {confirmDelete && (

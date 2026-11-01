@@ -26,6 +26,7 @@ import { StateBar } from '../components/ui/StateTag'
 import type { DisplayState } from '../lib/ticketState'
 import type { ActivityLog, ProjectReport, ReportGroup, ReportStates } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
+import { projectLink } from '../lib/projectLink'
 
 type Range = '1d' | '7d' | '30d' | 'all'
 const RANGE_LABELS: Record<Range, string> = { '1d': '24h', '7d': '7 days', '30d': '30 days', all: 'All time' }
@@ -130,7 +131,7 @@ export function Report() {
     const lines = [
       `# Report · project ${pid} · ${RANGE_LABELS[range]}`, '',
       `${report.completed} done, ${report.dispatched} started, ${report.created} created. Median time to done ${hours(report.median_cycle_hours)}.`, '',
-      '## Standup', '', '| Person | Done | Now | Waiting on them | Ready next |', '|---|---:|---|---|---:|',
+      '## Standup', '', '| Person | Done | Now | Questions | Ready next |', '|---|---:|---|---|---:|',
       ...peopleRows(tasks, activity, people, since).map(r => `| ${r.name} | ${r.done.length} | ${r.flying.map(t => `#${t.id} ${t.name}`).join('; ') || '—'} | ${r.questions.map(t => `#${t.id} ${t.block_reason}`).join('; ') || '—'} | ${r.ready} |`), '',
       '## Token spend', '', `${tokens((report.usage?.input_tokens ?? 0) + (report.usage?.output_tokens ?? 0))} tokens, ${usd(report.usage?.cost_usd ?? 0)} over ${report.usage?.runs ?? 0} runs.`, '',
       '| Model | Runs | Input | Output | Cost |', '|---|---:|---:|---:|---:|',
@@ -182,12 +183,12 @@ export function Report() {
 
           <PeoplePanel tasks={tasks} activity={activity} people={people} since={since} rangeLabel={RANGE_LABELS[range]}
             usageByPerson={new Map((report.people ?? []).map(g => [g.key, g.usage]))}
-            onOpen={id => navigate(`/project/${pid}?ticket=${id}`)} />
+            onOpen={id => navigate(projectLink(pid, 'mission', id))} />
 
           <StandupSheet projectId={pid} />
 
           <HumanWorkPanel work={report.work} people={people} rangeLabel={RANGE_LABELS[range]}
-            onOpen={id => navigate(`/project/${pid}?ticket=${id}`)} />
+            onOpen={id => navigate(projectLink(pid, 'mission', id))} />
 
           <Panel label="Spend" title="Tokens by model" right={<span>runs recorded in {RANGE_LABELS[range].toLowerCase()}</span>}>
             {!report.usage_by_model?.length ? (

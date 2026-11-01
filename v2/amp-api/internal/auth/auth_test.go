@@ -255,3 +255,110 @@ func TestChannel(t *testing.T) {
 		t.Fatalf("auth off, MCP: %q", got)
 	}
 }
+
+// identitySeen runs one request through v and returns the identity.
+func identitySeen(t *testing.T, v *Verifier, authz string) *Identity {
+	t.Helper()
+	var got *Identity
+	h := v.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = FromContext(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	if authz != "" {
+		req.Header.Set("Authorization", authz)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("request refused: %d %s", rec.Code, rec.Body)
+	}
+	return got
+}
+
+// The audit log's auth_method and session_id: the UI's session, an MCP
+// client's OAuth token, authadmin (no listener label, behind oauth2-proxy)
+// and auth off. The session id is derived from sub+iat, never the token.
+func TestAuthMethodAndSession(t *testing.T) {
+	idp := newTestIdP(t)
+	base, err := NewVerifier(context.Background(), Config{IssuerURL: testIssuer, DiscoveryURL: idp.server.URL, UIClientID: "amp-ui"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	iat := time.Now().Add(-time.Minute).Truncate(time.Second)
+	ui := idp.token(t, map[string]any{"aud": "amp-ui", "iat": iat.Unix()})
+	mcpTok := idp.token(t, map[string]any{"aud": []string{"amp-mcp"}, "azp": "mcp-1234", "iat": iat.Unix()})
+	for _, tc := range []struct {
+		name string
+		v    *Verifier
+		tok  string
+		want string
+	}{
+		{"UI token on REST", base.WithAudiences("rest", "amp-ui", "amp-mcp"), ui, AuthDexSession},
+		{"MCP token on REST", base.WithAudiences("rest", "amp-ui", "amp-mcp"), mcpTok, AuthOAuthMCP},
+		{"MCP token on MCP", base.WithAudiences("mcp", "amp-mcp"), mcpTok, AuthOAuthMCP},
+		{"authadmin (no label)", base, ui, AuthDexSession},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ident := identitySeen(t, tc.v, "Bearer "+tc.tok)
+			if ident.AuthMethod != tc.want {
+				t.Fatalf("auth method = %q, want %q", ident.AuthMethod, tc.want)
+			}
+			if want := SessionID("user-1", iat); ident.SessionID != want || len(want) != 32 {
+				t.Fatalf("session id = %q, want %q", ident.SessionID, want)
+			}
+			if strings.Contains(tc.tok, ident.SessionID) {
+				t.Fatal("session id is part of the token")
+			}
+		})
+	}
+	off, _ := NewVerifier(context.Background(), Config{})
+	if got := identitySeen(t, off.WithAudiences("rest"), ""); got.AuthMethod != AuthLocalDev {
+		t.Fatalf("auth off: %q", got.AuthMethod)
+	}
+	if SessionID("user-1", iat) == SessionID("user-1", iat.Add(time.Second)) {
+		t.Fatal("a new sign-in (new iat) kept the session id")
+	}
+	if SessionID("", iat) != "" || SessionID("user-1", time.Time{}) != "" {
+		t.Fatal("session id without sub or iat")
+	}
+}
+
+// #2440 (review #2432 L3): oauth2-proxy refreshes the UI token hourly. Dex
+// keeps the sign-in's nonce in every refreshed token but issues a new iat,
+// so the session id follows the nonce (or auth_time), and auth.login is
+// written once per sign-in, not once an hour.
+func TestSessionSurvivesRefresh(t *testing.T) {
+	idp := newTestIdP(t)
+	v, err := NewVerifier(context.Background(), Config{IssuerURL: testIssuer, DiscoveryURL: idp.server.URL, UIClientID: "amp-ui"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v = v.WithAudiences("rest", "amp-ui")
+	t0 := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	sid := func(claims map[string]any) string {
+		t.Helper()
+		claims["aud"] = "amp-ui"
+		return identitySeen(t, v, "Bearer "+idp.token(t, claims)).SessionID
+	}
+	signIn := sid(map[string]any{"iat": t0.Unix(), "nonce": "n-1"})
+	refreshed := sid(map[string]any{"iat": t0.Add(time.Hour).Unix(), "nonce": "n-1"})
+	again := sid(map[string]any{"iat": t0.Add(2 * time.Hour).Unix(), "nonce": "n-1"})
+	if signIn == "" || refreshed != signIn || again != signIn {
+		t.Fatalf("a refreshed token (same nonce, new iat) changed the session: %q %q %q", signIn, refreshed, again)
+	}
+	if other := sid(map[string]any{"iat": t0.Add(time.Hour).Unix(), "nonce": "n-2"}); other == signIn {
+		t.Fatal("a new sign-in (new nonce) kept the session id")
+	}
+	// auth_time wins over the nonce when Dex sets it.
+	at := sid(map[string]any{"iat": t0.Unix(), "auth_time": t0.Unix(), "nonce": "n-1"})
+	if at2 := sid(map[string]any{"iat": t0.Add(time.Hour).Unix(), "auth_time": t0.Unix(), "nonce": "n-9"}); at2 != at || at == signIn {
+		t.Fatalf("auth_time session ids: %q %q (nonce one %q)", at, at2, signIn)
+	}
+	// Neither: iat, as before (so existing rows keep their meaning).
+	if got := sid(map[string]any{"iat": t0.Unix()}); got != SessionID("user-1", t0) {
+		t.Fatalf("no nonce: %q, want the sub+iat id", got)
+	}
+	if DexSessionID("", 1, "n", t0) != "" {
+		t.Fatal("session id without a subject")
+	}
+}

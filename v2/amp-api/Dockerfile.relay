@@ -1,0 +1,25 @@
+# amp-relay: the remote control relay (epic 165, #2387), its own service.
+# Same module as amp-api (shared packages); only cmd/relay is built here, so
+# this image contains no amp-api, and the amp-api image no relay.
+FROM golang:1.25-alpine AS builder
+WORKDIR /app
+# Install any CA certs dropped into the repo-root certs/ directory.
+# This handles corporate/VPN SSL inspection (e.g. Zscaler).
+RUN apk add --no-cache ca-certificates
+COPY certs/ /tmp/certs/
+RUN cat /tmp/certs/*.pem /tmp/certs/*.crt > /usr/local/share/ca-certificates/custom.crt 2>/dev/null || true \
+    && update-ca-certificates
+COPY amp-api/go.mod amp-api/go.sum ./
+RUN go mod download
+COPY amp-api/ .
+RUN CGO_ENABLED=0 go build -o amp-relay ./cmd/relay
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates && adduser -D -u 1000 amp
+WORKDIR /app
+COPY --from=builder /app/amp-relay .
+RUN chown amp:amp /app/amp-relay
+USER 1000
+# 3002: public (Envoy: /relay/, /api/sessions); 3003: internal (relay replicas, amp-api ctl calls).
+EXPOSE 3002 3003
+CMD ["./amp-relay"]

@@ -3,6 +3,8 @@
 //! with an isolated HOME, a file credential store and no AMP_* variables leaking in.
 #![allow(dead_code, reason = "each test binary uses a different subset")]
 
+pub mod provider;
+
 use std::{
     borrow::Cow,
     path::{Path, PathBuf},
@@ -29,6 +31,16 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 
+/// The tools the mock serves that are not contract tools: one for the KB, one that always fails,
+/// and the two AMP tools from #2204/#2801 a harness may have to do without (an old server has
+/// neither, and the harness's fallbacks cover it).
+pub const EXTRA_TOOLS: &[&str] = &[
+    "amp_kb_search",
+    "amp_fail",
+    "amp_set_task_state",
+    "amp_return_task",
+];
+
 /// The D11 contract (kept in sync by `doctor_reports_missing_contract_tools`).
 pub const CONTRACT: &[&str] = &[
     "amp_whoami",
@@ -39,6 +51,7 @@ pub const CONTRACT: &[&str] = &[
     "amp_get_plan",
     "amp_check_plan",
     "amp_dispatch_task",
+    "amp_claim_task",
     "amp_complete_task",
     "amp_block_task",
     "amp_report_run",
@@ -56,6 +69,10 @@ pub struct MockAmp {
     pub omit: Vec<&'static str>,
     /// Every `tools/call` as (name, arguments).
     pub calls: Arc<Mutex<Vec<(String, Value)>>>,
+    /// #2425: what `amp_check_plan` answers, changed by the test as a person's approval in the
+    /// web UI would change it; with it, project 2 requires plan approval. `None`: the fixed
+    /// answer below.
+    pub plan: Option<Arc<Mutex<Value>>>,
 }
 
 impl MockAmp {
@@ -64,6 +81,7 @@ impl MockAmp {
             legacy_only: false,
             omit: Vec::new(),
             calls: Arc::default(),
+            plan: None,
         }
     }
 
@@ -143,6 +161,19 @@ pub fn list_tasks_json(owner: &str) -> Value {
     })
 }
 
+/// `amp_list_tasks(owner=any, format=compact)`: the board the metadata poller reads.
+pub fn compact_tasks_json() -> Value {
+    json!({
+        "ready_to_dispatch": [2086], "in_progress": [2085],
+        "questions": [{"id": 2084, "name": "M1-3 OAuth", "question": "Keychain or file?"}],
+        "waiting": 1, "scheduled": 1, "completed": 1, "quiet": [], "waiting_on_people": [2092],
+        "by_epic": {"AMP Harness": [
+            {"id": 2085, "name": "M1-4 CLI", "state": "in_progress", "assigned_to": "amp:amp-worker-backend"}
+        ]},
+        "count": 7, "owner_filter": "any"
+    })
+}
+
 pub fn get_task_json(with_comments: bool) -> Value {
     let mut out = json!({
         "task": task(2085, "M1-4 CLI", "in_progress", json!({
@@ -199,7 +230,7 @@ impl ServerHandler for MockAmp {
     ) -> Result<ListToolsResult, ErrorData> {
         let tools = CONTRACT
             .iter()
-            .chain(&["amp_kb_search", "amp_fail"])
+            .chain(EXTRA_TOOLS)
             .filter(|name| !self.omit.contains(name))
             .map(|name| tool(name))
             .collect();
@@ -216,15 +247,30 @@ impl ServerHandler for MockAmp {
             .lock()
             .unwrap()
             .push((request.name.to_string(), args.clone()));
+        // A tool this server doesn't list is one it doesn't have: answer the way AMP's mcp-go
+        // does (a JSON-RPC invalid-params error, ErrToolNotFound), e.g. amp_return_task on a
+        // server from before AMP #2801 (#2946).
+        if self.omit.contains(&request.name.as_ref()) {
+            return Err(ErrorData::invalid_params(
+                format!("tool '{}' not found: tool not found", request.name),
+                None,
+            ));
+        }
         match request.name.as_ref() {
             "amp_whoami" => ok_json(whoami_json()),
             "amp_get_project" => match args["project_id"].as_i64() {
                 Some(2) => ok_json(
-                    json!({"project": {"id": 2, "name": "AMP v2", "code": "amp-v2", "state": "active"}}),
+                    json!({"project": {"id": 2, "name": "AMP v2", "code": "amp-v2", "state": "active",
+                                       "require_plan_approval": self.plan.is_some()}}),
                 ),
                 _ => tool_error("project not found"),
             },
             "amp_list_tasks" => {
+                // M3-3: the metadata poller's board (render-chrome --live).
+                if args["format"] == "compact" && args["owner"] == "any" && args["project_id"] == 2
+                {
+                    return ok_json(compact_tasks_json());
+                }
                 if args["format"] != "full" {
                     return tool_error("mock: the CLI must ask for format=full");
                 }
@@ -241,6 +287,140 @@ impl ServerHandler for MockAmp {
                     ok_json(get_task_json(with_comments))
                 }
                 _ => tool_error("task not found"),
+            },
+            // M2-5: ticket 4040 belongs to someone else, like AMP's refusal. Since AMP #2801 the
+            // answer also carries the dispatch token the worker starts and closes the ticket
+            // with; ticket 4043 answers like an older server (no token at all).
+            "amp_dispatch_task" => match args["task_id"].as_i64() {
+                Some(4040) => tool_error("task 4040 is owned by someone else"),
+                Some(4043) => ok_json(json!({
+                    "task_id": 4043, "dispatched_to": args["agent_id"], "state": "in_progress",
+                })),
+                Some(id) => ok_json(json!({
+                    "task_id": id,
+                    "agent_id": args["agent_id"],
+                    "state": "in_progress",
+                    "phase": "not_started",
+                    "dispatch_id": format!("d_mock{id}"),
+                    "start_by": "2026-10-29T15:40:00Z",
+                    "flag_after_minutes": 10,
+                    "next": "Start the worker now, in this same turn.",
+                })),
+                None => tool_error("task_id is required"),
+            },
+            // AMP #2801: the worker starts its ticket with the token from dispatch. A stale one
+            // is refused, as AMP refuses it (the ticket was returned and dispatched again);
+            // ticket 4044's token is stale, and 4045's claim is refused for another reason.
+            "amp_claim_task" => match args["task_id"].as_i64() {
+                Some(4045) => {
+                    tool_error("ticket 4045 is not dispatched: there is nothing to start")
+                }
+                Some(id) => match args["dispatch_id"].as_str() {
+                    None | Some("") => {
+                        ok_json(json!({"task": {"id": id}, "already_started": true}))
+                    }
+                    Some(d) if d == format!("d_mock{id}") => ok_json(json!({
+                        "task": {"id": id}, "started_at": "2026-10-29T15:41:00Z",
+                        "phase": "started", "dispatch_id": d, "already_started": false,
+                    })),
+                    Some(d) => tool_error(&format!(
+                        "ticket {id}: dispatch {d} is no longer current (current: d_mock{id})"
+                    )),
+                },
+                None => tool_error("task_id is required"),
+            },
+            // AMP #2801: the returned path. It refuses a started ticket — that is what the
+            // harness's fallback is for, so the mock tells them apart by task id: 4046's ticket
+            // was started, everything else is still dispatched-and-unstarted.
+            "amp_return_task" => match args["task_id"].as_i64() {
+                Some(4046) | Some(4048) => tool_error(
+                    "task 4046 was started (by amp:amp-worker-backend): returning it would pull                      it out from under a worker that is running. Block it with a question, or                      close it out with closeout_reason",
+                ),
+                // AMP #2909: 4049 answers like a current server. Its ticket was started (the
+                // harness claimed it), and only the run holding its current dispatch may return
+                // it; no token, or a stale one, is refused.
+                Some(4049) => match args["dispatch_id"].as_str() {
+                    Some("d_mock4049") => ok_json(json!({
+                        "task_id": 4049, "state": "backlog", "returned": true,
+                        "returned_reason": args["reason"],
+                    })),
+                    Some(d) if !d.is_empty() => tool_error(&format!(
+                        "task 4049: dispatch \"{d}\" is no longer current (current: d_mock4049)"
+                    )),
+                    _ => tool_error(
+                        "task 4049 was started (by amp:amp-worker-backend): returning it would pull \
+                         it out from under a worker that is running. Block it with a question, or \
+                         close it out with closeout_reason",
+                    ),
+                },
+                Some(4047) => tool_error("task 4047 not found"),
+                Some(4042) => tool_error("task 4042 is owned by someone else"),
+                Some(id) => ok_json(json!({
+                    "task_id": id, "state": "backlog", "returned": true,
+                    "returned_reason": args["reason"],
+                })),
+                None => tool_error("task_id is required"),
+            },
+            "amp_complete_task" | "amp_block_task" => {
+                ok_json(json!({"task_id": args["task_id"], "ok": true}))
+            }
+            // M2-6: ticket 4041's runs are refused, like AMP refusing a run it can't record.
+            "amp_report_run" => match args["task_id"].as_i64() {
+                Some(4041) => tool_error("task 4041 not found"),
+                Some(id) => ok_json(json!({"task_id": id, "outcome": args["outcome"]})),
+                None => tool_error("task_id is required"),
+            },
+            // #2204: an abandoned ticket handed back to ready; ticket 4042 is refused (as AMP
+            // refuses moving someone else's ticket).
+            "amp_set_task_state" => match args["task_id"].as_i64() {
+                Some(4042) => tool_error("task 4042 is owned by someone else"),
+                // #2802: the fallback path for a ticket amp_return_task refused because it was
+                // started. 4048 refuses here too, so a test can see both refusals reported.
+                Some(4048) => tool_error("task 4048 cannot be set back to backlog"),
+                Some(id) => ok_json(
+                    json!({"task_id": id, "from_state": "in_progress", "to_state": args["state"]}),
+                ),
+                None => tool_error("task_id is required"),
+            },
+            "amp_get_plan" => ok_json(json!({"project_id": 2, "epics": [
+                {"id": 150, "name": "Earlier", "stories": []},
+                {"id": 161, "name": "AMP Harness", "stories": [{"id": 391, "name": "M1 CLI"}]}
+            ]})),
+            "amp_list_artifacts" => ok_json(json!({"artifacts": []})),
+            // #2205: amp-api without APP_PUBLIC_URL (compose) gives relative web UI links.
+            "amp_check_plan" if self.plan.is_some() => {
+                ok_json(self.plan.as_ref().unwrap().lock().unwrap().clone())
+            }
+            "amp_check_plan" => ok_json(json!({
+                "project_id": 2, "require_plan_approval": true, "awaiting_approval": [4042],
+                "approve_url": "/project/2/my-work?approve=all"
+            })),
+            // M3-4: /questions answers through the metadata poller's connection.
+            "amp_answer_question" => match args["task_id"].as_i64() {
+                Some(2084) => ok_json(json!({"task_id": 2084, "state": "backlog", "ok": true})),
+                _ => tool_error("task is not blocked with a question"),
+            },
+            // M4-1 setup: the project picker and project creation.
+            "amp_list_projects" => ok_json(json!({"projects": [
+                {"id": 2, "name": "AMP v2", "code": "AV", "state": "active", "org_id": 1},
+                {"id": 9, "name": "Old", "code": "OLD", "state": "archived", "org_id": 1},
+                {"id": 68, "name": "QA throwaway", "code": "QT", "state": "archived", "org_id": 1}
+            ]})),
+            "amp_list_orgs" => ok_json(json!({"orgs": [{"id": 1, "name": "Default"}]})),
+            "amp_create_project" => match (args["name"].as_str(), args["code"].as_str()) {
+                // Codes are unique, archived projects included (OLD and QT are archived; HI
+                // belongs to a project this user can't list). Like compose, the refusal is a
+                // JSON-RPC error (-32603), not a tool result.
+                (Some(_), Some(code @ ("AV" | "OLD" | "QT" | "HI"))) => {
+                    Err(ErrorData::internal_error(
+                        format!("project code \"{code}\" already exists"),
+                        None,
+                    ))
+                }
+                (Some(name), Some(code)) if !name.is_empty() && !code.is_empty() => ok_json(
+                    json!({"id": 77, "name": name, "code": code, "state": "active", "org_id": 1}),
+                ),
+                _ => tool_error("name and code are required"),
             },
             "amp_fail" => tool_error("it broke"),
             "amp_kb_search" => Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -270,6 +450,35 @@ impl Drop for Running {
 
 /// Serves `mock` at `/mcp`. With `bearer`, requests without that token get a 401 challenge.
 pub async fn spawn(mock: MockAmp, bearer: Option<&'static str>) -> Running {
+    let app = app(&mock, bearer);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Running {
+        url: format!("http://{addr}/mcp"),
+        mock,
+        task,
+    }
+}
+
+/// Serves `app` (built from `mock`, e.g. [`app`] plus more routes) on a loopback port.
+pub async fn serve(app: axum::Router, mock: MockAmp) -> Running {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Running {
+        url: format!("http://{addr}/mcp"),
+        mock,
+        task,
+    }
+}
+
+/// The mock's axum app (`/mcp`), for tests that serve it themselves (tests/doctor.rs: over TLS).
+pub fn app(mock: &MockAmp, bearer: Option<&'static str>) -> axum::Router {
     let served = mock.clone();
     let service: StreamableHttpService<MockAmp, LocalSessionManager> = StreamableHttpService::new(
         move || Ok(served.clone()),
@@ -282,16 +491,7 @@ pub async fn spawn(mock: MockAmp, bearer: Option<&'static str>) -> Running {
             require_bearer(token, req, next)
         }));
     }
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let task = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    Running {
-        url: format!("http://{addr}/mcp"),
-        mock,
-        task,
-    }
+    app
 }
 
 async fn require_bearer(token: &'static str, req: Request, next: Next) -> Response {
@@ -347,6 +547,77 @@ impl Output {
     }
 }
 
+/// `--snapshot` rows of a `width`-column screen without the chat's padding: the left padding
+/// (`[tui] padding`, #2251; halved at 80 columns or fewer, #2344), the blank row above the
+/// screen (#2344, checked blank), and the boxes' side edges (#2882: a box's `│` sits in
+/// the padding's last column, so it reads as padding; the right one goes), so a test that checks
+/// where something sits reads rows and columns as before. amp-tui's `tests/padding.rs` and
+/// `tests/boxes.rs` cover the padding and the boxes themselves.
+pub fn unpad(mut rows: Vec<String>, width: usize) -> Vec<String> {
+    // The blank row above the screen (since #2882, none below it).
+    let gap = amp_tui::Gap::rows_at(rows.len());
+    for _ in 0..gap {
+        assert!(rows[0].trim().is_empty(), "top padding row: {rows:#?}");
+        rows.remove(0);
+    }
+    let cols = amp_tui::Padding::new(amp_tui::DEFAULT_PADDING).at(width);
+    let pad = " ".repeat(cols);
+    let edge = format!("{}│", " ".repeat(cols.saturating_sub(1)));
+    rows.into_iter()
+        .map(|r| match r.strip_prefix(&edge) {
+            Some(inner) if cols > 0 => {
+                let inner = inner.trim_end();
+                inner
+                    .strip_suffix('│')
+                    .unwrap_or(inner)
+                    .trim_end()
+                    .to_owned()
+            }
+            _ => r.strip_prefix(&pad).map(str::to_owned).unwrap_or(r),
+        })
+        .collect()
+}
+
+/// The screen's words on one line, so a wrapped line reads as one. Each row loses one box side
+/// edge (#2882: `│`, or `|` in the ASCII boxes) at its start and one at its end before its words
+/// are joined, so the edges of a box that wraps a line don't land inside the text. Only edges
+/// are dropped: a `│` or `|` inside a row stays. A token wider than a row (a long path) is
+/// hard-broken by the wrap (amp-tui `wrap.rs`) and reads here as two words.
+pub fn flat(screen: &str) -> String {
+    const EDGES: [char; 2] = ['│', '|'];
+    screen
+        .lines()
+        .flat_map(|row| {
+            let row = row.trim();
+            let row = row.strip_prefix(EDGES).unwrap_or(row);
+            let row = row.strip_suffix(EDGES).unwrap_or(row);
+            row.split_whitespace()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A command that runs the amp-harness binary with the pty on its stdin as its controlling
+/// terminal (#2906). Give it the pty slave as stdin before spawning. Without this the child
+/// keeps the test runner's controlling terminal, and amp-harness reads that terminal for its
+/// size (crossterm `window_size()` opens `/dev/tty`) and for the OSC 11 background query
+/// (amp-tui `theme/select.rs`). Under `script -q /dev/null` (a 0x0 tty) it draws nothing to the
+/// test's pty. A new session plus `TIOCSCTTY` on stdin make `/dev/tty` the test's pty. This
+/// crate forbids `unsafe` (`Command::pre_exec`), so python3 does that and then execs the binary,
+/// keeping the same pid, like `setup_ctrl_c.rs`. Add the binary's arguments with `.args`.
+pub fn pty_command() -> std::process::Command {
+    let mut cmd = std::process::Command::new("python3");
+    cmd.args([
+        "-c",
+        "import fcntl, os, sys, termios\n\
+         os.setsid()\n\
+         fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n\
+         os.execv(sys.argv[1], sys.argv[1:])",
+        env!("CARGO_BIN_EXE_amp-harness"),
+    ]);
+    cmd
+}
+
 /// Runs the binary in `dir/project` with HOME in `dir/home`, the file credential store,
 /// `AMP_MCP_URL=url` and no other AMP_* settings. `env` adds variables.
 pub async fn run(dir: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
@@ -361,7 +632,11 @@ pub async fn run(dir: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> 
         .env("AMP_HARNESS_CEILING_DIR", dir)
         .env_remove("AMP_TOKEN")
         .env_remove("AMP_CA_FILE")
+        .env_remove("AMP_WEB_URL")
         .env_remove("AMP_MCP_PROTOCOL")
+        .env_remove("AMP_HARNESS_PROFILE")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OPENROUTER_API_KEY")
         .env_remove("RUST_LOG");
     for (k, v) in env {
         cmd.env(k, v);
