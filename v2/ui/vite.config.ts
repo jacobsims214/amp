@@ -6,18 +6,34 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { cspFor } from './src/remote/csp'
 
+/** The static home pages (public/home/**) and their asset URLs. */
+const isHomePage = (path: string) => path === '/home' || path.startsWith('/home/')
+
 /**
- * The pages' CSPs under `vite preview`, matching nginx in production: the strict
- * one on /sessions/, the baseline everywhere else, none on the proxied /api/.
- * Not under `vite dev`: its HMR client injects inline script and styles.
+ * The pages' CSPs, matching nginx in production: the strict one on /sessions/, the
+ * baseline everywhere else, none on the proxied /api/.
+ *
+ * Under `vite preview` it covers every page. Under `vite dev` it covers only the static
+ * /home/ pages: they are plain HTML with no dev client, while the app's own index.html gets
+ * Vite's HMR client, which injects inline script and styles. Without this the home pages
+ * were the one thing dev never tested against the CSP they ship under (#2968).
  */
 function pageCsp(): Plugin {
+  const apply = (path: string, res: { setHeader(name: string, value: string): void }) => {
+    if (!path.startsWith('/api/')) res.setHeader('Content-Security-Policy', cspFor(path))
+  }
   return {
     name: 'amp-page-csp',
-    configurePreviewServer(server) {
+    configureServer(server) {
       server.middlewares.use((req, res, next) => {
         const path = req.url ?? '/'
-        if (!path.startsWith('/api/')) res.setHeader('Content-Security-Policy', cspFor(path))
+        if (isHomePage(path.split('?')[0])) apply(path, res)
+        next()
+      })
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use((req, res, next) => {
+        apply(req.url ?? '/', res)
         next()
       })
     },

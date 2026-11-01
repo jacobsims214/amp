@@ -229,12 +229,15 @@ section.hero { padding-block: 0; }
 .hero .kicker .plain { letter-spacing: 0; text-transform: none; }
 .flow.d1 { animation-delay: -.3s; } .flow.d2 { animation-delay: -.6s; } .flow.d3 { animation-delay: -.9s; }
 .c-ink-3 { color: var(--ink-3); }
+.c-star-2 { color: var(--star-2); }
 .c-star-3 { color: var(--star-3); }
 .bt { border-top: 1px solid var(--line); }
 .band-surface { background: var(--surface); border-block: 1px solid var(--line); }
 .split.top { align-items: start; }
 .stack { display: grid; gap: 18px; }
 .viewer .vbar .t .ver { color: var(--ink-3); font-size: 12px; }
+.code.w { white-space: pre-wrap; overflow-wrap: anywhere; }
+.mono.sm { font-size: 13px; }
 .panel.dark { background: var(--void); border-color: var(--void-line); }
 .panel.dark .ph { background: var(--void-2); border-color: var(--void-line); }
 .launch .head .label { color: var(--star-3); }
