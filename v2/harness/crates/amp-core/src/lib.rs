@@ -69,6 +69,12 @@
 //! - [`dispatch_ledger`]: the tickets this machine dispatched, with a per-process liveness lock,
 //!   so a chat that dies is noticed and its tickets are handed back at the next startup.
 //!
+//! Story 454 (#3000, local session resume):
+//! - [`session_index`]: which saved sessions belong to the working directory the harness is in now
+//!   (`/sessions`). It scans the existing per-role JSONL directories, matches the header's
+//!   canonical `cwd` exactly, skips worker (ticket id) directories, and reads only a bounded head
+//!   and tail of each file — never repairing, rewriting or locking one.
+//!
 //! #2364:
 //! - [`workspace`]: `[workers] isolation` (auto | worktree | folder | shared) and what git offers
 //!   the manager's folder: git worktrees in a usable repository, a folder per ticket outside git.
@@ -119,6 +125,7 @@ pub mod repo_trust;
 pub mod request_time;
 pub mod roles;
 pub mod run_report;
+pub mod session_index;
 pub mod supervisor;
 pub mod templates;
 pub mod text_tool_calls;
