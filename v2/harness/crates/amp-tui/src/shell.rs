@@ -62,9 +62,10 @@
 
 use std::{
     future::Future,
+    path::PathBuf,
     pin::Pin,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use amp_core::events::{RunEvent, Totals};
@@ -82,7 +83,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::amp_render::{self, ApprovalNotice};
 use crate::history::{PromptHistory, Recall};
 use crate::newline::NewlineMode;
-use crate::overlay::{self, InfoPanel, ModelRow, PanelKind, PanelState, Stage, Target};
+use crate::overlay::{self, InfoPanel, ModelRow, PanelKind, PanelState, SessionRow, Stage, Target};
 use crate::roster::{NoticeKind, Phase, WorkerEntry};
 use crate::scroll::ScrollPos;
 use crate::slash::MenuKey;
@@ -164,6 +165,10 @@ enum ShellMsg {
         active: bool,
         manual: bool,
     },
+    /// `/sessions` scanned this directory's saved chats (AMP #3010).
+    Sessions(Result<SessionList, String>),
+    /// A confirmed resume finished: the harness switched to that session, or why it refused.
+    Resumed(Box<ResumeRequest>, Result<Resumed, String>),
 }
 
 /// The shell's watch on its harness's event bus (#2388: compaction progress). rpi's watch
@@ -359,6 +364,61 @@ pub trait ConfigControl: Send + Sync {
 /// changed by a CLI in another terminal and brings the chat's session up to date.
 pub trait ReloadControl: Send + Sync {
     fn reload(&self) -> ReloadFuture;
+}
+
+/// What `/sessions` asks of the binary, and nothing more (AMP #3010). The picker browses, and the
+/// person confirms; the *switch* — loading the file, guarding it, resetting the per-session state
+/// of §6.3 — is the caller's one transaction (AMP #3012), so the TUI never opens a second loader and
+/// never touches a session file itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeRequest {
+    /// The session file to continue: the exact path the scan listed (`<state>/sessions/<role>/…`).
+    pub path: PathBuf,
+    /// The session's short id, for the line that records what happened (`8f3d…a1c2`), drawn from
+    /// the row the person picked rather than re-derived from the path.
+    pub id: String,
+    /// How many messages the file held when it was picked; 0 when the scan could not count them.
+    pub messages: u64,
+    /// When it was last written, for the same line (`2h ago`).
+    pub modified_at: SystemTime,
+}
+
+pub type ResumeFuture = Pin<Box<dyn Future<Output = Result<Resumed, String>> + Send>>;
+
+/// A session the harness switched to, as the chat reports it: the file it continues, its message
+/// count, and — when the caller knows it — the model the resumed conversation actually runs on
+/// (the live harness keeps its model, so this is usually the chat's, disclosed in the line).
+pub struct Resumed {
+    pub path: PathBuf,
+    pub messages: u64,
+    /// The model the resumed session runs on (`provider/model`), when the caller resolved it.
+    pub model: Option<String>,
+}
+
+/// The harness side of `/sessions` (AMP #3010): scanning this directory's saved chats, and handing
+/// a chosen one to the session-switch transaction. Both run in the background, so the screen never
+/// waits on the disk; [`Shell::poll`] applies the result.
+pub trait SessionControl: Send + Sync {
+    /// The saved sessions of the harness's current directory, newest activity first, exactly as
+    /// [`amp_core::session_index::list`] returns them (already filtered by canonical cwd, already
+    /// bounded and read-only).
+    fn list(&self) -> SessionListFuture;
+    /// Asks for the session at `request` to become this chat's: the binary's one switch transaction
+    /// (AMP #3012). On `Err` the chat must be exactly as it was — same session, same transcript.
+    fn resume(&self, request: ResumeRequest) -> ResumeFuture;
+}
+
+pub type SessionListFuture = Pin<Box<dyn Future<Output = Result<SessionList, String>> + Send>>;
+
+/// What a `/sessions` scan found: the rows to draw, and the file this chat is writing (which the
+/// picker marks `· current` and will not resume).
+pub struct SessionList {
+    /// The canonical directory that was scanned, shown above the rows.
+    pub scope: String,
+    /// The sessions started in it, newest activity first.
+    pub rows: Vec<SessionRow>,
+    /// The session this chat writes now; `None` with `--no-session` or an in-memory session.
+    pub current: Option<PathBuf>,
 }
 
 /// The block a manager turn opens with when workers ended since the last one (AMP #2857): one
@@ -950,6 +1010,9 @@ pub struct Shell {
     reload_again: Option<ReloadCause>,
     /// The configuration panels (#2245), if the caller gave them.
     config: Option<Arc<dyn ConfigControl>>,
+    /// `/sessions` (AMP #3010), if the caller gave it: the scan of this directory's saved chats, and
+    /// the switch transaction a confirmed pick asks for.
+    session_control: Option<Arc<dyn SessionControl>>,
     /// A slash command chosen in a configuration panel (Enter or a letter key), run by
     /// [`Shell::key`] / [`Shell::press`] (commands are async; the panel keys are not).
     pending_command: Option<String>,
@@ -1094,6 +1157,7 @@ impl Shell {
                 reloading: false,
                 reload_again: None,
                 config: None,
+                session_control: None,
                 pending_command: None,
                 esc_hint_until: None,
                 quit_hint_until: None,
@@ -1696,7 +1760,7 @@ impl Shell {
         }
         match self.view.panel().state().map(|s| s.stage) {
             None | Some(Stage::Answer { .. }) => true,
-            Some(Stage::Confirm { .. } | Stage::Sending { .. }) => false,
+            Some(Stage::Confirm { .. } | Stage::Sending { .. } | Stage::Resume { .. }) => false,
             Some(Stage::Browse) => self.editor_clicked || !self.view.editor().get_text().is_empty(),
         }
     }
@@ -1735,7 +1799,7 @@ impl Shell {
         };
         if matches!(
             self.view.panel().state().map(|s| s.stage),
-            Some(Stage::Confirm { .. } | Stage::Sending { .. })
+            Some(Stage::Confirm { .. } | Stage::Sending { .. } | Stage::Resume { .. })
         ) {
             return false;
         }
@@ -2071,6 +2135,87 @@ impl Shell {
         self.config = Some(control);
     }
 
+    /// Gives the shell `/sessions` (AMP #3010): the directory scan and the switch transaction. The
+    /// harness side is the binary's, so the TUI opens no session file and takes no lock itself.
+    pub fn set_session_control(&mut self, control: Arc<dyn SessionControl>) {
+        self.session_control = Some(control);
+    }
+
+    /// `/sessions` (AMP #3010, artifact #28): the saved chats this directory holds, newest activity
+    /// first, to resume one. Refused — never queued — while a reply runs or prompts are queued: the
+    /// switch is one transaction (AMP #3012) and a queued prompt would land in whichever session
+    /// got there first, so the guard is [`Shell::settled`]'s, the same one `/server` and quit use.
+    fn sessions_command(&mut self) {
+        let Some(control) = self.session_control.clone() else {
+            self.view.add_notice(
+                "/sessions: not available in this session (the chat runs without a session store)",
+            );
+            return;
+        };
+        if !self.settled() || !self.prompt_queue.is_empty() {
+            self.view.add_warning(
+                "/sessions is unavailable while the manager is replying — try again when it \
+                 finishes. Your chat is unchanged.",
+            );
+            return;
+        }
+        if self.switching {
+            self.view
+                .add_notice("/sessions: already switching servers; wait for it to finish");
+            return;
+        }
+        // The scan runs in the background; the panel shows "scanning…" until it lands, and keeps
+        // its height so rows arriving don't make the list jump. The binary reports the canonical
+        // scope and the file this chat writes, so the shell keeps no second copy of either.
+        self.view
+            .panel()
+            .open(PanelState::sessions(None, None, None));
+        let tx = self.msgs_tx.clone();
+        self.in_flight += 1;
+        tokio::spawn(async move {
+            let _ = tx.send(ShellMsg::Sessions(control.list().await));
+        });
+    }
+
+    /// Asks the harness to resume the session the person confirmed: the switch is async (it loads
+    /// and guards the file), so [`Shell::poll`] applies its outcome.
+    fn resume_session(&mut self, request: ResumeRequest) {
+        let Some(control) = self.session_control.clone() else {
+            self.view
+                .add_error("/sessions: not available in this session (no session store)");
+            return;
+        };
+        if !self.settled() || !self.prompt_queue.is_empty() {
+            self.view.add_warning(
+                "/sessions: a reply started meanwhile — the resume was not sent. Your chat is \
+                 unchanged.",
+            );
+            self.view.panel().close();
+            return;
+        }
+        let request = ResumeRequest {
+            path: request.path,
+            id: request.id,
+            messages: request.messages,
+            modified_at: request.modified_at,
+        };
+        // The picker stays up until the switch is known to have worked (#3010: a failure must
+        // leave the chat usable): the confirm stage says it is on its way, and `apply_resumed`
+        // either closes it with the resumed line or puts the list back with the reason.
+        self.view.panel().update(|s| {
+            if s.kind == PanelKind::Sessions {
+                s.note = Some((format!("resuming {}…", request.id), false));
+            }
+        });
+        self.view.add_notice(&format!("resuming {}…", request.id));
+        let tx = self.msgs_tx.clone();
+        self.in_flight += 1;
+        tokio::spawn(async move {
+            let result = control.resume(request.clone()).await;
+            let _ = tx.send(ShellMsg::Resumed(Box::new(request), result));
+        });
+    }
+
     /// `/mcp`, `/agents`, `/skills`, `/config`, `/model <role> …` (#2245): runs in the
     /// background; [`Shell::poll`] applies the reply.
     fn config_command(&mut self, name: &str, arg: &str) {
@@ -2100,6 +2245,74 @@ impl Shell {
             };
             let _ = tx.send(ShellMsg::Config { result, command });
         });
+    }
+
+    /// `/sessions`'s scan landed (AMP #3010): the rows replace "scanning…" in the open picker, or
+    /// the failure is what the panel says instead. Only the picker still open is filled, so a scan
+    /// that arrives after Esc changes nothing.
+    fn apply_sessions(&mut self, listed: Result<SessionList, String>) {
+        self.view.panel().update(|s| {
+            if s.kind != PanelKind::Sessions {
+                return;
+            }
+            match listed {
+                Ok(list) => {
+                    s.sessions = Some(Ok(list.rows));
+                    s.sessions_scope = Some(list.scope);
+                    s.sessions_current = list.current;
+                }
+                Err(why) => {
+                    s.sessions = Some(Err(crate::chrome::clean(&why)));
+                }
+            }
+            // The cursor starts on the first selectable row (the newest session that isn't the
+            // current one, artifact #28).
+            s.selected = 0;
+            s.stage = Stage::Browse;
+        });
+    }
+
+    /// A confirmed resume's outcome (AMP #3010): on success the chat reports where it continues;
+    /// on failure the chat is untouched and the picker comes back on the list, with the reason.
+    fn apply_resumed(&mut self, request: ResumeRequest, result: Result<Resumed, String>) {
+        match result {
+            Ok(resumed) => self.after_resumed(&request, &resumed),
+            Err(why) => {
+                let why = crate::chrome::clean(&why);
+                // Back to the list, on the row that was picked, so another can be picked.
+                self.view.panel().update(|s| {
+                    if s.kind != PanelKind::Sessions {
+                        return;
+                    }
+                    s.stage = Stage::Browse;
+                    s.note = Some((format!("not resumed: {why}"), true));
+                });
+                self.view
+                    .add_error(&format!("/sessions: {} was not resumed: {why}", request.id));
+            }
+        }
+    }
+
+    /// The transcript's one line after a resume (artifact #28): `✓ resumed <id> · <age> · N
+    /// messages · continues in the original file`, plus the model it runs on when the caller
+    /// resolved one (the live harness keeps its own, so the session a person remembers may not be
+    /// the model it would have run on). Kept separate so the resume path itself is #3012's.
+    fn after_resumed(&mut self, request: &ResumeRequest, resumed: &Resumed) {
+        let age = crate::roster::ago(request.modified_at, SystemTime::now());
+        let messages = count(
+            resumed.messages.max(request.messages),
+            "message",
+            "messages",
+        );
+        let mut line = format!(
+            "✓ resumed {} · {age} · {messages} · continues in the original file",
+            request.id
+        );
+        if let Some(model) = &resumed.model {
+            line.push_str(&format!(" · runs on {model}"));
+        }
+        self.view.add_notice(&line);
+        self.view.panel().close();
     }
 
     /// A configuration command's reply: the panel, the transcript, the note, then the reload.
@@ -3143,7 +3356,7 @@ impl Shell {
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         let confirming = matches!(
             self.view.panel().state().map(|s| s.stage),
-            Some(Stage::Confirm { .. } | Stage::Sending { .. })
+            Some(Stage::Confirm { .. } | Stage::Sending { .. } | Stage::Resume { .. })
         );
         // ↑↓ recall earlier prompts (#2348): before the `/` menu while a recalled prompt is
         // shown (a recalled `/usage` opens the menu), after it otherwise.
@@ -3407,6 +3620,7 @@ impl Shell {
             "server" => self.server_command(arg),
             "reload" => self.reload_command(ReloadCause::Command),
             "remote" => self.remote_command(arg),
+            "sessions" => self.sessions_command(),
             "close" => self.view.panel().close(),
             "" => self.view.add_notice("empty command (try /help)"),
             other => self
@@ -3680,6 +3894,24 @@ impl Shell {
                 _ => {}
             }
         }
+        // `/sessions` also takes Ctrl+P / Ctrl+N for ↑↓ (artifact #28's keyboard table), the
+        // history keys' chords, so the list moves without leaving the home row.
+        if state.kind == PanelKind::Sessions
+            && state.stage == Stage::Browse
+            && key.modifiers == KeyModifiers::CONTROL
+        {
+            match key.code {
+                KeyCode::Char('p') => {
+                    panel.move_selection(-1);
+                    return true;
+                }
+                KeyCode::Char('n') => {
+                    panel.move_selection(1);
+                    return true;
+                }
+                _ => {}
+            }
+        }
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -3713,8 +3945,51 @@ impl Shell {
                 true
             }
             Stage::Sending { .. } => true,
+            // `/sessions`' confirm (artifact #28): Enter asks for the file; Esc (or `q`, as in the
+            // list) goes back with nothing resumed and the cursor where it was.
+            Stage::Resume { path } => {
+                match key.code {
+                    KeyCode::Enter => {
+                        let request = panel.state().and_then(|s| {
+                            let row = s.session_row(&path)?;
+                            Some(ResumeRequest {
+                                path: row.path.clone(),
+                                id: row.id.clone(),
+                                messages: 0,
+                                modified_at: row.modified_at,
+                            })
+                        });
+                        match request {
+                            Some(request) => self.resume_session(request),
+                            None => {
+                                panel.update(|s| {
+                                    s.stage = Stage::Browse;
+                                    s.note = Some((
+                                        "that session is no longer in the list".to_owned(),
+                                        true,
+                                    ));
+                                });
+                            }
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        panel.update(|s| {
+                            s.stage = Stage::Browse;
+                            s.note = None;
+                        });
+                    }
+                    _ => {}
+                }
+                true
+            }
             Stage::Browse => {
                 if key.code == KeyCode::Esc {
+                    panel.close();
+                    return true;
+                }
+                // Artifact #28's keyboard table: `q` closes the picker too, in the same state the
+                // arrows act in (empty editor, keys on the panel), so nothing changes.
+                if key.code == KeyCode::Char('q') && state.kind == PanelKind::Sessions {
                     panel.close();
                     return true;
                 }
@@ -3748,6 +4023,16 @@ impl Shell {
                         Some(Target::Model(reference)) => {
                             panel.close();
                             self.pending_model = Some(reference);
+                        }
+                        // `/sessions` (AMP #3010, artifact #28): Enter asks once, in place of the
+                        // list — nothing is loaded, guarded or switched until the confirm's Enter.
+                        Some(Target::Session(path)) => {
+                            if state.kind == PanelKind::Sessions {
+                                panel.update(|s| {
+                                    s.stage = Stage::Resume { path };
+                                    s.note = None;
+                                });
+                            }
                         }
                         Some(Target::Item(_)) => {
                             if let Some(command) = overlay::info_enter(&state) {
@@ -3975,6 +4260,8 @@ impl Shell {
                 }
                 ShellMsg::Config { result, command } => self.apply_config(result, &command),
                 ShellMsg::RemoteDone(reply) => self.remote_done(reply),
+                ShellMsg::Sessions(listed) => self.apply_sessions(listed),
+                ShellMsg::Resumed(request, result) => self.apply_resumed(*request, result),
                 ShellMsg::Notice { .. }
                 | ShellMsg::ReloadRequest
                 | ShellMsg::Remote(_)

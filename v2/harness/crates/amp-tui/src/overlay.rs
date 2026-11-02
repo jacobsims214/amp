@@ -29,6 +29,7 @@
 use std::{
     any::Any,
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
@@ -71,6 +72,10 @@ pub enum PanelKind {
     /// A configuration panel the harness describes ([`InfoPanel`], #2245): `/mcp`, `/agents`,
     /// `/skills`, `/model roles`, `/config`. No AMP data needed.
     Info,
+    /// `/sessions` (AMP #3010): the saved chats started in this directory, to resume one. Its rows
+    /// come from [`PanelState::sessions`] (the harness scanned the session files; the panel never
+    /// touches the disk).
+    Sessions,
 }
 
 impl PanelKind {
@@ -84,11 +89,13 @@ impl PanelKind {
             Self::Project => "AMP · project",
             Self::Model => "model",
             Self::Info => "settings",
+            Self::Sessions => "Sessions · this directory",
         }
     }
 }
 
-/// Where `/questions` is in answering one.
+/// Where `/questions` is in answering one, and where `/sessions` is in picking one (artifact #28:
+/// browse → confirm, and a resume closes the picker).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stage {
     /// Browsing the rows.
@@ -103,6 +110,9 @@ pub enum Stage {
     },
     /// The answer is on its way.
     Sending { ticket: i64 },
+    /// `/sessions`: the person asked to resume `path`; Enter asks the harness to, Esc goes back to
+    /// the list with the cursor where it was.
+    Resume { path: PathBuf },
 }
 
 /// The open panel.
@@ -124,6 +134,77 @@ pub struct PanelState {
     pub info: Option<Arc<InfoPanel>>,
     /// Lines scrolled past the selection (a configuration panel longer than it shows).
     pub scroll: usize,
+    /// [`PanelKind::Sessions`]'s rows: `None` while the scan runs, `Some(Err)` when it failed.
+    pub sessions: Option<Result<Vec<SessionRow>, String>>,
+    /// The directory the `sessions` rows were scanned for (the canonical working directory), shown
+    /// so the scope is visible.
+    pub sessions_scope: Option<String>,
+    /// The session this chat is writing, so its row is marked `· current` and is not selectable.
+    pub sessions_current: Option<PathBuf>,
+}
+
+/// One saved session in the `/sessions` picker (AMP #3010): a [`amp_core::session_index::SessionEntry`]
+/// flattened for drawing, plus the fact the picker itself knows — whether it can be resumed here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRow {
+    /// The session file: what a resume opens, and how a row is matched against the current one.
+    pub path: PathBuf,
+    /// The short id the rest of the chrome shows (`01a1…c795`).
+    pub id: String,
+    /// The directory it lives in (`amp-manager`, `amp-worker-backend`); empty when it is
+    /// `amp-manager`, the default, so the row does not repeat it.
+    pub role: String,
+    /// When it was last written: drawn relative (`2h ago`) and the sort key.
+    pub modified_at: SystemTime,
+    /// The latest thing said in it, one line: the second row of the entry.
+    pub preview: Option<String>,
+    /// Why this harness can't offer it: unreadable, an older format, or owned by a live writer.
+    /// `None` when it can be resumed.
+    pub problem: Option<SessionProblem>,
+}
+
+/// Why a `/sessions` row can't be resumed. Every one is drawn on its row (never skipped): a
+/// session silently missing from the list is worse than one that says why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionProblem {
+    /// The header could not be read: a torn first line, or damage before its first append.
+    Unreadable(String),
+    /// A format this harness does not read (a version other than 4).
+    Incompatible(String),
+    /// Another live harness process is writing it. Resuming it would fork one file between two
+    /// writers, so it is refused in the list rather than after a failed swap.
+    Locked(String),
+}
+
+impl SessionProblem {
+    /// The word the row carries, then the reason: `locked · running elsewhere`.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Self::Unreadable(_) => "unreadable",
+            Self::Incompatible(_) => "older format",
+            Self::Locked(_) => "locked · running elsewhere",
+        }
+    }
+
+    /// The reason, in words for a person.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Unreadable(reason) | Self::Incompatible(reason) | Self::Locked(reason) => reason,
+        }
+    }
+}
+
+impl SessionRow {
+    /// Whether Enter (or a click) on this row asks to resume it: a session this harness can open,
+    /// opened by no live writer, and not the one already being written.
+    pub fn selectable(&self, current: Option<&PathBuf>) -> bool {
+        self.problem.is_none() && current.is_none_or(|path| path != &self.path)
+    }
+
+    /// Whether this is the session the chat is writing now.
+    pub fn is_current(&self, current: Option<&PathBuf>) -> bool {
+        current == Some(&self.path)
+    }
 }
 
 /// One model in the `/model` picker.
@@ -150,7 +231,43 @@ impl PanelState {
             models: Vec::new(),
             info: None,
             scroll: 0,
+            sessions: None,
+            sessions_scope: None,
+            sessions_current: None,
         }
+    }
+
+    /// The `/sessions` picker: the rows for `scope` (or `None` while the scan runs), and the file
+    /// this chat writes now (`None` with `--no-session`), which its row marks `· current`.
+    pub fn sessions(
+        rows: Option<Result<Vec<SessionRow>, String>>,
+        scope: Option<String>,
+        current: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            sessions: rows,
+            sessions_scope: scope,
+            sessions_current: current,
+            ..Self::new(PanelKind::Sessions)
+        }
+    }
+
+    /// The `/sessions` row of `path`, when the scan has it (the confirm stage's copy).
+    pub fn session_row(&self, path: &std::path::Path) -> Option<&SessionRow> {
+        match self.sessions.as_ref()? {
+            Ok(rows) => rows.iter().find(|row| row.path == path),
+            Err(_) => None,
+        }
+    }
+
+    /// What the confirm stage says about the chat the person is leaving: `b2c4…7f09` when it has
+    /// a session file, `this chat` when it is in memory (`--no-session`) or a session another
+    /// directory holds.
+    pub fn sessions_leaving(&self) -> String {
+        self.sessions_current
+            .as_ref()
+            .and_then(|path| self.session_row(path).map(|row| row.id.clone()))
+            .unwrap_or_else(|| "this chat".to_owned())
     }
 
     /// A configuration panel ([`PanelKind::Info`]); the row whose key is `select` is selected.
@@ -574,6 +691,8 @@ pub enum Target {
     Model(String),
     /// A row of a configuration panel ([`InfoRow::key`]).
     Item(String),
+    /// A saved session in `/sessions`: Enter asks to resume that file (never resumes by itself).
+    Session(PathBuf),
 }
 
 /// One piece of a row.
@@ -605,6 +724,9 @@ pub struct Row {
     pub indent: usize,
     /// A single flex piece wraps at word boundaries (as an indented one does).
     pub wrap: bool,
+    /// What the selection marker column holds when this row is not under the cursor: a state marker
+    /// (`•` for `/sessions`' current session) or, by default, a space.
+    pub mark: Option<String>,
 }
 
 impl Row {
@@ -622,6 +744,18 @@ impl Row {
 
     fn indent(mut self, n: usize) -> Self {
         self.indent = n;
+        self
+    }
+
+    /// The marker this row shows when the cursor is not on it (`•` for the current session).
+    fn mark(mut self, marker: String) -> Self {
+        self.mark = Some(marker);
+        self
+    }
+
+    /// A row of prose: its single flex piece wraps at word boundaries instead of being shortened.
+    fn wrap(mut self) -> Self {
+        self.wrap = true;
         self
     }
 }
@@ -878,6 +1012,10 @@ fn build_rows(state: &PanelState, data: Option<&ChromeData>, p: &AmpPalette) -> 
     if state.kind == PanelKind::Info {
         return info_rows(state);
     }
+    // `/sessions` reads no AMP data: its rows come from the disk scan the shell ran.
+    if state.kind == PanelKind::Sessions {
+        return session_rows(state);
+    }
     let Some(data) = data else {
         return vec![Row::new(vec![flex(
             "no AMP metadata: the chat is not connected to AMP's metadata poller",
@@ -893,7 +1031,156 @@ fn build_rows(state: &PanelState, data: Option<&ChromeData>, p: &AmpPalette) -> 
         PanelKind::Project => project_rows(data, p),
         PanelKind::Model => model_rows(state),
         PanelKind::Info => info_rows(state),
+        PanelKind::Sessions => session_rows(state),
     }
+}
+
+/// `/sessions`'s confirm stage (artifact #28): what is being resumed, and what does *not* happen,
+/// in place of the list. Enter asks for it; Esc goes back to the list with the cursor where it was.
+fn session_confirm_rows(state: &PanelState, path: &std::path::Path) -> Vec<Row> {
+    let c = colors();
+    let Some(row) = state.session_row(path) else {
+        return vec![Row::new(vec![flex(
+            "that session is no longer in the list; Esc goes back to it",
+            c.error,
+        )])];
+    };
+    let mut rows = vec![Row::new(vec![
+        fixed(c.accent.fg("Resume")),
+        flex(&row.id, c.text),
+        fixed(
+            c.muted
+                .fg(&crate::roster::ago(row.modified_at, SystemTime::now())),
+        ),
+    ])];
+    if let Some(preview) = &row.preview {
+        rows.push(Row::new(vec![Piece::Flex(preview.clone(), c.dim)]).indent(2));
+    }
+    rows.push(Row::new(Vec::new()));
+    let leaving = state.sessions_leaving();
+    // Wrapped: the copy is the part a person must be able to read before pressing Enter.
+    let mut prose = |text: String, color: Color| {
+        rows.push(Row::new(vec![Piece::Flex(text, color)]).wrap());
+    };
+    prose(
+        format!("The current chat stays saved as {leaving}."),
+        c.text,
+    );
+    prose(
+        "The resumed session continues in the original file; it does not re-run its tool calls \
+         or re-dispatch its workers."
+            .to_owned(),
+        c.dim,
+    );
+    rows
+}
+
+/// `/sessions` (AMP #3010, artifact #28): the saved chats of this directory, newest activity
+/// first, two lines each — id · age · role · `· current`, then the latest text — with the scope
+/// line above them. The current session and every problem row stay in the list (so "did it save?"
+/// has an answer, and a damaged file isn't silently missing) and carry no target, so ↑↓ skips
+/// them. No disk access happens here: the rows were scanned when `/sessions` ran.
+fn session_rows(state: &PanelState) -> Vec<Row> {
+    let c = colors();
+    if let Stage::Resume { path } = &state.stage {
+        return session_confirm_rows(state, path);
+    }
+    let mut rows = Vec::new();
+    if let Some(scope) = &state.sessions_scope {
+        rows.push(Row::new(vec![flex(
+            &format!("scope {scope} · exact match on the session's directory"),
+            c.dim,
+        )]));
+    }
+    let Some(listed) = &state.sessions else {
+        // The scan runs in the shell, not here; a panel drawn before it lands says so rather than
+        // flashing an empty list that then fills in. The glyph is the Message box's spinner
+        // (artifact #28: same glyph and placement), still: the scan is a directory read, and
+        // animating it would need a redraw tick the panel doesn't have.
+        rows.push(Row::new(vec![
+            fixed(c.accent.fg("⠋")),
+            flex("scanning saved sessions…", c.muted),
+        ]));
+        return rows;
+    };
+    let entries = match listed {
+        Ok(entries) => entries,
+        Err(why) => {
+            rows.push(Row::new(vec![flex(why, c.error)]));
+            return rows;
+        }
+    };
+    if entries.is_empty() {
+        rows.push(Row::new(vec![flex("no sessions here yet", c.text)]));
+        rows.push(Row::new(vec![flex(
+            "sessions are saved as you chat in this directory; another directory's sessions \
+             don't appear here",
+            c.dim,
+        )]));
+        return rows;
+    }
+    let current = state.sessions_current.as_ref();
+    for entry in entries {
+        let is_current = entry.is_current(current);
+        let mut head = vec![flex(&entry.id, c.text)];
+        head.push(label("·"));
+        head.push(fixed(
+            c.muted
+                .fg(&crate::roster::ago(entry.modified_at, SystemTime::now())),
+        ));
+        if !entry.role.is_empty() {
+            head.push(label("·"));
+            head.push(fixed(c.muted.fg(&entry.role)));
+        }
+        if is_current {
+            head.push(label("·"));
+            head.push(fixed(c.success.fg("current")));
+        }
+        match &entry.problem {
+            None => {
+                let mut row = Row::new(head);
+                if is_current {
+                    row = row.mark(c.success.fg("•"));
+                } else {
+                    row = row.target(Target::Session(entry.path.clone()));
+                }
+                rows.push(row);
+                if let Some(preview) = &entry.preview {
+                    rows.push(Row::new(vec![Piece::Flex(preview.clone(), c.dim)]).indent(2));
+                }
+            }
+            Some(problem) => {
+                head.push(label("·"));
+                head.push(fixed(c.error.fg(problem.word())));
+                head.push(label("·"));
+                head.push(Piece::Flex(problem.reason().to_owned(), c.error));
+                rows.push(Row::new(head));
+                // An older file is the row someone rescues by hand, so it carries its name.
+                if matches!(problem, SessionProblem::Incompatible(_)) {
+                    let name = entry
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    rows.push(Row::new(vec![flex(&name, c.error)]).indent(2));
+                }
+            }
+        }
+    }
+    let problems = entries.iter().filter(|row| row.problem.is_some()).count();
+    if problems > 0 {
+        // The count of what can't be picked, under the list (artifact #28): the rows say why
+        // each one can't, this says how many there are, so a long list doesn't hide the tally.
+        rows.push(Row::new(Vec::new()));
+        rows.push(Row::new(vec![flex(
+            &format!(
+                "{problems} file{} can't be resumed; see the reason on each row",
+                if problems == 1 { "" } else { "s" },
+            ),
+            c.dim,
+        )]));
+    }
+    rows
 }
 
 /// A configuration panel's rows as [`Row`]s: each cell styled whole, the flex one shortened.
@@ -1529,7 +1816,7 @@ fn question_rows(state: &PanelState, data: &ChromeData, p: &AmpPalette) -> Vec<R
                 fixed(c.muted.fg("…")),
             ])];
         }
-        Stage::Browse => {}
+        Stage::Browse | Stage::Resume { .. } => {}
     }
     let Some(board) = m.board.get() else {
         let note = match (&m.board.error, m.project_id) {
@@ -1974,8 +2261,13 @@ fn hint(state: &PanelState, has_targets: bool, overflow: bool) -> String {
         }
         (Stage::Confirm { .. }, _) => "y / Enter send · n / Esc cancel".to_owned(),
         (Stage::Sending { .. }, _) => "sending…".to_owned(),
+        // The resume confirm (artifact #28); short enough for the box's bottom edge at 80 columns.
+        (Stage::Resume { .. }, _) => "Enter resume · Esc back".to_owned(),
         (Stage::Browse, PanelKind::Model) if has_targets => {
             "↑↓ select · Enter switch · Esc close".to_owned()
+        }
+        (Stage::Browse, PanelKind::Sessions) if has_targets => {
+            "↑↓ select · Enter resume · Esc close".to_owned()
         }
         // #2395: chords only, so typing reaches the editor while /workers is open.
         // #2882: short enough for the box's bottom edge at 80 columns (a click still watches).
@@ -2015,11 +2307,12 @@ fn layout(
         if is_target {
             target_index += 1;
         }
-        // The marker shows only while the keys go to the panel.
+        // The marker shows only while the keys go to the panel; a row that isn't under the cursor
+        // may carry its own (`•` on `/sessions`' current session, artifact #28).
         let marker = if is_selected {
             c.accent.fg("›")
         } else {
-            " ".to_owned()
+            row.mark.clone().unwrap_or_else(|| " ".to_owned())
         };
         if is_selected {
             selected_line = lines.len();
@@ -2161,12 +2454,35 @@ pub fn panel_body(
     guard(body, width)
 }
 
-/// The boxed panel's title (#2882): `/workers` counts its workers ([`workers_title`]).
+/// The boxed panel's title (#2882): `/workers` counts its workers ([`workers_title`]), `/sessions`
+/// counts the resumable sessions (artifact #28: `Sessions · this directory · 2 of 5 resumable`).
 pub fn panel_title(state: &PanelState, data: Option<&ChromeData>) -> String {
     match state.kind {
         PanelKind::Workers => workers_title(data),
+        PanelKind::Sessions => sessions_title(state),
         _ => state.title(),
     }
+}
+
+/// `/sessions`'s box title (artifact #28): the scope and the count (`Sessions · this directory ·
+/// 5`), or — when some files can't be offered — how many of the scanned files this harness can
+/// resume (`Sessions · this directory · 2 of 5 resumable`). Only a *problem* row ([`SessionRow::problem`])
+/// makes the title split: the current session is one of the 5 in the artifact's clean list, so it
+/// counts as present-and-well rather than as something missing.
+pub fn sessions_title(state: &PanelState) -> String {
+    let base = state.title();
+    let Some(Ok(rows)) = &state.sessions else {
+        return base;
+    };
+    let total = rows.len();
+    if total == 0 {
+        return base;
+    }
+    let problems = rows.iter().filter(|row| row.problem.is_some()).count();
+    if problems == 0 {
+        return format!("{base} · {total}");
+    }
+    format!("{base} · {} of {total} resumable", total - problems)
 }
 
 /// The boxed panel's key hint for its bottom edge at content `width`, or empty when it doesn't
@@ -2200,7 +2516,7 @@ pub fn target_url(meta: &AmpMeta, target: &Target) -> Option<String> {
             Some(inst.ticket_url(meta.project_id?, *id))
         }
         Target::Page(url) => Some(url.clone()),
-        Target::Model(_) | Target::Item(_) => None,
+        Target::Model(_) | Target::Item(_) | Target::Session(_) => None,
     }
 }
 
@@ -2619,6 +2935,169 @@ mod tests {
         );
         meta.project_id = Some(5);
         assert!(!text(&meta).contains("marker"), "{}", text(&meta));
+    }
+
+    /// Panel lines as plain text, joined: what a test matches on.
+    fn text(lines: &[String]) -> String {
+        lines
+            .iter()
+            .map(|l| chrome::plain(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// AMP #3010, artifact #28: `/sessions` draws one line per saved chat (id · age · role ·
+    /// `current`) with the latest text under it, counts them in the title, and keeps the current
+    /// session and problem rows in the list without making them selectable.
+    #[test]
+    fn the_sessions_picker_lists_two_line_rows_and_skips_problems() {
+        let p = palette();
+        let now = SystemTime::now();
+        let row = |id: &str, ago_secs: u64, role: &str, preview: Option<&str>| SessionRow {
+            path: PathBuf::from(format!("/state/sessions/amp-manager/{ago_secs}-{id}.jsonl")),
+            id: id.to_owned(),
+            role: role.to_owned(),
+            modified_at: now - Duration::from_secs(ago_secs),
+            preview: preview.map(str::to_owned),
+            problem: None,
+        };
+        let current = row("b2c4…7f09", 2, "", Some("Two tickets in AMP Harness"));
+        let mut unreadable = row("4d2e…b310", 4 * 86_400, "", None);
+        unreadable.problem = Some(SessionProblem::Unreadable("permission denied".to_owned()));
+        let mut older = row("9c1a…55de", 5 * 86_400, "", None);
+        older.problem = Some(SessionProblem::Incompatible(
+            "a v3 file: this harness reads v4".to_owned(),
+        ));
+        let mut locked = row("3ff9…08ac", 14 * 86_400, "", None);
+        locked.problem = Some(SessionProblem::Locked(
+            "another live process owns it".to_owned(),
+        ));
+        let newest = row(
+            "8f3d…a1c2",
+            2 * 3600,
+            "amp-worker-backend",
+            Some("…the changelog groups the tickets by epic"),
+        );
+        let rows = vec![newest.clone(), current.clone(), unreadable, older, locked];
+        let state = PanelState::sessions(
+            Some(Ok(rows)),
+            Some("/dev/amp".to_owned()),
+            Some(current.path.clone()),
+        );
+
+        // The title carries the scope and how many of the scanned files Enter can pick (artifact
+        // #28's problems screen: `2 of 5 resumable` for two good rows and three problems). The
+        // current session is one of the two — it is well-formed and present, just not something to
+        // resume, so it never makes the title split.
+        assert_eq!(
+            panel_title(&state, None),
+            "Sessions · this directory · 2 of 5 resumable"
+        );
+        // A clean list shows the count alone (artifact #28's list screen: `· 5`), current row and
+        // all.
+        assert_eq!(
+            panel_title(
+                &PanelState::sessions(
+                    Some(Ok(vec![newest.clone(), current.clone()])),
+                    Some("/dev/amp".to_owned()),
+                    Some(current.path.clone())
+                ),
+                None
+            ),
+            "Sessions · this directory · 2"
+        );
+
+        let lines: Vec<String> = render_panel(&state, None, &p, 100)
+            .iter()
+            .map(|l| chrome::plain(l))
+            .collect();
+        let all = lines.join("\n");
+        // The scope is visible, and a worktree's session stays in its own directory's list.
+        assert!(
+            all.contains("scope /dev/amp · exact match on the session's directory"),
+            "{all}"
+        );
+        // Two lines per good session: the row, then its latest text under the id column.
+        let first = lines
+            .iter()
+            .position(|l| l.contains("8f3d…a1c2"))
+            .expect("first row");
+        assert!(lines[first].contains("2h ago"), "{:?}", lines[first]);
+        assert!(
+            lines[first].contains("amp-worker-backend"),
+            "{:?}",
+            lines[first]
+        );
+        assert!(lines[first + 1].trim_start().starts_with("…the changelog"));
+        // The current one is marked (and its row is not a target).
+        let cur = lines
+            .iter()
+            .position(|l| l.contains("b2c4…7f09"))
+            .expect("current row");
+        assert!(lines[cur].contains("current"), "{:?}", lines[cur]);
+        // Every problem says why, and an older format carries its file name for a hand rescue.
+        assert!(all.contains("unreadable"), "{all}");
+        assert!(all.contains("permission denied"), "{all}");
+        assert!(all.contains("older format"), "{all}");
+        assert!(
+            all.contains("432000-9c1a…55de.jsonl"),
+            "the file name rides under the id: {all}"
+        );
+        assert!(all.contains("locked · running elsewhere"), "{all}");
+        // The tally under the list (artifact #28): three of the five can't be picked.
+        assert!(
+            all.contains("3 files can't be resumed; see the reason on each row"),
+            "{all}"
+        );
+        // Only the one resumable, non-current session is selectable.
+        let panel = Panel::new(Chrome::new());
+        panel.open(state.clone());
+        assert_eq!(panel.targets(), vec![Target::Session(newest.path.clone())]);
+        assert_eq!(panel.selected(), Some(Target::Session(newest.path.clone())));
+
+        // The confirm stage replaces the list and says what does not happen.
+        let mut confirming = state.clone();
+        confirming.stage = Stage::Resume {
+            path: newest.path.clone(),
+        };
+        let lines: Vec<String> = render_panel(&confirming, None, &p, 100)
+            .iter()
+            .map(|l| chrome::plain(l))
+            .collect();
+        let all = lines.join("\n");
+        assert!(all.contains("Resume 8f3d…a1c2"), "{all}");
+        assert!(all.contains("stays saved as b2c4…7f09"), "{all}");
+        assert!(all.contains("does not re-run its tool calls"), "{all}");
+        assert!(!all.contains("older format"), "the list is replaced: {all}");
+        assert!(
+            lines.iter().any(|l| l.contains("Enter resume · Esc back")),
+            "{lines:#?}"
+        );
+    }
+
+    /// A scan that has not landed yet, an empty directory and a failed scan each say so in the
+    /// panel rather than showing nothing (artifact #28's loading and empty states).
+    #[test]
+    fn the_sessions_picker_says_when_it_is_scanning_empty_or_broken() {
+        let p = palette();
+        let scanning = PanelState::sessions(None, None, None);
+        let all = text(&render_panel(&scanning, None, &p, 90));
+        // The spinner glyph the Message box uses, then what is happening (artifact #28).
+        assert!(all.contains("⠋ scanning saved sessions…"), "{all}");
+        assert_eq!(panel_title(&scanning, None), "Sessions · this directory");
+
+        let empty = PanelState::sessions(Some(Ok(Vec::new())), Some("/dev/amp".to_owned()), None);
+        let all = text(&render_panel(&empty, None, &p, 90));
+        assert!(all.contains("no sessions here yet"), "{all}");
+        assert!(all.contains("saved as you chat in this directory"), "{all}");
+
+        let broken = PanelState::sessions(
+            Some(Err("read /state/sessions: permission denied".to_owned())),
+            None,
+            None,
+        );
+        let all = text(&render_panel(&broken, None, &p, 90));
+        assert!(all.contains("permission denied"), "{all}");
     }
 
     #[test]

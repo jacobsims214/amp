@@ -90,15 +90,17 @@ pub use inset::{
 };
 pub use newline::NewlineMode;
 pub use overlay::{
-    Cell, InfoPanel, InfoRow, ModelRow, Panel, PanelKey, PanelKind, PanelState, Stage, Target, Tone,
+    Cell, InfoPanel, InfoRow, ModelRow, Panel, PanelKey, PanelKind, PanelState, SessionProblem,
+    SessionRow, Stage, Target, Tone,
 };
 pub use roster::{Phase, Roster, WorkerEntry, WorkerStrip};
 pub use scroll::{NEW_OUTPUT, TranscriptScroll};
 pub use shell::{
     CTRL_D_SETTLE, ConfigControl, ConfigFuture, ConfigReply, ConnectFuture, ConnectReply, CtrlC,
     CtrlD, ESC_HINT, ESC_HINT_FOR, ModelChoice, Notifier, Opener, ProjectLinked, ProviderConnect,
-    QUIT_HINT, QUIT_HINT_FOR, ReloadControl, ReloadFuture, ReloadReply, RunDone, STOPPED,
-    ServerControl, ServerSwitched, Shell, ShellInfo, Submit, WAKE_LIMIT, WAKE_PROMPT, WAKE_SETTLE,
+    QUIT_HINT, QUIT_HINT_FOR, ReloadControl, ReloadFuture, ReloadReply, ResumeFuture,
+    ResumeRequest, Resumed, RunDone, STOPPED, ServerControl, ServerSwitched, SessionControl,
+    SessionList, SessionListFuture, Shell, ShellInfo, Submit, WAKE_LIMIT, WAKE_PROMPT, WAKE_SETTLE,
     WAKE_WINDOW, WakeGuard, WakeVerdict, esc_hint, wake_notice, wake_paused_notice,
 };
 pub use slash::{
