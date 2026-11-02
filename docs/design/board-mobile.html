@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Board — mobile layout (D3) mockup</title>
+<!--
+  BUILDER NOTES
+  - Maps to v2/ui/src/pages/Board.tsx. Below 768px (md) replace the kanban grid
+    (LABEL_COL 240 + 5×TASK_COL 200, minWidth 1240px) with this stacked list:
+    epic sections → story groups → full-width ticket cards with a state chip.
+    The desktop grid is untouched (≥md renders exactly the current grid).
+  - Implementation sketch: keep one data path; render `isMobile && <MobileBoard/>`
+    else the existing grid, OR a single tree with a CSS-only swap
+    (`.board-grid { display:none } .board-list { display:block }` under a md
+    media query on the same DOM). The CSS-only swap needs both markups in the DOM,
+    so a React branch on a useMediaQuery('(max-width:767px)') hook is cheaper.
+  - Row actions (+ Add story/task, ⋯ menu) are ALWAYS visible on mobile with
+    40×40px hit areas (icon stays 14px) — this fixes D4 too. Desktop keeps
+    hover-reveal as-is.
+  - Epic/story state counts move into a per-state chip strip on the row's right
+    (or a wrap row at ≤360px): the same colors/labels as the column headers.
+  - Ticket card = the existing TaskCard, full width, plus a state chip in its
+    top-right corner (text + color, never color alone).
+  - Long names: epic name clamps at 2 lines then ellipsis (title attr = full).
+  - Collapse: chevron tap collapses the epic/story exactly like desktop.
+  - States switcher (top bar) and theme toggle are reviewer-only chrome.
+-->
+<link href="https://fonts.googleapis.com/css2?family=Barlow:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Barlow+Condensed:wght@500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  /* ── AMP tokens (from v2/ui/src/index.css, theme "Stripe") ── */
+  :root {
+    --bg:#F2F2F0; --surface:#FFFFFF; --surface-2:#FAFAF9; --surface-3:#EFEFEC; --scrim:rgba(22,24,27,.32);
+    --line-sub:#E9E9E6; --line:#DCDDDA; --line-str:#C3C5C1;
+    --ink:#16181B; --ink-2:#50555C; --ink-3:#8E939A; --on-ink:#FFFFFF;
+    --primary:#16181B; --accent:#D9482B; --link:#2C66B8;
+    --band-1:#D9482B; --band-2:#EB8A2E; --band-3:#EBC34B; --band-4:#2C66B8;
+    --st-ready:#16181B; --st-prog:#2C66B8; --st-wait:#8E939A; --st-flag:#D9482B; --st-sched:#7A5BB5; --st-done:#16181B;
+    --danger:#D9482B; --danger-ink:#B23A20; --success:#2F7D4E; --success-ink:#2A6E45;
+    --warning:#D08A1C; --warning-ink:#9A5E0A; --violet:#7A5BB5;
+    --font-body:"Barlow",ui-sans-serif,system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
+    --font-label:"Barlow Condensed","Arial Narrow","Barlow",sans-serif;
+    --font-data:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --radius:2px;
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; background:var(--bg); color:var(--ink); font-family:var(--font-body); font-size:14px; -webkit-font-smoothing:antialiased; }
+  button { font:inherit; cursor:pointer; }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+
+  .amp-label { font-family:var(--font-label); font-weight:600; font-size:10.5px; line-height:1; letter-spacing:.18em; text-transform:uppercase; color:var(--ink-3); }
+  .amp-num { font-family:var(--font-data); font-variant-numeric:tabular-nums; }
+  .amp-bands-v { width:5px; align-self:stretch; flex-shrink:0; background:linear-gradient(var(--band-1) 0 25%, var(--band-2) 25% 50%, var(--band-3) 50% 75%, var(--band-4) 75%); }
+  .amp-btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; font-family:var(--font-label); font-weight:600; font-size:11.5px; line-height:1; letter-spacing:.14em; text-transform:uppercase; white-space:nowrap; padding:9px 13px; border-radius:var(--radius); border:1px solid var(--ink); background:var(--surface); color:var(--ink); }
+  .amp-btn:hover { background:var(--surface-3); }
+  .amp-btn-primary { background:var(--primary); color:var(--on-ink); border-color:var(--primary); }
+  .amp-btn-sm { padding:6px 9px; font-size:10.5px; }
+
+  /* ── Reviewer-only state switcher ── */
+  .states { position:sticky; top:0; z-index:50; display:flex; flex-wrap:wrap; gap:6px; align-items:center; padding:8px 12px; background:#16181B; color:#fff; }
+  .states .lbl { font-family:var(--font-data); font-size:10px; letter-spacing:.06em; color:#8E939A; margin-right:2px; }
+  .states button { font-family:var(--font-label); font-weight:600; font-size:11px; letter-spacing:.1em; text-transform:uppercase; padding:6px 10px; border:1px solid #3A3E44; background:transparent; color:#C8CCD2; border-radius:2px; }
+  .states button[aria-pressed="true"] { background:#fff; color:#16181B; border-color:#fff; }
+  body[data-state="filled"]   [data-show]:not([data-show~="filled"]),
+  body[data-state="empty"]    [data-show]:not([data-show~="empty"]),
+  body[data-state="question"] [data-show]:not([data-show~="question"]),
+  body[data-state="collapsed"] [data-show]:not([data-show~="collapsed"]) { display:none !important; }
+
+  /* ── Phone frame chrome (project header strip) ── */
+  .pagehead { background:var(--surface); border-bottom:1px solid var(--line); padding:10px 16px; display:flex; align-items:center; gap:10px; }
+  .pagehead .code { font-family:var(--font-data); font-size:11px; color:var(--ink-3); border:1px solid var(--line); padding:3px 6px; }
+  .pagehead .name { font-family:var(--font-label); font-weight:600; font-size:13px; letter-spacing:.12em; text-transform:uppercase; }
+  .pagehead .spacer { flex:1; }
+  .pagehead .live { display:flex; align-items:center; gap:5px; font-family:var(--font-data); font-size:11px; color:var(--success-ink); }
+  .pagehead .live i { width:6px; height:6px; background:var(--success); display:block; }
+  .filterrow { display:flex; gap:8px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--line-sub); background:var(--bg); overflow-x:auto; }
+  .filterrow .chip { font-family:var(--font-label); font-weight:600; font-size:11px; letter-spacing:.1em; text-transform:uppercase; border:1px solid var(--line-str); background:var(--surface); padding:7px 11px; border-radius:2px; white-space:nowrap; color:var(--ink-2); }
+  .filterrow .chip.on { border-color:var(--ink); color:var(--ink); background:var(--surface-3); }
+
+  /* ══════════════ MOBILE BOARD (the design under review) ══════════════ */
+  .board { padding:0 0 48px; }
+
+  /* Epic section header */
+  .epic { border-bottom:1px solid var(--line); background:var(--surface); }
+  .epic-head { position:relative; display:flex; align-items:flex-start; gap:10px; padding:14px 12px 12px 16px; background:var(--surface-2); cursor:pointer; user-select:none; }
+  .epic-head .car { margin-top:3px; color:var(--line-str); flex-shrink:0; }
+  .epic-head .body { min-width:0; flex:1; }
+  .epic-name { display:flex; gap:8px; align-items:flex-start; }
+  .epic-name h2 { margin:0; font-family:var(--font-label); font-weight:600; font-size:16px; letter-spacing:.08em; text-transform:uppercase; line-height:1.3; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; overflow-wrap:anywhere; }
+  @media (max-width:360px) { .epic-name h2 { font-size:15px; } }
+  .epic-meta { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:6px; font-size:12px; color:var(--ink-3); }
+  .epic-counts { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+
+  /* state chip (counts on rows, state on cards) */
+  .stchip { display:inline-flex; align-items:center; gap:5px; font-family:var(--font-label); font-weight:600; font-size:10.5px; letter-spacing:.1em; text-transform:uppercase; padding:4px 7px; border:1px solid var(--line); background:var(--surface); color:var(--ink-2); border-radius:2px; white-space:nowrap; }
+  .stchip i { width:7px; height:7px; display:block; flex-shrink:0; }
+  .stchip .n { font-family:var(--font-data); font-size:10.5px; }
+
+  /* Row actions: always visible, ≥40px hit areas (D4 fix) */
+  .rowacts { display:flex; align-items:center; flex-shrink:0; margin-top:-6px; margin-right:-6px; margin-left:6px; }
+  .rowacts button { display:inline-flex; align-items:center; justify-content:center; width:40px; height:40px; background:transparent; border:0; border-radius:2px; color:var(--ink-2); }
+  .rowacts button:hover, .rowacts button:active { background:var(--surface-3); color:var(--ink); }
+
+  /* Story group */
+  .story { border-bottom:1px solid var(--line-sub); }
+  .story-head { display:flex; align-items:flex-start; gap:8px; padding:11px 12px 10px 26px; background:var(--surface); cursor:pointer; user-select:none; position:relative; }
+  .story-head::before { content:""; position:absolute; left:12px; top:14px; bottom:14px; width:3px; background:var(--line-sub); }
+  .story-head .car { margin-top:2px; color:var(--line); flex-shrink:0; }
+  .story-head .body { min-width:0; flex:1; }
+  .story-name { margin:0; font-size:13.5px; font-weight:600; line-height:1.3; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; overflow-wrap:anywhere; }
+  .story-meta { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:5px; font-size:12px; color:var(--ink-3); }
+
+  /* Ticket card: TaskCard full-width + state chip */
+  .cards { display:grid; gap:8px; padding:10px 12px 14px 26px; background:var(--bg); }
+  @media (max-width:360px) { .cards { padding-left:16px; } .story-head { padding-left:20px; } }
+  .card { position:relative; text-align:left; width:100%; background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:9px 10px 10px 12px; display:grid; gap:6px; }
+  .card .row1 { display:flex; align-items:center; gap:8px; }
+  .card .tid { font-family:var(--font-data); font-size:11px; color:var(--ink-3); }
+  .card .pri { font-family:var(--font-data); font-size:10px; font-weight:500; padding:2px 5px; border:1px solid var(--line); color:var(--ink-2); border-radius:2px; }
+  .card .pri.p3 { border-color:var(--accent); color:var(--danger-ink); }
+  .card .pri.p2 { border-color:var(--warning); color:var(--warning-ink); }
+  .card .st { margin-left:auto; }
+  .card h3 { margin:0; font-size:13.5px; font-weight:500; line-height:1.35; }
+  .card .why { font-size:12px; line-height:1.4; color:var(--danger-ink); }
+  .card .when { display:flex; align-items:center; gap:6px; font-size:11.5px; color:var(--violet); }
+  .card .row3 { display:flex; align-items:center; gap:8px; min-width:0; padding-top:2px; }
+  .tag-person { display:inline-flex; align-items:center; gap:4px; font-family:var(--font-label); font-weight:600; font-size:11px; letter-spacing:.08em; text-transform:uppercase; padding:4px 6px; border:1px solid var(--ink); color:var(--ink); max-width:100%; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .agent { display:inline-flex; align-items:center; gap:6px; min-width:0; overflow:hidden; font-family:var(--font-data); font-size:11px; color:var(--ink-2); }
+  .agent span:last-child { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .agent .av { width:18px; height:18px; border-radius:50%; background:var(--link); color:#fff; display:inline-flex; align-items:center; justify-content:center; font-family:var(--font-data); font-size:9px; flex-shrink:0; }
+  .card .owner { margin-left:auto; display:flex; align-items:center; gap:8px; flex-shrink:0; }
+  .owner-av { width:20px; height:20px; border-radius:50%; background:var(--ink); color:#fff; display:inline-flex; align-items:center; justify-content:center; font-family:var(--font-data); font-size:9px; }
+  .unassigned { font-size:11px; color:var(--ink-3); border:1px dashed var(--line-str); padding:3px 7px; border-radius:999px; }
+  .deps { display:inline-flex; align-items:center; gap:4px; font-family:var(--font-data); font-size:11px; color:var(--ink-3); }
+
+  /* Done state de-emphasis */
+  .card.done { opacity:.62; }
+  .card.done h3 { text-decoration:none; }
+
+  /* Empty board */
+  .empty { display:flex; flex-direction:column; align-items:center; justify-content:center; padding:64px 24px; gap:14px; text-align:center; }
+  .empty .icon { width:56px; height:56px; border-radius:14px; background:var(--surface); border:1px solid var(--line); display:flex; align-items:center; justify-content:center; color:var(--line-str); }
+  .empty p { margin:0; }
+  .empty .t { font-size:14px; font-weight:600; }
+  .empty .d { font-size:12.5px; color:var(--ink-2); max-width:300px; line-height:1.5; }
+
+  /* drop-down menu (epic ⋯ open state shown in 'question' state section) */
+  .menu { position:absolute; right:6px; top:38px; z-index:20; min-width:132px; background:var(--surface); border:1px solid var(--line); box-shadow:0 8px 24px rgba(22,24,27,.12); padding:4px 0; }
+  .menu button { display:block; width:100%; text-align:left; padding:11px 14px; font-size:13px; background:none; border:0; color:var(--ink); }
+  .menu button.danger { color:var(--danger-ink); }
+
+  .annotation { padding:20px 16px; background:var(--surface-2); border-top:1px solid var(--line); font-size:12px; color:var(--ink-2); line-height:1.6; }
+  .annotation h4 { margin:0 0 6px; font-family:var(--font-label); font-size:11.5px; letter-spacing:.14em; text-transform:uppercase; color:var(--ink); }
+  .annotation code { font-family:var(--font-data); font-size:11px; background:var(--surface-3); padding:1px 4px; }
+</style>
+</head>
+<body data-state="filled">
+
+<div class="states" role="toolbar" aria-label="Mockup state">
+  <span class="lbl">STATE</span>
+  <button data-setstate="filled" aria-pressed="true">Filled board</button>
+  <button data-setstate="question" aria-pressed="false">Question + menu open</button>
+  <button data-setstate="collapsed" aria-pressed="false">Collapsed</button>
+  <button data-setstate="empty" aria-pressed="false">Empty</button>
+</div>
+
+<!-- ═══════════ FILLED ═══════════ -->
+<main data-show="filled collapsed question">
+  <div class="pagehead">
+    <span class="code">NWC</span>
+    <span class="name">Northwind Commerce</span>
+    <span class="spacer"></span>
+    <span class="live"><i></i>Live</span>
+  </div>
+  <div class="filterrow" aria-label="Filters">
+    <button class="chip on">Mine</button>
+    <button class="chip">Everyone</button>
+    <button class="chip">All states</button>
+    <button class="chip">All epics</button>
+    <button class="chip">Search…</button>
+  </div>
+
+  <div class="board">
+
+    <!-- ── EPIC 1 (expanded) ── -->
+    <section class="epic" aria-label="Epic: Q4 storefront performance and checkout conversion">
+      <div class="epic-head" role="button" tabindex="0" aria-expanded="true">
+        <span class="car" aria-hidden="true">▾</span>
+        <div class="body">
+          <div class="epic-name">
+            <span class="amp-bands-v" style="height:18px" aria-hidden="true"></span>
+            <h2 title="Q4 storefront performance and checkout conversion">Q4 storefront performance and checkout conversion</h2>
+          </div>
+          <div class="epic-meta">
+            <span class="amp-num">3 stories · 9 tickets</span>
+            <span class="owner-av" title="Owner: Priya N">PN</span>
+            <span class="owner-av" style="background:var(--link)" title="Owner: Jacob S">JS</span>
+          </div>
+          <div class="epic-counts" aria-label="Ticket counts by state">
+            <span class="stchip"><i style="background:var(--st-sched)"></i>Scheduled <span class="n">1</span></span>
+            <span class="stchip"><i style="background:var(--st-ready)"></i>Ready <span class="n">3</span></span>
+            <span class="stchip"><i style="background:var(--st-prog)"></i>In progress <span class="n">2</span></span>
+            <span class="stchip"><i style="background:var(--st-flag)"></i>Waiting <span class="n">2</span></span>
+            <span class="stchip"><i style="background:var(--st-done)"></i>Done <span class="n">1</span></span>
+          </div>
+        </div>
+        <div class="rowacts">
+          <button aria-label="Add a story to Q4 storefront performance and checkout conversion" title="Add story">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
+          <button aria-label="Epic actions" aria-haspopup="menu" title="Edit or delete epic" id="epicMenuBtn">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>
+          </button>
+        </div>
+        <div class="menu" id="epicMenu" role="menu" aria-label="Epic actions" hidden>
+          <button role="menuitem">Edit</button>
+          <button role="menuitem" class="danger">Delete</button>
+        </div>
+      </div>
+
+      <!-- Story 1 -->
+      <section class="story" aria-label="Story: Cache the catalog API responses">
+        <div class="story-head" role="button" tabindex="0" aria-expanded="true">
+          <span class="car" aria-hidden="true">▾</span>
+          <div class="body">
+            <h3 class="story-name" title="Cache the catalog API responses">Cache the catalog API responses</h3>
+            <div class="story-meta"><span class="amp-num">4 tickets</span><span class="owner-av" style="width:16px;height:16px;font-size:8px">PN</span></div>
+          </div>
+          <div class="rowacts">
+            <button aria-label="Add a task to Cache the catalog API responses" title="Add task">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+            <button aria-label="Story actions" aria-haspopup="menu" title="Edit or delete story">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="cards">
+
+          <button class="card" style="box-shadow:inset 3px 0 0 var(--st-prog)" aria-label="Ticket 1042: Warm the edge cache on deploy, In progress">
+            <span class="row1">
+              <span class="tid">#1042</span><span class="pri">P1</span>
+              <span class="st stchip"><i style="background:var(--st-prog)"></i>In progress</span>
+            </span>
+            <h3>Warm the edge cache on deploy so the first shopper never hits a cold origin</h3>
+            <span class="row3">
+              <span class="agent"><span class="av">aw</span><span>amp-worker</span></span>
+              <span class="owner"><span class="owner-av" title="Owner">PN</span></span>
+            </span>
+          </button>
+
+          <button class="card" style="box-shadow:inset 3px 0 0 var(--st-ready)" aria-label="Ticket 1047: Add cache headers to product images, Ready">
+            <span class="row1">
+              <span class="tid">#1047</span><span class="pri">P1</span>
+              <span class="st stchip"><i style="background:var(--st-ready)"></i>Ready</span>
+            </span>
+            <h3>Add cache headers to product images</h3>
+            <span class="row3">
+              <span class="agent" style="color:var(--ink-3)">amp-worker</span>
+              <span class="owner"><span class="deps" title="Waiting on #1042"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3v12M6 15a3 3 0 1 0 0 6 3 3 0 0 0 0-6zm12-9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 0v3a4 4 0 0 1-4 4H9"/></svg>1</span><span class="owner-av" title="Owner">PN</span></span>
+            </span>
+          </button>
+
+          <button class="card done" style="box-shadow:inset 3px 0 0 var(--st-done)" aria-label="Ticket 1031: Measure current TTFB on catalog endpoints, Done">
+            <span class="row1">
+              <span class="tid">#1031</span><span class="pri">P1</span>
+              <span class="st stchip"><i style="background:var(--st-done)"></i>Done</span>
+            </span>
+            <h3>Measure current TTFB on the catalog endpoints</h3>
+            <span class="row3">
+              <span class="agent"><span class="av">aw</span><span>amp-worker</span></span>
+              <span class="owner"><span class="owner-av">JS</span></span>
+            </span>
+          </button>
+
+          <button class="card" style="box-shadow:inset 3px 0 0 var(--st-sched)" aria-label="Ticket 1051: Review cache hit rate after Black Friday, Scheduled">
+            <span class="row1">
+              <span class="tid">#1051</span><span class="pri">P0</span>
+              <span class="st stchip"><i style="background:var(--st-sched)"></i>Scheduled</span>
+            </span>
+            <h3>Review cache hit rate after Black Friday traffic</h3>
+            <span class="when"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>Starts Dec 2, 9:00 AM</span>
+            <span class="row3">
+              <span class="agent" style="color:var(--ink-3)">amp-worker</span>
+              <span class="owner"><span class="owner-av">PN</span></span>
+            </span>
+          </button>
+
+        </div>
+      </section>
+
+      <!-- Story 2 -->
+      <section class="story" id="story2" aria-label="Story: One-page checkout">
+        <div class="story-head" role="button" tabindex="0" aria-expanded="true">
+          <span class="car" aria-hidden="true">▾</span>
+          <div class="body">
+            <h3 class="story-name" title="One-page checkout">One-page checkout</h3>
+            <div class="story-meta"><span class="amp-num">3 tickets</span><span class="owner-av" style="width:16px;height:16px;font-size:8px;background:var(--link)">JS</span>
+              <span class="hidden-summary stchip" style="display:none"><i style="background:var(--st-flag)"></i>1 question · <i style="background:var(--st-ready)"></i>1 ready · <i style="background:var(--st-prog)"></i>1 in progress</span>
+            </div>
+          </div>
+          <div class="rowacts">
+            <button aria-label="Add a task to One-page checkout" title="Add task">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+            <button aria-label="Story actions" aria-haspopup="menu" title="Edit or delete story">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="cards">
+
+          <button class="card" style="box-shadow:inset 3px 0 0 var(--st-flag)" aria-label="Ticket 1058: Pick a tax provider, Waiting — question">
+            <span class="row1">
+              <span class="tid">#1058</span><span class="pri p3">P3</span>
+              <span class="st stchip" style="border-color:var(--st-flag);color:var(--danger-ink)"><i style="background:var(--st-flag)"></i>Question</span>
+            </span>
+            <h3>Pick a tax provider for the new checkout</h3>
+            <span class="why">Avalara or Stripe Tax? Both work in the sandbox; Stripe is cheaper under 10k invoices a month and we already have an account.</span>
+            <span class="row3">
+              <span class="tag-person" title="A person does this; agents never pick it up">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                Person · Decision
+              </span>
+              <span class="owner"><span class="owner-av" style="background:var(--link)">JS</span></span>
+            </span>
+          </button>
+
+          <button class="card" style="box-shadow:inset 3px 0 0 var(--st-ready)" aria-label="Ticket 1060: Collapse the three checkout steps into one page, Ready">
+            <span class="row1">
+              <span class="tid">#1060</span><span class="pri p2">P2</span>
+              <span class="st stchip"><i style="background:var(--st-ready)"></i>Ready</span>
+            </span>
+            <h3>Collapse the three checkout steps into one page behind a feature flag</h3>
+            <span class="row3">
+              <span class="agent" style="color:var(--ink-3)">amp-worker-frontend</span>
+              <span class="owner"><span class="deps" title="Waiting on #1058"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3v12M6 15a3 3 0 1 0 0 6 3 3 0 0 0 0-6zm12-9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 0v3a4 4 0 0 1-4 4H9"/></svg>1</span><span class="unassigned">Unassigned</span></span>
+            </span>
+          </button>
+
+          <button class="card" style="box-shadow:inset 3px 0 0 var(--st-prog)" aria-label="Ticket 1062: Load test the payment webhook at 5k rpm, In progress">
+            <span class="row1">
+              <span class="tid">#1062</span><span class="pri">P1</span>
+              <span class="st stchip"><i style="background:var(--st-prog)"></i>In progress</span>
+            </span>
+            <h3>Load test the payment webhook at 5k requests/min</h3>
+            <span class="row3">
+              <span class="agent"><span class="av" style="background:var(--teal, #1F8A7E)">ab</span><span>amp-worker-backend</span></span>
+              <span class="owner"><span class="owner-av">JS</span></span>
+            </span>
+          </button>
+
+        </div>
+      </section>
+    </section>
+
+    <!-- ── EPIC 2 (collapsed for variety) ── -->
+    <section class="epic" aria-label="Epic: Returns and refunds rebuild">
+      <div class="epic-head" role="button" tabindex="0" aria-expanded="false">
+        <span class="car" aria-hidden="true">▸</span>
+        <div class="body">
+          <div class="epic-name">
+            <span class="amp-bands-v" style="height:18px" aria-hidden="true"></span>
+            <h2 title="Returns and refunds rebuild">Returns and refunds rebuild</h2>
+          </div>
+          <div class="epic-meta">
+            <span class="amp-num">2 stories · 6 tickets</span>
+            <span class="owner-av" title="Owner: Priya N">PN</span>
+          </div>
+          <div class="epic-counts">
+            <span class="stchip"><i style="background:var(--st-ready)"></i>Ready <span class="n">4</span></span>
+            <span class="stchip"><i style="background:var(--st-prog)"></i>In progress <span class="n">1</span></span>
+            <span class="stchip"><i style="background:var(--st-done)"></i>Done <span class="n">1</span></span>
+          </div>
+        </div>
+        <div class="rowacts">
+          <button aria-label="Add a story to Returns and refunds rebuild" title="Add story">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
+          <button aria-label="Epic actions" aria-haspopup="menu" title="Edit or delete epic">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>
+          </button>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <div class="annotation" data-show="filled collapsed question">
+    <h4>What changed from the desktop grid</h4>
+    Epic/story columns and the five state columns collapse into one vertical list. State moves onto each card as a labeled chip (text + color, never color alone) and onto each epic header as a count strip. Row actions stay visible with 40×40px hit areas instead of hover-reveal 19px buttons. Nothing on this screen is wider than the viewport — no horizontal panning at 320/390/430.
+  </div>
+</main>
+
+<!-- ═══════════ EMPTY ═══════════ -->
+<main data-show="empty">
+  <div class="pagehead">
+    <span class="code">NWC</span>
+    <span class="name">Northwind Commerce</span>
+    <span class="spacer"></span>
+    <span class="live"><i></i>Live</span>
+  </div>
+  <div class="filterrow"><button class="chip on">Mine</button><button class="chip">Everyone</button></div>
+  <div class="empty">
+    <div class="icon">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3v12M6 15a3 3 0 1 0 0 6 3 3 0 0 0 0-6zm12-9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 0v3a4 4 0 0 1-4 4H9"/></svg>
+    </div>
+    <p class="t">No epics yet</p>
+    <p class="d">Ask the amp-manager to plan your project — tickets will appear here in real time.</p>
+    <button class="amp-btn amp-btn-primary amp-btn-sm" style="margin-top:6px">+ New epic</button>
+  </div>
+</main>
+
+<script>
+  const btns = document.querySelectorAll('[data-setstate]');
+  const epicMenu = document.getElementById('epicMenu');
+  const story2 = document.getElementById('story2');
+  const story2Head = story2.querySelector('.story-head');
+  const story2Cards = story2.querySelector('.cards');
+  function applyState(s) {
+    document.body.dataset.state = s;
+    btns.forEach(x => x.setAttribute('aria-pressed', String(x.dataset.setstate === s)));
+    // question state: epic ⋯ menu open
+    epicMenu.hidden = s !== 'question';
+    // collapsed state: story 2 collapsed; show its hidden-tickets summary chip
+    const collapse = s === 'collapsed';
+    story2Head.setAttribute('aria-expanded', String(!collapse));
+    story2Head.querySelector('.car').textContent = collapse ? '▸' : '▾';
+    story2Cards.style.display = collapse ? 'none' : '';
+    story2Head.querySelector('.hidden-summary').style.display = collapse ? '' : 'none';
+  }
+  btns.forEach(b => b.addEventListener('click', () => applyState(b.dataset.setstate)));
+  document.getElementById('epicMenuBtn').addEventListener('click', e => {
+    e.stopPropagation(); epicMenu.hidden = !epicMenu.hidden;
+  });
+  // collapse toggles are visual-only in the mockup
+  document.querySelectorAll('.rowacts button').forEach(b => b.addEventListener('click', e => e.stopPropagation()));
+  document.querySelectorAll('.epic-head, .story-head').forEach(h => h.addEventListener('click', () => {
+    const expanded = h.getAttribute('aria-expanded') === 'true';
+    h.setAttribute('aria-expanded', String(!expanded));
+    const cards = h.nextElementSibling;
+    h.querySelector('.car').textContent = expanded ? '▸' : '▾';
+    if (cards && (cards.classList.contains('cards') || cards.classList.contains('story'))) {
+      cards.style.display = expanded ? 'none' : '';
+    }
+    if (expanded) { // collapsing an epic hides its stories
+      let sib = h.nextElementSibling;
+      while (sib && sib.classList.contains('story')) { sib.style.display = 'none'; sib = sib.nextElementSibling; }
+    } else {
+      let sib = h.nextElementSibling;
+      while (sib && sib.classList.contains('story')) { sib.style.display = ''; sib = sib.nextElementSibling; }
+    }
+  }));
+</script>
+</body>
+</html>
