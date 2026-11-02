@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local design/audit fixtures (isolated dev harnesses; never shipped)
+.fixtures/
