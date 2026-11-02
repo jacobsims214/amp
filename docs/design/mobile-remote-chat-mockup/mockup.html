@@ -1,0 +1,582 @@
+<!doctype html>
+<!--
+  Chat-first mobile remote-session mockup — AMP ticket #3062.
+  Implements the APPROVED audit #3026 (artifact #29; KB discoveries/mobile-remote-chat-audit.md):
+  1. WorkerChips collapsed to a one-line summary + chevron; bottom-sheet drawer holds the full roster. Status never hidden.
+  2. Stop demoted from full-width 48px to an inline composer-row button (~42px), enabled whenever online (R-M7).
+  3. Header rows merged under `sm` into <=64px of chrome (header + TicketLine in one).
+  4. `resize: none !important` on the textarea (F5 — .amp-input must not re-enable the UA resize grip).
+  5. StatusLine hidden while the visual viewport is shrunk (keyboard); env(safe-area-inset-bottom) moved to the dock (F6).
+  6. Banners, autoscroll stickiness and queue strip unchanged.
+
+  For the builder (maps to v2/ui):
+  - Frame header + TicketLine  -> Session.tsx Frame / SessionParts.tsx TicketLine  (merge under `sm`)
+  - Roster summary + drawer     -> SessionParts.tsx WorkerChips (new collapsed mode + sheet)
+  - Composer with inline Stop   -> SessionParts.tsx Composer
+  - StatusLine hidden on kbd    -> SessionParts.tsx StatusLine + Session.tsx pb-[env(safe-area-inset-bottom)] moves to dock
+  Behaviour not visible here: drawer opens on summary tap, closes on scrim tap / drag-down / Escape;
+  keyboard state is a visualViewport resize listener (height < ~70% of layout viewport).
+  Tokens below are copied one-to-one from v2/ui/src/index.css. No org design system exists yet
+  (org "simstech" hasn't published); this mockup follows the product's own tokens.
+-->
+<html lang="en" class="js"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Mobile chat-first remote session — mockup (#3062)</title>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:ital,wght@0,400;0,500;0,600;1,400&family=Barlow+Condensed:wght@500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+/* ── Product tokens (v2/ui/src/index.css, copied 1:1) ─────────────────── */
+:root {
+  --bg:#F2F2F0; --surface:#FFFFFF; --surface-2:#FAFAF9; --surface-3:#EFEFEC;
+  --scrim:rgba(22,24,27,.32);
+  --line-sub:#E9E9E6; --line:#DCDDDA; --line-str:#C3C5C1;
+  --ink:#16181B; --ink-2:#50555C; --ink-3:#8E939A; --on-ink:#FFFFFF;
+  --primary:#16181B; --accent:#D9482B; --link:#2C66B8;
+  --st-ready:#16181B; --st-prog:#2C66B8; --st-wait:#8E939A; --st-flag:#D9482B; --st-sched:#7A5BB5;
+  --danger:#D9482B; --danger-ink:#B23A20; --success:#2F7D4E; --success-ink:#2A6E45;
+  --warning:#D08A1C; --warning-ink:#9A5E0A; --violet:#7A5BB5;
+  --font-body:"Barlow",ui-sans-serif,system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
+  --font-label:"Barlow Condensed","Arial Narrow","Barlow",sans-serif;
+  --font-data:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --radius:2px;
+}
+* { box-sizing:border-box; margin:0; }
+html,body { height:100%; }
+body {
+  font-family:var(--font-body); font-size:14px; color:var(--ink); background:#3A3D42;
+  display:flex; flex-direction:column; align-items:center;
+}
+.amp-label { font-family:var(--font-label); font-weight:600; font-size:10.5px; line-height:1; letter-spacing:.18em; text-transform:uppercase; color:var(--ink-3); }
+.amp-num { font-family:var(--font-data); font-variant-numeric:tabular-nums; }
+button { font-family:inherit; cursor:pointer; }
+:focus-visible { outline:2px solid var(--link); outline-offset:2px; }
+@media (prefers-reduced-motion: reduce) { * { transition:none !important; animation:none !important; } }
+
+/* ── Mockup scaffolding (reviewer chrome, not the design) ─────────────── */
+.switcher {
+  width:100%; max-width:1100px; padding:10px 14px; display:flex; flex-wrap:wrap; gap:14px 22px;
+  color:#C9CCD1; font-size:12px; position:sticky; top:0; z-index:50; background:#3A3D42;
+  border-bottom:1px solid #4A4E55;
+}
+.switcher .grp { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+.switcher .grp.w { display:none; }            /* width chips: phones emulate it */
+@media (min-width:900px) { .switcher .grp.w { display:flex; } }
+.switcher .grp > span { font-family:var(--font-label); font-weight:600; letter-spacing:.14em; text-transform:uppercase; font-size:10px; color:#8E939A; }
+.switcher button {
+  background:#2C2F33; color:#C9CCD1; border:1px solid #4A4E55; border-radius:3px;
+  padding:4px 9px; font-size:11.5px;
+}
+.switcher button[aria-pressed="true"] { background:#E8E9E7; color:#16181B; border-color:#E8E9E7; font-weight:600; }
+.note { width:100%; max-width:1100px; padding:8px 14px 12px; color:#9BA0A7; font-size:12px; line-height:1.5; }
+.note b { color:#D7DADE; font-weight:600; }
+.note code { font-family:var(--font-data); font-size:11px; }
+
+/* ── Device frame ─────────────────────────────────────────────────────── */
+.stage { padding:8px 0 48px; }
+.device {
+  position:relative; overflow:hidden; background:var(--bg);
+  border-radius:14px; box-shadow:0 18px 50px rgba(0,0,0,.45), 0 0 0 1px #54575d;
+}
+/* Fixed phone size: the design must hold at exactly 320/390/430, not stretch. */
+[data-theme="portrait"]  .device { width:var(--devw, 390px); height:760px; }
+[data-theme="landscape"] .device { width:min(844px, calc(100vw - 32px)); height:390px; }
+.screen { position:absolute; inset:0; display:flex; flex-direction:column; background:var(--bg); }
+
+/* ── Merged mobile header (<=64px of chrome) ──────────────────────────── */
+.mhdr {
+  flex:none; background:var(--surface); border-bottom:1px solid var(--line);
+  padding:6px 10px 6px 6px; display:flex; flex-direction:column; gap:2px; min-height:0;
+}
+.mhdr .row1 { display:flex; align-items:center; gap:6px; min-width:0; }
+.mhdr .back { display:inline-flex; align-items:center; justify-content:center; width:34px; height:34px; flex:none;
+  color:var(--ink-2); background:none; border:1px solid transparent; border-radius:var(--radius); }
+.mhdr .back:hover { background:var(--surface-3); color:var(--ink); }
+.mhdr .host { display:flex; align-items:baseline; gap:7px; min-width:0; flex:1; }
+.mhdr .host h1 { font-size:15px; font-weight:600; letter-spacing:.02em; text-transform:uppercase; white-space:nowrap; }
+.mhdr .facts { font-family:var(--font-data); font-size:10.5px; color:var(--ink-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+.mhdr .ampdot { display:inline-flex; align-items:center; gap:4px; font-size:10.5px; color:var(--ink-2); flex:none; }
+.mhdr .ampdot .amp-label { font-size:9px; }
+.mhdr .row2 { display:flex; align-items:center; gap:8px; min-width:0; padding-left:42px; }
+.mhdr .more { margin-left:auto; flex:none; display:inline-flex; align-items:center; justify-content:center;
+  border:1px solid var(--line-str); background:var(--surface); border-radius:var(--radius);
+  width:32px; height:30px; font-size:14px; line-height:1; font-weight:600; color:var(--ink-2); }
+.presence { display:inline-flex; align-items:center; gap:5px; font-size:11px; font-weight:600; flex:none; }
+.presence .dot, .ampdot .dot { width:6px; height:6px; border-radius:50%; background:currentColor; }
+.presence.on  { color:var(--success-ink); }
+.presence.off { color:var(--danger-ink); }
+.presence.rec { color:var(--warning-ink); }
+/* Ticket chip — TicketLine merged into the header's second row */
+.tchip { display:inline-flex; align-items:center; gap:6px; min-width:0; font-size:11.5px;
+  border:1px solid var(--line); background:var(--surface-2); border-radius:var(--radius); padding:2px 7px; }
+.tchip .tid { font-family:var(--font-data); font-weight:600; }
+.tchip .tname { color:var(--ink-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.stag { display:inline-flex; align-items:center; gap:4px; flex:none; font-family:var(--font-label); font-weight:600;
+  font-size:9.5px; letter-spacing:.12em; text-transform:uppercase; padding:2px 5px; border-radius:1px; }
+.stag.prog { background:color-mix(in srgb, var(--st-prog) 12%, var(--surface)); color:var(--st-prog); }
+.stag.flag { background:color-mix(in srgb, var(--st-flag) 12%, var(--surface)); color:var(--st-flag); }
+.sdot { width:7px; height:7px; border-radius:1px; flex:none; }
+.sdot.prog { background:var(--st-prog); } .sdot.flag { background:var(--st-flag); }
+.sdot.ready { background:var(--st-ready); } .sdot.sched { background:var(--st-sched); }
+/* Disconnect menu (positioned to the header, not the button, so it works
+   from either the portrait row-1 button or the landscape row-2 button) */
+.menuwrap { position:relative; flex:none; }
+.mhdr { position:relative; }
+.menu { position:absolute; right:8px; top:calc(100% + 2px); z-index:30; background:var(--surface);
+  border:1px solid var(--line); border-radius:3px; box-shadow:0 8px 24px rgba(22,24,27,.16);
+  min-width:190px; padding:4px; display:none; }
+.menu.open { display:block; }
+.menu button { display:flex; align-items:center; gap:8px; width:100%; text-align:left; background:none; border:0;
+  padding:9px 10px; font-size:12.5px; color:var(--ink); border-radius:2px; }
+.menu button:hover { background:var(--surface-3); }
+.menu button.danger { color:var(--danger-ink); }
+</style>
+<style>
+/* ── Banners (unchanged from product) ─────────────────────────────────── */
+.banner { flex:none; display:flex; align-items:flex-start; gap:8px; border-left:3px solid; background:var(--surface);
+  padding:7px 12px; font-size:12.5px; line-height:1.45; }
+.banner svg { flex:none; margin-top:1px; }
+.banner.warn   { border-color:var(--warning); color:var(--warning-ink); }
+.banner.info   { border-color:var(--line-str); color:var(--ink-2); }
+.banner.danger { border-color:var(--danger);  color:var(--danger-ink); }
+
+/* ── Transcript (unchanged visuals from product) ──────────────────────── */
+.transcript { flex:1; min-height:0; overflow-y:auto; }
+.transcript .inner { max-width:860px; margin:0 auto; padding:12px 12px 14px; display:grid; gap:12px; }
+.umsg { display:flex; flex-direction:column; align-items:flex-end; }
+.umsg .bubble { max-width:min(85%,680px); background:var(--ink); color:var(--on-ink);
+  padding:7px 11px; font-size:13.5px; line-height:1.55; white-space:pre-wrap; word-break:break-word; border-radius:var(--radius); }
+.umsg .who { font-size:10px; color:var(--ink-3); margin-top:3px; }
+.amsg { font-size:13.5px; line-height:1.6; color:var(--ink); display:grid; gap:8px; }
+.amsg p { margin:0; }
+.think { font-size:12.5px; color:var(--ink-3); font-style:italic; display:flex; align-items:center; gap:5px; }
+.toolgroup { border:1px solid var(--line); background:var(--surface); border-radius:var(--radius); overflow:hidden; }
+.toolrow { display:flex; align-items:center; gap:7px; padding:4px 9px; font-size:12px; min-width:0; border-top:1px solid var(--line-sub); }
+.toolrow:first-child { border-top:0; }
+.toolrow .tname { font-family:var(--font-data); font-weight:600; flex:none; }
+.toolrow .targs { font-family:var(--font-data); color:var(--ink-3); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+.toolrow .tsep { color:var(--line-str); flex:none; }
+.toolrow .tsum { color:var(--ink-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+.toolrow .tel { margin-left:auto; flex:none; font-family:var(--font-data); font-size:10.5px; color:var(--ink-3); }
+.glyph { flex:none; display:inline-flex; }
+.glyph.ok  { color:var(--success-ink); } .glyph.run { color:var(--st-prog); } .glyph.fail { color:var(--danger-ink); }
+.note-line { font-size:12.5px; color:var(--ink-3); }
+.runline { font-size:12.5px; color:var(--ink-3); }
+.runline.failed { color:var(--danger-ink); }
+
+/* ── Roster summary (replaces WorkerChips' N rows) ────────────────────── */
+.roster {
+  flex:none; display:flex; align-items:center; gap:8px; width:100%;
+  border:0; border-top:1px solid var(--line); background:var(--surface);
+  padding:8px 12px; font-size:12px; text-align:left; min-height:34px;
+}
+.roster:hover { background:var(--surface-3); }
+.roster .counts { display:flex; align-items:center; gap:10px; min-width:0; flex:1; }
+.roster .c { display:inline-flex; align-items:center; gap:5px; white-space:nowrap; }
+.roster .c b { font-family:var(--font-data); font-weight:600; }
+.roster .c.running  { color:var(--st-prog); }
+.roster .c.blocked  { color:var(--st-flag); }
+.roster .c.done     { color:var(--ink-3); }
+.roster .hint { font-size:11px; color:var(--ink-3); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+.roster .chev { flex:none; color:var(--ink-3); }
+.roster[aria-expanded="true"] .chev { transform:rotate(180deg); }
+
+/* ── Working line + queue strip (unchanged from product) ──────────────── */
+.working { flex:none; display:flex; align-items:center; gap:8px; border-top:1px solid var(--line);
+  background:var(--surface); padding:6px 12px; font-size:12px; color:var(--ink-2); }
+.working .spin { color:var(--st-prog); flex:none; }
+.working .stophint { margin-left:auto; flex:none; font-size:10.5px; color:var(--ink-3); }
+.queue { flex:none; border-top:1px solid var(--line); background:var(--surface-2); padding:7px 12px; display:grid; gap:5px; }
+.queue .qhead { display:flex; align-items:center; gap:8px; }
+.queue .qhead .sub { font-size:11px; color:var(--ink-3); }
+.qbtn { margin-left:auto; background:none; border:0; font-size:11.5px; font-weight:600; color:var(--ink-2); padding:4px 6px; }
+.qbtn:hover { color:var(--ink); }
+.qrow { display:flex; align-items:baseline; gap:7px; font-size:12px; min-width:0; }
+.qrow .qn { font-family:var(--font-data); color:var(--ink-3); flex:none; }
+.qrow .qt { color:var(--ink-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+.qrow .qw { margin-left:auto; flex:none; font-family:var(--font-data); font-size:10px; color:var(--ink-3); }
+
+/* ── Composer with inline Stop + safe-area on the dock (F3, F5, F6) ───── */
+.dock { flex:none; background:var(--surface); border-top:1px solid var(--line);
+  padding:8px 10px calc(8px + env(safe-area-inset-bottom, 0px)); }
+.dock form { display:flex; gap:7px; align-items:flex-end; }
+.dock textarea {
+  flex:1; min-width:0; resize:none !important; /* F5: .amp-input must not re-enable the grip */
+  background:var(--surface); border:1px solid var(--line); border-radius:var(--radius);
+  padding:9px 10px; font:inherit; font-size:16px; line-height:1.3; color:var(--ink);
+  height:42px; max-height:120px; outline:none; display:block;
+}
+.dock textarea:focus { border-color:var(--ink); box-shadow:0 0 0 3px color-mix(in srgb, var(--ink) 8%, transparent); }
+.dock textarea::placeholder { color:var(--ink-3); }
+.dock textarea:disabled { background:var(--surface-3); color:var(--ink-3); }
+.btn { display:inline-flex; align-items:center; justify-content:center; gap:5px;
+  height:42px; border-radius:var(--radius); border:1px solid transparent;
+  font-family:var(--font-label); font-weight:600; letter-spacing:.14em; text-transform:uppercase; font-size:12px; padding:0 14px; flex:none; align-self:flex-end; }
+.btn-send { background:var(--primary); color:var(--on-ink); border-color:var(--primary); }
+.btn-send:hover { background:#2C2F33; }
+.btn-stop { background:var(--accent); color:#fff; border-color:var(--accent); width:42px; padding:0; }
+.btn-stop:hover { background:var(--danger-ink); }
+.btn:disabled { opacity:.45; cursor:not-allowed; }
+.dock .reason { font-size:11px; color:var(--ink-3); margin:0 2px 6px; }
+
+/* ── Status line (hidden while the keyboard is up) ────────────────────── */
+.statusline { flex:none; border-top:1px solid var(--line); background:var(--surface-2);
+  padding:7px 12px; display:grid; gap:4px; }
+.statusline dl { display:flex; flex-wrap:wrap; gap:2px 14px; font-size:11px; }
+.statusline dl > div { display:flex; align-items:baseline; gap:5px; min-width:0; }
+.statusline dt { font-family:var(--font-label); font-weight:600; font-size:9.5px; letter-spacing:.16em; text-transform:uppercase; color:var(--ink-3); }
+.statusline dd { font-family:var(--font-data); color:var(--ink); white-space:nowrap; }
+.statusline .board { display:flex; flex-wrap:wrap; align-items:center; gap:4px 12px; font-size:11px; color:var(--ink-2); }
+.statusline .board .b { display:inline-flex; align-items:center; gap:4px; font-family:var(--font-data); }
+</style>
+<style>
+/* ── Bottom-sheet roster drawer ───────────────────────────────────────── */
+.scrim { position:absolute; inset:0; background:var(--scrim); opacity:0; pointer-events:none; transition:opacity 180ms ease-out; z-index:20; }
+.sheet {
+  position:absolute; left:0; right:0; bottom:0; z-index:21; background:var(--surface);
+  border-top:1px solid var(--line); border-radius:10px 10px 0 0;
+  box-shadow:0 -12px 32px rgba(22,24,27,.22);
+  transform:translateY(102%); transition:transform 220ms cubic-bezier(.2,.8,.3,1);
+  max-height:72%; display:flex; flex-direction:column;
+  padding-bottom:calc(10px + env(safe-area-inset-bottom, 0px));
+}
+[data-state="drawer"] .scrim { opacity:1; pointer-events:auto; }
+[data-state="drawer"] .sheet { transform:translateY(0); }
+.sheet .grip { flex:none; display:flex; justify-content:center; padding:8px 0 4px; }
+.sheet .grip::before { content:""; width:36px; height:4px; border-radius:2px; background:var(--line-str); }
+.sheet .shead { flex:none; display:flex; align-items:center; gap:8px; padding:2px 14px 8px; border-bottom:1px solid var(--line-sub); }
+.sheet .shead .amp-label { font-size:11px; color:var(--ink-2); }
+.sheet .shead .sub { font-size:11px; color:var(--ink-3); }
+.sheet .sclose { margin-left:auto; width:32px; height:32px; display:inline-flex; align-items:center; justify-content:center;
+  background:none; border:0; color:var(--ink-2); border-radius:var(--radius); }
+.sheet .sclose:hover { background:var(--surface-3); color:var(--ink); }
+.sheet .sbody { overflow-y:auto; padding:6px 14px 4px; display:grid; gap:2px; }
+.wrow { display:flex; align-items:center; gap:7px; min-width:0; font-size:12px; padding:6px 0 6px 8px; border-left:2px solid var(--line); }
+.wrow.running { border-color:var(--st-prog); } .wrow.blocked { border-color:var(--st-flag); }
+.wrow.done    { border-color:var(--line-str); } .wrow.failed { border-color:var(--danger); }
+.wrow .wid { font-family:var(--font-data); font-weight:600; color:var(--accent); flex:none; }
+.wrow .wname { color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+.wrow .wstate { flex:none; font-family:var(--font-data); font-size:11px; }
+.wrow .wstate.running { color:var(--st-prog); } .wrow .wstate.blocked { color:var(--st-flag); }
+.wrow .wstate.done { color:var(--ink-2); } .wrow .wstate.failed { color:var(--danger-ink); }
+.wrow .wmeta { flex:none; font-family:var(--font-data); font-size:10.5px; color:var(--ink-3); }
+.wrow .wmeta.warn { color:var(--warning-ink); }
+.sheet .sfoot { flex:none; padding:8px 14px 0; font-size:11px; color:var(--ink-3); }
+
+/* ── Simulated keyboard (mockup only) ─────────────────────────────────── */
+.kbd { position:absolute; left:0; right:0; bottom:0; z-index:10; height:250px; flex:none;
+  background:#D4D7DB; border-top:1px solid #B9BDC2; display:none; padding:10px 12px; gap:6px;
+  grid-template-rows:repeat(4,1fr); }
+.kbd .krow { display:flex; gap:6px; }
+.kbd .key { flex:1; background:#FCFCFD; border-radius:5px; box-shadow:0 1px 0 #9DA1A6; }
+.kbd .key.wide { flex:2.1; } .kbd .key.space { flex:5; }
+/* Keyboard state: the dock collapses to composer-only and sits directly on the
+   keyboard; the roster summary, working line, queue strip and status line all
+   yield to the transcript (rec. 5). The keyboard is a flex child of .screen. */
+[data-state="keyboard"] .kbd { display:grid; position:static; flex:none; }
+[data-state="keyboard"] .mhdr .row2,
+[data-state="keyboard"] .roster,
+[data-state="keyboard"] .working,
+[data-state="keyboard"] .queue,
+[data-state="keyboard"] .statusline { display:none !important; }
+[data-state="keyboard"] .dock { display:block !important; padding-bottom:8px; }
+[data-state="keyboard"] .dock .reason { display:none !important; }
+
+/* ── State visibility switches (reviewer chrome) ──────────────────────── */
+/* An element shows when the body's data-state appears in its data-show list,
+   keeping the display its class defines. Keyboard always hides the status line
+   (rec. 5) — that rule is part of the design, not just the mockup. */
+.js [data-show]:not([data-on]) { display:none !important; }
+[data-state="keyboard"] .statusline { display:none !important; }
+
+/* ── Landscape: one 44px header row (chat-first); the roster drawer becomes a right sheet ── */
+.mhdr .lmenu { display:none; }
+[data-theme="landscape"] .mhdr { flex-direction:row; align-items:center; gap:8px; padding:3px 8px 3px 2px; }
+[data-theme="landscape"] .mhdr .row1 { flex:0 0 auto; min-width:0; }
+[data-theme="landscape"] .mhdr .host { flex:0 1 auto; }
+[data-theme="landscape"] .mhdr .host h1 { font-size:13px; }
+[data-theme="landscape"] .mhdr .facts { font-size:9.5px; }
+[data-theme="landscape"] .mhdr .back { width:30px; height:30px; }
+[data-theme="landscape"] .mhdr .row1 .menuwrap { display:none; }   /* the menu moves to the end of the single row */
+[data-theme="landscape"] .mhdr .lmenu { display:block; margin-left:auto; }
+[data-theme="landscape"] .mhdr .row2 { padding-left:0; flex:1; min-width:0; }
+[data-theme="landscape"] .mhdr .row2 .tchip { min-width:0; }
+[data-theme="landscape"] .mhdr .row2 .tchip .tname { max-width:260px; }
+[data-theme="landscape"] .mhdr .ampdot { display:none !important; }  /* facts already carry the connection */
+[data-theme="landscape"] .statusline { display:none !important; }   /* chat-first: status lives in the header facts */
+[data-theme="landscape"] .transcript .inner { padding:8px 14px 10px; }
+[data-theme="landscape"] .sheet { left:auto; top:0; right:0; bottom:0; max-height:none; width:min(360px, 78%);
+  border-top:0; border-left:1px solid var(--line); border-radius:0; transform:translateX(102%); padding-bottom:10px; }
+[data-theme="landscape"] [data-state="drawer"] .sheet { transform:translateX(0); }
+[data-theme="landscape"] .sheet .grip { display:none; }
+[data-theme="landscape"] .kbd { height:190px; }
+
+/* 320px: the facts yield before anything else (width via --devw, not the window) */
+.device.narrow .mhdr .facts,
+.device.narrow .mhdr .ampdot span:last-child,
+.device.narrow .roster .hint { display:none; }
+.device.narrow .tchip .tname { max-width:150px; }
+</style>
+</head>
+<body data-state="running" data-theme="portrait">
+
+<div class="switcher" role="toolbar" aria-label="Mockup controls">
+  <div class="grp"><span>State</span>
+    <button data-setstate="running" aria-pressed="true">Running · 4 workers</button>
+    <button data-setstate="drawer" aria-pressed="false">Roster drawer</button>
+    <button data-setstate="keyboard" aria-pressed="false">Keyboard open</button>
+    <button data-setstate="offline" aria-pressed="false">Offline</button>
+    <button data-setstate="reconnect" aria-pressed="false">Reconnecting</button>
+    <button data-setstate="ended" aria-pressed="false">Ended</button>
+    <button data-setstate="no-workers" aria-pressed="false">No workers</button>
+  </div>
+  <div class="grp"><span>Orientation</span>
+    <button data-settheme="portrait" aria-pressed="true">Portrait</button>
+    <button data-settheme="landscape" aria-pressed="false">Landscape</button>
+  </div>
+  <div class="grp w"><span>Viewport</span>
+    <button data-setwidth="320" aria-pressed="false">320</button>
+    <button data-setwidth="390" aria-pressed="true">390</button>
+    <button data-setwidth="430" aria-pressed="false">430</button>
+  </div>
+</div>
+<p class="note"><b>Chat-first mobile redesign of the remote-session page</b> — per approved audit #3026.
+Header + ticket merged into ≤64px of chrome · workers collapsed to one summary line (tap → bottom sheet; status never hidden) ·
+Stop inline in the composer (~42px, enabled whenever online) · textarea <code>resize:none</code> · status line hidden while the keyboard is up, safe-area padding moved to the dock.
+The 320/390/430 buttons approximate phone widths; orientation switches portrait/landscape.</p>
+
+<div class="stage">
+<div class="device"><div class="screen">
+
+  <!-- ══ Merged header (≤64px): Frame header + TicketLine in one ══ -->
+  <header class="mhdr">
+    <div class="row1">
+      <button class="back" aria-label="All sessions">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>
+      </button>
+      <div class="host">
+        <h1>Jacobs-MBP</h1>
+        <span class="facts amp-num">AMP #2 · amp (amp-3062) · amp-manager · macos</span>
+      </div>
+      <span class="ampdot" data-show="running offline reconnect ended no-workers keyboard">
+        <span class="amp-label">AMP</span><span class="dot" style="color:var(--success-ink)"></span><span>connected</span>
+      </span>
+      <span class="presence on" data-show="running reconnect ended no-workers keyboard"><span class="dot"></span>Online</span>
+      <span class="presence off" data-show="offline"><span class="dot"></span>Offline</span>
+      <div class="menuwrap">
+        <button class="more" id="morebtn" aria-haspopup="menu" aria-expanded="false" aria-label="Session menu">⋯</button>
+      </div>
+    </div>
+    <div class="menu" id="more" role="menu">
+      <button role="menuitem">Copy session link</button>
+      <button role="menuitem">Open in AMP</button>
+      <button role="menuitem" class="danger">Disconnect…</button>
+    </div>
+    <div class="row2" data-show="running reconnect keyboard">
+      <span class="tchip"><span class="stag prog">In progress</span><span class="tid">#3062</span><span class="tname">Mockup: chat-first mobile remote session layout</span></span>
+      <div class="menuwrap lmenu">
+        <button class="more" aria-haspopup="menu" aria-expanded="false" aria-label="Session menu" onclick="event.stopPropagation();const m=document.getElementById('more');const o=m.classList.toggle('open');this.setAttribute('aria-expanded',String(o))">⋯</button>
+      </div>
+    </div>
+    <div class="row2" data-show="offline">
+      <span class="tchip"><span class="stag prog">In progress</span><span class="tid">#3062</span><span class="tname">Mockup: chat-first mobile remote session layout</span></span>
+      <div class="menuwrap lmenu">
+        <button class="more" aria-haspopup="menu" aria-expanded="false" aria-label="Session menu" onclick="event.stopPropagation();const m=document.getElementById('more');const o=m.classList.toggle('open');this.setAttribute('aria-expanded',String(o))">⋯</button>
+      </div>
+    </div>
+    <div class="row2" data-show="ended no-workers">
+      <span class="tchip"><span class="stag prog">In progress</span><span class="tid">#3055</span><span class="tname">Wave 1: chat-first session page build</span></span>
+      <div class="menuwrap lmenu">
+        <button class="more" aria-haspopup="menu" aria-expanded="false" aria-label="Session menu" onclick="event.stopPropagation();const m=document.getElementById('more');const o=m.classList.toggle('open');this.setAttribute('aria-expanded',String(o))">⋯</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ══ Banners (as-is from product) ══ -->
+  <div class="banner warn" data-show="offline" role="status">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+    <div>Laptop offline. It may be asleep or off the network; this page catches up when it's back.</div>
+  </div>
+  <div class="banner info" data-show="reconnect" role="status">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+    <div>Reconnecting to AMP… Nothing is lost: the page picks up where it left off.</div>
+  </div>
+  <div class="banner info" data-show="ended" role="status">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+    <div>Stopped. The laptop session keeps running locally.</div>
+  </div>
+
+  <!-- ══ Transcript ══ -->
+  <div class="transcript" aria-label="Transcript" aria-live="polite"><div class="inner">
+    <div class="umsg">
+      <div class="bubble">Audit the mobile remote session page: 320–430px portrait and landscape, keyboard open, and 8 workers. Report what breaks.</div>
+      <span class="who">typed on the laptop</span>
+    </div>
+    <div class="amsg">
+      <span class="think"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m9 18 6-6-6-6"/></svg>Thought for 0s</span>
+      <p>Looking at the session page at 390px now. The dock stacks worker chips, the working line, the queue strip, the composer and the status line.</p>
+      <p>With four workers running, the chips alone take about a third of the viewport. The transcript gets what is left.</p>
+    </div>
+    <div class="toolgroup">
+      <div class="toolrow"><span class="glyph ok"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></span><span class="tname">bash</span><span class="targs">node capture-mobile.mjs…</span><span class="tsep">·</span><span class="tsum">shots/390-light-def…</span><span class="tel">800 ms</span></div>
+      <div class="toolrow"><span class="glyph run"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.2-8.56"/></svg></span><span class="tname">amp_dispatch_task</span><span class="targs">#3003</span><span class="tsep">·</span><span class="tsum">Write the drawer component</span><span class="tel">6m02s</span></div>
+    </div>
+    <div class="umsg" data-show="running keyboard">
+      <div class="bubble">Also check the reconnect banner while you're in there.</div>
+      <span class="who">Remote · Jacob's iPhone (this device)</span>
+    </div>
+    <div class="amsg" data-show="running keyboard">
+      <p>Good call — the reconnect state sits between the header and the transcript, so it's the first thing that collides with the merged 64px header. Checking it against the offline banner next.</p>
+    </div>
+    <div class="runline" data-show="ended">Stopped.</div>
+    <div class="note-line" data-show="offline">Earlier messages aren't available.</div>
+  </div></div>
+
+  <!-- ══ Roster summary (one line; tap → bottom sheet) ══ -->
+  <button class="roster" id="rosterbtn" aria-expanded="false" aria-controls="sheet" data-show="running reconnect keyboard">
+    <span class="counts">
+      <span class="c running"><span class="sdot prog"></span><b>3</b> running</span>
+      <span class="c blocked"><span class="sdot flag"></span><b>1</b> blocked</span>
+      <span class="hint">· tap for the roster</span>
+    </span>
+    <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>
+  </button>
+
+  <!-- ══ Working line (as-is) ══ -->
+  <div class="working" data-show="running keyboard" role="status">
+    <svg class="spin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.2-8.56"/></svg>
+    <span>Working… 2m41s</span>
+    <span class="stophint">Stop to interrupt</span>
+  </div>
+
+  <!-- ══ Queue strip (as-is) ══ -->
+  <div class="queue" data-show="running keyboard" aria-label="Queued messages">
+    <div class="qhead">
+      <span class="amp-label">Queued (2)</span>
+      <span class="sub">Runs when the agent finishes.</span>
+      <button class="qbtn" type="button">Cancel queued</button>
+    </div>
+    <div class="qrow"><span class="qn">1.</span><span class="qt">Then measure the keyboard case with 8 workers…</span><span class="qw">you</span></div>
+    <div class="qrow"><span class="qn">2.</span><span class="qt">Screenshot the landscape layout too</span><span class="qw">laptop</span></div>
+  </div>
+
+  <!-- ══ Composer: inline Stop, resize:none, safe-area on the dock ══ -->
+  <div class="dock">
+    <p class="reason" id="docknote" data-show="running keyboard">Agent busy — your message joins the queue (2 ahead).</p>
+    <form onsubmit="return false" aria-label="Message composer">
+      <label for="msg" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)">Message</label>
+      <textarea id="msg" rows="1" placeholder="Message the agent…"
+        aria-describedby="docknote" data-show="running reconnect keyboard no-workers"></textarea>
+      <textarea rows="1" placeholder="Laptop offline" disabled
+        data-show="offline"></textarea>
+      <textarea rows="1" placeholder="Session ended" disabled data-show="ended"></textarea>
+      <button class="btn btn-send" type="submit" data-show="running reconnect keyboard">Queue</button>
+      <button class="btn btn-send" type="submit" disabled data-show="offline">Send</button>
+      <button class="btn btn-send" type="submit" data-show="no-workers">Send</button>
+      <button class="btn btn-stop" type="button" aria-label="Stop the agent" title="Stop the agent"
+        data-show="running reconnect keyboard">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>
+      </button>
+      <button class="btn btn-stop" type="button" aria-label="Stop the agent" disabled data-show="offline no-workers">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>
+      </button>
+    </form>
+  </div>
+
+  <!-- ══ Simulated keyboard (mockup only) ══ -->
+  <div class="kbd" aria-hidden="true">
+    <div class="krow"><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div></div>
+    <div class="krow"><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div></div>
+    <div class="krow"><div class="key wide"></div><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div><div class="key"></div><div class="key wide"></div></div>
+    <div class="krow"><div class="key wide"></div><div class="key wide"></div><div class="key space"></div><div class="key wide"></div><div class="key wide"></div></div>
+  </div>
+
+  <!-- ══ Status line (hidden while the keyboard is up) ══ -->
+  <div class="statusline" data-show="running offline reconnect ended no-workers">
+    <dl aria-label="Session status">
+      <div><dt>Model</dt><dd>claude-opus-5-5</dd></div>
+      <div><dt>Context</dt><dd>41%</dd></div>
+      <div><dt>Tokens</dt><dd>86.4k</dd></div>
+      <div><dt>Cost</dt><dd>$2.91</dd></div>
+      <div><dt>Up</dt><dd>1h00m</dd></div>
+      <div data-show="running reconnect offline ended"><dt>Workers</dt><dd>3 running</dd></div>
+      <div data-show="no-workers"><dt>Workers</dt><dd>0</dd></div>
+    </dl>
+    <div class="board" aria-label="Board">
+      <span class="stag flag">2 questions</span>
+      <span class="b"><span class="sdot prog"></span>3 In progress</span>
+      <span class="b"><span class="sdot ready"></span>5 Ready</span>
+      <span class="b"><span class="sdot sched"></span>1 Scheduled</span>
+    </div>
+  </div>
+
+  <!-- ══ Bottom-sheet roster drawer ══ -->
+  <div class="scrim" id="scrim"></div>
+  <div class="sheet" id="sheet" role="dialog" aria-modal="true" aria-label="Workers">
+    <div class="grip" aria-hidden="true"></div>
+    <div class="shead">
+      <span class="amp-label">Workers (4)</span>
+      <span class="sub">3 running · 1 blocked</span>
+      <button class="sclose" id="sclose" aria-label="Close roster">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+      </button>
+    </div>
+    <div class="sbody">
+      <div class="wrow running"><span class="sdot prog"></span><span class="wid">#3001</span><span class="wname">Audit mobile chat viewport and worker-panel usability</span><span class="wstate running">· running 6m02s</span><span class="wmeta">48.0k tok</span><span class="wmeta">ctx 31%</span></div>
+      <div class="wrow running"><span class="sdot prog"></span><span class="wid">#3003</span><span class="wname">Write the mobile drawer component</span><span class="wstate running">· running 2m14s</span><span class="wmeta">12.7k tok</span><span class="wmeta warn">ctx 84%</span></div>
+      <div class="wrow running"><span class="sdot prog"></span><span class="wid">#3005</span><span class="wname">Landscape capture pass</span><span class="wstate running">· running 41s</span><span class="wmeta">3.1k tok</span><span class="wmeta">ctx 12%</span></div>
+      <div class="wrow blocked"><span class="sdot flag"></span><span class="wid">#3002</span><span class="wname">Roster summary interaction copy</span><span class="wstate blocked">· blocked</span><span class="wmeta">question</span></div>
+      <div class="wrow done"><span class="sdot ready"></span><span class="wid">#2998</span><span class="wname">Fixture: MockRelay scenes</span><span class="wstate done">· done 12m</span><span class="wmeta">61.2k tok</span><span class="wmeta">$0.41</span></div>
+    </div>
+    <div class="sfoot">Watch or stop a worker on the laptop — per-worker actions land in M2.</div>
+  </div>
+
+</div></div>
+</div>
+
+<script>
+// Reviewer chrome: state / orientation / width switching. data-setstate / data-settheme are
+// what the capture tool looks for; width is manual (the capture tool passes real widths).
+const body = document.body;
+function press(group, value) {
+  document.querySelectorAll(`[data-set${group}]`).forEach(b =>
+    b.setAttribute('aria-pressed', String(b.dataset[`set${group}`] === value)));
+}
+const visBase = s => s === 'drawer' ? 'running' : s;
+function setState(s) { body.dataset.state = s; press('state', s);
+  const base = visBase(s);
+  document.querySelectorAll('[data-show]').forEach(el => {
+    const on = el.dataset.show.split(/\s+/).includes(base);
+    if (on) el.setAttribute('data-on', ''); else el.removeAttribute('data-on');
+  });
+  document.getElementById('rosterbtn')?.setAttribute('aria-expanded', String(s === 'drawer')); }
+function setTheme(t) { body.dataset.theme = t; press('theme', t); }
+function setWidth(w) { press('width', w);
+  const d = document.querySelector('.device');
+  d.style.setProperty('--devw', w + 'px');
+  d.classList.toggle('narrow', +w <= 340); }
+/* In a phone-sized window the device takes the window's width and the 320
+   narrow treatment follows automatically; the width chips are for wider screens. */
+function fit() {
+  const w = window.innerWidth;
+  const d = document.querySelector('.device');
+  if (w < 600) { d.style.setProperty('--devw', w + 'px'); d.classList.toggle('narrow', w <= 340); }
+}
+window.addEventListener('resize', fit);
+fit();
+document.querySelectorAll('[data-setstate]').forEach(b => b.addEventListener('click', () => setState(b.dataset.setstate)));
+document.querySelectorAll('[data-settheme]').forEach(b => b.addEventListener('click', () => setTheme(b.dataset.settheme)));
+document.querySelectorAll('[data-setwidth]').forEach(b => b.addEventListener('click', () => setWidth(b.dataset.setwidth)));
+setState(body.dataset.state);
+
+// Live bits: roster summary toggles the sheet; the header ⋯ menu opens.
+const sheet = document.getElementById('sheet'), rosterbtn = document.getElementById('rosterbtn');
+rosterbtn.addEventListener('click', () => setState(body.dataset.state === 'drawer' ? 'running' : 'drawer'));
+document.getElementById('scrim').addEventListener('click', () => setState('running'));
+document.getElementById('sclose').addEventListener('click', () => setState('running'));
+const more = document.getElementById('more'), morebtn = document.getElementById('morebtn');
+morebtn.addEventListener('click', e => { e.stopPropagation();
+  const open = more.classList.toggle('open'); morebtn.setAttribute('aria-expanded', String(open)); });
+document.addEventListener('click', () => more.classList.remove('open'));
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { more.classList.remove('open'); if (body.dataset.state === 'drawer') setState('running'); } });
+</script>
+</body></html>
