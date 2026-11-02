@@ -60,7 +60,11 @@ use rpi_harness::{
     agent_harness::AgentHarness,
     context_files::{ContextFile, format_project_context, load_project_context_files},
     session::{
-        DefaultIdGenerator, InMemorySessionStorage, Session, SystemClock, types::SessionMetadata,
+        DefaultIdGenerator, InMemorySessionStorage, Session, SystemClock,
+        types::{
+            EntryOrder, LaneRecord, QueueCancelledRecord, QueueEnqueuedRecord, RecordBase,
+            RecordQuery, SessionMetadata,
+        },
     },
     skills::format_skill_invocation,
     system_prompt::compose_system_prompt,
@@ -1746,7 +1750,11 @@ impl ResumeError {
 /// 1. [`session_store::load`] validates the file, claims it, and only then replays it (a repair runs
 ///    under the guard — storage §10.3). It must be claimed **before** `load`: a live writer's file is
 ///    never opened for repair, and a resumed session keeps the guard across every append after it.
-/// 2. [`AgentHarness::set_session`] swaps the storage in. rpi rejects the swap with `LaneBusy` while
+/// 2. [`discard_persisted_queues`] cancels every prompt the file still had queued, on the loaded
+///    session and before it is swapped in, so `set_session`'s `rebuild_queues` rebuilds nothing.
+///    Without it a session saved mid-reply hands the next turn the prompts the person queued in a
+///    chat that is over (AMP #3012).
+/// 3. [`AgentHarness::set_session`] swaps the storage in. rpi rejects the swap with `LaneBusy` while
 ///    a run is active and builds the new queues before publishing it, so a rejection leaves the old
 ///    session and its queues untouched.
 ///
@@ -1765,6 +1773,15 @@ pub async fn resume_session(
     agent_id: &str,
 ) -> Result<PathBuf, ResumeError> {
     let opened = session_store::load(path, cwd, agent_id).await?;
+    // 2. Drop what the file still had queued. Failure here is a switch refused, not a switch with
+    //    prompts in it: the loaded session is dropped with its guard below, exactly as a rejected
+    //    `set_session` would leave it.
+    discard_persisted_queues(&opened.session)
+        .await
+        .map_err(|why| ResumeError::Switch {
+            path: opened.path.clone(),
+            why,
+        })?;
     // Dropping `opened.session` on a rejection drops the guard it took: a resumed-but-not-switched
     // file must not stay owned by a harness that is not writing it.
     harness
@@ -1775,6 +1792,73 @@ pub async fn resume_session(
             why: e.to_string(),
         })?;
     Ok(opened.path)
+}
+
+/// Cancels every prompt `session` still has queued, on every lane, by recording the `queue_cancelled`
+/// each `queue_enqueued` is missing (AMP #3012).
+///
+/// Why this is not `clear_queue`: `AgentHarness::set_session` rebuilds the in-memory queues from the
+/// durable records — every `queue_enqueued` with no matching `queue_cancelled` whose target entry was
+/// never committed, in *every* queue kind, `next_run` included ([`rebuild_queues`]).
+/// `AgentLane::clear_queue` only drains steering and follow-up on one lane, and touches `next_run`
+/// never; a resumed session would still fold those into the next turn. Recording the cancellation is
+/// what rpi itself does when it drops a queued item (`clear_queue`/`cancel_queued`), so the discard
+/// survives a later reopen of the same file too.
+///
+/// A prompt whose target entry already committed was consumed by a run and is history, not a queue:
+/// it is left alone, exactly as `rebuild_queues` skips it.
+async fn discard_persisted_queues(session: &Session) -> Result<(), String> {
+    let records = session
+        .find_records(&RecordQuery {
+            order: Some(EntryOrder::OldestFirst),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| format!("reading the session's queued prompts: {e}"))?;
+    let mut cancelled: BTreeSet<String> = BTreeSet::new();
+    let mut pending: Vec<QueueEnqueuedRecord> = Vec::new();
+    for record in &records {
+        match record {
+            LaneRecord::QueueCancelled(c) => {
+                cancelled.insert(c.entry_id.clone());
+            }
+            LaneRecord::QueueEnqueued(e) => pending.push(e.clone()),
+            _ => {}
+        }
+    }
+    for enqueued in pending {
+        let lane = enqueued.base.lane.clone();
+        let Some(entry_id) = enqueued.target.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if cancelled.contains(entry_id) {
+            continue;
+        }
+        // Committed already: the run it belonged to consumed it, so it is history.
+        let committed = session
+            .view(&lane)
+            .get_entry(entry_id)
+            .await
+            .map_err(|e| format!("reading the session's queued prompts: {e}"))?
+            .is_some();
+        if committed {
+            continue;
+        }
+        session
+            .append_record(LaneRecord::QueueCancelled(QueueCancelledRecord {
+                base: RecordBase {
+                    id: session.id_generator().next(),
+                    seq: 0,
+                    lane,
+                    timestamp: 0,
+                },
+                run_id: enqueued.run_id,
+                entry_id: entry_id.to_owned(),
+            }))
+            .await
+            .map_err(|e| format!("dropping the session's queued prompts: {e}"))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

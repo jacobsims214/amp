@@ -251,6 +251,11 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     }
     // /connect: store a provider key (hidden) and use it without a restart (#2163).
     shell.set_connect(crate::connect::ChatConnect::new(Arc::clone(&session.rt))?);
+    // AMP #3012: `/sessions`'s binary side — the scan of this directory's saved chats, and the one
+    // switch transaction a confirmed pick asks for. It is installed whether or not this chat writes
+    // a session file (`--no-session` still lists and can resume: the resumed file becomes the one
+    // the chat writes), and the shell refuses the command when there is no control at all.
+    let session_file = session_control(&mut shell, &session);
     // Quitting mid-dispatch cancels the manager's workers and waits for their run reports (D8).
     shell.set_supervisor(session.supervisor.clone());
     // AMP #2802: a ticket that comes back (returned by this chat) is said to the person, above
@@ -408,7 +413,6 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
                 .chrome()
                 .set_workers(Arc::new(move || sup.workers()));
         }
-        let session_file = session.agent.session_file.clone();
         // #2373: the remote link (off until `/remote` turns it on, #2376). `Err` says why remote
         // control can't be used from here (a switch, the login, plain http); `/remote` shows it.
         let remote: Result<_, String> = crate::remote::build(
@@ -442,9 +446,11 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         relinker.abort();
         // Stdio MCP servers get EOF and their process groups are killed before we exit.
         hub.shutdown().await;
-        // Back on the main screen: where the conversation was saved (#2184).
+        // Back on the main screen: where the conversation was saved (#2184) — the file `/sessions`
+        // last resumed it onto, when it did (AMP #3012).
+        let saved = session_file.lock().ok().and_then(|f| f.clone());
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        if let Some(line) = exit_line(session_file.as_deref(), home.as_deref()) {
+        if let Some(line) = exit_line(saved.as_deref(), home.as_deref()) {
             // Wrapped at the `·` rather than inside the path (#2351).
             let width = crate::setup::ui::terminal_width(&std::io::stdout());
             println!("{}", crate::setup::ui::wrap_text(&line, width));
@@ -786,6 +792,32 @@ pub(crate) fn tilde(path: &Path, home: Option<&Path>) -> String {
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),
     }
+}
+
+/// Gives the chat `/sessions` (AMP #3012): the directory scan the picker draws, and the switch
+/// transaction behind a confirmed pick. The state directory decides where sessions live; the model
+/// is what a resumed conversation will actually run on (a hot-swap keeps the live harness's), so the
+/// resumed line reports it rather than the file's recorded model.
+///
+/// Returns the handle naming the file the chat writes, which a successful switch updates: the exit
+/// line reads it, so `/sessions` then quitting names the conversation the person actually continued.
+fn session_control(
+    shell: &mut Shell,
+    session: &session::Session,
+) -> Arc<std::sync::Mutex<Option<PathBuf>>> {
+    let root = amp_core::session_index::sessions_root(&session.rt.state_dir);
+    let current = Arc::new(std::sync::Mutex::new(session.agent.session_file.clone()));
+    let control = crate::chat_sessions::ChatSessions::new(
+        Arc::clone(&session.agent.harness),
+        &session.cwd,
+        &root,
+        &session.agent.role.id,
+        &session.agent.role.id,
+        session.agent.resolved.model_ref(),
+        Arc::clone(&current),
+    );
+    shell.set_session_control(Arc::new(control) as Arc<dyn amp_tui::SessionControl>);
+    current
 }
 
 /// The banner's session line (#2186): `session 01a1…c795 (/usage for path)`, one row at 80
