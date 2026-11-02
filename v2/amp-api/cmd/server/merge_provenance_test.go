@@ -243,9 +243,9 @@ func TestMergeProvenance_NoIntegrationBranchStillGates(t *testing.T) {
 // entry in the unmerged queue — a run with no branch and no PR is not work
 // waiting for a person to merge. Without this pin, an edit to
 // Repo.UnmergedWork's selection (it takes any run with a non-empty branch or
-// pr_url, and ignores pushed) or to mergeGateFor could put every
-// unchanged run back in front of a person as a non-actionable merge card
-// (AMP #2966, #3007).
+// pr_url, and ignores pushed) or to mergeGateFor could put every unchanged
+// run back in front of a person as a non-actionable merge card (AMP #2966,
+// #3007).
 func TestMergeProvenance_NoGitFieldsCompletionIsNotUnmerged(t *testing.T) {
 	w := newRBACWorld(t)
 	alice := w.s.as(w.alice)
