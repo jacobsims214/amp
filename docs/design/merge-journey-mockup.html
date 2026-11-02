@@ -1,34 +1,44 @@
 <!doctype html>
 <!--
-  AMP #3001 — Mockup: one actionable merge journey per PR.
-  Spec: discoveries/merge-actions-user-journey.md (#2978, reviewed #2979).
+  AMP #3001 — Mockup v2: one actionable merge journey per PR — alert only when a human must act.
+  Spec: discoveries/merge-actions-user-journey.md (#2978, reviewed #2979) + user direction 2026-11-02:
+    "Human review/approval alerts only when work targets the repository's DEFAULT branch (detected,
+     never hardcoded) or when repository RULES actually require my approval. Agent worktree and
+     integration branches are agent organization — informational, non-actionable, no acknowledgement.
+     Already merged = never alerted. Never a human ticket AND a merge item for the same PR."
 
   FOR THE BUILDER:
-  - Tokens are copied 1:1 from v2/ui/src/index.css (theme "Stripe"). The merge kind
-    colour is --teal (--k-merge in projectMyWork.css).
-  - Card anatomy matches .pmw-item (3px left kind bar, surface, line border, radius 2px)
-    from v2/ui/src/pages/projectMyWork.css; buttons match .amp-btn / .amp-btn-primary /
-    .amp-btn-ghost; labels match .amp-label; numbers .amp-num / --font-data.
-  - New data the cards assume (backend work in later tickets, per #2979's sequence):
-    * MergeRef gains base_branch / PR target (repository/waiting.go LatestMergeRefs).
-    * holding_up filters waits_for_merge:false dependents (repository/waiting.go OpenDependents).
-    * WaitItem gains tracked_by (the human merge ticket id, from a `merge_for` metadata key)
-      and that ticket's unmet prerequisites (its open dependencies).
-    * Two-way bridge: Mark merged on a tracked card completes the human ticket with the PR
-      link; CompleteHumanTask with the PR link records the merge (bridgeHumanMerge exists).
-    * GitHub-webhook / CI merge records reconcile the same tracked step (card clears itself).
-    * No-change runs emit no git fields (per #2982) so UnmergedWork never lists them.
-  - Behaviour not visible in the static states:
-    * "Mark merged" on a tracked-ready card completes BOTH the merge record and the tracked
-      human ticket in one call (idempotent; first report wins).
-    * "Not needed" stays a quiet ghost on every needed card (unchanged behaviour).
-    * Explanations (states 4/6/7) render as sentences, never as disabled buttons.
+  - Tokens are copied 1:1 from v2/ui/src/index.css (theme "Stripe"). The merge kind colour is
+    --teal (--k-merge in projectMyWork.css). Card anatomy matches .pmw-item; buttons match
+    .amp-btn / .amp-btn-primary / .amp-btn-ghost; labels .amp-label; numbers --font-data.
+  - THE ALERT POLICY (new, per the direction above) — a WaitItem surfaces in My work only if:
+      a) its PR targets the repo's detected default branch (read from
+         `git symbolic-ref refs/remotes/origin/HEAD` / GitHub repo metadata, cached per repo —
+         NEVER a hardcoded "main"), OR
+      b) the repo's branch protection / rulesets on the PR's target require a human approval
+         the current user can give (e.g. CODEOWNERS review). The card names the exact rule.
+    If default branch or rules can't be read (missing token scope), the card says so
+    explicitly (state 9) — unknown is never silently treated as internal.
+  - Alerting is separate from dependency readiness: holding_up still filters
+    waits_for_merge:false dependents (repository/waiting.go OpenDependents), but a
+    default-branch PR alerts even when nothing waits, and an internal-branch PR never
+    alerts even when dependents exist.
+  - ONE CARD PER PR: when the plan has a human merge step (ticket with `merge_for: <id>`),
+    it folds into the merge card (tracked-by chip, prerequisites on the card). The Do card
+    never renders alongside. Two-way bridge unchanged: Mark merged on a tracked-ready card
+    completes the human ticket with the PR link; CompleteHumanTask with the PR link records
+    the merge (bridgeHumanMerge). GitHub-webhook / CI merge records reconcile the same step.
+  - Repo-rule approvals (state 3): the action is the review link itself — approval happens on
+    GitHub, the webhook records the merge, the card clears itself. No Mark merged is offered.
+  - Internal-landed items (state 6) are informational sentences; they clear themselves when
+    the integration PR's merge is recorded. Mark merged is never offered for them.
+  - No-change runs emit no git fields (per #2982) so UnmergedWork never lists them.
 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>My work — one merge journey per PR (mockup, AMP #3001)</title>
+<title>My work — one merge journey per PR (mockup v2, AMP #3001)</title>
 <link href="https://fonts.googleapis.com/css2?family=Barlow:ital,wght@0,400;0,500;0,600;1,400&family=Barlow+Condensed:wght@500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 /* ── Tokens: copied from v2/ui/src/index.css (theme "Stripe") ─────────────── */
@@ -128,6 +138,36 @@ body {
 .merge-route .arrow { color: var(--ink-3); font-family: var(--font-body); }
 .merge-route .target { color: var(--ink); }
 
+/* why-you're-asked line + detected-repo chip */
+.why {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  font-size: 13px; color: var(--ink-2); line-height: 1.5; margin: 0 0 8px;
+}
+.why .amp-label { flex-shrink: 0; color: var(--k-merge); }
+.why b { color: var(--ink); font-weight: 600; }
+.repo-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-family: var(--font-data); font-size: 11px; color: var(--ink-2);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--surface-2); padding: 2px 7px;
+  max-width: 100%; white-space: normal; line-height: 1.5;
+}
+.repo-chip svg { flex-shrink: 0; position: relative; top: 0; }
+.repo-chip svg { color: var(--success); flex-shrink: 0; }
+.repo-chip.warn { color: var(--warning-ink); border-color: var(--warning); background: #FBF4E6; }
+.repo-chip.warn svg { color: var(--warning-ink); }
+
+/* repository-rule explanation (state 3) */
+.rule-box {
+  display: grid; gap: 3px;
+  background: var(--surface-3); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 9px 12px; margin: 10px 0 2px;
+}
+.rule-box .amp-label { color: var(--ink-2); }
+.rule-box p { margin: 0; font-size: 13px; color: var(--ink-2); line-height: 1.5; }
+.rule-box p b { color: var(--ink); font-weight: 600; }
+.rule-box code { font-family: var(--font-data); font-size: 12px; }
+
 /* prerequisite chips (sequenced gate) */
 .prereqs { display: grid; gap: 6px; margin: 10px 0 12px; }
 .prereq {
@@ -201,19 +241,20 @@ body {
 .panel .ph .amp-label { color: var(--ink-2); }
 
 [data-state] [data-show] { display: none; }
-[data-state="actionable"] [data-show~="actionable"],
+[data-state="default-actionable"] [data-show~="default-actionable"],
+[data-state="default-quiet"] [data-show~="default-quiet"],
+[data-state="rule-required"] [data-show~="rule-required"],
 [data-state="seq-waiting"] [data-show~="seq-waiting"],
 [data-state="seq-ready"] [data-show~="seq-ready"],
-[data-state="nothing-waits"] [data-show~="nothing-waits"],
+[data-state="internal"] [data-show~="internal"],
 [data-state="external"] [data-show~="external"],
-[data-state="integration"] [data-show~="integration"],
-[data-state="no-change"] [data-show~="no-change"] { display: block; }
+[data-state="no-change"] [data-show~="no-change"],
+[data-state="rules-unknown"] [data-show~="rules-unknown"] { display: block; }
 
 .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
 .compare .col-h { margin-bottom: 6px; }
 .old-card { opacity: .92; border-top: 1px dashed var(--line-str); padding-top: 12px; margin-top: 12px; }
 .old-card.first { border-top: 0; padding-top: 0; margin-top: 0; }
-.old-card .strike { position: relative; }
 .old-badge {
   display: inline-block; font-family: var(--font-label); font-weight: 600; font-size: 10px;
   letter-spacing: .14em; text-transform: uppercase; color: var(--danger-ink);
@@ -228,32 +269,38 @@ body {
   .compare { grid-template-columns: 1fr; }
   .wrap { padding: 20px 12px 64px; }
   .actions .right { margin-left: 0; }
+  .why { display: grid; gap: 4px; }
 }
 </style>
 </head>
-<body data-state="actionable">
+<body data-state="default-actionable">
 
 <!-- Reviewer state switcher -->
 <div class="states" role="toolbar" aria-label="Mockup state">
   <span class="lbl">Journey states</span>
-  <button data-setstate="actionable" aria-pressed="true">1 · Actionable merge</button>
-  <button data-setstate="seq-waiting" aria-pressed="false">2 · Sequenced, waiting</button>
-  <button data-setstate="seq-ready" aria-pressed="false">3 · Sequenced, ready</button>
-  <button data-setstate="nothing-waits" aria-pressed="false">4 · Nothing waits</button>
-  <button data-setstate="external" aria-pressed="false">5 · Merged externally</button>
-  <button data-setstate="integration" aria-pressed="false">6 · Integration-landed</button>
-  <button data-setstate="no-change" aria-pressed="false">7 · No-change run</button>
+  <button data-setstate="default-actionable" aria-pressed="true">1 · Default branch, actionable</button>
+  <button data-setstate="default-quiet" aria-pressed="false">2 · Default branch, nothing waits</button>
+  <button data-setstate="rule-required" aria-pressed="false">3 · Repo rule requires approval</button>
+  <span class="sep" aria-hidden="true"></span>
+  <button data-setstate="seq-waiting" aria-pressed="false">4 · Sequenced, waiting</button>
+  <button data-setstate="seq-ready" aria-pressed="false">5 · Sequenced, ready</button>
+  <span class="sep" aria-hidden="true"></span>
+  <button data-setstate="internal" aria-pressed="false">6 · Internal-landed</button>
+  <button data-setstate="external" aria-pressed="false">7 · Merged externally</button>
+  <button data-setstate="no-change" aria-pressed="false">8 · No-change run</button>
+  <button data-setstate="rules-unknown" aria-pressed="false">9 · Rules unknown</button>
 </div>
 
 <div class="wrap">
 
-  <!-- ════════════════════════ STATE 1 · ACTIONABLE MERGE ════════════════════ -->
-  <div data-show="actionable">
+  <!-- ═════════════ STATE 1 · DEFAULT-BRANCH PR, ACTIONABLE ═════════════════ -->
+  <div data-show="default-actionable">
     <div class="scenario">
-      <h1>One card per PR — and this one genuinely needs you</h1>
-      <p class="sub">#2897 finished with a PR to <b>main</b> and two tickets really wait on the merge
-        (neither opted out with <span class="amp-num">waits_for_merge: false</span>).
-        The card names the PR <em>and its target</em>, counts only the true waiters, and keeps one primary action.</p>
+      <h1>You're asked because this PR targets the repository's default branch</h1>
+      <p class="sub">#2897 finished with a PR to <b>main</b> — the default branch AMP <em>detected</em> for this repo
+        (<span class="amp-num">origin/HEAD</span>, not a hardcoded "main"). The card says why you're asked, names the PR
+        <em>and its target</em>, counts only true waiters (no <span class="amp-num">waits_for_merge: false</span> opt-outs),
+        and keeps one primary action.</p>
     </div>
 
     <div class="section-label amp-label">My work · Merge</div>
@@ -269,7 +316,14 @@ body {
           <span class="it-id">· from #2897</span>
         </span>
       </div>
-      <p class="note">Done · <b>2 tickets wait on this merge</b>: #2901 Pricing page smoke test and #2904 Announce in changelog.</p>
+      <p class="why">
+        <span class="amp-label">Why you're asked</span>
+        <span>Targets <b>main</b>, this repository's default branch.
+          <span class="repo-chip" title="Read from the repository, cached per repo — never assumed">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
+            default: main · detected from origin/HEAD</span></span>
+      </p>
+      <p class="note"><b>2 tickets wait on this merge</b>: #2901 Pricing page smoke test and #2904 Announce in changelog.</p>
       <div class="actions">
         <a class="amp-btn amp-btn-sm" href="#" onclick="return false">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
@@ -281,22 +335,109 @@ body {
             Mark merged</button>
         </span>
       </div>
-      <p class="guard full">Use <b>Mark merged</b> only after you merged it on GitHub — when GitHub or CI records the merge first, this card clears itself and no click is owed.</p>
+      <p class="guard full">Use <b>Mark merged</b> only after you merged it on GitHub — when GitHub or CI records the merge first, this card clears itself and no click is owed. If the merge is already recorded, you never see this card.</p>
     </div>
   </div>
 
-  <!-- ════════════════════ STATE 2 · SEQUENCED GATE, WAITING ═════════════════ -->
+  <!-- ═══════ STATE 2 · DEFAULT-BRANCH PR, NOTHING WAITS ════════════════════ -->
+  <div data-show="default-quiet">
+    <div class="scenario">
+      <h1>Nothing waits — but it's still the default branch, so it's still your call</h1>
+      <p class="sub">#2897's only dependent (#2904) opted out with <span class="amp-num">waits_for_merge: false</span> — it started
+        when the PR opened. Alerting is separate from dependency readiness: the merge to <b>main</b> is a human decision,
+        so the card stays. What changes is the copy: honest that nothing waits, and GitHub or CI will record the merge.</p>
+    </div>
+
+    <div class="section-label amp-label">My work · Merge</div>
+    <div class="pmw-item k-merge" role="group" aria-label="Merge PR #94, nothing waits">
+      <div class="merge-head">
+        <span class="pmw-kind k-merge amp-label"><i aria-hidden="true"></i>Merge</span>
+        <span class="it-title">Open PR: usage caps on the public pricing page</span>
+        <span class="merge-route">
+          <span class="pr">PR #94</span>
+          <span>feat/usage-caps</span>
+          <span class="arrow">→</span>
+          <span class="target">main</span>
+          <span class="it-id">· from #2897</span>
+        </span>
+      </div>
+      <p class="why">
+        <span class="amp-label">Why you're asked</span>
+        <span>Targets <b>main</b>, this repository's default branch.
+          <span class="repo-chip">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
+            default: main · detected from origin/HEAD</span></span>
+      </p>
+      <p class="note"><b>Nothing waits on this merge</b> — #2904 reviews the open PR and does not wait for it. You're asked because merging to the default branch is your call, not because work is held up.</p>
+      <div class="actions">
+        <a class="amp-btn amp-btn-sm" href="#" onclick="return false">Review PR #94</a>
+        <span class="right">
+          <button type="button" class="amp-btn amp-btn-primary amp-btn-sm">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></svg>
+            Mark merged</button>
+        </span>
+      </div>
+      <p class="guard full">One alert, one action — never one alert per dependent. GitHub or CI recording the merge clears this card by itself; there is no acknowledgement click.</p>
+    </div>
+  </div>
+
+  <!-- ═══════ STATE 3 · REPO RULE REQUIRES YOUR APPROVAL (NON-DEFAULT) ══════ -->
+  <div data-show="rule-required">
+    <div class="scenario">
+      <h1>A non-default branch stays quiet — unless a repository rule genuinely needs you</h1>
+      <p class="sub">PR #96 targets <span class="amp-num">feat/billing</span>, an integration branch: normally pure agent
+        organization and never a card. But branch protection on <span class="amp-num">feat/billing</span> requires a
+        CODEOWNERS review, and you own <span class="amp-num">/billing</span>. That is a real repository requirement, so it
+        surfaces — as <b>one</b> clear action that names the rule. The action is the review itself; no Mark merged is offered.</p>
+    </div>
+
+    <div class="section-label amp-label">My work · Merge</div>
+    <div class="pmw-item k-merge" role="group" aria-label="Approval required on PR #96">
+      <div class="merge-head">
+        <span class="pmw-kind k-merge amp-label"><i aria-hidden="true"></i>Approval required</span>
+        <span class="it-title">Review required: metered billing webhook handler</span>
+        <span class="merge-route">
+          <span class="pr">PR #96</span>
+          <span>amp-2955</span>
+          <span class="arrow">→</span>
+          <span class="target">feat/billing</span>
+          <span class="it-id">· integration branch · from #2955</span>
+        </span>
+      </div>
+      <p class="why">
+        <span class="amp-label">Why you're asked</span>
+        <span>A <b>repository rule</b> on this branch requires your approval.
+          <span class="repo-chip">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
+            rules read from GitHub branch protection</span></span>
+      </p>
+      <div class="rule-box">
+        <span class="amp-label">The exact requirement</span>
+        <p>Branch protection on <code>feat/billing</code>: pull requests need <b>1 approving review from a code owner</b>.
+          You own <code>/billing</code> in <code>CODEOWNERS</code>, so the merge is blocked until you approve on GitHub.</p>
+      </div>
+      <div class="actions">
+        <a class="amp-btn amp-btn-primary amp-btn-sm" href="#" onclick="return false">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+          Review and approve PR #96</a>
+      </div>
+      <p class="guard full">The action happens on GitHub. Once you approve and the PR merges, the webhook records it and this card clears itself — no Mark merged, no acknowledgement. Internal-branch merges without a rule like this never appear here at all (state 6).</p>
+    </div>
+  </div>
+
+  <!-- ════════════════════ STATE 4 · SEQUENCED GATE, WAITING ════════════════ -->
   <div data-show="seq-waiting">
     <div class="scenario">
-      <h1>A planned merge gate is the card's face — not a second card</h1>
-      <p class="sub">The plan says PR #88 merges only after the review (#2303) and the release (#2131), tracked by the human
-        ticket #2304 (linked at plan time with <span class="amp-num">merge_for: 2302</span>). Today that would be two cards —
-        a Merge item and a Do item. Here it is one card, inert until its prerequisites are met. No Mark merged yet.</p>
+      <h1>A planned merge gate is the card's face — never a second card</h1>
+      <p class="sub">The plan says PR #88 (to the detected default branch) merges only after the review (#2303) and the
+        release (#2131), and it created a human ticket #2304 for the click (linked with
+        <span class="amp-num">merge_for: 2302</span>). Today that's a Merge item <em>and</em> a Do item for the same PR.
+        Here the human step folds into the one card: prerequisites on its face, inert until due, no Mark merged yet.</p>
     </div>
 
     <div class="compare">
       <div>
-        <div class="col-h amp-label">Today — two cards, one merge <span class="old-badge">duplicate</span></div>
+        <div class="col-h amp-label">Today — two cards, one PR <span class="old-badge">duplicate</span></div>
         <div class="pmw-item k-merge old-card first">
           <div class="merge-head">
             <span class="pmw-kind k-merge amp-label"><i aria-hidden="true"></i>Merge</span>
@@ -312,11 +453,11 @@ body {
         </div>
         <div class="pmw-item old-card" style="margin-top:10px">
           <div class="merge-head">
-            <span class="pmw-kind amp-label" style="--k-do:var(--ink)"><i aria-hidden="true" style="background:var(--ink)"></i>Do</span>
+            <span class="pmw-kind amp-label"><i aria-hidden="true" style="background:var(--ink)"></i>Do</span>
             <span class="it-title">Merge PR: harness public page (harness-v0.2.0 is published)</span>
             <span class="it-id">#2304 · your ticket</span>
           </div>
-          <p class="note">Waiting on #2303 and #2131. Never mentions the Merge card above; needs the exact PR URL pasted in a Link field to record anything.</p>
+          <p class="note">Waiting on #2303 and #2131. Same PR as the Merge card above, shown again as a human task — and it needs the exact PR URL pasted into a Link field to record anything.</p>
         </div>
       </div>
 
@@ -334,11 +475,15 @@ body {
               <span class="it-id">· from #2302</span>
             </span>
           </div>
+          <p class="why">
+            <span class="amp-label">Why you're asked</span>
+            <span>Targets <b>main</b>, the detected default branch — gated by the plan's human step
+              <span class="amp-num">#2304</span>, folded into this card. <b>No separate Do ticket appears.</b></span>
+          </p>
           <div class="prereqs" role="list" aria-label="Merge prerequisites">
             <div class="prereq done" role="listitem"><span class="box" aria-hidden="true"></span><span><span class="rid">#2303</span> Code review: harness public page PR — done</span></div>
             <div class="prereq" role="listitem"><span class="box" aria-hidden="true"></span><span><span class="rid">#2131</span> Tag and publish harness-v0.1.0 — <b>waiting on you</b></span></div>
           </div>
-          <p class="note">Merge after the release exists. The plan's acceptance criterion stays on the card, not in a second ticket's text.</p>
           <div class="actions">
             <a class="amp-btn amp-btn-sm" href="#" onclick="return false">Review PR #88</a>
             <span class="tracked-by">tracked by <span class="rid">#2304</span></span>
@@ -349,13 +494,13 @@ body {
     </div>
   </div>
 
-  <!-- ═════════════════════ STATE 3 · SEQUENCED GATE, READY ══════════════════ -->
+  <!-- ═════════════════════ STATE 5 · SEQUENCED GATE, READY ═════════════════ -->
   <div data-show="seq-ready">
     <div class="scenario">
       <h1>When the gate opens, one click does both jobs</h1>
       <p class="sub">#2131 is done; every prerequisite is met. The same card now offers <b>Mark merged</b> once:
-        it records the merge for #2302's dependents <em>and</em> completes the tracked ticket #2304 with the PR link —
-        the two-way bridge. Acknowledging one system never leaves the other dangling.</p>
+        it records the merge for #2302's dependents <em>and</em> completes the folded human step #2304 with the PR link —
+        the two-way bridge. Acknowledging one system never leaves the other dangling, and no Do card ever existed.</p>
     </div>
 
     <div class="section-label amp-label">My work · Merge</div>
@@ -389,53 +534,57 @@ body {
     </div>
   </div>
 
-  <!-- ══════════════════════ STATE 4 · NOTHING WAITS ═════════════════════════ -->
-  <div data-show="nothing-waits">
+  <!-- ═══════════════════ STATE 6 · INTERNAL-LANDED (AGENT-OWNED) ═══════════ -->
+  <div data-show="internal">
     <div class="scenario">
-      <h1>Nothing waits on it? Then nothing is asked of you</h1>
-      <p class="sub">#2302's only dependent (#2303, the review) has <span class="amp-num">waits_for_merge: false</span> — it started
-        when the PR opened. The card is honest about that and demotes Mark merged to a quiet secondary:
-        GitHub or CI will record this merge; a click here is optional bookkeeping, never a gate.</p>
+      <h1>Landed on an agent-internal branch? Informational, and quiet by design</h1>
+      <p class="sub">#2968's work merged into <span class="amp-num">feat/harness-home-page</span>, the story's integration
+        branch. Worktree (<span class="amp-num">amp-*</span>) and integration branches are <b>agent organization, not human
+        merge chores</b> — even when dependents exist, this never alerts. At most a passive sentence says where the work
+        went and where the real action lives; it clears itself when the final PR's merge is recorded.</p>
     </div>
 
     <div class="section-label amp-label">My work · Merge</div>
-    <div class="pmw-item k-merge" role="group" aria-label="Merge PR #88, nothing waits">
+    <div class="pmw-item k-merge inert" role="group" aria-label="Integration branch, informational">
       <div class="merge-head">
-        <span class="pmw-kind k-merge amp-label"><i aria-hidden="true"></i>Merge</span>
-        <span class="it-title">Open PR: harness on the public home page</span>
+        <span class="pmw-kind k-merge amp-label"><i aria-hidden="true"></i>Merge · agent-internal</span>
+        <span class="it-title">Public page: harness hero section</span>
         <span class="merge-route">
-          <span class="pr">PR #88</span>
-          <span>feat/harness-home-page</span>
+          <span>amp-2968</span>
           <span class="arrow">→</span>
-          <span class="target">main</span>
-          <span class="it-id">· from #2302</span>
+          <span class="target">feat/harness-home-page</span>
+          <span class="it-id">· integration branch · from #2968</span>
         </span>
       </div>
-      <p class="note"><b>Nothing waits on this merge</b> — #2303 reviews the open PR and does not wait for it. GitHub or CI will record the merge when it happens.</p>
+      <p class="why">
+        <span class="amp-label">Why you're not asked</span>
+        <span><b>feat/harness-home-page</b> is an agent-internal branch, not the repository default
+          (<span class="amp-num">main</span>), and no repository rule requires your approval here.</span>
+      </p>
+      <p class="note">The work is merged — nothing to do, nothing to acknowledge. The final PR to main is tracked by
+        <span class="amp-num">#2302</span> (PR #88); its card is the only one that can ever ask you for anything.</p>
       <div class="actions">
-        <a class="amp-btn amp-btn-sm" href="#" onclick="return false">Review PR #88</a>
-        <span class="right">
-          <button type="button" class="amp-btn amp-btn-quiet amp-btn-sm" title="Optional: record a merge you already made on GitHub">Mark merged…</button>
-        </span>
+        <a class="amp-btn amp-btn-ghost amp-btn-sm" href="#" onclick="return false">See PR #88 card</a>
       </div>
-      <p class="guard full">Mark merged is demoted because it releases nothing. A merge recorded on GitHub clears this card by itself — no acknowledgement owed.</p>
+      <p class="guard full">No Mark merged is ever offered for internal work, and this row disappears on its own when the integration PR's merge to main is recorded. (It may also be collapsed under "quiet activity" — but it is never an action item.)</p>
     </div>
   </div>
 
-  <!-- ════════════════════ STATE 5 · MERGED EXTERNALLY ═══════════════════════ -->
+  <!-- ════════════════════ STATE 7 · MERGED EXTERNALLY ══════════════════════ -->
   <div data-show="external">
     <div class="scenario">
-      <h1>Merged on GitHub? The card clears itself — and reconciles the same step</h1>
-      <p class="sub">The webhook (or CI's <span class="amp-num">amp_report_merged</span>) recorded the merge of PR #88.
-        The Merge item leaves the list with no click, lands in Done today with its source, and — because the card was
-        tracked by #2304 — the same record completes the tracked human ticket. One Git event, one outcome, no fake Mark done.</p>
+      <h1>Already merged? You were never going to be asked</h1>
+      <p class="sub">The webhook (or CI's <span class="amp-num">amp_report_merged</span>) recorded the merge of PR #88
+        before you ever looked. <b>Already-merged work is never an alert:</b> the Merge item leaves the list with no
+        click, lands in Done today with its source, and — because the card was tracked by #2304 — the same record
+        completes the folded human step. One Git event, one outcome, no fake Mark done.</p>
     </div>
 
     <div class="section-label amp-label">My work · Merge</div>
     <div class="panel">
       <div class="pmw-clear" style="padding:24px 20px">
-        <h2 style="font-size:17px">No merges waiting on you.</h2>
-        <p style="margin:0">PR #88 was recorded by GitHub 12 min ago. What waited on it can start.</p>
+        <h2 style="font-size:17px;margin:0 0 4px">No merges waiting on you.</h2>
+        <p style="margin:0">PR #88 was recorded by GitHub 12 min ago. What waited on it can start — you didn't have to do anything.</p>
       </div>
     </div>
 
@@ -452,40 +601,10 @@ body {
         <span class="s">Completed by the same GitHub merge record — no separate Mark done owed · 12:04</span>
       </div>
     </div>
-    <p class="guard" style="margin-top:10px">An external merge reconciles the tracked step instead of leaving a pure-acknowledgement click behind (today: the webhook clears the Merge item but #2304 still demands a Mark done).</p>
+    <p class="guard" style="margin-top:10px">Reconciliation, not acknowledgement: an external merge completes the tracked step instead of leaving a click behind (today: the webhook clears the Merge item but #2304 still demands a Mark done).</p>
   </div>
 
-  <!-- ═══════════════════ STATE 6 · INTEGRATION-LANDED ═══════════════════════ -->
-  <div data-show="integration">
-    <div class="scenario">
-      <h1>Landed on the integration branch? An explanation, never a button</h1>
-      <p class="sub">#2968's work merged into <span class="amp-num">feat/harness-home-page</span>, the story's integration branch.
-        By design nothing is asked here — the final PR to main is its own card (#2302). The sentence says why, and points
-        to where the real action lives. Mark merged is never offered for integration work.</p>
-    </div>
-
-    <div class="section-label amp-label">My work · Merge</div>
-    <div class="pmw-item k-merge inert" role="group" aria-label="Integration branch explanation">
-      <div class="merge-head">
-        <span class="pmw-kind k-merge amp-label"><i aria-hidden="true"></i>Merge · nothing to do</span>
-        <span class="it-title">Public page: harness hero section</span>
-        <span class="merge-route">
-          <span>amp-2968</span>
-          <span class="arrow">→</span>
-          <span class="target">feat/harness-home-page</span>
-          <span class="it-id">· integration branch · from #2968</span>
-        </span>
-      </div>
-      <p class="note">Merged into <b>feat/harness-home-page</b> — nothing to do here. The final PR to main is tracked by
-        <span class="amp-num">#2302</span> (PR #88), whose card appears above when it's your turn.</p>
-      <div class="actions">
-        <a class="amp-btn amp-btn-sm" href="#" onclick="return false">See PR #88 card</a>
-      </div>
-      <p class="guard full">Integration work never requires Mark merged: its merge to main is recorded by the integration PR's own card.</p>
-    </div>
-  </div>
-
-  <!-- ═══════════════════════ STATE 7 · NO-CHANGE RUN ════════════════════════ -->
+  <!-- ═══════════════════════ STATE 8 · NO-CHANGE RUN ═══════════════════════ -->
   <div data-show="no-change">
     <div class="scenario">
       <h1>A run that changed nothing opens no merge — and never appears here</h1>
@@ -497,8 +616,8 @@ body {
     <div class="section-label amp-label">My work · Merge — empty</div>
     <div class="panel">
       <div class="pmw-clear" style="padding:24px 20px">
-        <h2 style="font-size:17px">No merges waiting on you.</h2>
-        <p style="margin:0">Two runs finished today with nothing to merge: #2966 (no changes in its worktree) and #2971 (docs-only, pushed to the integration branch). Neither opens a merge, so neither asks you for one.</p>
+        <h2 style="font-size:17px;margin:0 0 4px">No merges waiting on you.</h2>
+        <p style="margin:0">Two runs finished today with nothing to merge: #2966 (no changes in its worktree) and #2971 (docs-only, landed on the integration branch). Neither opens a merge, so neither asks you for one.</p>
       </div>
     </div>
 
@@ -511,6 +630,49 @@ body {
       </div>
     </div>
     <p class="guard" style="margin-top:10px">The old failure mode: provenance guesses marked the run "pushed" and a Merge item appeared for a commit already on main — a gate gating nothing, needing a fake Mark merged. With no git fields emitted, the card simply never exists.</p>
+  </div>
+
+  <!-- ═════════════ STATE 9 · DEFAULT BRANCH / RULES UNKNOWN ════════════════ -->
+  <div data-show="rules-unknown">
+    <div class="scenario">
+      <h1>Can't read the repo's default branch or rules? It says so — it never assumes</h1>
+      <p class="sub">For <span class="amp-num">git.acme.io/ops/runbooks</span> the token lacks administration access, so AMP
+        can't detect the default branch or read branch protection. The card is explicit about the unknown instead of
+        silently treating the PR as internal (which could hide a merge that truly needs you) or assuming it's the default.</p>
+    </div>
+
+    <div class="section-label amp-label">My work · Merge</div>
+    <div class="pmw-item k-merge" role="group" aria-label="Merge PR #97, repository rules unknown">
+      <div class="merge-head">
+        <span class="pmw-kind k-merge amp-label"><i aria-hidden="true"></i>Merge</span>
+        <span class="it-title">Open PR: rotate staging database credentials</span>
+        <span class="merge-route">
+          <span class="pr">PR #97</span>
+          <span>amp-2960</span>
+          <span class="arrow">→</span>
+          <span class="target">trunk</span>
+          <span class="it-id">· from #2960</span>
+        </span>
+      </div>
+      <p class="why">
+        <span class="amp-label">Why you're asked</span>
+        <span>AMP <b>couldn't verify</b> whether <span class="amp-num">trunk</span> is the default branch or whether rules
+          require your approval — so it's shown rather than hidden.
+          <span class="repo-chip warn" title="Grant read access to repository settings to resolve this">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            default branch &amp; rules: unknown — token can't read repo settings</span></span>
+      </p>
+      <p class="note"><b>1 ticket waits on this merge</b>: #2975 Deploy runbook to staging.</p>
+      <div class="actions">
+        <a class="amp-btn amp-btn-sm" href="#" onclick="return false">Review PR #97</a>
+        <span class="right">
+          <button type="button" class="amp-btn amp-btn-primary amp-btn-sm">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></svg>
+            Mark merged</button>
+        </span>
+      </div>
+      <p class="guard full">Unknown is explicit, never assumed safe: shown with this notice until repository settings are readable (grant the token read access, or set the repo's default branch in AMP's repo settings). Once detected, the normal policy applies — internal targets go quiet automatically.</p>
+    </div>
   </div>
 
 </div>
