@@ -235,3 +235,66 @@ func TestMergeProvenance_NoIntegrationBranchStillGates(t *testing.T) {
 		t.Fatalf("build missing from the unmerged queue: %s", um)
 	}
 }
+
+// An unchanged worktree (AMP #3005): the harness emits no git fields at all,
+// because the run created no commits, so all that arrives is usage. This is
+// the shape every no-change completion now sends, and it must leave nothing
+// waiting on a merge: no gate (none/false), the dependent released, and no
+// entry in the unmerged queue — a run with no branch and no PR is not work
+// waiting for a person to merge. Without this pin, an edit to
+// Repo.UnmergedWork's selection (it takes any run with a non-empty branch or
+// pr_url, and ignores pushed) or to mergeGateFor could put every
+// unchanged run back in front of a person as a non-actionable merge card
+// (AMP #2966, #3007).
+func TestMergeProvenance_NoGitFieldsCompletionIsNotUnmerged(t *testing.T) {
+	w := newRBACWorld(t)
+	alice := w.s.as(w.alice)
+	build, deploy := mergeChain(t, w, "nogitfields")
+
+	// Exactly what the harness reports for an unchanged worktree: usage, and
+	// no branch, commit, pushed or pr_url.
+	finishWith(t, alice, build, map[string]any{
+		"model":         "openrouter/deepseek/deepseek-v4.1-flash-1017",
+		"input_tokens":  float64(214746),
+		"output_tokens": float64(68218),
+	})
+
+	b := planTask(t, alice, build)
+	if b["state"] != "completed" {
+		t.Fatalf("build after completion = %v, want completed", b["state"])
+	}
+	if b["merge_state"] != domain.MergeNone || b["merge_required"] != false {
+		t.Fatalf("build = merge_state %v merge_required %v, want none/false", b["merge_state"], b["merge_required"])
+	}
+	// The run really is the no-git-fields shape the pin is about.
+	runs, _ := alice.call(t, "amp_get_task", map[string]any{"task_id": float64(build), "include": []any{"runs"}})["runs"].([]any)
+	if len(runs) != 1 {
+		t.Fatalf("build has %d runs, want 1", len(runs))
+	}
+	run := runs[0].(map[string]any)
+	for _, gitField := range []string{"branch", "commit", "pr_url", "base_branch", "pushed"} {
+		if v, ok := run[gitField]; ok {
+			t.Fatalf("the completion run carries %s=%v; this test pins a run with no git fields at all", gitField, v)
+		}
+	}
+	if run["input_tokens"] == nil || run["output_tokens"] == nil {
+		t.Fatalf("the completion run lost its usage: %v", run)
+	}
+
+	// The dependent is released, and says nothing about a merge.
+	d := planTask(t, alice, deploy)
+	if d["state"] != "backlog" {
+		t.Fatalf("deploy after a no-git-fields completion = %s, want backlog", d["state"])
+	}
+	if wd, _ := d["waiting_detail"].(string); wd != "" {
+		t.Fatalf("deploy waiting_detail = %q, want none", wd)
+	}
+
+	// Absent from the merge-needed queue: the ticket, and the queue itself.
+	if um := unmergedIDs(t, alice); strings.Contains(um, fmt.Sprintf("task_id:%d ", build)) {
+		t.Fatalf("build is in the unmerged queue after a no-git-fields completion: %s", um)
+	}
+	if q := alice.call(t, "amp_list_unmerged", map[string]any{"project_id": float64(w.s.projectID)}); q["count"] != 0.0 {
+		t.Fatalf("unmerged queue = %v, want empty", q)
+	}
+}
