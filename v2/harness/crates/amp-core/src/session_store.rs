@@ -459,7 +459,7 @@ mod tests {
     use rpi_agent::AgentMessage;
     use rpi_ai::types::{UserContent, UserMessage};
     use rpi_harness::{
-        agent_harness::AgentHarness,
+        agent_harness::{AgentHarness, AgentLane},
         session::types::{Entry, EntryOrder, EntryQuery, LogOptions},
         types::AgentHarnessOptions,
     };
@@ -898,5 +898,124 @@ mod tests {
             first_bytes,
             "the file it left is never written again"
         );
+    }
+
+    // -- What a resume must drop (AMP #3012) ----------------------------------
+
+    /// A prompt the file still had queued must not run in the resumed chat. `set_session` rebuilds
+    /// rpi's in-memory queues from the durable `queue_enqueued` records, so without an explicit
+    /// cancel a session saved mid-reply hands the next turn prompts the person queued in a chat
+    /// that is over — including `next_run`, which `clear_queue` never touches.
+    #[tokio::test]
+    async fn a_resume_drops_the_prompts_the_file_still_had_queued() {
+        let dir = tmpdir("resume-drops-queues");
+        let file = saved(&dir, &dir, "before the switch").await;
+        // Queue two prompts of different kinds, exactly as a chat does mid-reply: one steered into
+        // the running turn and one for the next. Both are durable records with reserved entries.
+        {
+            let writer = harness_on(load_session(&file).await).await;
+            writer
+                .steer(user("steered into the dead run"))
+                .await
+                .expect("steer");
+            writer
+                .next_run(user("queued for the next turn"))
+                .await
+                .expect("next_run");
+            let queued = writer.queued_messages().await.expect("queued");
+            assert_eq!(queued.steering.len(), 1, "{queued:?}");
+            drop(writer);
+        }
+        assert!(free(&file), "the writer that queued them is gone");
+
+        // A fresh harness resumes it. Nothing of the old queues may come with it.
+        let harness = harness_on(memory_session()).await;
+        resume_session(&harness, &file, &dir, "amp-manager")
+            .await
+            .expect("resume");
+        let queued = harness.queued_messages().await.expect("queued");
+        assert!(
+            queued.is_empty(),
+            "the resumed chat starts with nothing queued: {queued:?}"
+        );
+
+        // And it is durable, not just in memory: the records on the file itself say every enqueue
+        // was cancelled, so a later reopen of this file finds nothing pending either.
+        let reopened = harness.session();
+        let records = reopened
+            .find_records(&RecordQuery {
+                record_type: Some("queue_enqueued"),
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .expect("records");
+        let cancelled = reopened
+            .find_records(&RecordQuery {
+                record_type: Some("queue_cancelled"),
+                ..Default::default()
+            })
+            .await
+            .expect("records");
+        assert_eq!(
+            records.len(),
+            cancelled.len(),
+            "every enqueue was cancelled on disk"
+        );
+        assert!(!records.is_empty(), "there were enqueues to cancel");
+    }
+
+    /// The other half: a prompt the run already consumed is history, not a queue. Resuming must not
+    /// rewrite a conversation's records for messages the model already saw.
+    #[tokio::test]
+    async fn a_resume_leaves_prompts_a_run_already_consumed_alone() {
+        let dir = tmpdir("resume-keeps-consumed");
+        let file = saved(&dir, &dir, "a prompt a run took").await;
+        let cancellations = {
+            let session = load_session(&file).await;
+            session
+                .find_records(&RecordQuery {
+                    record_type: Some("queue_cancelled"),
+                    ..Default::default()
+                })
+                .await
+                .expect("records")
+                .len()
+        };
+        let harness = harness_on(memory_session()).await;
+        resume_session(&harness, &file, &dir, "amp-manager")
+            .await
+            .expect("resume");
+        let after = harness
+            .session()
+            .find_records(&RecordQuery {
+                record_type: Some("queue_cancelled"),
+                ..Default::default()
+            })
+            .await
+            .expect("records")
+            .len();
+        assert_eq!(
+            after, cancellations,
+            "a plain conversation has no queue records to cancel"
+        );
+        // Its history is intact and still there — the resume did not drop the conversation.
+        let entries = harness
+            .session()
+            .find_entries(&EntryQuery::default())
+            .await
+            .expect("entries");
+        assert!(
+            entries.iter().any(|e| matches!(e, Entry::Message { .. })),
+            "the saved prompt is still in the session: {entries:?}"
+        );
+    }
+
+    /// A session file opened for writing under its own guard (what `load` does, without a harness).
+    async fn load_session(path: &Path) -> Session {
+        load(path, path.parent().unwrap(), "amp-manager")
+            .await
+            .expect("load")
+            .session
     }
 }

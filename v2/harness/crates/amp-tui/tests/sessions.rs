@@ -75,6 +75,9 @@ struct Recorded {
     resumed: Vec<ResumeRequest>,
     /// What `resume` answers. `None`: the switch succeeds.
     refuse: Option<String>,
+    /// The transcript a successful switch hands back (AMP #3012). Only #3012's reset-list tests
+    /// fill it: the picker's own tests pass `None` and never look at the conversation.
+    transcript: Option<Vec<(Option<SystemTime>, rpi_agent::AgentEvent)>>,
 }
 
 #[derive(Clone)]
@@ -86,7 +89,15 @@ impl Control {
             listed: Vec::new(),
             resumed: Vec::new(),
             refuse,
+            transcript: None,
         })))
+    }
+
+    /// A control whose switch also hands back a transcript (AMP #3012's reset list).
+    fn with_transcript(transcript: Vec<(Option<SystemTime>, rpi_agent::AgentEvent)>) -> Self {
+        let control = Self::new(None);
+        control.0.lock().unwrap().transcript = Some(transcript);
+        control
     }
 
     fn listed(&self) -> Vec<PathBuf> {
@@ -116,12 +127,14 @@ impl SessionControl for Control {
         let control = self.clone();
         Box::pin(async move {
             control.0.lock().unwrap().resumed.push(request.clone());
-            match control.0.lock().unwrap().refuse.clone() {
+            let recorded = control.0.lock().unwrap();
+            match recorded.refuse.clone() {
                 Some(why) => Err(why),
                 None => Ok(Resumed {
                     path: request.path,
                     messages: 38,
                     model: Some("openrouter/xiaomi/mimo-v2.6-pro".to_owned()),
+                    transcript: recorded.transcript.clone().unwrap_or_default(),
                 }),
             }
         })
@@ -210,6 +223,16 @@ impl Rig {
 
     fn screen(&self) -> String {
         self.shell.view().render_plain(W, H).join("\n")
+    }
+
+    /// Everything the conversation holds, not just what fits the frame: the transcript is taller
+    /// than the screen after a restore, and the point of these tests is what is *in* it.
+    fn transcript(&self) -> String {
+        self.shell
+            .view()
+            .transcript_component()
+            .render(W)
+            .join("\n")
     }
 
     fn stage(&self) -> Stage {
@@ -388,7 +411,7 @@ async fn while_a_reply_runs_the_picker_never_opens() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        flat.contains("/sessions is unavailable while the manager is replying"),
+        flat.contains("/sessions is unavailable: the manager is replying"),
         "{screen}"
     );
     assert!(flat.contains("Your chat is unchanged"), "{screen}");
@@ -526,4 +549,185 @@ async fn without_a_session_store_the_command_says_so() {
         "{screen}"
     );
     assert!(!shell.view().panel().is_open());
+}
+
+// -- AMP #3012: the reset list ----------------------------------------------------------------
+
+/// What a worker saved: a prompt and its reply, in the shape `worker_session::replay` produces.
+fn restored_transcript() -> Vec<(Option<SystemTime>, rpi_agent::AgentEvent)> {
+    use rpi_agent::{AgentEvent, AgentMessage};
+    use rpi_ai::{
+        providers::faux::{FauxBlock, faux_assistant_message},
+        types::{StopReason, UserContent, UserMessage},
+    };
+
+    // `replay` emits a user message as MessageStart (the prompt is what the person said, "before"
+    // the run), and the assistant's MessageEnd is the reply.
+    let prompt = AgentEvent::MessageStart {
+        message: AgentMessage::User(UserMessage {
+            role: Default::default(),
+            content: UserContent::Text("what did we decide about the lock order?".into()),
+            timestamp: 0,
+        }),
+    };
+    let reply = AgentEvent::MessageEnd {
+        message: AgentMessage::Assistant(Box::new(faux_assistant_message(
+            FauxBlock::text("the loader claims the file before it replays it"),
+            StopReason::Stop,
+        ))),
+    };
+    let at = SystemTime::now();
+    vec![(Some(at), prompt), (Some(at), reply)]
+}
+
+/// The acceptance criterion's first half: after a switch the person sees the resumed
+/// conversation — not the one they left, and not an empty screen — and the per-session display
+/// state the old conversation owned is gone with it (discovery §6.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_shows_the_resumed_transcript_and_resets_the_per_session_state() {
+    let mut rig = rig(Control::with_transcript(restored_transcript())).await;
+    // Talk to *this* session first, so there is something to clear: a prompt in history and a
+    // reply in the transcript that the resumed conversation never had.
+    rig.say("a prompt only the old session saw").await;
+    assert!(
+        rig.shell
+            .history()
+            .iter()
+            .any(|p| p.contains("old session")),
+        "the prompt is in this chat's history: {:?}",
+        rig.shell.history()
+    );
+    let old = rig.transcript();
+    assert!(old.contains("a prompt only the old session saw"), "{old}");
+
+    // Resume. The picker's confirm is Enter on the list then Enter on the row.
+    rig.say("/sessions").await;
+    rig.key(KeyCode::Enter).await;
+    rig.key(KeyCode::Enter).await;
+    assert_eq!(rig.control.resumed().len(), 1);
+
+    let screen = rig.transcript();
+    // The resumed conversation is what is shown, with its own prompt and reply.
+    assert!(
+        screen.contains("what did we decide about the lock order?"),
+        "the resumed prompt is in the transcript: {screen}"
+    );
+    assert!(
+        screen.contains("the loader claims the file before it replays it"),
+        "and its reply: {screen}"
+    );
+    // The old conversation is not, and neither is the resumed line's own incantation of the old id.
+    assert!(
+        !screen.contains("a prompt only the old session saw"),
+        "the old conversation was replaced, not appended to: {screen}"
+    );
+    // The resumed line still says where the continuation went.
+    assert!(screen.contains("✓ resumed 8f3d…a1c2"), "{screen}");
+
+    // Per-session display state: history reset (recalling would re-send a prompt into a
+    // conversation that never saw it)…
+    assert!(
+        rig.shell.history().is_empty(),
+        "prompt history was reset: {:?}",
+        rig.shell.history()
+    );
+    // …and the totals start empty: the old session's spend is not this one's.
+    assert_eq!(rig.shell.totals().turns, 0, "run numbering restarted");
+    assert_eq!(rig.shell.totals().tool_calls, 0);
+}
+
+/// A switch that fails leaves the conversation exactly as it was — same transcript, same history,
+/// same session — and says why. This is the "busy/error paths preserve old session" criterion at
+/// the shell's level; the harness-level halves are in `session_ownership.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_switch_leaves_the_conversation_and_its_history_untouched() {
+    let mut rig = rig(Control::new(Some(
+        "its transcript could not be read (permission denied); the session already open is \
+         unchanged and nothing was written"
+            .to_owned(),
+    )))
+    .await;
+    rig.say("a prompt that must survive a failed switch").await;
+    let before = rig.transcript();
+
+    rig.say("/sessions").await;
+    rig.key(KeyCode::Enter).await;
+    rig.key(KeyCode::Enter).await;
+    assert_eq!(rig.control.resumed().len(), 1, "it was asked");
+
+    let after = rig.transcript();
+    assert!(
+        after.contains("a prompt that must survive a failed switch"),
+        "the old conversation is still shown: {after}"
+    );
+    assert!(
+        after.contains("its transcript could not be read"),
+        "and the reason is given: {after}"
+    );
+    assert!(
+        rig.shell
+            .history()
+            .iter()
+            .any(|p| p.contains("must survive a failed switch")),
+        "history was not reset by a failed switch: {:?}",
+        rig.shell.history()
+    );
+    assert!(
+        !before.contains("its transcript could not be read"),
+        "the failure line is new, not something that was already there"
+    );
+}
+
+/// The refusals, one per state, each naming what to do next and cancelling nothing.
+///
+/// There are two gates and they say different things, deliberately: `/sessions` does not even
+/// *open* while the chat is not at rest (the picker's own guard, #3010), and the transaction
+/// itself re-checks every state before a switch is asked for (`Shell::switch_blocker`, #3012) —
+/// the second gate is what covers a state that appeared while the picker was open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_busy_chat_refuses_the_picker_and_says_why() {
+    // A slow reply, so a prompt can be queued behind it while it streams.
+    let script = FauxScript::new().with_tokens_per_second(20.0);
+    let words: Vec<String> = (0..400).map(|i| format!("word{i}")).collect();
+    script.set_responses(vec![FauxStep::text(words.join(" "))]);
+    let mut rig = rig_with(Control::new(None), script).await;
+
+    assert_eq!(rig.shell.submit("go").await, Submit::Continue);
+    assert!(rig.shell.is_running());
+    // Typed while it runs: queued as a later turn (AMP #2889), not refused.
+    assert_eq!(rig.shell.submit("sent later").await, Submit::Continue);
+    assert_eq!(
+        rig.shell.queued_prompts(),
+        vec!["sent later".to_owned()],
+        "it is queued here"
+    );
+
+    // `/sessions` while replying: no scan, no picker, and a line saying when to try again.
+    assert_eq!(rig.shell.submit("/sessions").await, Submit::Continue);
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        rig.shell.poll();
+    }
+    assert!(rig.control.listed().is_empty(), "no scan while busy");
+    assert!(!rig.shell.view().panel().is_open(), "no picker while busy");
+    let flat = rig
+        .screen()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        flat.contains("/sessions is unavailable: the manager is replying"),
+        "{}",
+        rig.screen()
+    );
+    assert!(flat.contains("Your chat is unchanged"), "{}", rig.screen());
+    assert!(
+        rig.shell.is_running(),
+        "nothing was cancelled to make room for a switch"
+    );
+    assert_eq!(
+        rig.shell.queued_prompts(),
+        vec!["sent later".to_owned()],
+        "and the queued prompt is still queued"
+    );
 }

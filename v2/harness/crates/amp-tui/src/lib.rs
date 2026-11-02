@@ -101,7 +101,8 @@ pub use shell::{
     QUIT_HINT, QUIT_HINT_FOR, ReloadControl, ReloadFuture, ReloadReply, ResumeFuture,
     ResumeRequest, Resumed, RunDone, STOPPED, ServerControl, ServerSwitched, SessionControl,
     SessionList, SessionListFuture, Shell, ShellInfo, Submit, WAKE_LIMIT, WAKE_PROMPT, WAKE_SETTLE,
-    WAKE_WINDOW, WakeGuard, WakeVerdict, esc_hint, wake_notice, wake_paused_notice,
+    WAKE_WINDOW, WakeGuard, WakeVerdict, esc_hint, session_banner_id, session_path_display,
+    wake_notice, wake_paused_notice,
 };
 pub use slash::{
     COMMANDS, CommandMenu, CommandSpec, DRAG_KEY, Group, HelpBlock, KEYS, LEGACY_SHIFT_ENTER,
