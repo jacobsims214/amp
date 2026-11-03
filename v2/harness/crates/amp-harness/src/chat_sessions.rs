@@ -136,6 +136,16 @@ impl ChatSessions {
             .into_iter()
             .map(|entry| {
                 let problem = match &entry.status {
+                    // #3014: the file *this* chat is writing is not a problem row. It is held, by
+                    // this process, and it is offered as `· current` — which is a state, not a
+                    // reason it cannot be resumed (it cannot: it is the one being resumed onto).
+                    // Probing it would draw `· current · locked · running elsewhere`, and count
+                    // it as un-resumable in the title, both of which are untrue of the session
+                    // the person is sitting in (artifact #28: the current session is present and
+                    // well, just not pickable). The `Held` wording still reaches a *transaction*
+                    // that names this file — see [`busy`] — where "this chat has it open" is the
+                    // useful sentence.
+                    EntryStatus::Ok if current.as_ref() == Some(&entry.path) => None,
                     EntryStatus::Ok => busy(&entry.path).map(SessionProblem::Locked),
                     EntryStatus::Unreadable(why) => Some(SessionProblem::Unreadable(why.clone())),
                     EntryStatus::Incompatible(why) => {
