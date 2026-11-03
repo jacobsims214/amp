@@ -4,18 +4,21 @@ name: Guide docs
 # v2/amp-api/cmd/server/guide_test.go (pages parse, start page exists, cross-references resolve).
 # test.yml only triggers on v2/amp-api/** changes, so a docs-only change under v2/kb/ got no check
 # on the milestone branches (found on harness-m4, #2366). This runs just that test (it needs no
-# Postgres/Typesense/Valkey) for v2/kb changes pushed to, or PR'd into, the milestone integration
-# branches. Scoped to harness-m*/remote-m* so main's CI behaviour is unchanged.
+# Postgres/Typesense/Valkey) for v2/kb changes pushed to, or PR'd into, the integration branches.
+# Covered bases: harness-m* and remote-m* (milestones), plus fix/* and feat/* (AMP's integration
+# branches such as fix/actionable-merge-workflow; its story PRs got no guide check until AMP #3132).
+# A new integration branch outside these patterns must be added to both branch filters below.
+# main stays out so main's CI behaviour is unchanged.
 
 on:
   pull_request:
-    branches: ["harness-m*", "remote-m*"]
+    branches: ["harness-m*", "remote-m*", "fix/*", "feat/*"]
     paths:
       - "v2/kb/**"
       - "v2/amp-api/cmd/server/guide_test.go"
       - ".github/workflows/guide-docs.yml"
   push:
-    branches: ["harness-m*", "remote-m*"]
+    branches: ["harness-m*", "remote-m*", "fix/*", "feat/*"]
     paths:
       - "v2/kb/**"
       - "v2/amp-api/cmd/server/guide_test.go"
