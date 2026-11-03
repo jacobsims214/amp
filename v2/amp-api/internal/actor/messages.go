@@ -185,8 +185,14 @@ type MsgCompleteTask struct {
 	CloseoutOK bool
 	// InUI is set when a person completes the ticket in the AMP web UI: that
 	// is their own act, recorded as theirs, never as a manager's closeout.
-	InUI    bool
-	ReplyCh chan ReplyComplete
+	InUI bool
+	// MergeStepFor (AMP #3009), non-zero: this completion is a human merge
+	// step completing because the merge of ticket MergeStepFor was recorded
+	// by Source ("github", "ci" or "ui"). The step's history says that, so
+	// nobody reads it as a sign-off the person gave.
+	MergeStepFor int
+	Source       string
+	ReplyCh      chan ReplyComplete
 }
 
 // ReplyComplete answers MsgCompleteTask: the ticket after the completion and

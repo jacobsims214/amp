@@ -390,7 +390,7 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 		// dispatch that completed it, which the ticket no longer carries.
 		return !a.task.IsHuman(), nil
 	}
-	if a.task.State != domain.TaskStateInProgress && !msg.CloseoutOK {
+	if a.task.State != domain.TaskStateInProgress && !msg.CloseoutOK && msg.MergeStepFor == 0 {
 		if msg.RequireStarted {
 			return false, fmt.Errorf("task %d is %s: it was never dispatched, so it can't be completed off the web UI; dispatch it first, "+
 				"or close it out with closeout_reason if its worker already finished it", a.task.ID, a.task.State)
@@ -471,6 +471,13 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 	a.publish(domain.EventTaskCompleted, a.withBlockedBy())
 	who := nameOr(msg.ByName, "agent (no dispatch)")
 	switch {
+	case msg.MergeStepFor != 0:
+		// A person's merge step done because the merge it tracks was
+		// recorded, not because the person said so (AMP #3009): the
+		// history says whose report finished it, and records no run for
+		// them, so nothing reads as a sign-off nobody gave.
+		a.logActivityBy(who, by, "completed", string(prevState), "completed",
+			fmt.Sprintf("Its tracked merge (#%d) was recorded by %s: the step is complete", msg.MergeStepFor, nameOr(msg.Source, "a merge report")))
 	case a.task.IsHuman():
 		a.logActivityBy(domain.HumanAgentID, by, "completed", string(prevState), "completed", "Done by its owner (human work)")
 	case closeout:
