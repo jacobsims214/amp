@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/simstech/amp-api/internal/domain"
+	"github.com/simstech/amp-api/internal/service"
 )
 
 // A done ticket's merge gate follows the latest run that put work up
@@ -296,5 +299,102 @@ func TestMergeProvenance_NoGitFieldsCompletionIsNotUnmerged(t *testing.T) {
 	}
 	if q := alice.call(t, "amp_list_unmerged", map[string]any{"project_id": float64(w.s.projectID)}); q["count"] != 0.0 {
 		t.Fatalf("unmerged queue = %v, want empty", q)
+	}
+}
+
+// An abandoned gate is a person's decision, and no run undoes it (AMP #3002,
+// #3007): after a PR is closed without merging, a corrective run reporting
+// the work on the ticket's integration branch releases nothing. It does this
+// by falling through afterRun's switch — the release arm matches MergeNeeded
+// only — so the dependent keeps waiting and says the PR was closed.
+//
+// The negative is made meaningful by the first half of the test: the same
+// corrective run on the same chain, before the PR was closed, does release a
+// needed gate. So a change that widened that arm to "needed or abandoned"
+// (or that moved the release into setMergeState while widening its From
+// filter the same way) fails here, rather than silently overriding the
+// person's decision.
+func TestMergeProvenance_AbandonedIsNotReleased(t *testing.T) {
+	w := newRBACWorld(t)
+	alice := w.s.as(w.alice)
+	svc := service.New(w.s.repo, w.s.reg, w.s.kb)
+	ctx := context.Background()
+	ib := uniq("fix/actionable-merge-workflow")
+	setStoryMeta(t, w.s.as(w.owner), w.s.storyID, map[string]any{domain.MetaIntegrationBranch: ib})
+
+	// The control: on the same story and integration branch, the corrective
+	// run this test is about does release a needed gate. Without this, the
+	// assertions below would pass even if the release path were dead, and
+	// would not show that abandoned is treated differently from needed.
+	ctlBuild, ctlDeploy := mergeChain(t, w, "control")
+	finishWith(t, alice, ctlBuild, map[string]any{"branch": uniq("amp-ctl"), "pr_url": "https://git.example/pr/" + uniq("ctl"), "base_branch": "main", "pushed": true})
+	if ms := mergeStateOf(t, alice, ctlBuild); ms != domain.MergeNeeded {
+		t.Fatalf("control build with a PR to main = %q, want needed", ms)
+	}
+	reportRun(t, alice, ctlBuild, map[string]any{"branch": ib, "commit": "3dea037", "base_branch": ib, "pushed": true})
+	assertReleased(t, alice, "control (a needed gate)", ctlBuild, ctlDeploy)
+
+	// The abandoned chain: the same completion, then the person's PR is
+	// closed instead.
+	build, deploy := mergeChain(t, w, "abandoned")
+	pr := "https://git.example/pr/" + uniq("ab")
+
+	// A PR to main gates the ticket, and holds the dependent.
+	finishWith(t, alice, build, map[string]any{"branch": uniq("amp-ab"), "pr_url": pr, "base_branch": "main", "pushed": true})
+	if ms := mergeStateOf(t, alice, build); ms != domain.MergeNeeded {
+		t.Fatalf("build with a PR to main = %q, want needed", ms)
+	}
+	if st := stateOf(t, alice, deploy); st != "blocked" {
+		t.Fatalf("deploy while the PR is open = %s, want blocked", st)
+	}
+
+	// The PR is closed without merging: a person must now reopen it or mark
+	// its merge not needed.
+	recs, err := svc.MarkAbandonedFrom(ctx, tokenPrincipal(w.alice), "", "", pr, domain.MergeSourceGitHub)
+	if err != nil || len(recs) != 1 || recs[0].MergeState != domain.MergeAbandoned {
+		t.Fatalf("abandon = %+v %v", recs, err)
+	}
+	if ms := mergeStateOf(t, alice, build); ms != domain.MergeAbandoned {
+		t.Fatalf("build after the PR was closed = %q, want abandoned", ms)
+	}
+	if st := stateOf(t, alice, deploy); st != "blocked" {
+		t.Fatalf("deploy after the abandon = %s, want blocked", st)
+	}
+
+	// The corrective run that releases a needed gate (first half of this
+	// test) arrives on the abandoned one: it must change nothing.
+	reportRun(t, alice, build, map[string]any{"branch": ib, "commit": "3dea037", "base_branch": ib, "pushed": true})
+	if ms := mergeStateOf(t, alice, build); ms != domain.MergeAbandoned {
+		t.Fatalf("build after a corrective integration run = %q, want abandoned", ms)
+	}
+	if st := stateOf(t, alice, deploy); st != "blocked" {
+		t.Fatalf("deploy after a corrective integration run = %s, want blocked", st)
+	}
+	// It keeps saying why: the PR was closed, not merged.
+	if wd, _ := planTask(t, alice, deploy)["waiting_detail"].(string); !strings.Contains(wd, "closed without merging") {
+		t.Fatalf("deploy waiting_detail = %q, want the closed-without-merging reason", wd)
+	}
+	// Still in the queue, as abandoned: a closed PR is still a person's call
+	// (UnmergedWork keeps it until reopen or Not needed).
+	um := alice.call(t, "amp_list_unmerged", map[string]any{"project_id": float64(w.s.projectID)})
+	found := false
+	for _, x := range um["waiting_to_merge"].([]any) {
+		m := x.(map[string]any)
+		if int(m["task_id"].(float64)) == build {
+			found = true
+			if m["merge_state"] != domain.MergeAbandoned {
+				t.Fatalf("build in the unmerged queue = %v, want merge_state abandoned", m)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("build left the unmerged queue after a corrective run on an abandoned gate: %v", um)
+	}
+
+	// The person's decision still ends it: Not needed releases the dependent.
+	ra := newRestAs(t, w)
+	ra.want(t, 200, "alice", http.MethodPost, fmt.Sprintf("/api/tasks/%d/merge/not-needed", build), nil)
+	if st := stateOf(t, alice, deploy); st != "backlog" {
+		t.Fatalf("deploy after not needed = %s, want backlog", st)
 	}
 }
