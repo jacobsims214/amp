@@ -351,6 +351,97 @@ async fn a_blocked_run_on_an_unpushed_commit_and_other_tickets_are_left_alone() 
     assert!(f.calls("amp_report_run").is_empty());
 }
 
+/// #3005: the #2966 shape end to end. A worker that changes nothing completes from a worktree cut
+/// off a pushed `main`, so its branch sits on a commit `origin/main` contains. Before #3005 both
+/// pushed-inference paths called that `pushed=true`, and a branch name took it into Merge needed
+/// — a gate for work that does not exist. Now it reports no git fields at all, the way a worker
+/// with no worktree does; a run that did commit still reports theirs (the test just above and
+/// `a_completed_run_carries_model_tokens_cost_and_pushed_git_without_overwriting`); and the
+/// worker's own fields survive untouched, which is the escape hatch for a push by refspec.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unchanged_run_reports_no_git_fields_even_on_a_pushed_main() {
+    let f = fixture("unchanged", true).await;
+    let sup = f.supervisor(config());
+    let wt = f.worktree(2966);
+    f.script(vec![
+        // Look at the worktree, change nothing in it, and complete.
+        template(
+            "Nothing to change.",
+            json!([{"name": "amp_complete_task", "arguments": {"task_id": 2966}}]),
+        ),
+        template("Finished #2966.", json!([])),
+    ]);
+
+    let r = sup
+        .run_ticket(req(2966, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Completed, "{r:?}");
+    assert_eq!(
+        git(&wt, &["rev-parse", "HEAD"]),
+        git(&f.repo, &["rev-parse", "HEAD"]),
+        "the run committed nothing"
+    );
+    // What the old inference would have said, so the test fails if the check is ever dropped.
+    assert!(
+        !git(
+            &wt,
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--contains",
+                "HEAD",
+                "--format=%(refname)",
+                "refs/remotes"
+            ]
+        )
+        .is_empty(),
+        "HEAD is contained in a remote-tracking ref: the #2966 false positive"
+    );
+
+    let complete = f.calls("amp_complete_task");
+    assert_eq!(complete.len(), 1, "{complete:?}");
+    let c = &complete[0];
+    for field in ["branch", "commit", "pushed"] {
+        assert!(c.get(field).is_none(), "{field} inferred: {c}");
+    }
+    assert_eq!(c["model"], "wf/wf-1", "the usage fields are still filled");
+    assert!(num(&c["input_tokens"]) > 0, "{c}");
+}
+
+/// #3005: the escape hatch. A run whose worktree changed nothing may still have pushed (a
+/// refspec push of pre-existing commits, #2966's worker pushing `feat/harness-home-page`). The
+/// harness stopped *inferring*; it never strips or overrides what the worker reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unchanged_run_keeps_the_destination_its_worker_reported() {
+    let f = fixture("unchanged-reported", true).await;
+    let sup = f.supervisor(config());
+    f.script(vec![
+        template(
+            "Pushed by refspec, nothing here.",
+            json!([{"name": "amp_complete_task", "arguments": {
+                "task_id": 2966, "branch": "feat/elsewhere", "commit": "3dea037",
+                "pushed": true, "base_branch": "feat/actionable-merge-workflow"}}]),
+        ),
+        template("Finished #2966.", json!([])),
+    ]);
+
+    let r = sup
+        .run_ticket(req(2966, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Completed, "{r:?}");
+    let complete = f.calls("amp_complete_task");
+    assert_eq!(complete.len(), 1, "{complete:?}");
+    assert_eq!(complete[0]["branch"], "feat/elsewhere");
+    assert_eq!(complete[0]["commit"], "3dea037");
+    assert_eq!(complete[0]["pushed"], true);
+    assert_eq!(
+        complete[0]["base_branch"], "feat/actionable-merge-workflow",
+        "a destination the harness could never infer is left alone"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn abandoned_runs_are_reported_with_usage_git_and_a_note() {
     let f = fixture("abandoned", false).await;
@@ -382,10 +473,17 @@ async fn abandoned_runs_are_reported_with_usage_git_and_a_note() {
     assert_eq!(num(&run["input_tokens"]), r.usage.input_tokens);
     assert_eq!(num(&run["output_tokens"]), r.usage.output_tokens);
     assert!(run.get("cost_usd").is_none(), "faux reports no cost: {run}");
-    let wt = f.worktree(2085);
-    assert_eq!(run["branch"], "amp-2085");
-    assert_eq!(run["commit"], git(&wt, &["rev-parse", "HEAD"]));
-    assert_eq!(run["pushed"], false, "no remote at all");
+    // AMP #3005: this run committed nothing, so it reports no git fields at all — not even its
+    // branch. A run that names a branch sits in `UnmergedWork` ("Merge needed") whatever
+    // `pushed` says, which is how a no-change run held the plan (#2966).
+    assert_eq!(
+        git(&f.worktree(2085), &["rev-parse", "HEAD"]),
+        git(&f.repo, &["rev-parse", "HEAD"]),
+        "the worktree made no commit"
+    );
+    for field in ["branch", "commit", "pushed"] {
+        assert!(run.get(field).is_none(), "{field}: {run}");
+    }
     assert!(
         r.notes
             .iter()

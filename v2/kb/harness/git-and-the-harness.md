@@ -19,7 +19,9 @@ Both, and it helps to know which part is which.
   the harness decides whether the worker gets its own git worktree, its own folder, or your
   folder. It decides this from your `[workers] isolation` setting and from what git offers the
   folder. It also tells the worker which one it has. Run reporting fills `branch`, `commit` and
-  `pushed` on the ticket only for a worker in a git worktree.
+  `pushed` on the ticket only for a worker in a git worktree — and only when that worker's run
+  actually made a commit there. A run that changed nothing reports no git fields at all, so it
+  never asks you to merge work that doesn't exist.
 - **Skills (guidance):** what a worker does at the end. `amp-execution` says to commit, push and
   report the branch *when the work is in git*. When the harness says there is no git (`git: none`)
   or no branch of the worker's own, the skill says to skip all of that and to list the files the
@@ -35,7 +37,7 @@ what the harness tells the worker.
 | chatting with the manager, planning, the AMP board, approvals, the KB | no |
 | workers on tickets, several at once | no: outside git each gets its own folder |
 | run records (model, tokens, cost) | no |
-| run records' `branch`, `commit`, `pushed` | yes: only workers in a git worktree have them |
+| run records' `branch`, `commit`, `pushed` | yes: only workers in a git worktree that committed something |
 | a worker on its own branch, merged later | yes: a git repository with at least one commit |
 | reviewers' `git diff` | yes; outside git they read the files the tickets list |
 | `amp-github-*` agents, PR review | yes (and GitHub) |
