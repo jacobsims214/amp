@@ -144,16 +144,25 @@ func (r *Repo) OpenDependents(ctx context.Context, ids []int) (map[int][]int, er
 
 // TrueWaiters maps each of ids to the open tickets that depend on it directly
 // *and actually wait for its merge*, by id: the same as OpenDependents but
-// without the dependents that opted out with waits_for_merge: false (AMP
-// #3011).
+// without the two kinds of dependent that the merge doesn't hold (AMP #3011).
 //
-// It is the count a Merge card may state. A waits_for_merge: false dependent
-// starts when its dependency completes (repository.RelaxMergeWaits), so it is
-// not held up by the merge and counting it would overstate what the person's
-// click unblocks — the defect discoveries/merge-actions-user-journey.md names
-// ("#2302's card would say 1 ticket waits when #2303 doesn't wait at all").
+// It is the count a Merge card may state. Two dependents must not be in it:
+//
+//   - one that opted out with waits_for_merge: false: it starts when its
+//     dependency completes (RelaxMergeWaits), so the merge doesn't hold it.
+//     Counting it made a card say "1 ticket waits" about a ticket that had
+//     already started — the defect
+//     discoveries/merge-actions-user-journey.md names ("#2302's card would say
+//     1 ticket waits when #2303 doesn't wait at all");
+//   - a human merge step tracking this very ticket (merge_for = the dependency):
+//     the step is the merge action, not a watcher of it, and the dependency
+//     rule already satisfies it by completion alone (DepStatesFor). Counting it
+//     would say one ticket waits on the merge when that ticket is the step the
+//     card folds in.
 func (r *Repo) TrueWaiters(ctx context.Context, ids []int) (map[int][]int, error) {
-	return r.dependents(ctx, ids, ` AND NOT `+noMergeWaitSQL)
+	step := mergeForSQLOf("t")
+	return r.dependents(ctx, ids, ` AND NOT `+noMergeWaitSQL+
+		` AND NOT (t.performer = '`+domain.PerformerHuman+`' AND `+step+` = d.depends_on)`)
 }
 
 // dependents is OpenDependents with an extra SQL condition on the dependent

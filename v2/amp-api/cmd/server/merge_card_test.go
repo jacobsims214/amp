@@ -315,3 +315,67 @@ func TestMergeCard_UnlinkedStepsUnchanged(t *testing.T) {
 		t.Fatalf("a legacy person's merge ticket disappeared from the list")
 	}
 }
+
+// MCP's waiting_on_people carries the same contract as REST, from the same
+// Service.WaitingOn: a card that only reached one of them would leave an agent
+// and a person disagreeing about the same merge.
+func TestMergeCard_MCPWaitingOnPeopleCarriesTheContract(t *testing.T) {
+	w := newRBACWorld(t)
+	alice := w.s.as(w.alice)
+	story := w.s.storyID
+	const pr = "https://github.com/acme/amp/pull/95"
+
+	res := alice.call(t, "amp_create_tasks", map[string]any{"project_id": float64(w.s.projectID), "tasks": []any{
+		map[string]any{"ref": "build", "story_id": float64(story), "name": "build",
+			"metadata": map[string]any{}},
+		map[string]any{"ref": "merge", "story_id": float64(story), "name": "Merge PR: mcp",
+			"performer": "human", "human_reason": "review", "owner": w.alice.Email,
+			"depends_on": []any{"build"}, "metadata": map[string]any{domain.MetaMergeFor: "build"}},
+		map[string]any{"ref": "optout", "story_id": float64(story), "name": "reads the PR", "depends_on": []any{"build"}},
+	}})
+	ids := map[string]int{}
+	for _, x := range res["created"].([]any) {
+		m := x.(map[string]any)
+		ids[m["ref"].(string)] = int(m["id"].(float64))
+	}
+	waitsForMergeOff(t, w, ids["optout"])
+	finishWith(t, alice, ids["build"], map[string]any{"pr_url": pr, "base_branch": "trunk", "pushed": true})
+
+	board := alice.call(t, "amp_list_tasks", map[string]any{"project_id": float64(w.s.projectID)})
+	var card map[string]any
+	for _, x := range board["waiting_on_people"].([]any) {
+		p := x.(map[string]any)
+		if p["kind"] == "merge" && int(p["id"].(float64)) == ids["build"] {
+			card = p
+		}
+	}
+	if card == nil {
+		t.Fatalf("no merge item in waiting_on_people: %v", board["waiting_on_people"])
+	}
+	if card["base_branch"] != "trunk" || card["target_source"] != "run" || card["pr_url"] != pr {
+		t.Fatalf("MCP merge card route = %v/%v/%v", card["base_branch"], card["target_source"], card["pr_url"])
+	}
+	// The opt-out is not counted, and is named instead.
+	if got := idsOf(t, card["holding_up"]); len(got) != 0 {
+		t.Fatalf("MCP holding_up = %v, want none (its only dependent opted out)", got)
+	}
+	if got := idsOf(t, card["not_waiting"]); !slices.Equal(got, []int{ids["optout"]}) {
+		t.Fatalf("MCP not_waiting = %v, want [%d]", got, ids["optout"])
+	}
+	tracked, ok := card["tracked_by"].(map[string]any)
+	if !ok {
+		t.Fatalf("MCP merge card tracks no step: %v", card)
+	}
+	// Not ready: its own prerequisite is the PR's ticket, which is still
+	// merge-needed — and that one is skipped, so it IS ready. Pinning the
+	// exemption from the MCP side too.
+	if int(tracked["task_id"].(float64)) != ids["merge"] || tracked["ready"] != true {
+		t.Fatalf("MCP tracked_by = %v, want #%d ready (its only prerequisite is the tracked ticket)", tracked, ids["merge"])
+	}
+	// And a person's step folded into the card is not a separate do item.
+	for _, x := range board["waiting_on_people"].([]any) {
+		if p := x.(map[string]any); p["kind"] == "do" && int(p["id"].(float64)) == ids["merge"] {
+			t.Fatalf("the folded step is also a do item in waiting_on_people: %v", p)
+		}
+	}
+}

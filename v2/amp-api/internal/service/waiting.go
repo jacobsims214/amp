@@ -511,19 +511,27 @@ func (s *Service) fillMergeItems(ctx context.Context, items []WaitItem, merges [
 			it.TargetSource = MergeTargetRun
 		}
 		it.HoldingUp = waiters[it.TaskID]
-		// Dependents that are open but opted out of waiting: named, never
-		// counted, so "nothing waits on this merge" is truthful.
+		step, hasStep := steps[it.TaskID]
+		if hasStep {
+			it.TrackedBy = s.mergeStepFold(step, done)
+		}
+		// Dependents that are open but do not wait for this merge: named,
+		// never counted, so "nothing waits on this merge" is truthful.
+		//
+		// NotWaiting is the opt-outs (waits_for_merge: false) — it is the list
+		// a card names as "reads the open PR and does not wait for it". The
+		// merge step is not one of those: it performs the merge, and it is
+		// already on the card as TrackedBy, so listing it here would read as a
+		// second, unexplained exclusion.
 		waiting := map[int]bool{}
 		for _, d := range waiters[it.TaskID] {
 			waiting[d] = true
 		}
 		for _, d := range all[it.TaskID] {
-			if !waiting[d] {
-				it.NotWaiting = append(it.NotWaiting, d)
+			if waiting[d] || (hasStep && d == step.TaskID) {
+				continue
 			}
-		}
-		if st, ok := steps[it.TaskID]; ok {
-			it.TrackedBy = s.mergeStepFold(st, done)
+			it.NotWaiting = append(it.NotWaiting, d)
 		}
 	}
 	return nil
