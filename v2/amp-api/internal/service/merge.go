@@ -189,9 +189,21 @@ func (s *Service) setMergeState(ctx context.Context, p authz.Principal, t *domai
 }
 
 // afterRun keeps t's merge state in step with a run just recorded on it:
-// a run that reports the work merged records the merge (if nothing had),
-// and a PR or pushed branch reported after t completed, while merges are
-// required, makes it wait on that merge.
+// a run that reports the work merged records the merge (if nothing had); a
+// done ticket's gate then follows the latest run that put work up — a PR or
+// pushed branch reported elsewhere makes it wait on that merge, and one that
+// landed the work on the ticket's integration branch releases the wait
+// (still unmerged: only the integration branch's own merge to main is
+// "merged"). Merged-first-wins: once a merge is recorded, no later run
+// changes it.
+//
+// The release is the same decision ReconcileMergeMetadata makes on a
+// metadata edit (Repo.IntegrationMerged), and both go through the same
+// domain rule (Run.LandsOn), so a #2966-shaped correction works whether it
+// arrives as a run or as metadata (#3002). It is also what keeps the two
+// consistent across several runs: only the LATEST run that put work up
+// decides, so a later PR to main reported after an integration landing
+// gates again, and a correction after that releases again.
 func (s *Service) afterRun(ctx context.Context, p authz.Principal, t *domain.Task, run domain.Run) {
 	switch {
 	case run.Merged != nil && *run.Merged:
@@ -203,6 +215,8 @@ func (s *Service) afterRun(ctx context.Context, p authz.Principal, t *domain.Tas
 			Detail: fmt.Sprintf("Merge recorded by %s (%s)", mergeSourceOf(p), p.Label())}); err != nil {
 			slog.Warn("record merge state", "task_id", t.ID, "err", err)
 		}
+	case t.State == domain.TaskStateCompleted && t.MergeState == domain.MergeMerged:
+		// First report wins: a later run never undoes a recorded merge.
 	case t.State == domain.TaskStateCompleted && t.MergeState == domain.MergeNone && !t.MergeRequired &&
 		s.mergeGateFor(ctx, t, &run, t.CompletedAt):
 		yes := true
@@ -211,7 +225,58 @@ func (s *Service) afterRun(ctx context.Context, p authz.Principal, t *domain.Tas
 			Detail: "Its work was reported on " + nameOrDash(mergeWhere(run)) + " after it was done: the tickets that depend on it wait for the merge"}); err != nil {
 			slog.Warn("record merge needed", "task_id", t.ID, "err", err)
 		}
+	case t.State == domain.TaskStateCompleted && t.MergeState == domain.MergeNeeded:
+		// A later run may correct where the work went: if the ticket's
+		// latest run that put work up landed on its integration branch,
+		// the wait is for a merge that will never happen.
+		s.releaseIntegrationLanding(ctx, p, t)
 	}
+}
+
+// releaseIntegrationLanding clears t's merge gate when the latest of t's
+// runs that put work up landed on t's integration branch: the same rule the
+// project-wide sweep applies (Repo.IntegrationMerged), on the same run
+// (Run.LandsOn — base_branch is it, or, with no PR, branch is it). No
+// integration branch, or work elsewhere, changes nothing. It never records
+// the ticket merged: the work is on the integration branch, not on the main
+// line, so it stays unmerged until that branch is merged (AMP #3002).
+// Only "needed" is released: an abandoned gate (a PR closed without
+// merging) is a person's decision to reopen or wave through, exactly as
+// IntegrationMerged leaves it.
+func (s *Service) releaseIntegrationLanding(ctx context.Context, p authz.Principal, t *domain.Task) {
+	ib := s.integrationBranch(ctx, t)
+	if ib == "" {
+		return
+	}
+	runs, err := s.Repo.TaskRuns(ctx, t.ID)
+	if err != nil {
+		slog.Warn("integration landing", "task_id", t.ID, "err", err)
+		return
+	}
+	if !latestOpeningRun(runs).LandsOn(ib) {
+		return
+	}
+	no := false
+	if _, err := s.setMergeState(ctx, p, t, actor.MsgSetMergeState{State: domain.MergeNone, Required: &no,
+		From: []string{domain.MergeNeeded},
+		Detail: "Its work is on its integration branch (" + ib + "): the tickets that depend on it no longer wait; " +
+			"it stays unmerged until that branch is merged"}); err != nil {
+		slog.Warn("release integration merge", "task_id", t.ID, "err", err)
+	}
+}
+
+// latestOpeningRun is the last of runs (oldest first) that put work up: it
+// reports a PR or a branch. Zero when none does, which LandsOn nothing. It
+// is the run the merge gate follows — the same one Repo.IntegrationMerged
+// picks (ORDER BY created_at DESC LIMIT 1), so a correction reported as a
+// run and one applied as metadata reach the same answer.
+func latestOpeningRun(runs []domain.Run) domain.Run {
+	for i := len(runs) - 1; i >= 0; i-- {
+		if runs[i].PRURL != "" || runs[i].Branch != "" {
+			return runs[i]
+		}
+	}
+	return domain.Run{}
 }
 
 func nameOrDash(s string) string {
