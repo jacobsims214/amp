@@ -443,20 +443,35 @@ func TestPlan_HumanGateCarriesMergeFor(t *testing.T) {
 }
 
 // reportFor is amp_check_plan's issues by kind, failing if a warning alone
-// made the plan NO-GO.
+// made the plan NO-GO (or an issue about the test environment did).
 func reportFor(t *testing.T, w *rbacWorld, s *mcpStack) map[string]map[string]any {
 	t.Helper()
 	report := s.call(t, "amp_check_plan", map[string]any{"project_id": float64(w.s.projectID)})
 	kinds := map[string]map[string]any{}
+	var blocking []string
 	for _, iss := range report["issues"].([]any) {
 		m := iss.(map[string]any)
-		kinds[m["kind"].(string)] = m
+		kind := m["kind"].(string)
+		kinds[kind] = m
+		if m["severity"] != "warn" && !envIssue(kind) {
+			blocking = append(blocking, fmt.Sprintf("%s: %v (tickets %v)", kind, m["message"], m["task_ids"]))
+		}
 	}
-	if report["ok"] != true {
-		t.Fatalf("a warning made the plan NO-GO: %v", report["summary"])
+	if len(blocking) > 0 {
+		// Name them: a bare summary leaves the reader guessing which blocking
+		// issue appeared, and these fixtures are sensitive to plan shape.
+		t.Fatalf("a warning alone made the plan NO-GO; blocking issue(s): %s (%s)", strings.Join(blocking, "; "), report["summary"])
 	}
 	return kinds
 }
+
+// envIssue reports whether issue kind is about the test environment rather
+// than the plan: no_context fires when the run has a live knowledge base
+// (Typesense, which CI has and a plain local run may not) and the project's
+// KB is empty, which every fixture here is. It is a real finding for a
+// project and noise for a fixture, and checking for it would make these tests
+// pass or fail on whether Typesense happens to be reachable.
+func envIssue(kind string) bool { return kind == "no_context" }
 
 // hasID reports whether ids has id.
 func hasID(ids []int, id int) bool {
