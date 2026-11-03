@@ -326,8 +326,14 @@ fn sidecar(path: &Path) -> PathBuf {
     session_lock::lock_path(path)
 }
 
-/// Whether this process can take `path`'s lock right now. `flock` is per open file description, so
-/// another handle in this same process conflicts too — which is how "released" is observable.
+/// Whether this process can take `path`'s lock **right now**. `flock` is per open file description,
+/// so another handle in this same process conflicts too — which is how "released" is observable.
+///
+/// Instant on purpose: use it where the test asserts a lock is *held* (`assert!(!free(&held))`), and
+/// where the writer was never this process's (`free(&never_locked)`) or has already exited
+/// (`free(&saved)` after `child.wait()`). Where the test emulates "the writer is gone" by dropping
+/// its own `Session`/`AgentHarness`, use [`wait_free`] instead: rpi 0.8.0's storage tears down
+/// asynchronously in-process, so the lock outlives the last handle by a few milliseconds (#3109).
 fn free(path: &Path) -> bool {
     match session_lock::claim_session_lock(path) {
         Ok(guard) => {
@@ -336,6 +342,38 @@ fn free(path: &Path) -> bool {
         }
         Err(SessionBusy::Held { .. }) => false,
         Err(other) => panic!("{other}"),
+    }
+}
+
+/// How long a dropped writer is given to finish letting go of its lock: a few seconds, long enough
+/// for rpi's in-process teardown (measured at ~25–30 ms on a loaded 12-core box) and short enough
+/// that a genuine failure still reports promptly instead of hanging the suite.
+const FREE_GRACE: Duration = Duration::from_secs(5);
+
+/// The interval between claims while waiting out [`FREE_GRACE`].
+const FREE_POLL: Duration = Duration::from_millis(10);
+
+/// Whether `path`'s lock is free, giving a writer this process just dropped a **bounded** grace
+/// period to finish its asynchronous teardown (#3109).
+///
+/// The product semantics are unchanged and are not what this covers: a real writer that died
+/// (SIGKILL) releases its lock at process death, which `tests/session_lock.rs` pins cross-process.
+/// This only covers the test's in-process emulation of "the writer is gone" — dropping the last
+/// `Session` does not synchronously close rpi's storage, so an immediate claim races its teardown
+/// and failed ~50% of full-suite runs locally with "the chat that wrote it is gone" (l.976).
+///
+/// Not for asserting a lock is *held*: that must stay instant (`free`). The wait gives up after
+/// [`FREE_GRACE`] and returns false, so a lock that never frees is still a test failure, not a hang.
+async fn wait_free(path: &Path) -> bool {
+    let deadline = std::time::Instant::now() + FREE_GRACE;
+    loop {
+        if free(path) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(FREE_POLL).await;
     }
 }
 
@@ -852,7 +890,7 @@ async fn prompts_the_saved_file_still_had_queued_never_run() {
             .expect("next_run");
     }
     assert!(
-        free(&saved),
+        wait_free(&saved).await,
         "the chat that queued them is gone, as a crashed chat's file is"
     );
 
@@ -973,7 +1011,7 @@ async fn a_compacted_conversation_resumes_from_its_summary_not_its_summarized_tu
             .await
             .expect("a later reply");
     }
-    assert!(free(&saved), "the chat that wrote it is gone");
+    assert!(wait_free(&saved).await, "the chat that wrote it is gone");
 
     let out = w
         .chat(&["/sessions", "key:enter", "key:enter", "and now?", "/quit"])
@@ -1180,7 +1218,10 @@ async fn a_session_a_live_writer_holds_is_a_locked_row_and_is_refused() {
     );
     assert!(!free(&held), "the live writer still owns it");
     drop(guard);
-    assert!(free(&held), "and it is free once that writer goes");
+    assert!(
+        wait_free(&held).await,
+        "and it is free once that writer goes"
+    );
 }
 
 /// A file whose last append was cut off mid-line (a killed writer) is *repaired*, not refused: the
