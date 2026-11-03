@@ -12,7 +12,10 @@ on, and the reports show what that waiting costs.
 
 Merging a pull request is **not** a human ticket. A ticket that finishes with a PR shows
 **Merge needed**, and the work after it waits for the merge on its own
-(`working/merging-and-ci.md`).
+(`working/merging-and-ci.md`). It reaches you as a **Merge** item, never as a Do item, and it's
+gone the moment the merge is recorded — by you, by CI, or by GitHub. Nothing asks you to
+acknowledge a merge that already happened, and work that landed on an integration branch asks you
+for nothing at all.
 
 ## Waiting on you
 
@@ -23,7 +26,7 @@ always shown in this order, oldest first:
 |---|---|---|
 | **Approve** | Tickets that wait for your plan approval, one item per epic | `working/planning-and-approval.md` |
 | **Answer** | A question an agent asked on a ticket you own | `working/questions.md` |
-| **Merge** | A ticket you own is done, but its PR isn't merged (or was closed without merging) | `working/merging-and-ci.md` |
+| **Merge** | A ticket you own is done with a PR (or a pushed branch) that isn't merged yet, or whose PR was closed without merging | `working/merging-and-ci.md` |
 | **Start** | A ticket you own was dispatched to an agent and no worker has started it, so nothing is happening on it | `working/running-work.md` |
 | **Do** | A human ticket you own that is ready or in progress | this page |
 
@@ -34,6 +37,12 @@ an ordinary slow start doesn't bother you. Nothing you click is required: leave 
 returns the ticket to ready by itself after the project's return timeout (30 minutes by
 default). **Return to ready** on the item does the same thing now, and clears the dispatch so
 the ticket can be dispatched again.
+
+**Merge** is one item per PR, never one per step. It clears the moment the merge is recorded,
+however it was recorded, so a merge GitHub or CI already recorded never becomes a question for
+you. A plan's `merge_for` step for that PR is folded into the item (see below) rather than counted
+as a second thing to do, and work that landed on an integration branch is not a Merge item at
+all: it asks nothing of anyone.
 
 **Coming up** lists your human tickets that can't start yet: they wait on other work, a
 schedule, or plan approval. They're shown but not counted, and move into Do when they're ready.
@@ -55,8 +64,15 @@ project, and every action happens in place:
   you read every ticket and approve all or some of them.
 - **Answer**: the question, suggested answers when the question offers a choice, a text box and
   **Send answer**.
-- **Merge**: the PR and how many tickets wait on it, **Review PR ↗**, **Mark merged** and **Not
-  needed**. A PR closed without merging offers **Reopen ticket** and **Not needed**.
+- **Merge**: one item per PR. The PR, the branch it came from and the target as the run reported
+  it (or an explicit **target & rules: unknown** — AMP reads no repository settings and never
+  assumes `main`), why you're being asked, and only the tickets that really wait on it. **Review
+  PR ↗** always; **Mark merged** and **Not needed** where they do something. When the plan has a
+  merge step for that PR it's folded in here as **Tracked by #N**, with its open prerequisites
+  listed and **Mark merged** withheld until they're met — one click then records the merge and
+  completes the step. When nothing waits on the merge, **Mark merged** is still there but quiet:
+  GitHub or CI records it by itself. A PR closed without merging offers **Reopen ticket** and
+  **Not needed**.
 - **Start**: the ticket, the agent it went to and how long ago, and **Return to ready** to clear
   the dispatch and dispatch it again. Leaving it alone returns it by itself.
 - **Do**: **Start**, then **Mark done…**, which takes a note, a link and the hours you spent.
@@ -124,8 +140,12 @@ work your org does by hand and whether that's expected.
 ### When to plan one, and when not
 
 Plan a human ticket for a step you can see coming that only a person can do. Don't plan one for:
-- **Merging a PR.** That's Merge needed, recorded by GitHub, CI or **Mark merged**
-  (`working/merging-and-ci.md`).
+- **Merging a PR**, as a separate step to acknowledge. A PR is Merge needed, recorded by GitHub,
+  CI or **Mark merged** (`working/merging-and-ci.md`). If the plan genuinely has to sequence a
+  merge after other work, that step is linked to the PR it merges with `merge_for` — it then folds
+  into the PR's own Merge item, and one click both records the merge and completes the step. An
+  unlinked "review and merge" ticket is a second card for one merge; `amp_check_plan` warns about
+  it (`unlinked_merge_step`).
 - **A question that comes up while an agent works.** The agent blocks its own ticket with the
   question, and you answer it (`working/questions.md`).
 - **Approving a mockup.** That's the design ticket's artifact review (`working/artifacts.md`).
@@ -143,8 +163,14 @@ set to the person. A human ticket must have an owner; the plan check calls one w
 NO-GO, since nobody would ever do it. `amp_check_plan` lists every human ticket under
 `human_gates`, with how much work waits on each.
 
-Older projects may still have "review and merge" human tickets. They keep working: marking one
-done with the PR link also records that PR as merged on the tickets that produced it.
+Older projects may still have unlinked "review and merge" human tickets. They keep working exactly
+as before: marking one done with the PR link also records that PR as merged on the tickets that
+produced it. Nothing about a ticket without `merge_for` changes — it just doesn't get the folded
+card, and a merge recorded by GitHub or CI won't clear it, so its owner still marks it done.
+
+A merge step's completion is never a sign-off someone gave. When a recorded merge finishes a
+linked step, the step's history says whose report finished it ("its tracked merge (#N) was
+recorded by github") and no run is recorded for its owner.
 
 ### In the app
 
