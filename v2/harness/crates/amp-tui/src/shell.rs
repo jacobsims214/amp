@@ -2155,18 +2155,42 @@ impl Shell {
     /// shows the role) is left alone.
     ///
     /// `None` for a session kept in memory: the banner then says so instead of naming a file.
+    ///
+    /// Every direction is handled, including the one a `--no-session` chat resumes into (#3129):
+    /// it starts with no file, so there is no old id to swap, but its banner does say `session in
+    /// memory (--no-session)` — the text `chat.rs::session_banner` builds for a memory session —
+    /// and that line must give way to the resumed file's session line. Without this case the
+    /// banner went on claiming the conversation was in memory while `/usage` and the exit line
+    /// named the file it was writing, the one place the chrome contradicted the chat.
     pub fn set_session_file(&mut self, path: Option<PathBuf>) {
         let previous = self.info.session_file.take();
         let shown = path.as_deref().map(session_path_display);
-        if let Some(previous) = previous {
-            let from = session_banner_id(&previous);
-            let to = match &shown {
-                Some(shown) => session_banner_id(shown),
-                None => "in memory".to_owned(),
-            };
-            if !from.is_empty() {
-                self.view.replace_in_banner(&from, &to);
+        match (previous, &shown) {
+            // A file either way: the banner's short id is swapped where it stands.
+            (Some(previous), Some(shown)) => {
+                let from = session_banner_id(&previous);
+                if !from.is_empty() {
+                    self.view
+                        .replace_in_banner(&from, &session_banner_id(shown));
+                }
             }
+            // Back to memory: the id gives way to the memory line.
+            (Some(previous), None) => {
+                let from = session_banner_id(&previous);
+                if !from.is_empty() {
+                    self.view.replace_in_banner(&from, "in memory");
+                }
+            }
+            // A `--no-session` chat resuming a saved conversation (#3129): no old id to replace,
+            // so the whole memory line — the literal `chat.rs::session_banner(None)` draws — is
+            // replaced by the file's session line, the same text `session_banner(Some(path))`
+            // builds. The line's tail (`(/usage for path)`) is the fixed part on both sides.
+            (None, Some(shown)) => {
+                let to = format!("session {} (/usage for path)", session_banner_id(shown));
+                self.view.replace_in_banner(MEMORY_SESSION_LINE, &to);
+            }
+            // Still in memory: nothing to point at, and nothing to correct.
+            (None, None) => {}
         }
         self.info.session_file = shown;
     }
@@ -5674,6 +5698,11 @@ pub fn short_role(role: &str) -> &str {
     let role = role.rsplit(':').next().unwrap_or(role);
     role.strip_prefix("amp-").unwrap_or(role)
 }
+
+/// The banner's session line for a chat that keeps its conversation in memory (`--no-session`):
+/// the literal `chat.rs::session_banner(None)` draws. A resume out of memory replaces this whole
+/// line with the resumed file's session line ([`Shell::set_session_file`], AMP #3129).
+pub const MEMORY_SESSION_LINE: &str = "session in memory (--no-session)";
 
 /// A session file as `/usage` names it, with `$HOME` written `~` (`chat.rs::tilde` for the exit
 /// line and the banner). The shell keeps the path only to show it, so it is stored in this form.

@@ -670,6 +670,72 @@ async fn after_a_resume_the_chat_names_the_file_it_continues() {
     );
 }
 
+/// A `--no-session` chat that resumes a saved conversation stops claiming the conversation is in
+/// memory (AMP #3129). It starts with no file, so its banner's session line is the memory line
+/// (`session in memory (--no-session)`); after the resume that line must name the resumed file's
+/// short id, the same id `/usage` and the exit line name — one claim in the chrome, not three
+/// that disagree.
+///
+/// The regression this pins: `Shell::set_session_file` only replaced the short id *when there was
+/// an old one* (`if let Some(previous) = previous`), so `None → Some` skipped the banner entirely
+/// and the chat went on saying `session in memory` while it was writing a real file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_no_session_chat_that_resumes_stops_claiming_the_session_is_in_memory() {
+    let w = World::new("no-session-resume-banner").await;
+    let older = exchange(
+        &w.sessions(),
+        1_600_000_000_000,
+        "older-conversation",
+        &w.repo,
+        "the conversation to continue",
+        "its answer",
+    );
+    let id = short_id(&older);
+
+    // The run starts in memory (`chat_listing`: `--no-session`), so its own banner says so.
+    let listed = World::screen(&w.chat_listing(&["/sessions"]).await);
+    assert!(
+        listed.contains("session in memory (--no-session)"),
+        "the memory chat's banner says so before the resume:\n{listed}"
+    );
+
+    // Resume it, then ask where the chat writes: the banner and `/usage` must name the same file.
+    let out = w
+        .chat_listing(&["/sessions", "key:enter", "key:enter", "/usage", "/quit"])
+        .await;
+    let screen = World::screen(&out);
+    assert!(
+        screen.contains(&format!("✓ resumed {id}")),
+        "the resume happened:\n{screen}"
+    );
+    // The stale claim is gone. `replace_in_banner` replaces in place, so the memory line cannot
+    // survive next to the file's — either one is a bug the person would read as "not saved".
+    assert!(
+        !screen.contains("session in memory"),
+        "the memory line is gone from the banner:\n{screen}"
+    );
+    // The banner's session line is the resumed file's, in the same text `chat.rs::session_banner`
+    // builds for a file.
+    assert!(
+        screen.contains(&format!("session {id} (/usage for path)")),
+        "the banner names the resumed file's short id:\n{screen}"
+    );
+    // And `/usage`'s last line names the same file (the whole name, under this run's state dir).
+    let usage = screen
+        .lines()
+        .map(|l| {
+            l.trim_matches(|c: char| c == '│' || c.is_whitespace())
+                .to_owned()
+        })
+        .find(|l| l.starts_with("session: "))
+        .unwrap_or_else(|| panic!("no `session: ` line in\n{screen}"));
+    let name = older.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        usage.ends_with(&name),
+        "/usage names the same file the banner shortens: {usage}"
+    );
+}
+
 /// The listing is this directory's, and the session this chat is writing is `· current`: present
 /// and well-formed, just not a target. A session another directory started is not listed at all
 /// (its tools, policy and prompt belong to that directory), and nothing of its text leaks into the
