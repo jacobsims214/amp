@@ -825,7 +825,9 @@ fn session_control(
 fn session_banner(file: Option<&Path>) -> String {
     match file {
         Some(path) => format!("session {} (/usage for path)", session_id(path)),
-        None => "session in memory (--no-session)".to_owned(),
+        // One literal, shared with the shell: a resume out of memory replaces this whole line
+        // (`Shell::set_session_file`, AMP #3129), so the two must not drift apart.
+        None => amp_tui::MEMORY_SESSION_LINE.to_owned(),
     }
 }
 
@@ -1071,6 +1073,9 @@ mod tests {
         assert_eq!(session_id(Path::new("/x/short.jsonl")), "short");
         assert_eq!(session_id(Path::new("/x/12-ab.jsonl")), "ab");
         assert_eq!(session_banner(None), "session in memory (--no-session)");
+        // The shell replaces exactly this line on a resume out of memory (AMP #3129), so the
+        // banner it draws and the line the shell looks for are the same string by construction.
+        assert_eq!(session_banner(None), amp_tui::MEMORY_SESSION_LINE);
     }
 
     #[test]
