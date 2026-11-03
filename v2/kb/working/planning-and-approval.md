@@ -29,7 +29,10 @@ Good tickets:
   See `working/human-work.md`.
 - **No merge tickets.** Don't plan "review and merge" steps: a ticket that finishes with a PR is
   **Merge needed**, and the work after it waits for the merge by itself
-  (`working/merging-and-ci.md`).
+  (`working/merging-and-ci.md`). If the merge genuinely has to come after another step, make that
+  step a human ticket linked to the PR it merges (`merge_for: <ticket id>`): My work folds it into
+  the PR's Merge item, so there is still one action for one PR. `amp_check_plan` warns about a
+  merge-looking step with no link (`unlinked_merge_step`).
 
 ## The plan check
 
