@@ -1579,7 +1579,13 @@ model = "silent/s-1"
     }
     let _ = master.write_all(b"\r");
     let _ = master.flush();
-    let text = wait_for!("queued behind it");
+    // Wait on the queue notice, never on the draft itself (AMP #3108). The text typed above is
+    // echoed into the editor as it arrives, so waiting for it returns as soon as the last
+    // character is echoed — before Enter has been read, let alone processed. Under load (CI) the
+    // pty reads split, and the assertions below then read a screen that predates the notice.
+    // `runs after this reply` is drawn only by `amp_tui::shell::queued_notice` (pinned in
+    // tests/chat_queue.rs), so it cannot be matched by anything this test writes.
+    let text = wait_for!("runs after this reply");
     assert!(
         text.contains("queued #1") || text.contains("1 queued"),
         "the prompt is queued behind the run:\n{text}"
