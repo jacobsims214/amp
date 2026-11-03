@@ -53,6 +53,18 @@ type PersonWait struct {
 	MergeState string `json:"merge_state,omitempty"`
 	PRURL      string `json:"pr_url,omitempty"`
 	Branch     string `json:"branch,omitempty"`
+	// merge (AMP #3011): where the merge would land as the run reported it,
+	// and where that came from. base_branch empty + target_source "unknown"
+	// means AMP could not verify the target — never "main".
+	BaseBranch   string `json:"base_branch,omitempty"`
+	TargetSource string `json:"target_source,omitempty"`
+	// TrackedBy: the plan's human merge step folded into this Merge card
+	// (merge_for), with the readiness the backend's bridges enforce, so the
+	// card never offers Mark merged for a step it would refuse to close.
+	TrackedBy *service.MergeStepFold `json:"tracked_by,omitempty"`
+	// NotWaiting: open dependents that opted out with waits_for_merge: false —
+	// they are not counted in holding_up because this merge doesn't hold them.
+	NotWaiting []int `json:"not_waiting,omitempty"`
 	// coming_up: what it still waits on
 	WaitsOn          []int      `json:"waits_on,omitempty"`
 	AwaitingApproval bool       `json:"awaiting_approval,omitempty"`
@@ -266,6 +278,8 @@ func (s *Server) personWait(it service.WaitItem, owner *int, ownerEmail string, 
 	case service.WaitMerge:
 		p.State = "completed"
 		p.MergeState, p.PRURL, p.Branch = it.MergeState, it.PRURL, it.Branch
+		p.BaseBranch, p.TargetSource = it.BaseBranch, it.TargetSource
+		p.TrackedBy, p.NotWaiting = it.TrackedBy, it.NotWaiting
 	case service.WaitStart:
 		p.State = domain.PhaseNotStarted
 		p.AgentID, p.NotStartedMinutes = it.AgentID, it.NotStartedMinutes
@@ -283,6 +297,15 @@ func (s *Server) personWait(it service.WaitItem, owner *int, ownerEmail string, 
 	}
 	if it.Kind != service.WaitApprove {
 		p.HoldingUp = holding(p.ID)
+	}
+	// A Merge item counts only dependents that actually wait for the merge
+	// (AMP #3011): the transitive set above includes ones that started already
+	// with waits_for_merge: false, and a card that says "3 tickets wait" when
+	// two of them didn't is the overstatement
+	// discoveries/merge-actions-user-journey.md names. service fills this from
+	// repository.TrueWaiters, so the count is what the action unblocks.
+	if it.Kind == service.WaitMerge {
+		p.HoldingUp = it.HoldingUp
 	}
 	return p
 }

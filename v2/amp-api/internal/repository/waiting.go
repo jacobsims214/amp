@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"time"
+
+	"github.com/simstech/amp-api/internal/domain"
 )
 
 // Waiting on you (AMP #2478, KB decisions/human-work-ux.md §1). These
@@ -137,12 +139,32 @@ func (r *Repo) DepSummaries(ctx context.Context, ids []int) (map[int]DepSummary,
 // OpenDependents maps each of ids to the open (not completed) tickets that
 // depend on it directly, by id.
 func (r *Repo) OpenDependents(ctx context.Context, ids []int) (map[int][]int, error) {
+	return r.dependents(ctx, ids, "")
+}
+
+// TrueWaiters maps each of ids to the open tickets that depend on it directly
+// *and actually wait for its merge*, by id: the same as OpenDependents but
+// without the dependents that opted out with waits_for_merge: false (AMP
+// #3011).
+//
+// It is the count a Merge card may state. A waits_for_merge: false dependent
+// starts when its dependency completes (repository.RelaxMergeWaits), so it is
+// not held up by the merge and counting it would overstate what the person's
+// click unblocks — the defect discoveries/merge-actions-user-journey.md names
+// ("#2302's card would say 1 ticket waits when #2303 doesn't wait at all").
+func (r *Repo) TrueWaiters(ctx context.Context, ids []int) (map[int][]int, error) {
+	return r.dependents(ctx, ids, ` AND NOT `+noMergeWaitSQL)
+}
+
+// dependents is OpenDependents with an extra SQL condition on the dependent
+// (alias t), or none.
+func (r *Repo) dependents(ctx context.Context, ids []int, extra string) (map[int][]int, error) {
 	out := map[int][]int{}
 	if len(ids) == 0 {
 		return out, nil
 	}
 	rows, err := r.db.Query(ctx, `SELECT d.depends_on, d.task_id FROM task_dependencies d JOIN tasks t ON t.id = d.task_id
-		WHERE d.depends_on = ANY($1) AND t.state <> 'completed' ORDER BY d.depends_on, d.task_id`, ids)
+		WHERE d.depends_on = ANY($1) AND t.state <> 'completed'`+extra+` ORDER BY d.depends_on, d.task_id`, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -157,12 +179,69 @@ func (r *Repo) OpenDependents(ctx context.Context, ids []int) (map[int][]int, er
 	return out, rows.Err()
 }
 
-// MergeRef is where a ticket's unmerged work is: the latest run that names
-// a pull request or a branch.
+// MergeStep is a person's merge step (a human ticket carrying merge_for) as a
+// merge card needs it: which ticket it tracks, what state it is in, and what
+// it waits on (AMP #3011, rendering AMP #3009's link as the approved
+// mockup's states 4-5).
+//
+// A step waiting only on the ticket it tracks is ready as soon as that ticket
+// has a PR: its job *is* that merge, which is why repository.DepStatesFor
+// satisfies the tracked dependency by completion alone.
+type MergeStep struct {
+	TaskID        int
+	Tracks        int
+	Name          string
+	State         string
+	BlockReason   string
+	DependencyIDs []int
+}
+
+// MergeStepsFor returns, for each of ticketIDs that has one, the human merge
+// step whose merge_for names it: ticket id → step. An open step wins over a
+// done one, the same order TasksTrackingMerge uses, because the step that
+// still has something to do is the one a Merge card folds in.
+func (r *Repo) MergeStepsFor(ctx context.Context, ticketIDs []int) (map[int]MergeStep, error) {
+	out := map[int]MergeStep{}
+	if len(ticketIDs) == 0 {
+		return out, nil
+	}
+	tracks := mergeForSQLOf("s")
+	rows, err := r.db.Query(ctx, `SELECT s.id, `+tracks+`, s.name, s.state, s.block_reason,
+		COALESCE((SELECT array_agg(d.depends_on ORDER BY d.depends_on) FROM task_dependencies d WHERE d.task_id = s.id), '{}')
+		FROM tasks s
+		WHERE s.performer = '`+domain.PerformerHuman+`' AND `+tracks+` = ANY($1)
+		ORDER BY (s.state = 'completed'), s.id`, ticketIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var st MergeStep
+		if err := rows.Scan(&st.TaskID, &st.Tracks, &st.Name, &st.State, &st.BlockReason, &st.DependencyIDs); err != nil {
+			return nil, err
+		}
+		if _, seen := out[st.Tracks]; !seen {
+			out[st.Tracks] = st // the open step first (ORDER BY), so it wins
+		}
+	}
+	return out, rows.Err()
+}
+
+// MergeRef is where a ticket's unmerged work is, as reported by the latest
+// run that names a pull request or a branch: the PR (or head branch) and the
+// branch it targets, which is the one fact a merge card needs to say where
+// the merge would go (AMP #3011).
+//
+// BaseBranch is only what a run said. A run that didn't report its target
+// leaves it empty, and empty means *unknown*, never "main": AMP invents no
+// default branch (approved mockup design/merge-journey-mockup.md, state 9).
 type MergeRef struct {
-	PRURL  string    `json:"pr_url,omitempty"`
-	Branch string    `json:"branch,omitempty"`
-	At     time.Time `json:"at"`
+	// RunID is the run these facts come from, so a card can point back at it.
+	RunID      int64     `json:"run_id,omitempty"`
+	PRURL      string    `json:"pr_url,omitempty"`
+	Branch     string    `json:"branch,omitempty"`
+	BaseBranch string    `json:"base_branch,omitempty"`
+	At         time.Time `json:"at"`
 }
 
 // LatestMergeRefs returns, for each of ids that has one, its latest run
@@ -172,7 +251,7 @@ func (r *Repo) LatestMergeRefs(ctx context.Context, ids []int) (map[int]MergeRef
 	if len(ids) == 0 {
 		return out, nil
 	}
-	rows, err := r.db.Query(ctx, `SELECT DISTINCT ON (task_id) task_id, pr_url, branch, created_at FROM task_runs
+	rows, err := r.db.Query(ctx, `SELECT DISTINCT ON (task_id) task_id, id, pr_url, branch, base_branch, created_at FROM task_runs
 		WHERE task_id = ANY($1) AND (pr_url <> '' OR branch <> '')
 		ORDER BY task_id, created_at DESC, id DESC`, ids)
 	if err != nil {
@@ -182,7 +261,7 @@ func (r *Repo) LatestMergeRefs(ctx context.Context, ids []int) (map[int]MergeRef
 	for rows.Next() {
 		var id int
 		var m MergeRef
-		if err := rows.Scan(&id, &m.PRURL, &m.Branch, &m.At); err != nil {
+		if err := rows.Scan(&id, &m.RunID, &m.PRURL, &m.Branch, &m.BaseBranch, &m.At); err != nil {
 			return nil, err
 		}
 		out[id] = m
