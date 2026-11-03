@@ -1041,6 +1041,11 @@ mod tests {
 
     /// A repository with a bare `origin` and `main` pushed to it, so `refs/remotes/origin/main`
     /// exists; the checkout is on `main` at that commit. Returns (repo, bare remote, HEAD).
+    ///
+    /// Both inits name the branch explicitly. The bare one must, or its `HEAD` points at whatever
+    /// `init.defaultBranch` happens to be — `master` on a CI runner — and a clone of it checks out
+    /// that instead of `main`, so the clone has no local `main` to push. Naming the branch is what
+    /// makes this fixture independent of the machine's git configuration (AMP #3146).
     fn repo_with_a_remote(name: &str) -> (PathBuf, PathBuf, String) {
         let dir = fixture_dir(name);
         let repo = dir.join("repo");
@@ -1050,7 +1055,10 @@ mod tests {
         sh_git(&repo, &["add", "."]);
         sh_git(&repo, &["commit", "-q", "-m", "init"]);
         let bare = dir.join("remote.git");
-        sh_git(&dir, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+        sh_git(
+            &dir,
+            &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
         let bare = std::fs::canonicalize(&bare).unwrap();
         sh_git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
         sh_git(&repo, &["push", "-q", "-u", "origin", "main"]);
