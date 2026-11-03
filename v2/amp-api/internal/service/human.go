@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/simstech/amp-api/internal/actor"
@@ -114,6 +115,33 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 	// produced it, so one acknowledgement clears both.
 	if ids := s.bridgeHumanMerge(ctx, p, t, run.PRURL); len(ids) > 0 {
 		details["merged_task_ids"] = ids
+	}
+	// The reverse bridge (AMP #3009): a step linked to its PR with merge_for
+	// records that ticket's merge as the same act, so finishing the step is
+	// one click for the whole merge and nothing is left half-recorded.
+	//
+	// It only ever records a merge that was still waiting to be recorded, and
+	// only when the person said they merged (a PR link on their run): merge_for
+	// says which ticket's merge the step tracks, not that every completion of
+	// the step is a merge. Without both, linking an approval or a sign-off to
+	// a ticket would claim a merge nobody performed, which is the opposite of
+	// what this key is for.
+	if forID := MergeFor(t); forID != 0 {
+		details["merge_for"] = forID
+		switch {
+		case run.PRURL == "":
+			details["merge_inferred"] = false
+		case !s.mergedNow(ctx, forID):
+			details["merge_recorded"] = false
+		default:
+			rec, err := s.MarkTaskMerged(ctx, p, forID, domain.MergeSourceUI, "")
+			if err != nil {
+				slog.Warn("record the merge a linked step finished", "task_id", taskID, "merge_for", forID, "err", err)
+				details["merge_error"] = err.Error()
+			} else {
+				details["merge_recorded"] = !rec.AlreadyRecorded
+			}
+		}
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "task.human.complete", ProjectID: intRef(t.ProjectID), TargetType: "task", TargetID: idStr(taskID),
 		TargetName: t.Name, Summary: fmt.Sprintf("%s marked their ticket %d done", p.Label(), taskID), Details: details})

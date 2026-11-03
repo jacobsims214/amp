@@ -508,6 +508,17 @@ func (r *Repo) CreateTask(ctx context.Context, req domain.CreateTaskRequest) (*d
 		req.CreatedBy, req.OwnerUserID, metaOrEmpty(req.Metadata), performerOrAgent(req.Performer), req.HumanReason,
 	), t)
 	if err != nil {
+		// Two merge steps created at once for the same ticket: the loser of
+		// idx_tasks_merge_for_open says so plainly (AMP #3009). The service
+		// checks first (checkMergeFor), but the check and this insert aren't
+		// one statement, so the index is what makes concurrent planning safe.
+		if isUniqueViolation(err) {
+			if forID, perr := domain.ParseMergeFor(req.Metadata[domain.MetaMergeFor]); perr == nil && forID != 0 && req.Performer == domain.PerformerHuman {
+				return nil, conflictf("ticket %d's merge is already tracked by another step (%s); one step per merge",
+					forID, uniqueConflictDetail(ctx, r, forID, 0))
+			}
+			return nil, conflictf("a change was made at the same time as this one; re-read the plan and try again")
+		}
 		return nil, err
 	}
 
@@ -1218,7 +1229,30 @@ func (r *Repo) MergeMetadata(ctx context.Context, kind string, id int, patch dom
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("%s %d: %w", kind, id, ErrNotFound)
 	}
+	if err != nil && kind == "task" && isUniqueViolation(err) {
+		// Two open steps can't track one merge (idx_tasks_merge_for_open, AMP
+		// #3009). The service checks this before writing, but two linkers can
+		// pass that check at the same instant; this is the write that lost, so
+		// it is reported as the duplicate it is rather than as a bare SQL error.
+		if forID, perr := domain.ParseMergeFor(set[domain.MetaMergeFor]); perr == nil && forID != 0 {
+			return nil, conflictf("ticket %d can't track ticket %d's merge: another step already does (%s); one step per merge",
+				id, forID, uniqueConflictDetail(ctx, r, forID, id))
+		}
+		return nil, conflictf("task %d: that change conflicts with another one made at the same time; re-read the ticket and try again", id)
+	}
 	return out, err
+}
+
+// uniqueConflictDetail names the other step tracking ticketID's merge, for the
+// conflict message when two linkers raced. Best effort: an empty string just
+// drops the detail.
+func uniqueConflictDetail(ctx context.Context, r *Repo, tracks, except int) string {
+	var other int
+	if err := r.db.QueryRow(ctx, `SELECT id FROM tasks WHERE performer = '`+domain.PerformerHuman+`'
+		AND state <> 'completed' AND `+mergeForSQL+` = $1 AND id <> $2 ORDER BY id LIMIT 1`, tracks, except).Scan(&other); err != nil {
+		return "it was taken by a step created at the same moment"
+	}
+	return fmt.Sprintf("ticket %d has it", other)
 }
 
 // InheritedMetadata returns what an item inherits: for an epic its

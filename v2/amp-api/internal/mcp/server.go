@@ -1398,7 +1398,7 @@ func (s *Server) createTasks(rctx context.Context, args map[string]interface{}) 
 		if !ok {
 			return nil, fmt.Errorf("tasks[%d] must be an object", i)
 		}
-		meta, err := optNewMetadata(m)
+		meta, err := optNewMetadataAllowMergeForRef(m)
 		if err != nil {
 			return nil, fmt.Errorf("tasks[%d]: %w", i, err)
 		}
@@ -2495,6 +2495,23 @@ func optNewMetadata(args map[string]interface{}) (domain.Metadata, error) {
 	p, err := optMetadataPatch(args)
 	if err != nil || p == nil {
 		return nil, err
+	}
+	return domain.Metadata(p).Clean()
+}
+
+// optNewMetadataAllowMergeForRef is optNewMetadata for amp_create_tasks, where
+// merge_for may name a ref in the same batch (AMP #3009): a non-numeric value
+// is left as the string it is, for CreateTasks to resolve into a ticket id.
+// Everywhere else a ref would be meaningless, so it is refused there.
+func optNewMetadataAllowMergeForRef(args map[string]interface{}) (domain.Metadata, error) {
+	p, err := optMetadataPatch(args)
+	if err != nil || p == nil {
+		return nil, err
+	}
+	if v, ok := p[domain.MetaMergeFor]; ok && v != nil {
+		if _, isStr := v.(string); !isStr {
+			return nil, fmt.Errorf("merge_for must be a ticket id (a number) or a ref in this batch")
+		}
 	}
 	return domain.Metadata(p).Clean()
 }
