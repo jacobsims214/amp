@@ -896,8 +896,39 @@ export interface WaitItem {
   not_started_minutes?: number
   /** merge: open tickets that depend on it directly */
   holding_up?: number[]
+  /**
+   * merge (AMP #3011): the branch the merge would land on, as a run reported it.
+   * Absent is *unknown*, never "main" — read target_source, not this, to decide.
+   */
+  base_branch?: string
+  /** merge: where base_branch came from — "run" when a run reported it, "unknown" when nothing did */
+  target_source?: MergeTargetSource
+  /** merge: open dependents that opted out with waits_for_merge: false — named, never counted */
+  not_waiting?: number[]
+  /** merge: the plan's human merge step folded into this card (its merge_for names this ticket) */
+  tracked_by?: MergeStepFold
   awaiting_approval?: boolean
   start_at?: string
+}
+
+/** Where a Merge card's target branch came from (service.MergeTargetRun / MergeTargetUnknown). */
+export type MergeTargetSource = 'run' | 'unknown'
+
+/**
+ * The plan's human merge step folded into a Merge card (AMP #3009's `merge_for`,
+ * service.MergeStepFold). `ready` is computed by the backend's own bridge guards,
+ * so the card never offers Mark merged for a step it would refuse to close.
+ */
+export interface MergeStepFold {
+  task_id: number
+  name: string
+  state: string
+  /** Mark merged may be offered: every prerequisite is met and no guard refuses it */
+  ready: boolean
+  /** the prerequisites still holding it (its dependencies that aren't satisfied yet) */
+  waiting_on?: number[]
+  /** why it isn't ready, in one sentence; empty when it is */
+  reason?: string
 }
 
 /** One project's card in the top-level My work summary. */
@@ -1297,6 +1328,21 @@ export interface MergeRecord {
   message: string
   run?: Run
   task?: Task
+  /** the plan's human merge step tracking this merge: what the report did to it (AMP #3009) */
+  linked_step?: MergeStepRecord
+}
+
+/**
+ * What a merge report did to the plan's human step whose `merge_for` names the
+ * ticket: completed it (one act, not two), found it already done, or left it
+ * open because its owner started it or a prerequisite is unfinished.
+ */
+export interface MergeStepRecord {
+  task_id: number
+  state: string
+  completed: boolean
+  already_done: boolean
+  message: string
 }
 
 /** A ticket's place in a project's My work list (WaitItem with its detail). */
