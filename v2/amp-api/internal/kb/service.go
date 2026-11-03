@@ -2680,11 +2680,28 @@ func quoteFilter(v string) string {
 	return "`" + strings.ReplaceAll(v, "`", "") + "`"
 }
 
+// isNotFound reports whether err is Typesense saying the collection, alias
+// or document does not exist: an actual HTTP 404.
+//
+// It is type-aware on purpose. Matching the message text is wrong: a
+// transport error (dial tcp … connection refused) embeds the collection
+// name, which embeds the KB's scope id (kb_team_<id>), so an id containing
+// "404" made a dead index read as a missing collection — status reported a
+// healthy-looking 0-doc index while Typesense was down, writes were dropped
+// as "already gone" and the reconciler treated a dead index as empty
+// (#3131). A connection error is never a 404.
 func isNotFound(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "Not Found")
+	var httpErr *typesense.HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.Status == http.StatusNotFound
+	}
+	// Fallback for an error that carries no status but quotes one: the
+	// client's own format is "status: <code> response: <body>", and only the
+	// prefix counts, so text that merely mentions 404 never matches.
+	return strings.HasPrefix(err.Error(), "status: 404 ")
 }
 
 func mapToDoc(raw interface{}) *Doc {

@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/typesense/typesense-go/v4/typesense"
 	"github.com/typesense/typesense-go/v4/typesense/api"
 )
 
@@ -289,4 +291,42 @@ func TestReindexSingleFlight(t *testing.T) {
 			t.Fatalf("failed lock left the KB marked busy: %v", s.reindexing)
 		}
 	})
+}
+
+// isNotFound answers about an actual HTTP 404 from Typesense, never about
+// text that happens to contain "404". A transport error embeds the
+// collection name, which embeds the KB's scope id, and test scopes are
+// random: before #3131 a scope id containing "404" turned a dead index into
+// a missing collection (#3131).
+func TestIsNotFound(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"404", &typesense.HTTPError{Status: http.StatusNotFound, Body: []byte(`{"message":"Not Found"}`)}, true},
+		{"404 without a body", &typesense.HTTPError{Status: http.StatusNotFound}, true},
+		{"500", &typesense.HTTPError{Status: http.StatusInternalServerError, Body: []byte(`{"message":"boom"}`)}, false},
+		{"503", &typesense.HTTPError{Status: http.StatusServiceUnavailable}, false},
+		{"a 404 wrapped by the caller", fmt.Errorf("read alias %s: %w", "kb_team_1", &typesense.HTTPError{Status: http.StatusNotFound}), true},
+		{
+			"a connection error whose text contains 404",
+			errors.New("count docs: Post \"http://127.0.0.1:1/collections/kb_team_9714046/documents/search\": dial tcp 127.0.0.1:1: connect: connection refused"),
+			false,
+		},
+		{
+			"a connection error whose text contains Not Found",
+			errors.New("Post \"http://127.0.0.1:1/collections/kb_team_1\": dial tcp 127.0.0.1:1: connect: connection refused (Not Found)"),
+			false,
+		},
+		{"the client's own 404 text", errors.New(`status: 404 response: {"message": "Not Found"}`), true},
+		{"the client's own 500 text", errors.New(`status: 500 response: {"message": "boom"}`), false},
+		{"status 404 in the middle of a message", errors.New("retried status: 404 response: {} again"), false},
+	}
+	for _, c := range cases {
+		if got := isNotFound(c.err); got != c.want {
+			t.Errorf("%s: isNotFound(%v) = %v, want %v", c.name, c.err, got, c.want)
+		}
+	}
 }
