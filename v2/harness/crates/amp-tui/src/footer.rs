@@ -160,6 +160,19 @@ impl Footer {
         self.with(|s| s.usage)
     }
 
+    /// Forgets this session's usage (AMP #3012): a switch to another saved session starts it at
+    /// zero, because the tokens and cost the footer shows are the transcript's, and that
+    /// transcript is gone. The context badge goes back to `?` too: the resumed session's latest
+    /// context is only known once its next reply reports one, and the old session's `ctx 84%`
+    /// would be a lie about the new one.
+    pub fn reset_session_usage(&self) {
+        self.with(|s| {
+            s.usage = UsageTotals::default();
+            s.context_tokens = None;
+            s.cache_hit = None;
+        });
+    }
+
     /// The latest prompt-cache hit rate, 0..=100.
     pub fn cache_hit_rate(&self) -> Option<f64> {
         self.with(|s| s.cache_hit)

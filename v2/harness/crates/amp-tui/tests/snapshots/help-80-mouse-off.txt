@@ -10,6 +10,7 @@
    /open [id|plan]          open the ticket (or the plan) in the browser
    /server [name|address]   the AMP servers; switch to another
    /remote [on|off|pair]    chat from a phone; /remote copy, open, devices
+   /sessions                saved chats in this directory; resume one
  Config
    /model [p/m|roles|role]  this chat's model; /model roles: every role's
    /connect [provider]      model providers and their keys; add a key

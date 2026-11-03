@@ -62,9 +62,10 @@
 
 use std::{
     future::Future,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use amp_core::events::{RunEvent, Totals};
@@ -82,7 +83,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::amp_render::{self, ApprovalNotice};
 use crate::history::{PromptHistory, Recall};
 use crate::newline::NewlineMode;
-use crate::overlay::{self, InfoPanel, ModelRow, PanelKind, PanelState, Stage, Target};
+use crate::overlay::{self, InfoPanel, ModelRow, PanelKind, PanelState, SessionRow, Stage, Target};
 use crate::roster::{NoticeKind, Phase, WorkerEntry};
 use crate::scroll::ScrollPos;
 use crate::slash::MenuKey;
@@ -164,6 +165,10 @@ enum ShellMsg {
         active: bool,
         manual: bool,
     },
+    /// `/sessions` scanned this directory's saved chats (AMP #3010).
+    Sessions(Result<SessionList, String>),
+    /// A confirmed resume finished: the harness switched to that session, or why it refused.
+    Resumed(Box<ResumeRequest>, Result<Resumed, String>),
 }
 
 /// The shell's watch on its harness's event bus (#2388: compaction progress). rpi's watch
@@ -359,6 +364,68 @@ pub trait ConfigControl: Send + Sync {
 /// changed by a CLI in another terminal and brings the chat's session up to date.
 pub trait ReloadControl: Send + Sync {
     fn reload(&self) -> ReloadFuture;
+}
+
+/// What `/sessions` asks of the binary, and nothing more (AMP #3010). The picker browses, and the
+/// person confirms; the *switch* — loading the file, guarding it, resetting the per-session state
+/// of §6.3 — is the caller's one transaction (AMP #3012), so the TUI never opens a second loader and
+/// never touches a session file itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeRequest {
+    /// The session file to continue: the exact path the scan listed (`<state>/sessions/<role>/…`).
+    pub path: PathBuf,
+    /// The session's short id, for the line that records what happened (`8f3d…a1c2`), drawn from
+    /// the row the person picked rather than re-derived from the path.
+    pub id: String,
+    /// How many messages the file held when it was picked; 0 when the scan could not count them.
+    pub messages: u64,
+    /// When it was last written, for the same line (`2h ago`).
+    pub modified_at: SystemTime,
+}
+
+pub type ResumeFuture = Pin<Box<dyn Future<Output = Result<Resumed, String>> + Send>>;
+
+/// A session the harness switched to, as the chat reports it: the file it continues, its message
+/// count, and — when the caller knows it — the model the resumed conversation actually runs on
+/// (the live harness keeps its model, so this is usually the chat's, disclosed in the line).
+pub struct Resumed {
+    pub path: PathBuf,
+    pub messages: u64,
+    /// The model the resumed session runs on (`provider/model`), when the caller resolved it.
+    pub model: Option<String>,
+    /// The loaded session's own transcript, display only (AMP #3012): what the chat replaces its
+    /// conversation with so the person sees the context the next turn continues from. The caller
+    /// builds it from the file it just loaded ([`amp_core::worker_session::replay`]'s shape), so
+    /// no tool runs and no model call: it is drawn through [`crate::ChatView::apply`] exactly as a
+    /// worker's saved session is. It is built **before** the swap, so a transcript that cannot be
+    /// read is an `Err` from `resume` and never a switched context under the old view.
+    pub transcript: Vec<(Option<SystemTime>, AgentEvent)>,
+}
+
+/// The harness side of `/sessions` (AMP #3010): scanning this directory's saved chats, and handing
+/// a chosen one to the session-switch transaction. Both run in the background, so the screen never
+/// waits on the disk; [`Shell::poll`] applies the result.
+pub trait SessionControl: Send + Sync {
+    /// The saved sessions of the harness's current directory, newest activity first, exactly as
+    /// [`amp_core::session_index::list`] returns them (already filtered by canonical cwd, already
+    /// bounded and read-only).
+    fn list(&self) -> SessionListFuture;
+    /// Asks for the session at `request` to become this chat's: the binary's one switch transaction
+    /// (AMP #3012). On `Err` the chat must be exactly as it was — same session, same transcript.
+    fn resume(&self, request: ResumeRequest) -> ResumeFuture;
+}
+
+pub type SessionListFuture = Pin<Box<dyn Future<Output = Result<SessionList, String>> + Send>>;
+
+/// What a `/sessions` scan found: the rows to draw, and the file this chat is writing (which the
+/// picker marks `· current` and will not resume).
+pub struct SessionList {
+    /// The canonical directory that was scanned, shown above the rows.
+    pub scope: String,
+    /// The sessions started in it, newest activity first.
+    pub rows: Vec<SessionRow>,
+    /// The session this chat writes now; `None` with `--no-session` or an in-memory session.
+    pub current: Option<PathBuf>,
 }
 
 /// The block a manager turn opens with when workers ended since the last one (AMP #2857): one
@@ -950,6 +1017,9 @@ pub struct Shell {
     reload_again: Option<ReloadCause>,
     /// The configuration panels (#2245), if the caller gave them.
     config: Option<Arc<dyn ConfigControl>>,
+    /// `/sessions` (AMP #3010), if the caller gave it: the scan of this directory's saved chats, and
+    /// the switch transaction a confirmed pick asks for.
+    session_control: Option<Arc<dyn SessionControl>>,
     /// A slash command chosen in a configuration panel (Enter or a letter key), run by
     /// [`Shell::key`] / [`Shell::press`] (commands are async; the panel keys are not).
     pending_command: Option<String>,
@@ -1094,6 +1164,7 @@ impl Shell {
                 reloading: false,
                 reload_again: None,
                 config: None,
+                session_control: None,
                 pending_command: None,
                 esc_hint_until: None,
                 quit_hint_until: None,
@@ -1696,7 +1767,7 @@ impl Shell {
         }
         match self.view.panel().state().map(|s| s.stage) {
             None | Some(Stage::Answer { .. }) => true,
-            Some(Stage::Confirm { .. } | Stage::Sending { .. }) => false,
+            Some(Stage::Confirm { .. } | Stage::Sending { .. } | Stage::Resume { .. }) => false,
             Some(Stage::Browse) => self.editor_clicked || !self.view.editor().get_text().is_empty(),
         }
     }
@@ -1735,7 +1806,7 @@ impl Shell {
         };
         if matches!(
             self.view.panel().state().map(|s| s.stage),
-            Some(Stage::Confirm { .. } | Stage::Sending { .. })
+            Some(Stage::Confirm { .. } | Stage::Sending { .. } | Stage::Resume { .. })
         ) {
             return false;
         }
@@ -2071,6 +2142,224 @@ impl Shell {
         self.config = Some(control);
     }
 
+    /// Gives the shell `/sessions` (AMP #3010): the directory scan and the switch transaction. The
+    /// harness side is the binary's, so the TUI opens no session file and takes no lock itself.
+    pub fn set_session_control(&mut self, control: Arc<dyn SessionControl>) {
+        self.session_control = Some(control);
+    }
+
+    /// Points the chat's session line at `path` (AMP #3012): after a resume, `/usage` and the
+    /// banner name the file the chat writes now, not the one it was writing before. The banner's
+    /// short id is the only thing that changes there — everything else on it belongs to the
+    /// process — so the old id is replaced where it stands, and the footer's session name (which
+    /// shows the role) is left alone.
+    ///
+    /// `None` for a session kept in memory: the banner then says so instead of naming a file.
+    ///
+    /// Every direction is handled, including the one a `--no-session` chat resumes into (#3129):
+    /// it starts with no file, so there is no old id to swap, but its banner does say `session in
+    /// memory (--no-session)` — the text `chat.rs::session_banner` builds for a memory session —
+    /// and that line must give way to the resumed file's session line. Without this case the
+    /// banner went on claiming the conversation was in memory while `/usage` and the exit line
+    /// named the file it was writing, the one place the chrome contradicted the chat.
+    pub fn set_session_file(&mut self, path: Option<PathBuf>) {
+        let previous = self.info.session_file.take();
+        let shown = path.as_deref().map(session_path_display);
+        match (previous, &shown) {
+            // A file either way: the banner's short id is swapped where it stands.
+            (Some(previous), Some(shown)) => {
+                let from = session_banner_id(&previous);
+                if !from.is_empty() {
+                    self.view
+                        .replace_in_banner(&from, &session_banner_id(shown));
+                }
+            }
+            // Back to memory: the id gives way to the memory line.
+            (Some(previous), None) => {
+                let from = session_banner_id(&previous);
+                if !from.is_empty() {
+                    self.view.replace_in_banner(&from, "in memory");
+                }
+            }
+            // A `--no-session` chat resuming a saved conversation (#3129): no old id to replace,
+            // so the whole memory line — the literal `chat.rs::session_banner(None)` draws — is
+            // replaced by the file's session line, the same text `session_banner(Some(path))`
+            // builds. The line's tail (`(/usage for path)`) is the fixed part on both sides.
+            (None, Some(shown)) => {
+                let to = format!("session {} (/usage for path)", session_banner_id(shown));
+                self.view.replace_in_banner(MEMORY_SESSION_LINE, &to);
+            }
+            // Still in memory: nothing to point at, and nothing to correct.
+            (None, None) => {}
+        }
+        self.info.session_file = shown;
+    }
+
+    /// `/sessions` (AMP #3010, artifact #28): the saved chats this directory holds, newest activity
+    /// first, to resume one. Refused — never queued — while the chat is not at rest.
+    ///
+    /// The gate is [`Shell::switch_blocker`], the same predicate the transaction itself checks
+    /// before it asks for a switch (AMP #3012): one predicate means the picker and the switch
+    /// cannot disagree about what "at rest" is, and the person gets the specific reason (a reply in
+    /// flight, prompts queued, workers live, remote control on, a plan-approval wait) instead of a
+    /// generic "busy". Every state is checked again at resume time, so one that appeared while the
+    /// list was open still refuses rather than switching.
+    fn sessions_command(&mut self) {
+        let Some(control) = self.session_control.clone() else {
+            self.view.add_notice(
+                "/sessions: not available in this session (the chat runs without a session store)",
+            );
+            return;
+        };
+        if let Some(why) = self.switch_blocker() {
+            self.view.add_warning(&format!(
+                "/sessions is unavailable: {why} Your chat is unchanged."
+            ));
+            return;
+        }
+        // The scan runs in the background; the panel shows "scanning…" until it lands, and keeps
+        // its height so rows arriving don't make the list jump. The binary reports the canonical
+        // scope and the file this chat writes, so the shell keeps no second copy of either.
+        self.view
+            .panel()
+            .open(PanelState::sessions(None, None, None));
+        let tx = self.msgs_tx.clone();
+        self.in_flight += 1;
+        tokio::spawn(async move {
+            let _ = tx.send(ShellMsg::Sessions(control.list().await));
+        });
+    }
+
+    /// What stops a session switch from starting right now, in words for the person (AMP #3012),
+    /// or `None` when the chat is in a state a switch can leave from.
+    ///
+    /// The seven states, each refused on its own terms because what the person does next differs:
+    /// a model turn in flight (wait, or Esc to stop it), prompts queued here (they would land in
+    /// whichever session got there first), workers live (they belong to this chat, and a switch
+    /// must not abandon them), remote control on *at all* (see below), a plan-approval wake armed
+    /// (its turn would start in the resumed session), a server switch running, and a quit begun.
+    ///
+    /// **Remote control is refused while it is on, not only while its queue is non-empty.** A
+    /// paired device can send at any moment, so an empty queue is not idleness: the prompt would
+    /// arrive in the middle of the transaction, tagged for the chat it was paired with, and be
+    /// answered by the session that replaced it. The link is bound to this chat's feed and its
+    /// device pins at pairing time; re-pointing it is not part of this transaction, so the honest
+    /// answer is to ask the person to `/remote off` first. A pairing answer pending is refused
+    /// separately, because *that* is answerable without turning remote off.
+    ///
+    /// Nothing here cancels anything: a switch is refused, never made to fit, and no device is
+    /// disconnected on the person's behalf.
+    fn switch_blocker(&self) -> Option<String> {
+        if self.running {
+            return Some(
+                "the manager is replying — wait for it to finish (or press Esc to stop it), then \
+                 try again."
+                    .to_owned(),
+            );
+        }
+        let queued = self.prompt_queue.len();
+        if queued > 0 {
+            return Some(if queued == 1 {
+                "the prompt you queued would run in the session you switch to — send it now, or \
+                 press Esc to drop it, then try again."
+                    .to_owned()
+            } else {
+                format!(
+                    "the {queued} prompts you queued would run in the session you switch to — \
+                     send them, or press Esc to drop them, then try again."
+                )
+            });
+        }
+        let live = self.live_tickets();
+        if !live.is_empty() {
+            return Some(match live.as_slice() {
+                [one] => format!(
+                    "worker #{one} of this chat is still running — wait for it, then try again \
+                     (/workers shows it)."
+                ),
+                many => format!(
+                    "the workers on {} are still running — wait for them, then try again \
+                     (/workers shows them).",
+                    ticket_list(many)
+                ),
+            });
+        }
+        if self.approval_wait.is_some() {
+            return Some(
+                "this chat is waiting to carry on when the plan is approved — press Esc to stop \
+                 waiting, then try again."
+                    .to_owned(),
+            );
+        }
+        if self.pairing_pending() {
+            return Some(
+                "a paired device is waiting for you to allow or refuse the pairing — answer it \
+                 first, then try again."
+                    .to_owned(),
+            );
+        }
+        if self.remote_active() {
+            let remote_queued = self.remote_queue_len();
+            let waiting = match remote_queued {
+                0 => String::new(),
+                1 => " (one prompt is waiting in it)".to_owned(),
+                n => format!(" ({n} prompts are waiting in it)"),
+            };
+            return Some(format!(
+                "remote control is on{waiting}, so a paired device could send a prompt into the \
+                 session you switch to — /remote off, then try again."
+            ));
+        }
+        if self.switching {
+            return Some(
+                "a server switch is running — wait for it to finish, then try again.".to_owned(),
+            );
+        }
+        if self.quitting {
+            return Some("the chat is quitting.".to_owned());
+        }
+        None
+    }
+
+    /// Asks the harness to resume the session the person confirmed: the switch is async (it loads
+    /// and guards the file), so [`Shell::poll`] applies its outcome. A state a switch cannot leave
+    /// from is refused by [`Shell::switch_blocker`] before anything is asked for.
+    fn resume_session(&mut self, request: ResumeRequest) {
+        let Some(control) = self.session_control.clone() else {
+            self.view
+                .add_error("/sessions: not available in this session (no session store)");
+            return;
+        };
+        if let Some(why) = self.switch_blocker() {
+            self.view.add_warning(&format!(
+                "/sessions: {why} The resume was not sent, and your chat is unchanged."
+            ));
+            self.view.panel().close();
+            return;
+        }
+        let request = ResumeRequest {
+            path: request.path,
+            id: request.id,
+            messages: request.messages,
+            modified_at: request.modified_at,
+        };
+        // The picker stays up until the switch is known to have worked (#3010: a failure must
+        // leave the chat usable): the confirm stage says it is on its way, and `apply_resumed`
+        // either closes it with the resumed line or puts the list back with the reason.
+        self.view.panel().update(|s| {
+            if s.kind == PanelKind::Sessions {
+                s.note = Some((format!("resuming {}…", request.id), false));
+            }
+        });
+        self.view.add_notice(&format!("resuming {}…", request.id));
+        let tx = self.msgs_tx.clone();
+        self.in_flight += 1;
+        tokio::spawn(async move {
+            let result = control.resume(request.clone()).await;
+            let _ = tx.send(ShellMsg::Resumed(Box::new(request), result));
+        });
+    }
+
     /// `/mcp`, `/agents`, `/skills`, `/config`, `/model <role> …` (#2245): runs in the
     /// background; [`Shell::poll`] applies the reply.
     fn config_command(&mut self, name: &str, arg: &str) {
@@ -2100,6 +2389,129 @@ impl Shell {
             };
             let _ = tx.send(ShellMsg::Config { result, command });
         });
+    }
+
+    /// `/sessions`'s scan landed (AMP #3010): the rows replace "scanning…" in the open picker, or
+    /// the failure is what the panel says instead. Only the picker still open is filled, so a scan
+    /// that arrives after Esc changes nothing.
+    fn apply_sessions(&mut self, listed: Result<SessionList, String>) {
+        self.view.panel().update(|s| {
+            if s.kind != PanelKind::Sessions {
+                return;
+            }
+            match listed {
+                Ok(list) => {
+                    s.sessions = Some(Ok(list.rows));
+                    s.sessions_scope = Some(list.scope);
+                    s.sessions_current = list.current;
+                }
+                Err(why) => {
+                    s.sessions = Some(Err(crate::chrome::clean(&why)));
+                }
+            }
+            // The cursor starts on the first selectable row (the newest session that isn't the
+            // current one, artifact #28).
+            s.selected = 0;
+            s.stage = Stage::Browse;
+        });
+    }
+
+    /// A confirmed resume's outcome (AMP #3010): on success the chat reports where it continues;
+    /// on failure the chat is untouched and the picker comes back on the list, with the reason.
+    fn apply_resumed(&mut self, request: ResumeRequest, result: Result<Resumed, String>) {
+        match result {
+            Ok(resumed) => self.after_resumed(&request, &resumed),
+            Err(why) => {
+                let why = crate::chrome::clean(&why);
+                // Back to the list, on the row that was picked, so another can be picked.
+                self.view.panel().update(|s| {
+                    if s.kind != PanelKind::Sessions {
+                        return;
+                    }
+                    s.stage = Stage::Browse;
+                    s.note = Some((format!("not resumed: {why}"), true));
+                });
+                self.view
+                    .add_error(&format!("/sessions: {} was not resumed: {why}", request.id));
+            }
+        }
+    }
+
+    /// The transcript's one line after a resume (artifact #28): `✓ resumed <id> · <age> · N
+    /// messages · continues in the original file`, plus the model it runs on when the caller
+    /// resolved one (the live harness keeps its own, so the session a person remembers may not be
+    /// the model it would have run on).
+    ///
+    /// The switch itself already happened in the binary (the harness is on the new session before
+    /// this line is drawn: `SessionControl::resume` only returns `Ok` once `set_session` has
+    /// published it). What is left is the chat's own state, and it is reset here in one place so
+    /// no per-session number or view survives into the resumed conversation (AMP #3012, discovery
+    /// §6.3):
+    ///
+    /// - **Run numbering** (`prompts`, and with it `run_N` on the feed) starts again. The feed
+    ///   itself is kept — its sequence numbers are the process's, and every remote cursor stays
+    ///   valid — but one chat no longer shows `run_7` as the first run of a session that never had
+    ///   runs 1–6.
+    /// - **`totals`** (the footer's `$0.004 · ctx 4%` and `/usage`) are the session's, so they
+    ///   start empty: the old session's spend is not this one's. The footer's usage line goes to
+    ///   zero with them and the context badge back to `?` until the resumed session reports one.
+    /// - **`history`** (↑ recalls) is cleared with it. Those are the prompts sent to the session
+    ///   this chat just left, and recalling one would re-send it into a conversation that never saw
+    ///   it — the same mistake the prompt-queue refusal exists to prevent, one keystroke later.
+    /// - **The transcript** is replaced by the resumed session's own (`resumed.transcript`,
+    ///   display only — built by the caller from the file it loaded), then the resumed line. The
+    ///   banner, the AMP header and the ticket marker are this process's and stay.
+    /// - **The prompt queue, wake state, approval wait and tool-call bookkeeping** must already be
+    ///   empty (the switch was refused otherwise) and are cleared again here so nothing carries
+    ///   over: a queued prompt would otherwise run in the resumed session, which is exactly what
+    ///   the refusal exists to prevent. rpi's own queues were cancelled and rebuilt by
+    ///   `resume_session`, so a prompt the file still had queued does not run either.
+    ///
+    /// The model, tools, policy and system prompt are **not** touched: the live harness keeps the
+    /// configuration it was built with, and `Resumed::model` says which model the resumed
+    /// conversation will actually run on (the `· runs on` tail) rather than claiming the file's.
+    fn after_resumed(&mut self, request: &ResumeRequest, resumed: &Resumed) {
+        // The old conversation's display goes first, so the resume line is the first thing in the
+        // resumed one.
+        self.view.show_restored(&resumed.transcript);
+        let age = crate::roster::ago(request.modified_at, SystemTime::now());
+        let messages = count(
+            resumed.messages.max(request.messages),
+            "message",
+            "messages",
+        );
+        let mut line = format!(
+            "✓ resumed {} · {age} · {messages} · continues in the original file",
+            request.id
+        );
+        if let Some(model) = &resumed.model {
+            line.push_str(&format!(" · runs on {model}"));
+        }
+        self.view.add_notice(&line);
+        self.view.panel().close();
+
+        // The session line follows: `/usage` and the banner's short id name the file this chat
+        // writes now, not the one it left.
+        self.set_session_file(Some(resumed.path.clone()));
+
+        // Per-session state, reset after the transcript so the reset's own writes are the only
+        // ones that land in the resumed view.
+        self.prompts = 0;
+        self.run_id = None;
+        self.totals = Totals::default();
+        self.view.footer().reset_session_usage();
+        self.history = PromptHistory::new();
+        self.prompt_queue.clear();
+        self.call_tickets.clear();
+        self.turn_live.clear();
+        self.turn_plan = false;
+        self.turn_refusals.clear();
+        self.waking = false;
+        self.wake_guard.reset();
+        self.end_seen_at = None;
+        self.streaming = None;
+        self.stop_approval_wait(None);
+        self.fed_workers = None;
     }
 
     /// A configuration command's reply: the panel, the transcript, the note, then the reload.
@@ -2485,6 +2897,17 @@ impl Shell {
                 true
             }
         }
+    }
+
+    /// Whether remote control is on right now (AMP #3012): the link exists, is usable here, and its
+    /// state is anything but `Off`. This is deliberately broader than "a device is paired": while
+    /// the link is up, a device may already be paired and able to send, so the chat is not at rest
+    /// even with an empty queue. `Starting` counts too — it becomes `On` without a keystroke here.
+    fn remote_active(&self) -> bool {
+        let Some(Ok(link)) = self.remote.as_ref().map(|r| r.link.as_ref()) else {
+            return false;
+        };
+        link.is_on()
     }
 
     /// Prompts from a paired device waiting in the remote link's queue (AMP #2891).
@@ -3143,7 +3566,7 @@ impl Shell {
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         let confirming = matches!(
             self.view.panel().state().map(|s| s.stage),
-            Some(Stage::Confirm { .. } | Stage::Sending { .. })
+            Some(Stage::Confirm { .. } | Stage::Sending { .. } | Stage::Resume { .. })
         );
         // ↑↓ recall earlier prompts (#2348): before the `/` menu while a recalled prompt is
         // shown (a recalled `/usage` opens the menu), after it otherwise.
@@ -3407,6 +3830,7 @@ impl Shell {
             "server" => self.server_command(arg),
             "reload" => self.reload_command(ReloadCause::Command),
             "remote" => self.remote_command(arg),
+            "sessions" => self.sessions_command(),
             "close" => self.view.panel().close(),
             "" => self.view.add_notice("empty command (try /help)"),
             other => self
@@ -3680,6 +4104,24 @@ impl Shell {
                 _ => {}
             }
         }
+        // `/sessions` also takes Ctrl+P / Ctrl+N for ↑↓ (artifact #28's keyboard table), the
+        // history keys' chords, so the list moves without leaving the home row.
+        if state.kind == PanelKind::Sessions
+            && state.stage == Stage::Browse
+            && key.modifiers == KeyModifiers::CONTROL
+        {
+            match key.code {
+                KeyCode::Char('p') => {
+                    panel.move_selection(-1);
+                    return true;
+                }
+                KeyCode::Char('n') => {
+                    panel.move_selection(1);
+                    return true;
+                }
+                _ => {}
+            }
+        }
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -3713,8 +4155,51 @@ impl Shell {
                 true
             }
             Stage::Sending { .. } => true,
+            // `/sessions`' confirm (artifact #28): Enter asks for the file; Esc (or `q`, as in the
+            // list) goes back with nothing resumed and the cursor where it was.
+            Stage::Resume { path } => {
+                match key.code {
+                    KeyCode::Enter => {
+                        let request = panel.state().and_then(|s| {
+                            let row = s.session_row(&path)?;
+                            Some(ResumeRequest {
+                                path: row.path.clone(),
+                                id: row.id.clone(),
+                                messages: 0,
+                                modified_at: row.modified_at,
+                            })
+                        });
+                        match request {
+                            Some(request) => self.resume_session(request),
+                            None => {
+                                panel.update(|s| {
+                                    s.stage = Stage::Browse;
+                                    s.note = Some((
+                                        "that session is no longer in the list".to_owned(),
+                                        true,
+                                    ));
+                                });
+                            }
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        panel.update(|s| {
+                            s.stage = Stage::Browse;
+                            s.note = None;
+                        });
+                    }
+                    _ => {}
+                }
+                true
+            }
             Stage::Browse => {
                 if key.code == KeyCode::Esc {
+                    panel.close();
+                    return true;
+                }
+                // Artifact #28's keyboard table: `q` closes the picker too, in the same state the
+                // arrows act in (empty editor, keys on the panel), so nothing changes.
+                if key.code == KeyCode::Char('q') && state.kind == PanelKind::Sessions {
                     panel.close();
                     return true;
                 }
@@ -3748,6 +4233,16 @@ impl Shell {
                         Some(Target::Model(reference)) => {
                             panel.close();
                             self.pending_model = Some(reference);
+                        }
+                        // `/sessions` (AMP #3010, artifact #28): Enter asks once, in place of the
+                        // list — nothing is loaded, guarded or switched until the confirm's Enter.
+                        Some(Target::Session(path)) => {
+                            if state.kind == PanelKind::Sessions {
+                                panel.update(|s| {
+                                    s.stage = Stage::Resume { path };
+                                    s.note = None;
+                                });
+                            }
                         }
                         Some(Target::Item(_)) => {
                             if let Some(command) = overlay::info_enter(&state) {
@@ -3975,6 +4470,8 @@ impl Shell {
                 }
                 ShellMsg::Config { result, command } => self.apply_config(result, &command),
                 ShellMsg::RemoteDone(reply) => self.remote_done(reply),
+                ShellMsg::Sessions(listed) => self.apply_sessions(listed),
+                ShellMsg::Resumed(request, result) => self.apply_resumed(*request, result),
                 ShellMsg::Notice { .. }
                 | ShellMsg::ReloadRequest
                 | ShellMsg::Remote(_)
@@ -5200,6 +5697,47 @@ fn remote_status_more(
 pub fn short_role(role: &str) -> &str {
     let role = role.rsplit(':').next().unwrap_or(role);
     role.strip_prefix("amp-").unwrap_or(role)
+}
+
+/// The banner's session line for a chat that keeps its conversation in memory (`--no-session`):
+/// the literal `chat.rs::session_banner(None)` draws. A resume out of memory replaces this whole
+/// line with the resumed file's session line ([`Shell::set_session_file`], AMP #3129).
+pub const MEMORY_SESSION_LINE: &str = "session in memory (--no-session)";
+
+/// A session file as `/usage` names it, with `$HOME` written `~` (`chat.rs::tilde` for the exit
+/// line and the banner). The shell keeps the path only to show it, so it is stored in this form.
+pub fn session_path_display(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home
+        .filter(|h| !h.as_os_str().is_empty())
+        .and_then(|h| path.strip_prefix(h).ok())
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// The short id the banner shows for a session (`01a1…c795`), from the display form `/usage`
+/// carries: the uuid's first and last four characters, or the whole stem when it is short enough.
+pub fn session_banner_id(display: &str) -> String {
+    let name = display.rsplit('/').next().unwrap_or(display);
+    let stem = name.strip_suffix(".jsonl").unwrap_or(name);
+    let id = match stem.split_once('-') {
+        Some((millis, rest))
+            if !millis.is_empty() && millis.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            rest
+        }
+        _ => stem,
+    };
+    let chars: Vec<char> = id.chars().collect();
+    if chars.len() <= 9 {
+        return id.to_owned();
+    }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}…{tail}")
 }
 
 /// `1 prompt`, `3 prompts`.

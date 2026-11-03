@@ -61,8 +61,10 @@ use rpi_harness::{
     context_files::{ContextFile, format_project_context, load_project_context_files},
     session::{
         DefaultIdGenerator, InMemorySessionStorage, Session, SystemClock,
-        jsonl::{JsonlV4Header, storage::JsonlSessionStorage},
-        types::SessionMetadata,
+        types::{
+            EntryOrder, LaneRecord, QueueCancelledRecord, QueueEnqueuedRecord, RecordBase,
+            RecordQuery, SessionMetadata,
+        },
     },
     skills::format_skill_invocation,
     system_prompt::compose_system_prompt,
@@ -84,6 +86,7 @@ use crate::{
     project::{ENV_CEILING_DIR, ProjectMarker},
     providers::{KeyLookup, ProviderSet},
     roles::{Role, RoleError, RoleRegistry},
+    session_store::{self, OpenError},
 };
 
 /// The rpi-tools every session starts from, before the role's policy filters them.
@@ -108,6 +111,11 @@ pub enum AgentError {
     Io(String),
     #[error("session: {0}")]
     Harness(String),
+    /// The session file could not be created or claimed (AMP #3006): its directory could not be
+    /// made, or its ownership lock could not be taken (another writer owns it, or the sidecar could
+    /// not be opened — the lock fails closed). Nothing was written.
+    #[error("session: {0}")]
+    Session(#[from] OpenError),
 }
 
 /// `$XDG_STATE_HOME/amp-harness`, else `~/.local/state/amp-harness`. Sessions and the
@@ -984,7 +992,9 @@ impl Runtime {
         let (session, session_file) = match &spec.session {
             SessionKind::Memory => (memory_session(), None),
             SessionKind::Jsonl { dir } => {
-                let (s, path) = jsonl_session(dir, &cwd).await?;
+                // #3006: the file is claimed before its header is written, and the guard lives in
+                // the session's storage for as long as this session may write it.
+                let (s, path) = jsonl_session(dir, &cwd, &role.id).await?;
                 (s, Some(path))
             }
         };
@@ -1684,33 +1694,171 @@ pub fn memory_session() -> Session {
     )
 }
 
-/// A new JSONL session file in `dir` (created), named `<unix ms>-<session id>.jsonl`.
-pub async fn jsonl_session(dir: &Path, cwd: &Path) -> Result<(Session, PathBuf), AgentError> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| AgentError::Io(format!("create {}: {e}", dir.display())))?;
-    let ids = Arc::new(DefaultIdGenerator::new());
-    let id = rpi_harness::session::types::IdGenerator::next(ids.as_ref());
-    let created = now_ms();
-    let path = dir.join(format!("{created}-{id}.jsonl"));
-    let header = JsonlV4Header::new(
-        id,
-        created,
-        cwd.to_string_lossy().into_owned(),
-        None,
-        None,
-        None,
-    );
-    let fs = Arc::new(OsExecutionEnv::with_cwd(dir.to_path_buf()));
-    let storage = JsonlSessionStorage::create(
-        fs,
-        &path.to_string_lossy(),
-        header,
-        Arc::new(SystemClock),
-        ids.clone(),
-    )
-    .await
-    .map_err(|e| AgentError::Harness(format!("{}: {e}", path.display())))?;
-    Ok((Session::new(Arc::new(storage), Some(ids)), path))
+/// A new JSONL session file in `dir` (created), named `<unix ms>-<session id>.jsonl`, **owned by
+/// this process until the session is dropped** (AMP #3006).
+///
+/// The file is claimed before its header is written and the guard travels inside the session's
+/// storage ([`crate::session_store::LockedStorage`]), so every append this session ever makes is
+/// made under it, and no other process can be writing the same file. `agent_id` names the holder in
+/// the lock's sidecar (`amp-manager`, `amp-worker-backend`, …) so a refusal elsewhere can say who
+/// has it.
+pub async fn jsonl_session(
+    dir: &Path,
+    cwd: &Path,
+    agent_id: &str,
+) -> Result<(Session, PathBuf), AgentError> {
+    let opened = session_store::create(dir, cwd, agent_id).await?;
+    Ok((opened.session, opened.path))
+}
+
+/// Why a session could not be resumed onto a live harness. Every variant leaves the harness on the
+/// session it was on, writing where it was writing.
+#[derive(Debug, thiserror::Error)]
+pub enum ResumeError {
+    /// The saved session could not be opened for writing: it is owned by another live writer (or by
+    /// this process already), is not one of this harness's sessions, was written elsewhere or in a
+    /// format this harness does not read, or its transcript is damaged.
+    #[error("{0}")]
+    Open(#[from] OpenError),
+    /// The session could not be swapped in. `AgentHarness::set_session` refuses while a run is in
+    /// flight (the turn must be stopped first), and refuses a session without the harness's lane.
+    /// Leave this variant temporary: the harness still reads and writes the session it had.
+    #[error("session {}: {why}; the session already open is unchanged", path.display())]
+    Switch {
+        /// The session that was being resumed.
+        path: PathBuf,
+        /// What the harness said.
+        why: String,
+    },
+}
+
+impl ResumeError {
+    /// Whether this process already owns the session it was refused ([`OpenError::held_by_this_process`]).
+    pub fn held_by_this_process(&self) -> bool {
+        match self {
+            Self::Open(open) => open.held_by_this_process(),
+            Self::Switch { .. } => false,
+        }
+    }
+}
+
+/// Continue the saved session at `path` on a live `harness`: the load-and-switch half of a
+/// `/sessions` resume (AMP #3006; the picker and its caller-side reset list are #3010/#3012).
+///
+/// In order, and every step guards the next one:
+///
+/// 1. [`session_store::load`] validates the file, claims it, and only then replays it (a repair runs
+///    under the guard — storage §10.3). It must be claimed **before** `load`: a live writer's file is
+///    never opened for repair, and a resumed session keeps the guard across every append after it.
+/// 2. [`discard_persisted_queues`] cancels every prompt the file still had queued, on the loaded
+///    session and before it is swapped in, so `set_session`'s `rebuild_queues` rebuilds nothing.
+///    Without it a session saved mid-reply hands the next turn the prompts the person queued in a
+///    chat that is over (AMP #3012).
+/// 3. [`AgentHarness::set_session`] swaps the storage in. rpi rejects the swap with `LaneBusy` while
+///    a run is active and builds the new queues before publishing it, so a rejection leaves the old
+///    session and its queues untouched.
+///
+/// Nothing is rebuilt: the harness re-reads its session on every run, so the next turn continues in
+/// the loaded file with the model, tools and prompt it already has (the caller's reset list — model
+/// snapshot, run numbering, transcript — is #3012). No Runtime, no `AgentHarness::create`, and no
+/// work is replayed: recorded tool calls are never re-run (`ToolReplay::Never`), and
+/// `set_session` clears `pending_resume`, so an interrupted request is not re-issued.
+///
+/// On any failure the harness keeps the session it had, guard and all — and the file that was being
+/// resumed is left byte-identical (refusals happen before `load`) and unclaimed.
+pub async fn resume_session(
+    harness: &AgentHarness,
+    path: &Path,
+    cwd: &Path,
+    agent_id: &str,
+) -> Result<PathBuf, ResumeError> {
+    let opened = session_store::load(path, cwd, agent_id).await?;
+    // 2. Drop what the file still had queued. Failure here is a switch refused, not a switch with
+    //    prompts in it: the loaded session is dropped with its guard below, exactly as a rejected
+    //    `set_session` would leave it.
+    discard_persisted_queues(&opened.session)
+        .await
+        .map_err(|why| ResumeError::Switch {
+            path: opened.path.clone(),
+            why,
+        })?;
+    // Dropping `opened.session` on a rejection drops the guard it took: a resumed-but-not-switched
+    // file must not stay owned by a harness that is not writing it.
+    harness
+        .set_session(opened.session)
+        .await
+        .map_err(|e| ResumeError::Switch {
+            path: opened.path.clone(),
+            why: e.to_string(),
+        })?;
+    Ok(opened.path)
+}
+
+/// Cancels every prompt `session` still has queued, on every lane, by recording the `queue_cancelled`
+/// each `queue_enqueued` is missing (AMP #3012).
+///
+/// Why this is not `clear_queue`: `AgentHarness::set_session` rebuilds the in-memory queues from the
+/// durable records — every `queue_enqueued` with no matching `queue_cancelled` whose target entry was
+/// never committed, in *every* queue kind, `next_run` included ([`rebuild_queues`]).
+/// `AgentLane::clear_queue` only drains steering and follow-up on one lane, and touches `next_run`
+/// never; a resumed session would still fold those into the next turn. Recording the cancellation is
+/// what rpi itself does when it drops a queued item (`clear_queue`/`cancel_queued`), so the discard
+/// survives a later reopen of the same file too.
+///
+/// A prompt whose target entry already committed was consumed by a run and is history, not a queue:
+/// it is left alone, exactly as `rebuild_queues` skips it.
+async fn discard_persisted_queues(session: &Session) -> Result<(), String> {
+    let records = session
+        .find_records(&RecordQuery {
+            order: Some(EntryOrder::OldestFirst),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| format!("reading the session's queued prompts: {e}"))?;
+    let mut cancelled: BTreeSet<String> = BTreeSet::new();
+    let mut pending: Vec<QueueEnqueuedRecord> = Vec::new();
+    for record in &records {
+        match record {
+            LaneRecord::QueueCancelled(c) => {
+                cancelled.insert(c.entry_id.clone());
+            }
+            LaneRecord::QueueEnqueued(e) => pending.push(e.clone()),
+            _ => {}
+        }
+    }
+    for enqueued in pending {
+        let lane = enqueued.base.lane.clone();
+        let Some(entry_id) = enqueued.target.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if cancelled.contains(entry_id) {
+            continue;
+        }
+        // Committed already: the run it belonged to consumed it, so it is history.
+        let committed = session
+            .view(&lane)
+            .get_entry(entry_id)
+            .await
+            .map_err(|e| format!("reading the session's queued prompts: {e}"))?
+            .is_some();
+        if committed {
+            continue;
+        }
+        session
+            .append_record(LaneRecord::QueueCancelled(QueueCancelledRecord {
+                base: RecordBase {
+                    id: session.id_generator().next(),
+                    seq: 0,
+                    lane,
+                    timestamp: 0,
+                },
+                run_id: enqueued.run_id,
+                entry_id: entry_id.to_owned(),
+            }))
+            .await
+            .map_err(|e| format!("dropping the session's queued prompts: {e}"))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

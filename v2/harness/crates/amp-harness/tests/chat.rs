@@ -123,13 +123,21 @@ async fn the_chat_talks_to_the_manager() {
     assert!(lines[59].contains("faux-1 • "), "{}", lines[59]);
     assert!(lines[58].trim_start().starts_with('└'), "{screen}");
 
-    // The session was written to the JSONL state dir, like run -p.
+    // The session was written to the JSONL state dir, like run -p. #3006: it is also *owned* — the
+    // session's own file plus the lock sidecar `<session>.jsonl.lock` beside it, and nothing else.
     let sessions = dir.join("home/.local/state/amp-harness/sessions/amp-manager");
-    assert!(
-        std::fs::read_dir(&sessions).unwrap().count() == 1,
-        "{}",
-        sessions.display()
-    );
+    let mut names: Vec<String> = std::fs::read_dir(&sessions)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 2, "{}: {names:?}", sessions.display());
+    let session = names
+        .iter()
+        .find(|n| n.ends_with(".jsonl"))
+        .unwrap_or_else(|| panic!("a session file: {names:?}"));
+    assert!(names.contains(&format!("{session}.lock")), "{names:?}");
 }
 
 #[tokio::test]

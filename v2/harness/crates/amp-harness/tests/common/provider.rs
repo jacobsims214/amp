@@ -33,6 +33,10 @@ pub struct ProviderState {
     pub seen: Arc<Mutex<Vec<Seen>>>,
     /// The `model` of every chat completion request (#2275: which model a role used).
     pub requested_models: Arc<Mutex<Vec<String>>>,
+    /// The whole body of every chat completion request (#3014: the messages a resumed turn was
+    /// sent — did the restored conversation reach the model, and did nothing historical ride
+    /// along with it).
+    pub bodies: Arc<Mutex<Vec<Value>>>,
     /// #2277: the key is expected in this header instead of `Authorization: Bearer`.
     pub key_header: Option<String>,
     /// #2277: every request's target (path and query) and headers (lowercase names).
@@ -65,6 +69,11 @@ impl MockProvider {
     /// Every request's target and headers (#2277).
     pub fn requests(&self) -> Vec<Request> {
         self.state.requests.lock().unwrap().clone()
+    }
+
+    /// The body of every chat completion it served (#3014).
+    pub fn bodies(&self) -> Vec<Value> {
+        self.state.bodies.lock().unwrap().clone()
     }
 }
 
@@ -134,11 +143,16 @@ async fn completions(
     if !authorized(&s, "/v1/chat/completions", &headers) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "bad key"}))).into_response();
     }
-    if let Some(model) = serde_json::from_slice::<Value>(&body)
-        .ok()
+    let parsed = serde_json::from_slice::<Value>(&body).ok();
+    if let Some(model) = parsed
+        .as_ref()
         .and_then(|v| v["model"].as_str().map(str::to_owned))
     {
         s.requested_models.lock().unwrap().push(model);
+    }
+    if let Some(parsed) = parsed {
+        // #3014: what the model was asked — the whole body, so a test can read `messages`.
+        s.bodies.lock().unwrap().push(parsed);
     }
     let chunk = |delta: Value, finish: Value| {
         json!({

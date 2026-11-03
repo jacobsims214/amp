@@ -352,13 +352,13 @@ pub fn session_state(i: &WorkerSessionInfo, now: SystemTime) -> String {
 /// The session's first event time `at` and its [`Instant`], given that `wall` is `now`
 /// (#2355). An `at` the monotonic clock can't go back to (from before this machine started)
 /// maps to `now`: only differences between event times matter then.
-fn anchor(at: SystemTime, now: Instant, wall: SystemTime) -> (SystemTime, Instant) {
+pub(crate) fn anchor(at: SystemTime, now: Instant, wall: SystemTime) -> (SystemTime, Instant) {
     let ago = wall.duration_since(at).unwrap_or(Duration::ZERO);
     (at, now.checked_sub(ago).unwrap_or(now))
 }
 
 /// The [`Instant`] of a wall-clock time `at`, by its distance from `anchor`.
-fn instant(at: SystemTime, (wall, instant): (SystemTime, Instant)) -> Instant {
+pub(crate) fn instant(at: SystemTime, (wall, instant): (SystemTime, Instant)) -> Instant {
     match at.duration_since(wall) {
         Ok(after) => instant + after,
         Err(e) => instant.checked_sub(e.duration()).unwrap_or(instant),
