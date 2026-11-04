@@ -1,11 +1,49 @@
-import ReactMarkdown, { type Components } from 'react-markdown'
+import type { ReactNode } from 'react'
+import ReactMarkdown, { type Components, type Options } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { ExternalLink } from 'lucide-react'
+import { Link, useInRouterContext, useParams } from 'react-router-dom'
+import { classifyHref } from '../../lib/links'
+import remarkTicketRefs from './remarkTicketRefs'
+
+const LINK = 'text-ink underline underline-offset-2 hover:text-accent'
+
+/**
+ * A markdown link: AMP routes open in-app (react-router, so the SPA keeps its
+ * state; /sessions/, /api/ and /home get a full page load), other http(s)/mailto links open in a new tab without opener or
+ * referrer, and anything else (javascript:, data:, bare relative paths) is
+ * shown as its text only.
+ */
+function MarkdownLink({ href, ticketRef, children }: { href?: string; ticketRef?: string; children: ReactNode }) {
+  const inRouter = useInRouterContext()
+  const target = classifyHref(href)
+  const data = ticketRef ? { 'data-ticket-ref': ticketRef } : {}
+  if (target.kind === 'blocked') return <span className="text-ink">{children}</span>
+  if (target.kind === 'internal') {
+    // fullLoad paths (/sessions/, /api/, /home) need a real page load.
+    return inRouter && !target.fullLoad
+      ? <Link to={target.to} className={LINK} {...data}>{children}</Link>
+      : <a href={target.to} className={LINK} {...data}>{children}</a>
+  }
+  return (
+    <a href={target.href} target="_blank" rel="noopener noreferrer" title={target.href} className={LINK}>
+      {children}<ExternalLink size={11} aria-hidden="true" className="inline-block align-baseline ml-0.5 text-ink-3" />
+    </a>
+  )
+}
 
 /**
  * Markdown in the house style: KB documents ('doc') and ticket text
  * ('compact', which agents write as markdown sections).
+ *
+ * Ticket refs like "#34" link to the ticket on the Board when a project is
+ * known (the `projectId` prop, or the current /project/:projectId route).
+ * Compact (ticket) text never loads images: agents write it, and a remote
+ * image is an exfiltration channel (as in SafeMarkdown).
  */
-export function Markdown({ children, size = 'doc' }: { children: string; size?: 'doc' | 'compact' }) {
+export function Markdown({ children, size = 'doc', projectId }: { children: string; size?: 'doc' | 'compact'; projectId?: number | string }) {
+  const routeProjectId = useParams().projectId
+  const project = projectId ?? routeProjectId
   const doc = size === 'doc'
   const body = doc ? 'text-sm leading-7' : 'text-[13px] leading-6'
   const gap = doc ? 'mb-4' : 'mb-2.5'
@@ -26,11 +64,24 @@ export function Markdown({ children, size = 'doc' }: { children: string; size?: 
     li: ({ children }) => <li>{children}</li>,
     blockquote: ({ children }) => <blockquote className={`pl-4 my-3 ${body} text-ink-2 border-l-[3px] border-ink`}>{children}</blockquote>,
     strong: ({ children }) => <strong className="text-ink font-semibold">{children}</strong>,
-    a: ({ children, href }) => <a href={href} className="text-ink underline underline-offset-2 hover:text-accent">{children}</a>,
+    a: ({ children, href, ...rest }) => {
+      const ref = (rest as Record<string, unknown>)['data-ticket-ref']
+      return <MarkdownLink href={href} ticketRef={typeof ref === 'string' ? ref : undefined}>{children}</MarkdownLink>
+    },
+    ...(doc ? {} : {
+      img: ({ src, alt }) => (
+        <span className="px-1 border border-dashed border-line-str text-[12px] text-ink-2 break-all" data-blocked-image="">
+          [image not loaded{alt ? `: ${alt}` : ''}]{typeof src === 'string' && src ? <span className="font-mono"> {src}</span> : null}
+        </span>
+      ),
+    } satisfies Components),
     hr: () => <hr className="border-line my-6" />,
     table: ({ children }) => <div className={`overflow-x-auto ${gap}`}><table className="w-full text-sm border-collapse">{children}</table></div>,
     th: ({ children }) => <th className="amp-label text-left px-3 py-2 bg-surface-2 border-b border-line">{children}</th>,
     td: ({ children }) => <td className="px-3 py-2 text-ink-2 text-sm border-b border-line">{children}</td>,
   }
-  return <div className="min-w-0 break-words"><ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>{children}</ReactMarkdown></div>
+  const plugins: Options['remarkPlugins'] = project != null && project !== ''
+    ? [remarkGfm, [remarkTicketRefs, { projectId: project }]]
+    : [remarkGfm]
+  return <div className="min-w-0 break-words"><ReactMarkdown remarkPlugins={plugins} components={components}>{children}</ReactMarkdown></div>
 }

@@ -59,11 +59,11 @@ export function SectionLabel({ children, right }: { children: React.ReactNode; r
 }
 
 /** A white panel; `top` adds the black rule along its top edge. */
-export function Panel({ title, label, right, top, className = '', children }: {
-  title?: React.ReactNode; label?: React.ReactNode; right?: React.ReactNode; top?: boolean; className?: string; children: React.ReactNode
+export function Panel({ id, title, label, right, top, className = '', children }: {
+  id?: string; title?: React.ReactNode; label?: React.ReactNode; right?: React.ReactNode; top?: boolean; className?: string; children: React.ReactNode
 }) {
   return (
-    <section className={`amp-panel ${top ? 'amp-panel-top' : ''} ${className}`}>
+    <section id={id} className={`amp-panel ${top ? 'amp-panel-top' : ''} ${className}`}>
       {(title || label || right) && (
         <div className="flex items-center gap-2.5 px-4 py-3 border-b border-line">
           {label && <span className="amp-label">{label}</span>}

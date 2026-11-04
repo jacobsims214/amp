@@ -3,10 +3,15 @@
  * URL; get the tickets whose agent runs produced it, and for each the story
  * of how it got there: the ticket as planned, the worker's comments, every
  * run (model, tokens, branch, commit), and the state changes.
+ *
+ * In the URL (v2/docs/url-state.md): `?q=<sha|branch|PR URL>` runs on load,
+ * and `&open=<task id>[,<task id>]` expands those stories, so a pasted Trace
+ * link shows what the sender saw.
  */
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { Loader2, Search } from 'lucide-react'
+import { Check, Link2, Loader2, Search } from 'lucide-react'
+import { idListParam, useSearchParamState, usePatchSearchParams } from '../hooks/useSearchParamState'
 import { api } from '../api/client'
 import { PageHeader, Panel } from '../components/ui/PageHeader'
 import { StateTag } from '../components/ui/StateTag'
@@ -24,29 +29,55 @@ function asQuery(v: string): { commit?: string; branch?: string; pr?: string } {
   return { branch: s }
 }
 
-function Story({ hit }: { hit: TraceHit }) {
-  const [open, setOpen] = useState(false)
+/** The absolute link that reopens this trace with one story expanded. */
+function traceLink(q: string, openId?: number): string {
+  const p = new URLSearchParams({ q })
+  if (openId != null) p.set('open', String(openId))
+  return `${window.location.origin}/trace?${p}`
+}
+
+function CopyLink({ url }: { url: string }) {
+  const [copied, setCopied] = useState(false)
+  const copy = () => {
+    navigator.clipboard?.writeText(url).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    }).catch(() => { /* no clipboard (insecure context): nothing to show */ })
+  }
+  return (
+    <button type="button" className="amp-btn amp-btn-sm amp-btn-ghost" onClick={copy} title={url}>
+      {copied ? <Check size={11} /> : <Link2 size={11} />}{copied ? 'Copied' : 'Copy link'}
+    </button>
+  )
+}
+
+function Story({ hit, q, open, onToggle }: { hit: TraceHit; q: string; open: boolean; onToggle: () => void }) {
   const [history, setHistory] = useState<ActivityLog[] | null>(null)
   const [comments, setComments] = useState<Comment[]>([])
-  const toggle = () => {
-    setOpen(o => !o)
-    if (!history) {
-      Promise.all([api.getHistory(hit.task.id), api.getComments(hit.task.id)])
-        .then(([h, c]) => { setHistory(h); setComments(c) }).catch(() => setHistory([]))
-    }
-  }
+  // Load the story the first time it's open (on a click, or from ?open= on arrival).
+  const id = hit.task.id
+  const needed = open && history == null
+  useEffect(() => {
+    if (!needed) return
+    let live = true
+    Promise.all([api.getHistory(id), api.getComments(id)])
+      .then(([h, c]) => { if (live) { setHistory(h); setComments(c) } })
+      .catch(() => { if (live) setHistory([]) })
+    return () => { live = false }
+  }, [needed, id])
   const events = [
     ...(history ?? []).map(h => ({ at: h.created_at, who: h.actor, what: h.action.replace('_', ' '), body: h.detail })),
     ...comments.map(c => ({ at: c.created_at, who: c.author, what: 'comment', body: c.body })),
   ].sort((a, b) => a.at.localeCompare(b.at))
   return (
-    <Panel label={hit.ref} title={hit.task.name} right={<span>{hit.project}</span>} top>
+    <Panel id={`trace-${hit.task.id}`} label={hit.ref} title={hit.task.name} right={<span>{hit.project}</span>} top>
       <div className="px-4 py-3 grid gap-3">
         <div className="flex items-center gap-3 flex-wrap text-[12.5px]">
           <StateTag state={displayState(hit.task)} />
           <span className="amp-num text-ink-2">{hit.runs.length} matching run{hit.runs.length === 1 ? '' : 's'}</span>
-          <Link to={projectLink(hit.task.project_id, 'mission', hit.task.id)} className="amp-btn amp-btn-sm">Open ticket</Link>
-          <button type="button" className="amp-btn amp-btn-sm amp-btn-ghost" onClick={toggle} aria-expanded={open}>{open ? 'Hide' : 'Show'} how it got here</button>
+          <Link to={projectLink(hit.task.project_id, 'board', hit.task.id)} className="amp-btn amp-btn-sm">Open ticket</Link>
+          <button type="button" className="amp-btn amp-btn-sm amp-btn-ghost" onClick={onToggle} aria-expanded={open}>{open ? 'Hide' : 'Show'} how it got here</button>
+          <CopyLink url={traceLink(q, hit.task.id)} />
         </div>
         {open && (
           <div className="grid gap-4">
@@ -74,17 +105,40 @@ function Story({ hit }: { hit: TraceHit }) {
 }
 
 export function Trace() {
-  const [params, setParams] = useSearchParams()
-  const [value, setValue] = useState(params.get('q') ?? '')
-  const [hits, setHits] = useState<TraceHit[] | null>(null)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const run = (q: string) => {
-    if (!q.trim()) return
-    setParams({ q: q.trim() }, { replace: true })
-    setBusy(true); setError(null)
-    api.trace(asQuery(q)).then(setHits).catch(e => setError(e instanceof Error ? e.message : 'Trace failed')).finally(() => setBusy(false))
+  const [params] = useSearchParams()
+  const patch = usePatchSearchParams()
+  const q = params.get('q')?.trim() ?? ''
+  const [openIds, setOpenIds] = useSearchParamState('open', idListParam)
+  const [value, setValue] = useState(q)
+  // Follow the URL when it changes underneath (Back, a pasted link).
+  const [shownQ, setShownQ] = useState(q)
+  if (shownQ !== q) { setShownQ(q); setValue(q) }
+
+  // The result for one query, so a stale answer never shows for a newer one.
+  const [result, setResult] = useState<{ q: string; hits?: TraceHit[]; error?: string } | null>(null)
+  const [retry, setRetry] = useState(0)
+  useEffect(() => {
+    if (!q) return
+    let live = true
+    api.trace(asQuery(q))
+      .then(hits => { if (live) setResult({ q, hits }) })
+      .catch(e => { if (live) setResult({ q, error: e instanceof Error ? e.message : 'Trace failed' }) })
+    return () => { live = false }
+  }, [q, retry])
+  const current = result?.q === q ? result : null
+  const busy = !!q && !current
+  const hits = current?.hits ?? null
+  const error = current?.error ?? null
+
+  // A new query is a new page: push it, and drop the old one's open stories.
+  const run = (v: string) => {
+    const next = v.trim()
+    if (!next) return
+    if (next === q) { setRetry(n => n + 1); return }
+    patch({ q: next, open: null }, { push: true })
   }
+  const toggle = (id: number) =>
+    setOpenIds(openIds.includes(id) ? openIds.filter(x => x !== id) : [...openIds, id], { push: true })
   return (
     <div className="flex flex-col min-h-full">
       <PageHeader crumb="Overview" title="Trace" meta="From a commit, branch, or pull request back to the tickets, decisions, and agent runs that produced it." />
@@ -96,7 +150,7 @@ export function Trace() {
         </form>
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
         {hits && hits.length === 0 && <div className="amp-panel px-4 py-4 text-[13px] text-ink-2">No ticket recorded that. Agents record their branch, commit and PR when they complete a ticket; work from before that, or from outside AMP, won't trace.</div>}
-        {hits?.map(h => <Story key={h.task.id} hit={h} />)}
+        {hits?.map(h => <Story key={h.task.id} hit={h} q={q} open={openIds.includes(h.task.id)} onToggle={() => toggle(h.task.id)} />)}
       </div>
     </div>
   )

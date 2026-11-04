@@ -17,6 +17,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { useFocusParam } from '../hooks/useFocusParam'
+import { FocusNotFound } from '../components/FocusNotFound'
+import { useFocusFallback } from '../hooks/useFocusFallback'
 import { GitBranch, Loader2, RefreshCw } from 'lucide-react'
 import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
@@ -142,6 +144,7 @@ export function FlightPlan() {
   }, [focus, shape])
   const focused = focus != null ? shape.byId.get(focus) ?? null : null
   const opened = openId != null ? tasks.find(t => t.id === openId) ?? null : null
+  const focusMissing = useFocusFallback(pid, 'plan', openId, tasks, loading)
 
   const rows = useMemo(() => epics.slice().sort((a, b) => a.id - b.id).map(e => ({
     epic: e,
@@ -196,6 +199,7 @@ export function FlightPlan() {
       </>} />
       <div className="p-7 pt-5 grid gap-4">
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
+        {focusMissing != null && <FocusNotFound id={focusMissing} onDismiss={() => setOpenId(null)} />}
         <ApprovalLink projectId={pid} project={approval.project} awaiting={awaiting} people={people} meId={me?.user_id} showApproved />
         <Readouts items={[
           { label: 'Tickets', value: tasks.length, sub: `${openCount} open` },

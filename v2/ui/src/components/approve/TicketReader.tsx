@@ -128,10 +128,10 @@ export function TicketReader(p: ReaderProps) {
             : <p className="m-0 text-[12.5px] text-ink-3">Nothing in this plan waits on it.</p>}
         </Section>
         <Section title="Description">
-          {t.description ? <Markdown size="compact">{t.description}</Markdown> : <p className="m-0 text-[12.5px] text-ink-3">No description.</p>}
+          {t.description ? <Markdown size="compact" projectId={p.projectId}>{t.description}</Markdown> : <p className="m-0 text-[12.5px] text-ink-3">No description.</p>}
         </Section>
         <Section title="Acceptance criteria">
-          {t.acceptance_criteria ? <Markdown size="compact">{t.acceptance_criteria}</Markdown> : <p className="m-0 text-[12.5px] text-ink-3">None given.</p>}
+          {t.acceptance_criteria ? <Markdown size="compact" projectId={p.projectId}>{t.acceptance_criteria}</Markdown> : <p className="m-0 text-[12.5px] text-ink-3">None given.</p>}
         </Section>
         <Link to={projectLink(p.projectId, 'board', id)} className="amp-btn amp-btn-ghost amp-btn-sm justify-self-start">
           Open on the Board<ExternalLink size={12} aria-hidden="true" /></Link>
