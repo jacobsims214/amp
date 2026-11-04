@@ -1,6 +1,6 @@
 import { PageHeader } from '../components/ui/PageHeader'
 import { Avatar } from '../components/ui/Avatar'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import { Check, ClipboardCopy, Loader2, RefreshCw, Save } from 'lucide-react'
@@ -9,6 +9,8 @@ import { useAuth } from '../hooks/useAuth'
 import { personName } from '../lib/people'
 import type { DayReport, DayReportItem, Member, VelocityDay } from '../types'
 import { projectLink } from '../lib/projectLink'
+import { withTimeout } from '../lib/timeout'
+import { LoadError } from '../components/ui/LoadError'
 
 // /reports — end-of-day reports. Your own day is built live from AMP (what
 // you completed, have in progress, are blocked on, started, created, and
@@ -37,10 +39,16 @@ export function DayReports() {
   const [picked, setWho] = useState<number | null>(null)
   const who = picked ?? meId ?? null
   const [error, setError] = useState<string | null>(null)
+  const [attempt, setAttempt] = useState(0)
 
   useEffect(() => {
-    api.reportPeople().then(setPeople).catch(e => setError(e instanceof Error ? e.message : 'Failed to load people'))
-  }, [])
+    let live = true
+    withTimeout(api.reportPeople(), 'Loading people')
+      .then(p => { if (live) setPeople(p) })
+      .catch(e => { if (live) setError(e instanceof Error ? e.message : 'Failed to load people') })
+    return () => { live = false }
+  }, [attempt])
+  const retryPeople = () => { setError(null); setAttempt(n => n + 1) }
 
   const sorted = useMemo(
     () => [...people].sort((a, b) => (a.user_id === meId ? -1 : b.user_id === meId ? 1 : personName(a).localeCompare(personName(b)))),
@@ -71,7 +79,7 @@ export function DayReports() {
 
         <main className="flex-1 overflow-y-auto">
           <div className="max-w-4xl px-7 py-5 grid gap-4">
-            {error && <p className="m-0 amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</p>}
+            {error && <LoadError message={error} onRetry={retryPeople} />}
             {selected && (
               <>
                 <Velocity key={`v-${selected.user_id}`} person={selected} />
@@ -131,12 +139,16 @@ function MyDay() {
   const [error, setError] = useState<string | null>(null)
   const [savedAt, setSavedAt] = useState<string | null>(null)
 
+  // Only the newest load may set state (a late answer after Retry, or for a
+  // day no longer picked, is dropped).
+  const loadSeq = useRef(0)
   const load = useCallback(() => {
+    const seq = ++loadSeq.current
     setLoading(true); setError(null)
-    api.dayReportDraft(day, TZ)
-      .then(r => { setReport(r); setSummary(r.summary); setSavedAt(r.saved ? r.updated_at ?? null : null) })
-      .catch(e => setError(e instanceof Error ? e.message : 'Failed to build the report'))
-      .finally(() => setLoading(false))
+    withTimeout(api.dayReportDraft(day, TZ), 'Building your day report')
+      .then(r => { if (seq === loadSeq.current) { setReport(r); setSummary(r.summary); setSavedAt(r.saved ? r.updated_at ?? null : null) } })
+      .catch(e => { if (seq === loadSeq.current) setError(e instanceof Error ? e.message : 'Failed to build the report') })
+      .finally(() => { if (seq === loadSeq.current) setLoading(false) })
   }, [day])
   useEffect(() => { load() }, [load])
 
@@ -180,8 +192,9 @@ function MyDay() {
           {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
           {report?.saved ? (dirty ? 'Save changes' : 'Save again') : 'Save report'}
         </button>
-        {error && <span className="text-xs text-danger-ink">{error}</span>}
+        {error && report && <span className="text-xs text-danger-ink">{error}</span>}
       </div>
+      {error && !report && <LoadError message={error} onRetry={load} />}
       {loading && !report ? (
         <Loader2 size={16} className="text-ink-3 animate-spin" />
       ) : report ? (
@@ -197,18 +210,21 @@ function History({ person, isMe }: { person: Member; isMe: boolean }) {
   const [reports, setReports] = useState<DayReport[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [open, setOpen] = useState<string | null>(null)
+  const [attempt, setAttempt] = useState(0)
 
   useEffect(() => {
+    let live = true
     const to = localDay()
-    api.dayReports({ user: String(person.user_id), from: addDays(to, -30), to, tz: TZ })
-      .then(r => { setReports(r); setOpen(r[0]?.day ?? null) })
-      .catch(e => setError(e instanceof Error ? e.message : 'Failed to load reports'))
-  }, [person.user_id])
+    withTimeout(api.dayReports({ user: String(person.user_id), from: addDays(to, -30), to, tz: TZ }), 'Loading saved reports')
+      .then(r => { if (live) { setReports(r); setOpen(r[0]?.day ?? null) } })
+      .catch(e => { if (live) setError(e instanceof Error ? e.message : 'Failed to load reports') })
+    return () => { live = false }
+  }, [person.user_id, attempt])
 
   return (
     <section className="space-y-3">
       <div className="flex items-center gap-2.5"><span className="amp-label">History</span><h2 className="m-0 text-[14.5px] font-semibold text-ink">{isMe ? 'Your saved reports' : `${personName(person)}'s reports`}</h2></div>
-      {error && <p className="text-xs text-danger-ink">{error}</p>}
+      {error && <LoadError message={error} onRetry={() => { setError(null); setAttempt(n => n + 1) }} />}
       {reports && reports.length === 0 && (
         <p className="text-xs text-ink-3">No saved reports in the last 30 days.</p>
       )}

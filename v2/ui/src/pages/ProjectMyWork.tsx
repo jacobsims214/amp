@@ -23,7 +23,8 @@ import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { ChevronRight, X } from 'lucide-react'
 import { api } from '../api/client'
 import { ProjectNav } from '../components/ProjectNav'
-import { BandLoader } from '../components/brand/BandLoader'
+import { SkeletonReadouts, SkeletonRegion, SkeletonSection } from '../components/ui/Skeleton'
+import { useDelayedFlag } from '../hooks/useDelayedFlag'
 import { ApproveCard } from '../components/approve/ApproveCard'
 import { ApproveView, type AlsoAwaiting } from '../components/approve/ApproveView'
 import { HumanActions } from '../components/human/HumanActions'
@@ -33,12 +34,15 @@ import { useSSE } from '../hooks/useSSE'
 import { personName } from '../lib/people'
 import { ago } from '../lib/approval'
 import { reasonLabel } from '../lib/human'
-import { KIND_LABEL } from '../lib/humanActions'
+import { KIND_LABEL, needsLine } from '../lib/humanActions'
 import { startItemText } from '../lib/dispatchState'
 import { mergeCardState } from '../lib/merge'
 import { projectLink } from '../lib/projectLink'
 import { refreshWaitCounts } from '../lib/waitCounts'
-import type { DepSummary, DoneItem, Project, ProjectMyWork as Data, ProjectWaitItem, WaitKind } from '../types'
+import { isNoUserError, noMyWorkReason } from '../lib/myWorkAccess'
+import { useAuth } from '../hooks/useAuth'
+import { MyWorkLoadError, MyWorkUnavailable } from '../components/human/MyWorkUnavailable'
+import type { DepSummary, DoneItem, Project, ProjectMyWork as Data, ProjectWaitItem, Task, WaitKind } from '../types'
 import './projectMyWork.css'
 
 const KINDS: WaitKind[] = ['approve', 'answer', 'merge', 'start', 'do']
@@ -134,6 +138,13 @@ export function ProjectMyWork() {
   const data = loaded?.key === key ? loaded.data : null
   const [project, setProject] = useState<Project | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const { me, loading: authLoading } = useAuth()
+  // "My work needs a signed-in AMP user": say why (sign-in off, or no AMP user)
+  // and what to do, not the server's words and a Try again that repeats them.
+  // Until the identity is known, keep the loader rather than guess which case.
+  const noUser = isNoUserError(error)
+  const noWork = noUser && !authLoading ? noMyWorkReason(me) ?? 'no-user' : null
+  const waitingForIdentity = noUser && authLoading
 
   const load = useCallback(() => {
     return api.projectMyWork(pid, { user })
@@ -152,6 +163,12 @@ export function ProjectMyWork() {
     sseTimer.current = setTimeout(changed, 1200)
   })
   useEffect(() => () => { if (sseTimer.current) clearTimeout(sseTimer.current) }, [])
+
+  // Tier 1: the nav is up at once; the list's shapes show only if the first load runs long.
+  // A reload keeps the loaded list on screen (data stays until the new one lands).
+  // An error about the identity waits for the identity before it says which case.
+  const firstLoad = !data && (!error || waitingForIdentity)
+  const showSkeleton = useDelayedFlag(firstLoad, undefined, 400)
 
   const name = project?.name ?? 'this project'
   const items = useMemo(() => (data ? itemsOf(data) : []), [data])
@@ -197,14 +214,20 @@ export function ProjectMyWork() {
         meta={readOnly ? "Someone else's list: what waits on them here. The actions are theirs." : "What in this project waits on you, and what's coming. Do it here."}
         rightSlot={<span className="max-md:hidden"><Link to={projectLink(pid, 'board')} className="amp-btn amp-btn-ghost amp-btn-sm">Everyone's work on the Board</Link></span>} />
       <div className="pmw px-7 pt-5 pb-12 max-md:px-4 max-w-[1240px] grid gap-[22px]">
-        {error && (
-          <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink flex items-center gap-3" role="alert">
-            Couldn't load My work: {error}
-            <button type="button" className="amp-btn amp-btn-sm ml-auto" onClick={() => load()}>Try again</button>
-          </div>
+        {noWork && <MyWorkUnavailable reason={noWork} projectId={pid} email={me?.email} />}
+        {!noWork && !waitingForIdentity && error && <MyWorkLoadError error={error} onRetry={() => load()} />}
+        {firstLoad && (
+          <SkeletonRegion label="Loading My work" className="grid gap-[22px]">
+            {showSkeleton && <>
+              <SkeletonReadouts cells={7} />
+              <div className="pmw-layout">
+                <div className="grid gap-2 min-w-0"><SkeletonSection rows={3} /></div>
+                <div className="pmw-side min-w-0"><SkeletonSection rows={3} /></div>
+              </div>
+            </>}
+          </SkeletonRegion>
         )}
-        {!data && !error && <div className="py-16 flex justify-center"><BandLoader label="Loading My work" /></div>}
-        {data && <Body data={data} items={items} name={name} pid={pid} focusId={focusId} setFocus={setFocus}
+        {data && !noUser && <Body data={data} items={items} name={name} pid={pid} focusId={focusId} setFocus={setFocus}
           onReview={approveParam.open} onChanged={changed} readOnly={readOnly} who={who} />}
       </div>
     </div>
@@ -354,7 +377,9 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
           {kind === 'do' && <span className="amp-label border border-line px-1.5 py-1 leading-none">{it.state === 'in_progress' ? 'In progress' : 'Ready'}</span>}
           {kind === 'start' && <span className="amp-label border px-1.5 py-1 leading-none" style={{ borderColor: 'var(--warning)', color: 'var(--warning-ink)' }}>Not started</span>}
         </div>
+        <p className="m-0 mt-1 text-[13.5px] leading-snug text-ink" data-needs="">{needsLine(it)}</p>
         <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[12.5px] text-ink-2">{meta.map(m => <span key={m}>{m}</span>)}</div>
+        {kind === 'do' && t && <Brief task={t} />}
         <div className="mt-3">
           {t ? <HumanActions task={t} kind={kind} canAct={!readOnly} prUrl={it.pr_url} branch={it.branch}
             baseBranch={it.base_branch} targetSource={it.target_source}
@@ -367,6 +392,29 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
       </article>
       {note}
     </>
+  )
+}
+
+/**
+ * A Do ticket's brief, folded: the description and acceptance criteria as written.
+ * (main's #140: the My work card says in one line what the item needs, and the
+ * brief is there to read when the person wants the detail.)
+ */
+function Brief({ task }: { task: Pick<Task, 'description' | 'acceptance_criteria'> }) {
+  const description = task.description?.trim()
+  const criteria = task.acceptance_criteria?.trim()
+  if (!description && !criteria) return null
+  return (
+    <details className="mt-2">
+      <summary className="amp-label cursor-pointer select-none text-ink-2 hover:text-ink">Show brief</summary>
+      <div className="mt-2 grid gap-2 border-l-2 border-line pl-3 text-[13px] leading-relaxed text-ink-2">
+        {description && <p className="m-0 whitespace-pre-line">{description}</p>}
+        {criteria && <div>
+          <span className="amp-label">Acceptance criteria</span>
+          <p className="m-0 mt-1 whitespace-pre-line">{criteria}</p>
+        </div>}
+      </div>
+    </details>
   )
 }
 

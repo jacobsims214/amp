@@ -1,13 +1,17 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { api } from '../api/client'
 import { useSSE } from './useSSE'
+import { withTimeout } from '../lib/timeout'
 import type { Epic, Story, Task, SSEEvent } from '../types'
 
 export interface BoardData {
   epics: Epic[]
   stories: Story[]
   tasks: Task[]
+  /** The first load: nothing of this project's board is on screen yet. */
   loading: boolean
+  /** A refetch while the loaded board stays on screen (refresh(), after a mutation). */
+  refreshing: boolean
   error: string | null
   refresh: () => void
   /** Merge an updated entity (e.g. from an assign/owner API response) by id. */
@@ -23,6 +27,8 @@ function fullTask(task: Task): Task {
   return { ...task, blocked_by_ids: task.blocked_by_ids ?? [], block_reason: task.block_reason ?? '', start_at: task.start_at }
 }
 
+const NONE: never[] = []
+
 function mergeById<T extends { id: number }>(item: T) {
   return (prev: T[]) => prev.map(x => x.id === item.id ? { ...x, ...item } : x)
 }
@@ -31,25 +37,37 @@ export function useBoardData(projectId: number): BoardData {
   const [epics, setEpics] = useState<Epic[]>([])
   const [stories, setStories] = useState<Story[]>([])
   const [tasks, setTasks] = useState<Task[]>([])
-  const [loading, setLoading] = useState(true)
+  const [inFlight, setInFlight] = useState(true)
+  // The project the arrays hold, so a project switch shows a first load, not the old board.
+  const [loadedFor, setLoadedFor] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // Each load gets a number; only the newest may set state, so a slow load that
+  // answers after a newer refetch, or after a timeout and Retry, can't overwrite it.
+  const loadSeq = useRef(0)
 
   const load = useCallback(async () => {
-    setLoading(true)
+    const mine = ++loadSeq.current
+    setInFlight(true)
     setError(null)
     try {
-      const [epicList, taskList] = await Promise.all([
-        api.listEpics(projectId),
-        api.listTasks(projectId),
-      ])
+      const { epicList, storyList, taskList } = await withTimeout((async () => {
+        const [epicList, taskList] = await Promise.all([
+          api.listEpics(projectId),
+          api.listTasks(projectId),
+        ])
+        const storyLists = await Promise.all(epicList.map(e => api.listStories(e.id)))
+        return { epicList, storyList: storyLists.flat(), taskList }
+      })(), 'Loading the board')
+      if (mine !== loadSeq.current) return
       setEpics(epicList)
-      const storyLists = await Promise.all(epicList.map(e => api.listStories(e.id)))
-      setStories(storyLists.flat())
+      setStories(storyList)
       setTasks(taskList)
+      setLoadedFor(projectId)
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load board')
+      // A failed (or timed-out) refetch keeps the board that is on screen; the caller shows the error.
+      if (mine === loadSeq.current) setError(e instanceof Error ? e.message : 'Failed to load board')
     } finally {
-      setLoading(false)
+      if (mine === loadSeq.current) setInFlight(false)
     }
   }, [projectId])
 
@@ -109,5 +127,12 @@ export function useBoardData(projectId: number): BoardData {
   const applyEpic = useCallback((epic: Epic) => setEpics(mergeById(epic)), [])
   const applyStory = useCallback((story: Story) => setStories(mergeById(story)), [])
 
-  return { epics, stories, tasks, loading, error, refresh: load, applyTask, applyEpic, applyStory }
+  const loaded = loadedFor === projectId
+  return {
+    epics: loaded ? epics : NONE, stories: loaded ? stories : NONE, tasks: loaded ? tasks : NONE,
+    // Not loaded and no error means a first load is due or in flight: that covers the
+    // render right after a project switch, before the load effect has run.
+    loading: !loaded && !error, refreshing: inFlight && loaded,
+    error, refresh: load, applyTask, applyEpic, applyStory,
+  }
 }

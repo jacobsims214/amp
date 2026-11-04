@@ -33,6 +33,7 @@ import {
   mergeTargetChip, mergeWaiters, mergeWhyText,
 } from '../../lib/merge'
 import type { MergeAlertKind, MergeRecord, MergeStepFold, MergeTargetSource, Task } from '../../types'
+import { Markdown } from '../ui/Markdown'
 
 export interface HumanActionsProps {
   task: Task
@@ -65,6 +66,8 @@ export interface HumanActionsProps {
   minutes?: number
   /** who asked (answer); defaults to the ticket's agent */
   askedBy?: string
+  /** do: the owner's name, for "Only <name> starts and finishes it" */
+  ownerName?: string
   /** called with the updated ticket (or null when only a merge record came back) */
   onChanged?: (t: Task | null, note?: string) => void
 }
@@ -112,7 +115,10 @@ function AnswerAction({ task, canAct, askedBy, onChanged }: HumanActionsProps) {
   return (
     <div className="grid gap-2.5" data-action="answer">
       <span className="amp-label" style={{ color: 'var(--danger-ink)' }}>{askedBy || task.agent_id || task.assigned_to || 'An agent'} asked</span>
-      <blockquote className="m-0 pl-3 text-[14px] leading-relaxed text-ink" style={{ borderLeft: '2px solid var(--line-str)' }}>{task.block_reason}</blockquote>
+      {/* Agents write their questions as markdown (lists of options, code): shown as such. */}
+      <blockquote className="m-0 pl-3 text-ink" style={{ borderLeft: '2px solid var(--line-str)' }}>
+        <Markdown size="compact">{task.block_reason ?? ''}</Markdown>
+      </blockquote>
       {!canAct ? (
         <span className="text-[12px] text-ink-2">Only people who can work this ticket can answer it.</span>
       ) : <>
@@ -365,7 +371,7 @@ function StartAction({ task, canAct, minutes, onChanged }: HumanActionsProps) {
 
 // ---- Do ----
 
-function DoAction({ task, canAct, onChanged }: HumanActionsProps) {
+function DoAction({ task, canAct, ownerName, onChanged }: HumanActionsProps) {
   const [finishing, setFinishing] = useState(false)
   const [note, setNote] = useState('')
   const [link, setLink] = useState('')
@@ -377,7 +383,7 @@ function DoAction({ task, canAct, onChanged }: HumanActionsProps) {
   if (task.state === 'blocked') {
     return <span className="text-[12.5px] text-ink-2" data-action="do">Waiting on #{(task.blocked_by_ids?.length ? task.blocked_by_ids : task.dependency_ids).join(', #')} before it can start.</span>
   }
-  if (!canAct) return <span className="text-[12.5px] text-ink-2" data-action="do">Only its owner starts and finishes it.</span>
+  if (!canAct) return <span className="text-[12.5px] text-ink-2" data-action="do">Only {ownerName || 'its owner'} starts and finishes it.</span>
   if (finishing) {
     return (
       <form className="grid gap-2" data-action="do" onSubmit={e => {

@@ -53,7 +53,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use amp_core::chat_event::{ChatEvent, NoticeLevel};
@@ -579,6 +579,78 @@ impl ChatView {
     /// This view's transcript, for showing it inside another view ([`SessionParts`]).
     pub fn transcript_component(&self) -> Arc<dyn Component> {
         self.transcript.clone()
+    }
+
+    /// Clears the transcript back to its welcome banner (AMP #3012): the chat's one session
+    /// switch swaps the conversation under it, so what was shown belongs to a file this chat no
+    /// longer writes. The banner stays (it is this process's, not the session's), and the
+    /// scroll goes to the end, where a fresh conversation starts.
+    ///
+    /// Every per-session piece of display state goes with it: the open tool group and the calls
+    /// in flight (their ids belong to the old transcript), the assistant block being streamed,
+    /// the last thinking that Ctrl+T reaches, and the two one-shot flags a restore must not
+    /// inherit (`stopping`: the *old* reply was stopped; `error_shown`: the old run's error
+    /// line was already said). What was restored after it renders through [`Self::apply`] like
+    /// any replayed transcript — display only, no tool runs, no model call.
+    pub fn clear_transcript(&mut self) {
+        let banner = self.banner.lock().ok().and_then(|b| b.clone());
+        self.transcript.clear();
+        if let Some(banner) = banner {
+            self.transcript.add_child(banner);
+        }
+        self.end_group();
+        self.assistant = None;
+        self.tools.clear();
+        self.last_thinking = None;
+        self.stopping = false;
+        self.error_shown = false;
+        self.clear_retry();
+        self.compaction = None;
+        self.status.clear();
+        self.scroll.to_end();
+        self.root.invalidate();
+    }
+
+    /// Shows a saved session's transcript in place of this one (AMP #3012): `events` is what
+    /// [`amp_core::worker_session::replay`] read out of the file being resumed, times included, so
+    /// every block keeps the duration it had. The same components render it as a live turn
+    /// ([`Self::apply`]) and as a worker's saved session ([`crate::workers::SessionView`]) — the
+    /// model is never called and no tool runs, because these are events, not calls.
+    ///
+    /// The event times are wall-clock; the transcript draws durations on the monotonic clock, so
+    /// they are anchored the way a replayed worker session is (#2355): the first timed event is
+    /// "now", and the rest are placed by their distance from it.
+    pub(crate) fn show_restored(&mut self, events: &[(Option<SystemTime>, AgentEvent)]) {
+        self.clear_transcript();
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let mut anchor = None;
+        for (at, event) in events {
+            let at = at.map(|at| {
+                let anchor = *anchor.get_or_insert_with(|| crate::workers::anchor(at, now, wall));
+                crate::workers::instant(at, anchor)
+            });
+            // [`Self::apply`] draws replies and tool calls but not what the person *said* (a live
+            // prompt is drawn by the shell's `add_user` before the run starts), so the prompt side
+            // of a restored conversation is drawn here — the same way a replayed worker session
+            // does it. Without this a resumed transcript reads as answers to questions that are
+            // no longer there.
+            if let AgentEvent::MessageStart {
+                message: AgentMessage::User(m),
+            } = event
+            {
+                let text = user_text(m);
+                if !text.trim().is_empty() {
+                    self.add_user(text.trim());
+                }
+            }
+            self.apply_at(event, at);
+        }
+        // A restored turn is history, not a reply in progress: no spinner, and the last message
+        // is complete, so the next thing said starts a fresh block.
+        self.assistant = None;
+        self.end_group();
+        self.scroll.to_end();
+        self.root.invalidate();
     }
 
     /// Columns of space left and right of every area (`[tui] padding`, #2251; at most
@@ -1615,6 +1687,24 @@ fn tool_summary(args: &serde_json::Value) -> String {
         .find_map(|k| args[*k].as_str().filter(|s| !s.trim().is_empty()))
         .map(|s| shorten(&clean(s.lines().next().unwrap_or("")), 120))
         .unwrap_or_default()
+}
+
+/// What a user message says, text blocks only: the one bubble the transcript draws holds text, and
+/// an image or a file reference has none to show. Used by the restored-transcript path, which has
+/// to draw the prompt side of a saved conversation itself (a live one is drawn by the shell's
+/// `add_user` before the run starts).
+fn user_text(m: &rpi_ai::types::UserMessage) -> String {
+    match &m.content {
+        rpi_ai::types::UserContent::Text(text) => text.clone(),
+        rpi_ai::types::UserContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|b| match b {
+                Content::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
 }
 
 /// The visible blocks of an assistant message (tool calls render as their own components).

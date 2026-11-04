@@ -89,6 +89,16 @@ describe('useFocusParam', () => {
     expect(search()).toBe('?view=x')
     expect(router.state.historyAction).toBe('REPLACE')
   })
+
+  it("drops the drawer's ?tab= with the ticket it belonged to", async () => {
+    const user = userEvent.setup()
+    setup('/project/2/board?focus=7&tab=history')
+    await user.click(screen.getByRole('button', { name: 'open 8' }))
+    expect(search()).toBe('?focus=8')
+    await user.click(screen.getByRole('button', { name: 'back' }))
+    await user.click(screen.getByRole('button', { name: 'dismiss' }))
+    expect(search()).toBe('')
+  })
 })
 
 describe('projectLink', () => {

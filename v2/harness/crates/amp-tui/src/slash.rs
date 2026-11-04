@@ -169,6 +169,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         "chat from a phone; /remote copy, open, devices",
     ),
     CommandSpec::new(
+        Group::Amp,
+        "sessions",
+        "",
+        "saved chats in this directory; resume one",
+    ),
+    CommandSpec::new(
         Group::Config,
         "model",
         "[p/m|roles|role]",

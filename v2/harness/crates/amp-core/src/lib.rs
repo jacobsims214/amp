@@ -69,6 +69,24 @@
 //! - [`dispatch_ledger`]: the tickets this machine dispatched, with a per-process liveness lock,
 //!   so a chat that dies is noticed and its tickets are handed back at the next startup.
 //!
+//! Story 454 (#3000, local session resume):
+//! - [`session_index`]: which saved sessions belong to the working directory the harness is in now
+//!   (`/sessions`). It scans the existing per-role JSONL directories, matches the header's
+//!   canonical `cwd` exactly, skips worker (ticket id) directories, and reads only a bounded head
+//!   and tail of each file — never repairing, rewriting or locking one.
+//! - [`session_lock`] (#3004): who owns a session file (local session storage §10). One live
+//!   writer per session, through a per-file sidecar and a non-blocking OS lock: a second writer is
+//!   refused rather than allowed to append concurrently, the OS lock alone decides ownership
+//!   (never a timestamp or a pid), a crashed run's leftover sidecar is simply claimable, and any
+//!   failure to take the lock fails closed.
+//! - [`session_store`] (#3006): the one way a session file is opened for writing. A
+//!   [`session_store::LockedStorage`] carries its [`session_lock::SessionLock`] inside the
+//!   `SessionStorage`, so the file is owned for the whole storage-writing lifetime — not just a
+//!   `Runtime`'s — and every append goes through it. `create` claims before the first byte;
+//!   `load` validates without repairing, refuses a live writer before reading, and only then runs
+//!   `JsonlSessionStorage::load` under the guard. [`agent::resume_session`] switches a live harness
+//!   onto a loaded session, leaving it untouched if anything fails.
+//!
 //! #2364:
 //! - [`workspace`]: `[workers] isolation` (auto | worktree | folder | shared) and what git offers
 //!   the manager's folder: git worktrees in a usable repository, a folder per ticket outside git.
@@ -119,6 +137,9 @@ pub mod repo_trust;
 pub mod request_time;
 pub mod roles;
 pub mod run_report;
+pub mod session_index;
+pub mod session_lock;
+pub mod session_store;
 pub mod supervisor;
 pub mod templates;
 pub mod text_tool_calls;

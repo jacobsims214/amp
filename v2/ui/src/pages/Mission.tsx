@@ -15,7 +15,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { useFocusParam } from '../hooks/useFocusParam'
-import { ChevronRight } from 'lucide-react'
+import { FocusNotFound } from '../components/FocusNotFound'
+import { useFocusFallback } from '../hooks/useFocusFallback'
+import { ChevronRight, UserX } from 'lucide-react'
 import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
 import { useAuth } from '../hooks/useAuth'
@@ -32,6 +34,7 @@ import type { ActivityLog, AuditEntry, Epic, PersonWaiting, Story, Task, WaitCou
 import { isHuman, reasonLabel } from '../lib/human'
 import { canApproveOnBehalf } from '../lib/approval'
 import { projectLink } from '../lib/projectLink'
+import { noMyWorkReason, type NoMyWork } from '../lib/myWorkAccess'
 import { projectCounts, refreshWaitCounts, useWaitCounts } from '../lib/waitCounts'
 import { needsMerge } from '../lib/merge'
 import { countsSummary, kindSummary, panelOrder, personLink, ticketsWaitingOn } from '../lib/waitingPanel'
@@ -133,6 +136,25 @@ function WaitingStrip({ projectId, counts }: { projectId: number; counts: WaitCo
   )
 }
 
+/**
+ * The strip without an AMP user: no counts and no green, just why and where
+ * to look instead (the Board has every ticket). My work explains in full.
+ */
+function NoWaitingStrip({ projectId, reason }: { projectId: number; reason: NoMyWork }) {
+  return (
+    <div className="amp-panel flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-3" role="status">
+      <span className="amp-label inline-flex items-center gap-1.5" style={{ color: 'var(--warning-ink)' }}><UserX size={14} aria-hidden="true" />Waiting on you: not counted</span>
+      <span className="text-[13px] text-ink-2">
+        {reason === 'local-dev' ? 'Sign-in is off on this AMP, so nothing can wait on you.' : 'You are not signed in as an AMP user.'} The Board has every ticket.
+      </span>
+      <span className="ml-auto flex gap-4">
+        <Link to={projectLink(projectId, 'board')} className="amp-label inline-flex items-center gap-1" style={{ color: 'var(--link)' }}>Board<ChevronRight size={14} aria-hidden="true" /></Link>
+        <Link to={projectLink(projectId, 'my-work')} className="amp-label inline-flex items-center gap-1" style={{ color: 'var(--link)' }}>Why<ChevronRight size={14} aria-hidden="true" /></Link>
+      </span>
+    </div>
+  )
+}
+
 /** One person in Waiting on people: their counts by kind, linking into their My work. */
 function PersonRow({ p, name, mine, href }: { p: PersonWaiting; name: string; mine: boolean; href: string }) {
   const summary = kindSummary(p)
@@ -175,9 +197,13 @@ export function Mission() {
   const pid = Number(projectId)
   const { epics, stories, tasks, loading, error, refresh, applyTask } = useBoardData(pid)
   const { members, myAccess, openReassign, people } = useProjectPeople(pid)
-  const { me } = useAuth()
+  const { me, loading: authLoading } = useAuth()
   const waitCounts = useWaitCounts()
-  const yours = projectCounts(waitCounts, pid)
+  // No AMP user (sign-in off, or signed out): the server's counts are all
+  // zeros because nothing can be anyone's, so show none of them.
+  // Until the identity is known, show no strip: the counts may be local dev's zeros.
+  const noWork = authLoading ? null : noMyWorkReason(me)
+  const yours = noWork || authLoading ? null : projectCounts(waitCounts, pid)
   // Waiting on people: every person's items, from the server's one definition
   // (GET /projects/:id/waiting-on-people), refetched shortly after tickets change.
   // Kept with its project id so another project's people never show here.
@@ -198,6 +224,7 @@ export function Mission() {
   const [lastSeen, setLastSeen] = useState<Map<number, number>>(new Map())
   const [now, setNow] = useState(Date.now)
   const selected = selectedId == null ? null : tasks.find(t => t.id === selectedId) ?? null
+  const focusMissing = useFocusFallback(pid, 'mission', selectedId, tasks, loading)
 
   // Latest activity; refreshed shortly after tickets change.
   const loadActivity = useCallback(() => {
@@ -277,7 +304,8 @@ export function Mission() {
       <ProjectNav projectId={pid} currentView="mission" />
       <div className="p-7 pt-5 grid gap-4">
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
-        {yours && <WaitingStrip projectId={pid} counts={yours} />}
+        {focusMissing != null && <FocusNotFound id={focusMissing} onDismiss={() => setSelectedId(null)} />}
+        {noWork ? <NoWaitingStrip projectId={pid} reason={noWork} /> : yours && <WaitingStrip projectId={pid} counts={yours} />}
         <Readouts wrap items={[
           { label: 'In progress', value: counts.prog, sub: quiet ? `${quiet} quiet · may have stalled` : runningSub, alarm: quiet > 0, color: 'var(--st-prog)' },
           { label: 'Ready', value: counts.ready, sub: 'can dispatch now' },

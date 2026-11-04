@@ -172,8 +172,9 @@ describe('ProjectSettings dispatch watchdog', () => {
     await vi.waitFor(() => expect(ret).toBeEnabled())
     await user.clear(ret)
     await user.type(ret, '0')
-    expect(screen.getByText('Off: this never happens.')).toBeInTheDocument()
-    expect(screen.getByText(/automatic return is off/i)).toBeInTheDocument()
+    // The hint renders after the input's state update; wait for it rather than racing it on a busy CI runner.
+    expect(await screen.findByText('Off: this never happens.')).toBeInTheDocument()
+    expect(await screen.findByText(/automatic return is off/i)).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: /save watchdog/i }))
     expect(state.update).toHaveBeenLastCalledWith(3, { not_started_flag_minutes: 10, not_started_return_minutes: 0 })
   })
