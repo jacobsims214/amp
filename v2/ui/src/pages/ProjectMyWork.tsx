@@ -35,6 +35,7 @@ import { ago } from '../lib/approval'
 import { reasonLabel } from '../lib/human'
 import { KIND_LABEL } from '../lib/humanActions'
 import { startItemText } from '../lib/dispatchState'
+import { mergeCardState } from '../lib/merge'
 import { projectLink } from '../lib/projectLink'
 import { refreshWaitCounts } from '../lib/waitCounts'
 import type { DepSummary, DoneItem, Project, ProjectMyWork as Data, ProjectWaitItem, WaitKind } from '../types'
@@ -316,7 +317,10 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
       <button type="button" aria-label="Dismiss the highlight" onClick={onDismiss}><X size={11} aria-hidden="true" /></button>
     </span>
   )
-  const frame = `pmw-item k-${kind}${focused ? ' focus' : ''}`
+  // A Merge card whose plan step still gates it is inert (artifact #27 state 4):
+  // shown so the sequencing is visible, but nothing is asked of the person yet.
+  const gated = kind === 'merge' && mergeCardState(it) === 'gated-waiting'
+  const frame = `pmw-item k-${kind}${gated ? ' inert' : ''}${focused ? ' focus' : ''}`
   if (kind === 'approve') {
     return (
       <div className={frame} data-item-key={it.key} data-focused={focused || undefined}>
@@ -330,8 +334,6 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
   if (kind === 'answer') meta.push(`Waiting ${short(it.since)} for an answer`)
   if (kind === 'merge') {
     meta.push(it.merge_state === 'abandoned' ? `PR closed ${ago(it.since)}` : `Done ${ago(it.completed_at ?? it.since)}${t?.agent_id ? ` by ${t.agent_id}` : ''}`)
-    const n = it.holding_up?.length ?? 0
-    meta.push(n ? `${plural(n, 'ticket')} wait${n === 1 ? 's' : ''} on the merge` : 'Nothing waits on it')
   }
   if (kind === 'do') {
     meta.push(`${it.state === 'in_progress' ? 'Started' : 'Ready'} ${ago(it.since)}`)
@@ -352,6 +354,8 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
         <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[12.5px] text-ink-2">{meta.map(m => <span key={m}>{m}</span>)}</div>
         <div className="mt-3">
           {t ? <HumanActions task={t} kind={kind} canAct={!readOnly} prUrl={it.pr_url} branch={it.branch}
+            baseBranch={it.base_branch} targetSource={it.target_source}
+            holdingUp={it.holding_up} notWaiting={it.not_waiting} trackedBy={it.tracked_by}
             minutes={it.not_started_minutes} onChanged={() => onChanged()} />
             : <span className="text-[12.5px] text-ink-2">{it.question ?? ''}</span>}
         </div>
@@ -361,11 +365,16 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
   )
 }
 
+/**
+ * The legend under the Merge section. A merge is recorded once, by whichever
+ * comes first — and when one of those already recorded it, the person owes no
+ * click (artifact #27 v2: an already-merged PR is never an alert).
+ */
 function MergeNote() {
   return (
     <p className="m-0 mb-1 flex gap-2.5 items-start bg-surface-2 border border-line px-3 py-2.5 text-[12.5px] leading-[1.45] text-ink-2">
       <span className="pmw-kind k-merge pt-1"><i aria-hidden="true" /></span>
-      <span>A merge is recorded once, by whichever comes first: GitHub's webhook (when this project has one), CI, or <b className="text-ink">Mark merged</b> here.</span>
+      <span>A merge is recorded once, by whichever comes first: GitHub's webhook (when this project has one), CI, or <b className="text-ink">Mark merged</b> here. When GitHub or CI recorded it, the card is already gone and nothing is owed.</span>
     </p>
   )
 }

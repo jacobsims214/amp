@@ -2,6 +2,9 @@
  * Helpers for HumanActions (components/human/HumanActions.tsx): which action a
  * ticket asks of a person, the kinds' labels and colours, and a done ticket's
  * merge status line (KB decisions/human-work-ux.md §2, §4, §5).
+ *
+ * The Merge card's copy (why it's shown, where the target came from) lives in
+ * lib/merge.ts with the rest of the merge concern.
  */
 import type { Task, WaitKind } from '../types'
 

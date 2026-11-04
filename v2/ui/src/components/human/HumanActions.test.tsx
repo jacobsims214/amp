@@ -103,6 +103,90 @@ describe('Merge', () => {
     expect(screen.getAllByRole('link')).toHaveLength(1)
     expect(screen.queryByRole('button')).toBeNull()
   })
+
+  // AMP #3013: one truthful card per PR. The card names the route and who waits,
+  // offers exactly one merge action, and says what recording it did to the plan.
+  it('renders the route and only the real waiters, with one Mark merged', async () => {
+    render(<HumanActions task={done} canAct prUrl="https://github.com/o/r/pull/88" branch="feat/x"
+      baseBranch="main" targetSource="run" holdingUp={[2490, 2491]} />)
+    expect(screen.getByTestId('merge-route')).toHaveTextContent('PR #88 · feat/x → main')
+    expect(screen.getByTestId('merge-waiters')).toHaveTextContent('2 tickets wait on this merge: #2490, #2491.')
+    expect(screen.getByText(/Why you're asked/)).toBeInTheDocument()
+    expect(screen.getByText(/reported main as the target/)).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: /mark merged/i })).toHaveLength(1)
+    expect(screen.getByRole('button', { name: /mark merged/i })).toHaveClass('amp-btn-primary')
+    // The guard keeps the label honest: it records a merge, it doesn't make one.
+    expect(screen.getByText(/only after you merged it on GitHub/)).toBeInTheDocument()
+  })
+
+  it('an unknown target is shown as unknown, with a warning chip — never as main', () => {
+    render(<HumanActions task={done} canAct prUrl="https://github.com/o/r/pull/88" branch="feat/x" targetSource="unknown" />)
+    expect(screen.getByTestId('merge-route')).toHaveTextContent('PR #88 · feat/x · target not verified')
+    expect(screen.queryByText(/→ main/)).toBeNull()
+    expect(screen.getByText(/AMP reads no repository settings/)).toBeInTheDocument()
+    expect(screen.getByText(/shown rather than hidden/)).toBeInTheDocument()
+  })
+
+  it('nothing waits: Mark merged stays, demoted, and the card says why it is quiet', () => {
+    render(<HumanActions task={done} canAct prUrl="https://github.com/o/r/pull/88" branch="feat/x"
+      baseBranch="main" targetSource="run" holdingUp={[]} notWaiting={[2492]} />)
+    const btn = screen.getByRole('button', { name: /mark merged/i })
+    expect(btn).not.toHaveClass('amp-btn-primary')
+    expect(screen.getByTestId('merge-waiters')).toHaveTextContent('Nothing waits on this merge — #2492 opted out')
+    expect(screen.getByTestId('merge-waiters')).toHaveTextContent('Recording it here is only for a merge you already made')
+  })
+
+  it('a pre-contract server: no waiter claim is invented, and the action stays ordinary', () => {
+    // No WaitItem data at all (the TaskDrawer's case, and a pre-#3011 server):
+    // the card must not say "nothing waits" — it says nothing about waiters.
+    render(<HumanActions task={done} canAct prUrl="https://github.com/o/r/pull/88" branch="fix/x" />)
+    expect(screen.getByTestId('merge-route')).toHaveTextContent('PR #88 · fix/x · target not verified')
+    expect(screen.queryByTestId('merge-waiters')).toBeNull()
+    expect(screen.getByRole('button', { name: /mark merged/i })).toHaveClass('amp-btn-primary')
+  })
+
+  it('linked and gated: no Mark merged, and the missing prerequisites are named', () => {
+    render(<HumanActions task={done} canAct prUrl="https://github.com/o/r/pull/88" branch="feat/x"
+      baseBranch="main" targetSource="run" holdingUp={[2490]}
+      trackedBy={{ task_id: 9, name: 'Merge PR', state: 'backlog', ready: false, waiting_on: [3, 4], reason: 'its merge step still waits on #3, #4' }} />)
+    // Absent, not disabled: the backend refuses a merge report on a gated step.
+    expect(screen.queryByRole('button', { name: /mark merged/i })).toBeNull()
+    expect(screen.getByTestId('merge-step')).toHaveTextContent('Tracked by #9 Merge PR')
+    expect(screen.getByTestId('merge-step')).toHaveTextContent('#3 still open')
+    expect(screen.getByTestId('merge-step')).toHaveTextContent('#4 still open')
+    expect(screen.getByText(/No Mark merged while its merge step/)).toHaveTextContent(/still waits on #3, #4/)
+  })
+
+  it('linked and ready: Mark merged records the merge and completes the step in one act', () => {
+    render(<HumanActions task={done} canAct prUrl="https://github.com/o/r/pull/88" branch="feat/x"
+      baseBranch="main" targetSource="run" holdingUp={[2490]}
+      trackedBy={{ task_id: 9, name: 'Merge PR', state: 'backlog', ready: true }} />)
+    expect(screen.getByTestId('merge-step')).toHaveTextContent('Mark merged records the merge and completes #9 in one step')
+    expect(screen.getByRole('button', { name: /mark merged/i })).toBeInTheDocument()
+  })
+
+  it('reports what the merge did to the linked step, so the person never marks it twice', async () => {
+    mergeReply = { task_id: 5, merge_state: 'merged', already_recorded: false, message: 'merged',
+      linked_step: { task_id: 9, state: 'completed', completed: true, already_done: false, message: 'completed by the merge' },
+      task: task({ state: 'completed', merge_state: 'merged' }) }
+    render(<HumanActions task={done} canAct prUrl="https://github.com/o/r/pull/88" branch="feat/x"
+      baseBranch="main" targetSource="run" trackedBy={{ task_id: 9, name: 'Merge PR', state: 'backlog', ready: true }} />)
+    await userEvent.click(screen.getByRole('button', { name: /mark merged/i }))
+    const status = await screen.findAllByRole('status')
+    expect(status.map(n => n.textContent).join(' ')).toContain('Its merge step #9 was completed by this record: nothing left to mark done.')
+    expect(calls.map(c => c.path)).toEqual(['/api/tasks/5/merge'])
+  })
+
+  it('leaves a started linked step open and says why, rather than closing someone\'s work', async () => {
+    mergeReply = { task_id: 5, merge_state: 'merged', already_recorded: false, message: 'merged',
+      linked_step: { task_id: 9, state: 'in_progress', completed: false, already_done: false, message: "its owner has started it" },
+      task: task({ state: 'completed', merge_state: 'merged' }) }
+    render(<HumanActions task={done} canAct prUrl="https://github.com/o/r/pull/88" baseBranch="main" targetSource="run"
+      trackedBy={{ task_id: 9, name: 'Merge PR', state: 'in_progress', ready: true }} />)
+    await userEvent.click(screen.getByRole('button', { name: /mark merged/i }))
+    const status = await screen.findAllByRole('status')
+    expect(status.map(n => n.textContent).join(' ')).toContain('Its merge step #9 stays open: its owner has started it.')
+  })
 })
 
 describe('Do', () => {
