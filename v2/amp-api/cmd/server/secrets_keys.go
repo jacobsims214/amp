@@ -36,6 +36,15 @@ func configureSecretsKeys(ctx context.Context, repo *repository.Repo) {
 	}
 	rep.Resealed += ghSealed
 	rep.Unopenable += ghUnopenable
+	// Projects' GitHub API credentials (AMP #3154). They are sealed only — an
+	// attach without a key is refused rather than stored in plaintext — so
+	// this reseals on a key rotation and counts values it can't open.
+	credSealed, credUnopenable, err := repo.ResealGitHubCredentialSecrets(ctx)
+	if err != nil {
+		slog.Error("encrypting stored project GitHub credentials failed", "err", err)
+	}
+	rep.Resealed += credSealed
+	rep.Unopenable += credUnopenable
 	switch {
 	case keys.CanSeal():
 		slog.Info("webhook secrets are encrypted at rest", "key_id", keys.CurrentID(), "sealed_now", rep.Resealed)
