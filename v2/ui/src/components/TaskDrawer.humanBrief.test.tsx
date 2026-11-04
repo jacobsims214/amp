@@ -137,6 +137,22 @@ describe('human ticket brief', () => {
     await waitFor(() => expect(inFlight).toBe(0))
     expect(listTasksCalls).toBe(1)
   })
+
+  it('rereads the project tickets when the drawer moves to another ticket', async () => {
+    // Following a "#N" link swaps the ticket without closing the drawer.
+    function Switch() {
+      const [id, setId] = useState(34)
+      return <><button type="button" onClick={() => setId(40)}>switch</button>
+        <TaskDrawer task={human({ id })} onClose={() => {}} members={members} meId={9} myAccess={access} /></>
+    }
+    render(<MemoryRouter initialEntries={['/project/2/board?focus=34']}><Switch /></MemoryRouter>)
+    expect(await screen.findByTestId('human-unblocks')).toHaveTextContent('Nothing waits on this')
+    // A ticket that depends on #40 was planned meanwhile.
+    projectTasks = [task({ id: 41, name: 'Build scorecard', state: 'blocked', dependency_ids: [40], agent_id: 'amp-worker' })]
+    await userEvent.click(screen.getByRole('button', { name: 'switch' }))
+    expect(await screen.findByRole('link', { name: '#41' })).toBeInTheDocument()
+    expect(listTasksCalls).toBe(2)
+  })
 })
 
 describe('drawer tab', () => {

@@ -129,9 +129,9 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   const [editError, setEditError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
   const people = useMemo(() => peopleById(members), [members])
-  // The project's tickets, epics and stories, read once per drawer: the human
-  // panel (what this unblocks) and the Details tab (pickers) share them.
-  const plan = useProjectPlan(task?.project_id)
+  // The project's tickets, epics and stories, read once per opened ticket: the
+  // human panel (what this unblocks) and the Details tab (pickers) share them.
+  const plan = useProjectPlan(task?.project_id, task?.id)
   const location = useLocation()
   const [searchParams] = useSearchParams()
 
