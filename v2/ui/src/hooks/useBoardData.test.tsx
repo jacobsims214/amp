@@ -60,6 +60,21 @@ describe('useBoardData', () => {
     expect(result.current.tasks.map(t => t.id)).toEqual([21])
   })
 
+  it('the very first render after a project switch is already a first load', async () => {
+    const renders: { pid: number; loading: boolean; tasks: number }[] = []
+    const { rerender } = renderHook(({ pid }) => {
+      const d = useBoardData(pid)
+      renders.push({ pid, loading: d.loading, tasks: d.tasks.length })
+      return d
+    }, { initialProps: { pid: 1 } })
+    await finish()
+    rerender({ pid: 2 })
+    // Every render for project 2 before its data lands reads as loading, so the
+    // Board never paints its empty state in between.
+    expect(renders.filter(r => r.pid === 2 && r.tasks === 0).every(r => r.loading)).toBe(true)
+    await finish()
+  })
+
   it('a slow earlier load cannot overwrite a newer one', async () => {
     const { result } = renderHook(() => useBoardData(1))
     await finish()

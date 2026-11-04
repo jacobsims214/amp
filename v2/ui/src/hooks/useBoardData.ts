@@ -125,7 +125,9 @@ export function useBoardData(projectId: number): BoardData {
   const loaded = loadedFor === projectId
   return {
     epics: loaded ? epics : NONE, stories: loaded ? stories : NONE, tasks: loaded ? tasks : NONE,
-    loading: inFlight && !loaded, refreshing: inFlight && loaded,
+    // Not loaded and no error means a first load is due or in flight: that covers the
+    // render right after a project switch, before the load effect has run.
+    loading: !loaded && !error, refreshing: inFlight && loaded,
     error, refresh: load, applyTask, applyEpic, applyStory,
   }
 }
