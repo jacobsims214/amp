@@ -412,8 +412,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"feature. Give each ticket a short `ref` (e.g. 'schema', 'api', 'ui'); `depends_on` lists refs of other tickets in "+
 			"this batch, or IDs of existing tickets. Everything is checked first (unknown refs, other projects, cycles); then "+
 			"tickets are created in dependency order. Returns the ID created for each ref. Tickets not connected to "+
-			"anything are reported, since they can all start at once. A step only a person can do (review and merge a PR, "+
-			"a sign-off, prod access, a decision, someone outside the team) is a ticket too: performer 'human' with its "+
+			"anything are reported, since they can all start at once. A step only a person can do (a sign-off, prod "+
+			"access, a decision, someone outside the team) is a ticket too: performer 'human' with its "+
 			"owner as the person, wired into depends_on, so the agent tickets after it wait for them. "+
 			"Merges: a ticket finished with a PR or pushed branch holds the tickets after it until the merge is recorded. "+
 			"Two metadata keys change that (inherited project -> epic -> story -> ticket; no re-approval): set "+

@@ -15,6 +15,7 @@ import (
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/hub"
 	"github.com/simstech/amp-api/internal/mcp"
+	"github.com/simstech/amp-api/internal/service"
 )
 
 // Planning: dependencies are validated, editable, kept right through
@@ -426,6 +427,61 @@ func TestPlan_ServerInstructions(t *testing.T) {
 	for _, want := range []string{"DEPENDENCIES ARE CRITICAL", "amp_create_tasks", "amp_check_plan", "never delete and re-create"} {
 		if !strings.Contains(string(raw), want) {
 			t.Errorf("initialize response lacks %q", want)
+		}
+	}
+}
+
+// The instructions teach the delivered merge workflow (AMP #3208): all five
+// waiting kinds including start, and no "review and merge" human ticket —
+// a completed ticket is Merge needed already, so planning a review-and-merge
+// step is the duplicate human merge ticket the workflow removed.
+func TestPlan_ServerInstructions_CurrentMergeWorkflow(t *testing.T) {
+	srv := newMCPServer(mcp.NewServer(nil, nil, hub.New(), nil))
+	raw, _ := json.Marshal(srv.HandleMessage(context.Background(), []byte(
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`)))
+	s := string(raw)
+	for _, want := range []string{"approve, answer, merge (Merge needed), start or do", "PEOPLE IN THE LOOP"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("initialize response lacks %q", want)
+		}
+	}
+	if strings.Contains(s, "review and merge a PR") {
+		t.Errorf("initialize response still teaches the removed review-and-merge human ticket")
+	}
+}
+
+// The MCP text an agent reads must not list the four-kind era or teach the
+// removed review-and-merge human ticket: WaitKinds is the source of truth,
+// and the instructions and the amp_create_tasks description follow it.
+func TestMCPText_NoStaleWaitingKindLists(t *testing.T) {
+	if got := strings.Join(service.WaitKinds, ", "); got != "approve, answer, merge, start, do" {
+		t.Fatalf("WaitKinds = %q", got)
+	}
+	s := setupMCP(t)
+	raw, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+	b, _ := json.Marshal(s.srv.HandleMessage(s.callCtx(), raw))
+	var resp struct {
+		Result struct {
+			Tools []struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(b, &resp); err != nil {
+		t.Fatal(err)
+	}
+	texts := map[string]string{"server instructions": mcp.Instructions}
+	for _, tl := range resp.Result.Tools {
+		texts[tl.Name+" description"] = tl.Description
+	}
+	for where, text := range texts {
+		if strings.Contains(text, "four kinds") {
+			t.Errorf("%s still counts four waiting kinds", where)
+		}
+		if strings.Contains(text, "approve, answer, merge, do") ||
+			strings.Contains(text, "approve, answer, merge (Merge needed) or do") {
+			t.Errorf("%s still lists the waiting kinds without start", where)
 		}
 	}
 }
