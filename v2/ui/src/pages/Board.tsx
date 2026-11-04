@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect } from 'react'
 import { useParams } from 'react-router-dom'
 import { useFocusParam } from '../hooks/useFocusParam'
-import { RefreshCw, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users, ListChecks } from 'lucide-react'
+import { RefreshCw, RotateCw, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users, ListChecks } from 'lucide-react'
 import { useBoardData } from '../hooks/useBoardData'
 import { useSSE } from '../hooks/useSSE'
 import { useAuth } from '../hooks/useAuth'
@@ -28,6 +28,7 @@ import { HUMAN_REASONS } from '../lib/human'
 import { SkeletonCard, SkeletonRegion, Skeleton } from '../components/ui/Skeleton'
 import { ProgressBand } from '../components/ui/ProgressBand'
 import { useDelayedFlag } from '../hooks/useDelayedFlag'
+import { LoadError } from '../components/ui/LoadError'
 import { ApprovalLink } from '../components/ApprovalLink'
 import { usePlanApproval } from '../hooks/usePlanApproval'
 import { awaitingApproval } from '../lib/approval'
@@ -316,8 +317,8 @@ export function Board() {
   const hasBoard = epics.length > 0 || tasks.length > 0
   if (error && !loading && !hasBoard) {
     return (
-      <div className="flex items-center justify-center h-full text-danger-ink text-sm" style={{ background: 'var(--bg)' }}>
-        {error}
+      <div className="flex items-center justify-center h-full p-6" style={{ background: 'var(--bg)' }}>
+        <LoadError message={error} onRetry={refresh} className="max-w-xl" />
       </div>
     )
   }
@@ -396,8 +397,10 @@ export function Board() {
 
       {error && hasBoard && (
         <div role="alert" className="px-5 py-2 flex-shrink-0 flex items-center gap-3 text-[12.5px] text-danger-ink border-b border-line-sub">
-          Couldn't refresh the board: {error}. Showing what was loaded.
-          <button type="button" className="amp-btn amp-btn-sm ml-auto" onClick={refresh}>Try again</button>
+          Couldn't refresh the board: {error.replace(/\.$/, '')}. Showing what was loaded.
+          <button type="button" className="amp-btn amp-btn-sm ml-auto" onClick={refresh}>
+            <RotateCw size={12} aria-hidden="true" />Retry
+          </button>
         </div>
       )}
 

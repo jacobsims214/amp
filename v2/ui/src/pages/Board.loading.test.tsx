@@ -6,6 +6,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AuthContext } from '../contexts/auth-context'
 import type { Epic, Story, Task } from '../types'
+import { LOAD_TIMEOUT_MS } from '../lib/timeout'
 
 const epic: Epic = { id: 1, project_id: 3, name: 'E', description: '', state: 'active', priority: '1', created_at: '', updated_at: '' } as Epic
 const story: Story = { id: 1, epic_id: 1, project_id: 3, name: 'S', description: '', acceptance_criteria: '', state: 'active', created_at: '', updated_at: '' } as Story
@@ -107,10 +108,26 @@ describe('Board first load', () => {
     expect(screen.getByRole('button', { name: /Ticket 11/ })).toBeInTheDocument()
   })
 
-  it('still shows the error page when the first load fails', async () => {
+  it('still shows the error page when the first load fails, with a Retry that loads it', async () => {
     renderBoard()
     await settle(() => epicsCall.reject(new Error('Board is down')))
-    expect(screen.getByText('Board is down')).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('Board is down')
+    expect(screen.queryByTestId('board-skeleton')).toBeNull()
+
+    epicsCall = deferred<Epic[]>()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(screen.getByRole('status', { name: 'Loading tickets' })).toBeInTheDocument()
+    await settle(() => epicsCall.resolve([epic]))
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByRole('button', { name: /Ticket 11/ })).toBeInTheDocument()
+  })
+
+  it('a first load that never answers times out to the error page with Retry', async () => {
+    renderBoard()
+    await tick(LOAD_TIMEOUT_MS)
+    expect(screen.getByRole('alert')).toHaveTextContent(/Loading the board took longer than 12 seconds/)
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
+    expect(screen.queryByRole('status', { name: 'Loading tickets' })).toBeNull()
   })
 })
 
@@ -168,5 +185,29 @@ describe('Board refetch', () => {
     await settle(() => epicsCall.reject(new Error('Network down')))
     expect(screen.getByRole('alert')).toHaveTextContent("Couldn't refresh the board: Network down")
     expect(card.isConnected).toBe(true)
+  })
+
+  it('a refetch that fails after a good load keeps the board, shows the error with Retry, and Retry recovers', async () => {
+    const { card, scroller } = await loaded()
+    scroller.scrollTop = 80
+    epicsCall = deferred<Epic[]>()
+    fireEvent.click(refreshButton())
+    await tick(LOAD_TIMEOUT_MS)
+    const alert = screen.getByRole('alert')
+    expect(alert).toHaveTextContent("Couldn't refresh the board: Loading the board took longer than 12 seconds")
+    expect(alert).toHaveTextContent('Showing what was loaded.')
+    expect(card.isConnected).toBe(true)
+    expect(screen.queryByTestId('board-skeleton')).toBeNull()
+    expect(screen.queryByRole('status', { name: 'Loading tickets' })).toBeNull()
+
+    epicsCall = deferred<Epic[]>()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(refreshButton()).toHaveAttribute('aria-busy', 'true')
+    expect(card.isConnected).toBe(true)
+    await settle(() => epicsCall.resolve([epic]))
+    expect(refreshButton()).toHaveAttribute('aria-busy', 'false')
+    expect(screen.getByRole('button', { name: /Ticket 11/ })).toBe(card)
+    expect(scroller.scrollTop).toBe(80)
   })
 })

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { api } from '../api/client'
 import { useSSE } from './useSSE'
+import { withTimeout } from '../lib/timeout'
 import type { Epic, Story, Task, SSEEvent } from '../types'
 
 export interface BoardData {
@@ -40,29 +41,33 @@ export function useBoardData(projectId: number): BoardData {
   // The project the arrays hold, so a project switch shows a first load, not the old board.
   const [loadedFor, setLoadedFor] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
-  // Only the latest load may land: a slow earlier refetch must not overwrite a newer one.
-  const seq = useRef(0)
+  // Each load gets a number; only the newest may set state, so a slow load that
+  // answers after a newer refetch, or after a timeout and Retry, can't overwrite it.
+  const loadSeq = useRef(0)
 
   const load = useCallback(async () => {
-    const mine = ++seq.current
+    const mine = ++loadSeq.current
     setInFlight(true)
     setError(null)
     try {
-      const [epicList, taskList] = await Promise.all([
-        api.listEpics(projectId),
-        api.listTasks(projectId),
-      ])
-      const storyLists = await Promise.all(epicList.map(e => api.listStories(e.id)))
-      if (mine !== seq.current) return
+      const { epicList, storyList, taskList } = await withTimeout((async () => {
+        const [epicList, taskList] = await Promise.all([
+          api.listEpics(projectId),
+          api.listTasks(projectId),
+        ])
+        const storyLists = await Promise.all(epicList.map(e => api.listStories(e.id)))
+        return { epicList, storyList: storyLists.flat(), taskList }
+      })(), 'Loading the board')
+      if (mine !== loadSeq.current) return
       setEpics(epicList)
-      setStories(storyLists.flat())
+      setStories(storyList)
       setTasks(taskList)
       setLoadedFor(projectId)
     } catch (e) {
-      // A failed refetch keeps the board that is on screen; the caller shows the error.
-      if (mine === seq.current) setError(e instanceof Error ? e.message : 'Failed to load board')
+      // A failed (or timed-out) refetch keeps the board that is on screen; the caller shows the error.
+      if (mine === loadSeq.current) setError(e instanceof Error ? e.message : 'Failed to load board')
     } finally {
-      if (mine === seq.current) setInFlight(false)
+      if (mine === loadSeq.current) setInFlight(false)
     }
   }, [projectId])
 
