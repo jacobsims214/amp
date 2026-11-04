@@ -365,13 +365,13 @@ func TestGitHubCredential_RejectsUnusableTokenShapes(t *testing.T) {
 	svc, ctx := credSvc(w), context.Background()
 	owner := credAs(w, "owner")
 	bad := map[string]string{
-		"empty":       "",
-		"too short":   "ghp_12",
-		"a newline":   "ghp_abcdef0123456789\n",
-		"a header":    "Authorization: token ghp_abcdef0123456789",
-		"a space":     "ghp_abcdef 0123456789",
-		"a tab":       "ghp_abcdef\t0123456789",
-		"too long":    strings.Repeat("g", 513),
+		"empty":        "",
+		"too short":    "ghp_12",
+		"a newline":    "ghp_abcdef0123456789\n",
+		"a header":     "Authorization: token ghp_abcdef0123456789",
+		"a space":      "ghp_abcdef 0123456789",
+		"a tab":        "ghp_abcdef\t0123456789",
+		"too long":     strings.Repeat("g", 513),
 		"a pasted url": "https://github.com/settings/tokens/ghp_abcdef",
 	}
 	for name, token := range bad {
