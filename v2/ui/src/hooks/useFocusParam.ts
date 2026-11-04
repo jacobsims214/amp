@@ -18,7 +18,9 @@ function parseId(v: string | null): number | null {
  * - The param stays in the URL until dismissed, so reload and back work.
  *   Focusing a ticket pushes a history entry (back returns to the previous
  *   ticket, or to none); dismissing removes the param with replace.
- * - Other query params are left alone.
+ * - Other query params are left alone, except the drawer's `?tab=`: it
+ *   belongs to the focused ticket, so focusing another one or dismissing it
+ *   drops the tab too (the next ticket opens on its own default tab).
  */
 export function useFocusParam(): [number | null, (id: number | null) => void] {
   const [params, setParams] = useSearchParams()
@@ -41,6 +43,7 @@ export function useFocusParam(): [number | null, (id: number | null) => void] {
     setParams(prev => {
       const next = new URLSearchParams(prev)
       ALIASES.forEach(a => next.delete(a))
+      next.delete('tab')
       if (id != null && id > 0) next.set('focus', String(id))
       else next.delete('focus')
       return next
