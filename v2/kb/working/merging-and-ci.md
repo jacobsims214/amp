@@ -1,6 +1,6 @@
 ---
 title: Merging and CI — closing the loop from ticket to main
-tags: [merge, ci, pull-request, unmerged, github, webhook, merge-needed, integration-branch, provenance]
+tags: [merge, ci, pull-request, unmerged, github, webhook, merge-needed, integration-branch, provenance, merge-alert, default-branch]
 ---
 
 # Merging and CI
@@ -13,6 +13,10 @@ whatever saw it happen; it is not a second ticket to acknowledge. So a merge sho
 one place — a **Merge** item in the person's My work tab — and it is gone the moment the merge is
 recorded, by any route.
 
+**Whether a merge asks a person and whether the work after it waits are two different questions.**
+The gate decides what merges hold up; the alert policy decides who is told about them. They are
+computed separately, and one never changes the other (see "Alerts are not the gate" below).
+
 ## Merge needed
 
 When a ticket completes with work that has to be merged, it is **Done · Merge needed**. Work has
@@ -23,8 +27,8 @@ work didn't land on the ticket's integration branch.
 
 - **The tickets that depend on it wait for the merge.** They show "Waiting on merge of #N (PR …)"
   and become ready once it's recorded.
-- **It waits on the ticket's owner.** It's a **Merge** item in their My work tab
-  (`working/human-work.md`).
+- **It waits on the ticket's owner** — if the alert policy says it's worth asking them (below).
+  Either way, the gate holds the dependents until the merge is recorded.
 
 A **run that changed nothing** is not work waiting to be merged. AMP Harness compares a worktree
 against the commit the run started from and, when the run made no commits, reports no `branch`,
@@ -34,36 +38,196 @@ does not become Merge needed and no one is asked. A worker that pushed anyway, o
 worktree that already had commits, says so itself: what a worker reports is never dropped, only
 what the harness would have guessed.
 
-### What one Merge item says, and what it refuses to claim
+## Which merges ask a person
 
-The item is built from facts AMP holds, and it says plainly which facts it lacks.
+A Merge item reaches My work (and `amp_list_tasks` → `waiting_on_people`) only when one of these
+is true:
 
-- **Where the work is.** `PR #N · head branch → target`, from the latest run that reported a PR or
-  a branch. The target is the run's `base_branch`.
-- **Whether that target is verified.** AMP keeps **no repository metadata** — no repository slug,
-  no default branch, no branch protection, no CODEOWNERS — and has no client for GitHub's API. So
-  it cannot compute "this is the repo's default branch" or "a rule here requires your approval",
-  and it does not guess `main`. A reported target is labelled *as reported* ("can't confirm this
-  is the default branch"); an unreported one shows **target & rules: unknown** with a warning, and
-  is shown rather than hidden. Unknown is never read as "internal, nothing to do".
-- **Who actually waits.** Only dependents that really wait are counted. A dependent with
-  `waits_for_merge: false` started when the work completed and is named separately
-  ("#2904 opted out"), never counted; a plan's merge step that performs the merge is not a waiter
-  on it at all.
-- **Nothing waits** is a statement, not a default. When the merge holds up no one, the item says
-  so and **Mark merged** is demoted to a quiet manual record — GitHub or CI records it by itself.
-- **A PR closed without merging** shows "PR closed without merging", and the work after it keeps
-  waiting. Choose **Reopen ticket** to have the work done again, or **Not needed** to release what
-  waits on it.
-- **Not needed** is also there for a merge that will never happen (the work was folded into
-  another PR, say). It releases the dependents.
+| The item says | When | What it offers |
+|---|---|---|
+| **targets the default branch** — chip `default: main · detected from GitHub` | GitHub itself says the PR's target is the repository's detected default branch. Safe even when nothing else could be read | the ordinary card: **Review PR ↗**, plus **Mark merged** and **Not needed** where they do something (below) |
+| **a rule requires your approval** — the rule box names the ruleset and what it demands | the PR targets another branch, and a repository rule requires *your* approval. **Not reachable today**: AMP can't yet tell whose approval a rule wants (below), so a demanding rule currently lands on unknown | **Review and approve PR #N ↗** only. **Mark merged** and **Not needed** are absent: the approval happens on GitHub, and the webhook records the merge afterwards |
+| **unknown** — warn chip `default: main · rules: unknown`, or `default branch & rules: unknown` | the evidence is missing, stale, partial or ambiguous | the card as it was built, with the warning: **Review PR ↗**, **Mark merged**, **Not needed**. Shown, never hidden |
+
+Two further outcomes ask nobody, and so never appear as a Merge item at all:
+
+- **Internal** — the PR targets a branch that isn't the default, and complete, fresh evidence
+  proves no rule requires anyone. Landing on an integration branch is agent organization: there
+  is no acknowledgement, no chore, and no card. (A rule that *does* demand an approval isn't quiet:
+  with AMP unable to attribute the rule to a person today, such a PR lands on **unknown**.)
+- **None** — GitHub's own pull read says the PR is already merged, even though AMP hadn't been
+  told. The item asks nobody and leaves My work; its ticket still reads Merge needed until the
+  merge is recorded, because suppressing an alert is not a merge (see "Alerts are not the gate").
+
+**Unknown is a floor, never a fallback.** Positive knowledge is the only thing that can quiet an
+item; absence of knowledge never can. A repository AMP can't read keeps showing its merges with
+the warn chip — the worst case is one extra card a person could ignore, because the reverse
+failure (silently dropping a real merge) is the one this policy exists to prevent. A target AMP
+can't verify is never assumed to be `main`, and an unverified item is never labelled "internal,
+nothing to do".
+
+The Merge item also says **where the work is** (`PR #N · head branch → target`) and **who really
+waits**: only dependents that actually wait are counted. A dependent with `waits_for_merge: false`
+started when the work completed and is named separately ("#2904 opted out"), never counted; a
+plan's merge step that performs the merge is not a waiter on it at all. **Nothing waits** is a
+statement, not a default: when the merge holds up no one, the item says so and **Mark merged** is
+demoted to a quiet manual record — GitHub or CI records it by itself.
 
 **Mark merged is an acknowledgement of a merge you made elsewhere**, never the act of merging: it
 says so, and it is only worth clicking after you merged on GitHub. Where it can't do its job it
-isn't offered: not on a PR closed without merging (there is nothing to mark), and not while a
-linked merge step is still gated (see below) — there, recording the merge would leave the step
-open anyway, so the one click the item promises can't do both jobs. The reason is written on the
-item instead.
+isn't offered: never on a rule alert (the owed act is the approval), not on a PR closed without
+merging (there is nothing to mark), and not while a linked merge step is still gated (see below) —
+there, recording the merge would leave the step open anyway, so the one click the item promises
+can't do both jobs. The reason is written on the item instead.
+
+**A PR closed without merging** shows "PR closed without merging", and the work after it keeps
+waiting. Choose **Reopen ticket** to have the work done again, or **Not needed** to release what
+waits on it. **Not needed** is also there for a merge that will never happen (the work was folded
+into another PR, say): it releases the dependents.
+
+## Where those facts come from
+
+AMP's server reads them from GitHub itself, over REST, with the project's credential:
+
+- the repository's **default branch** (`GET /repos/{owner}/{repo}` → `.default_branch`);
+- the PR's **actual target and requested reviewers** (`GET /repos/{owner}/{repo}/pulls/{n}`);
+- the **rules that apply to the target branch**, already evaluated across repository and
+  organization rulesets (`GET /repos/{owner}/{repo}/rules/branches/{branch}`);
+- whether **classic branch protection** could be read (`.../branches/{branch}/protection`).
+
+AMP's server has no checkout, so `origin/HEAD` — or any other local git state — is not one of its
+sources, and it never guesses `main`. The **target must be GitHub's own answer** for the PR. A
+run's reported `base_branch` is a hint: it can say where a worker *intended* to land and it is
+shown as reported, but it never decides which of the arms above an item is in. A run that reported
+a branch and no PR has no PR to read, so its item is unknown.
+
+The reads are cached, because a My work page can't be allowed to depend on GitHub being up:
+
+- a repository's default branch and a branch's rules are evidence for **15 minutes** — rule
+  content changes in real time, so an older read is not evidence of anything;
+- a PR's own facts (target, requested reviewers, whether it merged) are evidence for **60
+  seconds**;
+- a refresh that failed is not retried for **60 seconds**, so a repository nothing can read does
+  not turn every page load into another round of doomed GitHub calls.
+
+**A My work read never waits on GitHub.** It answers from the cache, at most *starts* one bounded
+background refresh (20 seconds end to end; at most 8 run at once in an AMP process, and a refresh
+beyond that is deferred rather than queued, so the next read tries again), and reports **unknown**
+for whatever the cache doesn't have. A slow, rate-limited or unreachable GitHub can make an item
+unknown; it can never make the page slow, and it can never make an item disappear.
+
+Facts are stored **per project and per repository**, and read with that project's own credential:
+one project's cache can't answer another project's read, so a token's visibility never leaks
+across projects.
+
+### The webhook empties the cache a delivery contradicts
+
+The TTLs are the backstop for when nothing tells AMP that GitHub changed. The project's merge
+webhook (below) is that something-changed, and its write to the cache is deliberately narrow:
+
+- **Every `pull_request` delivery drops that pull request's cached facts**, not just `closed`.
+  `edited` and `review_requested` change exactly the target and reviewers the policy reads, and
+  are the deliveries that most often precede a wrong alert.
+- **Only that PR's row, and only in the project in the URL.** A delivery to one project's hook
+  cannot touch another project's copy of the same repository — that copy simply stays stale until
+  its own TTL, which is the safe direction.
+- **The repository and branch rows survive.** A pull-request event says nothing about the default
+  branch or a branch's rules, and dropping them would throw away verified evidence. Renaming the
+  default branch is a `repository` event, which the merge webhook isn't subscribed to (it takes
+  pull requests only), so there the 15-minute TTL is the backstop.
+- It also clears the failed-refresh memory for that PR, so the next read refills it at once
+  instead of being silenced by the negative cache for up to a minute.
+- If the row can't be dropped, that is logged and the delivery's own work — recording a merge —
+  still succeeds. The TTL still bounds how long the stale row can be believed.
+
+## Settings → GitHub token
+
+The credential the reads use is the project's, and only project owners manage it
+(**Settings → GitHub token**): the panel is rendered for owners, and every call behind it refuses a
+member or a team lead with a 403 rather than a quiet success. Agents never touch it — the server
+reads with it on their behalf.
+
+- **It is write-only.** The token goes in, is sealed at rest, and never comes back out: the panel
+  shows the host, a label and when it was attached or replaced, never the value. No API answer, no
+  error message and no audit entry carries it — the audit records *that* it was attached, replaced
+  or removed, and for which host.
+- **Attach, replace, remove.** **Replace token** swaps it in place on the same credential, so what
+  the project already read stays its own view. **Remove token** deletes the credential *and every
+  repository fact it produced*, so no token-derived visibility outlives the token.
+- **The server needs an encryption key.** Without `AMP_SECRETS_KEY` (`ampApi.secretsEncryption` in
+  the Helm chart) AMP refuses to store a token at all — the panel disables the field and says why
+  — and a token already stored can't be opened, so the reads stay unknown until the key is back.
+- **No token is a real state.** A public repository is read without one. Attaching a token is what
+  makes a private repository (or a rate-limited one) readable at all, and it is what decides how
+  much of the repository the project can see.
+- **What it needs:** read access to the repository. `Metadata: read` covers the default branch and
+  the evaluated rules; `Pull requests: read` covers the PR, its target and its reviewers. Classic
+  branch protection is the one endpoint that needs admin — a member token gets a 404 there, which
+  is why the rules are treated as *partially* known, never as "no rule" (see below).
+- The token is sent in the request body only (never a query string, which every proxy logs), and
+  the panel keeps no copy of it after saving — no storage, no telemetry.
+
+## What stays unknown, on purpose
+
+These are limits of the shipped mechanism, not bugs to work around. Each one ends at the warn
+chip, never at silence:
+
+- **No credential, or a private repository the credential can't see.** GitHub answers 404 for "no
+  such repository" and "you can't see it" alike, so neither is read as a fact.
+- **A credential GitHub refuses**: revoked, expired, missing a scope, or rate-limited. A rate-limit
+  answer with a short advertised wait gets one retry; there is no backoff loop.
+- **Timeouts, transport failures, 5xx, an unreadable body** — unknown, per fact.
+- **A renamed or transferred repository** (GitHub's redirect) is reported, not followed: following
+  it would record the new repository's facts under the old name.
+- **Anything not on `github.com`.** A PR URL on another host is refused as unsupported. GitHub
+  Enterprise Server needs its own host and credential decision, and GitLab, Bitbucket and the rest
+  have different rule models entirely — none of them are implemented.
+- **A run with no PR URL** (a branch, or a URL AMP can't parse): the repository and PR number the
+  policy needs aren't there, so the item is unknown.
+- **Rules that AMP can't yet attribute to a person.** AMP stores no GitHub login for a user and
+  resolves no CODEOWNERS ownership, and it does not resolve team membership, so a rule that names
+  a reviewer, a team, or code owners, and a rule that requires *someone's* approval (one approving
+  review, an approval from someone other than the last pusher, an extra approval for unattributed
+  changes) all become **unknown** — never a rule alert addressed to the wrong person, and never
+  "internal" either. This is why the rule arm can't be reached today. A requested reviewer on its
+  own is never treated as proof that a rule requires them: GitHub auto-requests code owners
+  whether or not anything is protected.
+- **A partial rules read.** When the evaluated rules answered but classic branch protection could
+  not be read with this token, AMP cannot prove the *absence* of a rule, so it falls back to the
+  PR's own signals: a review GitHub says is required, plus this person among the requested
+  reviewers. The PR's review decision and mergeable state aren't read today, so that fallback
+  never fires and a partial read stays **unknown**.
+- **Classic branch protection's own settings.** AMP reads that endpoint to decide whether the rules
+  read is complete, but the review requirements configured there are not turned into rule
+  evidence: AMP's rule evidence is the evaluated rulesets. So a non-default branch protected *only*
+  by classic branch protection has no rule for AMP to name, and with both reads answered the
+  evidence looks complete — a PR into that branch classifies as internal. (A PR into the default
+  branch still asks its owner: clause (a) needs only the default branch.)
+- **A manual default-branch setting.** The policy has a slot for a person's declaration (one that
+  doesn't age out on the TTL), but no settings surface writes it yet, so a repository whose default
+  branch can't be read stays unknown even if everyone knows the answer.
+- **The cache itself being unreadable** is not a fact about the repository, so it is not "no rule
+  applies" either: unknown, and the item keeps asking the person, which is the safe direction.
+
+## Alerts are not the gate
+
+The two are computed separately, and this matters when you're reading a ticket that says **Merge
+needed** but isn't in anyone's My work:
+
+- **The gate alone** decides `merge_state` and which tickets wait
+  (`Service.mergeGateFor`). Suppressing an alert never records a merge and never releases a
+  dependent: an internal merge's ticket still reads Merge needed until the branch's merge is
+  recorded, and its dependents still wait.
+- **Mission's "Merge needed" counter and `amp_list_unmerged`** are the gate's bookkeeping, not a
+  list of chores. Mission counts done tickets whose `merge_state` is `needed` or `abandoned`, and
+  `amp_list_unmerged` lists the runs whose work isn't merged — including integration-branch work
+  whose `merge_state` is `none`. Neither is filtered by the alert policy, so a merge nobody is
+  asked about still shows up there while it is unrecorded.
+- **A planned merge step for a PR nobody is asked about** is not folded into a Merge item, because
+  there is no item: it stays an ordinary human ticket (a **Do** item). The merge is still somebody's
+  ticket; it just isn't a *merge alert*.
+- **An alert policy that goes quiet is not a sign-off.** It says "no one needs to be told about
+  this merge", not "this merged".
 
 ## Two plan shapes that don't wait for main
 
@@ -92,6 +256,10 @@ main at the end, sets `integration_branch: "<branch>"`.
   retry that corrects its destination doesn't leave dependents blocked behind a merge to main that
   will never happen. Setting `integration_branch` after the fact does the same for tickets whose
   work already landed there.
+- **Reading the integration branch's rules is how the policy knows it's internal.** AMP asks
+  GitHub for the rules on that target branch; if the read is complete and nothing requires
+  anyone, the item asks nobody. A branch where a rule *does* require a human approval is not
+  quiet — it is either a rule alert or, while AMP can't attribute the rule to a person, unknown.
 
 **An integration branch is agent organization, not a person's chore.** Landing on it asks nothing
 of anyone. There is no acknowledgement for it, and it never appears as a Merge item.
@@ -158,9 +326,12 @@ happened.
    it you merged. Recording a merge is a fact about the code, so anyone on the project may report
    it, and a repeat is a no-op.
 
-`amp_list_unmerged(project_id)` lists the done tickets whose work isn't merged yet, with their
-`merge_state` (`needed`, or `abandoned` when the PR was closed). It deliberately lists nothing for
-a run that reported no branch and no PR: there is nothing to merge there.
+`amp_list_unmerged(project_id)` lists the unmerged work: for each done ticket, the run that put it
+up, with the ticket's `merge_state` — `needed` (Merge needed), `abandoned` (the PR was closed
+without merging), or `none` (work that landed on its integration branch, which holds nothing until
+that branch reaches main). It deliberately lists nothing for a run that reported no branch and no
+PR: there is nothing to merge there. This list is about what is unmerged, not about who is asked,
+so it includes merges the alert policy keeps off My work.
 
 **Settings → Merges** turns the gate off for a project ("Hold dependent tickets until the work
 they build on is merged"). Off, dependents start as soon as a ticket is done, merged or not.
@@ -171,7 +342,8 @@ Agents set it with `amp_update_project_settings(require_merge)`.
 GitHub tells AMP when a pull request is merged or closed. A merged PR records the merge on the
 tickets that produced it and releases the tickets waiting on them; a PR closed without merging
 marks them as closed without merging. AMP matches a PR to tickets by its URL, its branch (not from
-a fork) or its commits, in this project only.
+a fork) or its commits, in this project only. The same delivery also drops the cached repository
+facts it contradicts (see above).
 
 The setting is **Settings → GitHub merge webhook**, which only project owners see. To set it up:
 
@@ -183,11 +355,14 @@ The setting is **Settings → GitHub merge webhook**, which only project owners 
 4. **Content type**: `application/json`.
 5. **Secret**: the secret from step 1.
 6. **Which events**: choose "Let me select individual events" and tick only **Pull requests**.
+   That is also all the cache invalidation above needs; other events aren't subscribed to and
+   change nothing.
 7. Add the webhook. GitHub sends a ping, and it shows under **Recent deliveries** in AMP.
 
-The panel shows recent deliveries and what each did, and counts requests AMP rejected: if GitHub
-sent them, its secret doesn't match. **Rotate secret** makes a new one (paste it into GitHub; the
-old one stops working at once). **Turn off** removes the secret and the delivery log.
+The panel shows recent deliveries and what each did — including when a delivery dropped a cached
+pull request's facts — and counts requests AMP rejected: if GitHub sent them, its secret doesn't
+match. **Rotate secret** makes a new one (paste it into GitHub; the old one stops working at once).
+**Turn off** removes the secret and the delivery log.
 
 GitHub doesn't retry a failed delivery by itself; use **Redeliver** on GitHub's webhook page.
 
