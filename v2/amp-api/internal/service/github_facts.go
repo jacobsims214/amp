@@ -291,6 +291,12 @@ type GitHubPullFactsView struct {
 	// reader can establish positively; "" and "unknown" both mean it did not.
 	State  string
 	ReadAt time.Time
+	// ReviewDecision and MergeableState are the classifier's PR-level positive
+	// signals (§3.3). Both are 044's closed vocabulary and "unknown" is a real
+	// value: it says the read did not establish them, which the classifier
+	// must never read as "no review is required".
+	ReviewDecision string
+	MergeableState string
 
 	Fresh   bool
 	Trusted bool
@@ -773,10 +779,21 @@ func (c *GitHubFactsCoordinator) storeFacts(ctx context.Context, key repository.
 				pullWrite.State = pullFactsState(facts.Pull)
 				pullWrite.RequestedReviewers = facts.Pull.RequestedReviewers
 				pullWrite.RequestedTeams = facts.Pull.RequestedTeams
-				// Complete: this row is about what the pull read established, and
-				// that read answered in full. A failed rules read says nothing about
-				// the pull request's own facts.
-				pullWrite.Completeness = repository.GitHubCompletenessComplete
+				// The classifier's two PR-level §3.3 signals. They come from two
+				// different reads (mergeable_state from REST `pulls/{n}`,
+				// reviewDecision from GraphQL), and each read's failure leaves
+				// only its own signal "unknown" — never "does not apply".
+				pullWrite.ReviewDecision = pullFactsReviewDecision(facts.Pull)
+				pullWrite.MergeableState = pullFactsMergeableState(facts.Pull)
+				// Complete only when BOTH pull reads answered: the REST read
+				// (base, reviewers, mergeable state) and the GraphQL read (the
+				// review decision). Partial when the REST read answered and the
+				// decision did not — the row is still verified (so its base and
+				// reviewers stay evidence), and the decision is honestly
+				// "unknown" rather than a claim that no review is required. A
+				// failed rules read says nothing about the pull request's own
+				// facts either way.
+				pullWrite.Completeness = pullFactsCompleteness(facts)
 				pullWrite.VerifiedAt = &verifiedAt
 			} else {
 				pullWrite.FailureClass = failureClass(facts, githubfacts.OpPull)
@@ -836,6 +853,7 @@ func (c *GitHubFactsCoordinator) pullView(f *repository.GitHubPullFacts, now tim
 	}
 	v.BaseBranch, v.State = f.BaseBranch, f.State
 	v.RequestedReviewers, v.RequestedTeams = f.RequestedReviewers, f.RequestedTeams
+	v.ReviewDecision, v.MergeableState = f.ReviewDecision, f.MergeableState
 	if f.FetchedAt != nil {
 		v.ReadAt = f.FetchedAt.UTC()
 	}
@@ -1134,6 +1152,20 @@ func failureClass(f *githubfacts.Facts, op githubfacts.Op) string {
 	return repository.GitHubFactInvalid
 }
 
+// pullFactsCompleteness: the pull row is complete only when every pull-level
+// read answered. The review decision is a second read of its own (GraphQL), so a
+// REST answer without it is Partial — verified enough to be evidence about the
+// base and the requested reviewers, not enough to claim the decision is known.
+func pullFactsCompleteness(f *githubfacts.Facts) repository.GitHubCompleteness {
+	if !f.ReadOK(githubfacts.OpPull) {
+		return repository.GitHubCompletenessUnknown
+	}
+	if !f.ReadOK(githubfacts.OpReviewDecision) {
+		return repository.GitHubCompletenessPartial
+	}
+	return repository.GitHubCompletenessComplete
+}
+
 // pullFactsState maps the reader's answer onto 044's closed vocabulary. Only
 // "merged" is knowable from this read: REST's merged_at is null for an open PR
 // *and* for a closed-unmerged one, and the read does not ask for `state`, so
@@ -1143,6 +1175,48 @@ func pullFactsState(p githubfacts.PullFacts) string {
 		return "merged"
 	}
 	return "unknown"
+}
+
+// pullFactsReviewDecision maps the GraphQL answer onto 044's closed
+// vocabulary. "" is the reader's "not read, or GitHub has not computed it",
+// which the column stores as "unknown" — never as "none", because "no review
+// required" is a claim this read cannot make (044's CHECK refuses anything
+// outside the set, so the mapping is the only place the two vocabularies
+// meet).
+func pullFactsReviewDecision(p githubfacts.PullFacts) string {
+	if !p.ReviewDecisionKnown {
+		return "unknown"
+	}
+	switch strings.ToLower(strings.TrimSpace(p.ReviewDecision)) {
+	case "approved":
+		return "approved"
+	case "changes_requested":
+		return "changes_requested"
+	case "review_required":
+		return "review_required"
+	case "":
+		// GitHub answered, and its answer was null: it has not computed the
+		// decision yet (observed on live PRs right after they open). That is
+		// "unknown", and the classifier must not read it as "no review".
+		return "unknown"
+	default:
+		// A value GitHub adds later. Keeping it out of the cache is the
+		// vocabulary's rule (044's CHECK, the same as every other closed set
+		// here): unknown is honest, an invented label is not.
+		return "unknown"
+	}
+}
+
+// pullFactsMergeableState maps the REST answer onto 044's closed vocabulary.
+// GitHub's "unknown" and "" both store as "unknown"; "blocked" is what the
+// classifier's §3.3 fallback reads.
+func pullFactsMergeableState(p githubfacts.PullFacts) string {
+	switch strings.ToLower(strings.TrimSpace(p.MergeableState)) {
+	case "blocked", "clean", "dirty", "unstable", "behind", "draft", "has_hooks":
+		return strings.ToLower(strings.TrimSpace(p.MergeableState))
+	default:
+		return "unknown"
+	}
 }
 
 // githubFactRule is one rule as 044 stores it: the reduced array the migration

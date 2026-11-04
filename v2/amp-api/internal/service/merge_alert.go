@@ -147,11 +147,19 @@ type MergeRuleFacts struct {
 	// ReviewDecision is the PR's GitHub review decision: "REVIEW_REQUIRED",
 	// "APPROVED", "CHANGES_REQUESTED", or "" when GitHub has not computed it
 	// yet (it does so asynchronously right after a PR opens — gotcha in §6).
+	//
+	// It reaches this struct through the real pipeline, not only from tests:
+	// the reader fetches it over GraphQL (REST `pulls/{n}` does not carry it),
+	// the cached pull write stores it in 044's closed vocabulary, and
+	// mergeAlertInputFromView copies it here. It is "" when that read failed,
+	// which is unknown and never "no review required" (AMP #3219).
 	ReviewDecision string
 	// MergeableState is the PR's mergeable state: "blocked", "clean", … "" or
 	// "unknown" when it is not computed yet. Blocked does not by itself mean
 	// "a person is required" — required status checks block too — so it is
-	// only ever a positive signal paired with a requested reviewer.
+	// only ever a positive signal paired with a requested reviewer. It comes
+	// from the same REST pull read as the base and reviewers, and "unknown"
+	// is what a failed or uncomputed read leaves.
 	MergeableState string
 	// RequestedReviewers are the PR's requested user reviewers (logins).
 	// GitHub over-approximates this on purpose: code owners are auto-requested
@@ -465,6 +473,10 @@ func mergeAlertRuleOrigin(r *MergePullRequestRule) string {
 // required: GitHub says so, or the PR is blocked from merging. Blocked alone
 // can mean required status checks, so this only ever pairs with the requested
 // reviewers — never on its own (§1c, §3.3).
+//
+// Both inputs are populated by the production read path (AMP #3219); until
+// then this was true only of hand-built test inputs, so the §3.3 arm could not
+// fire for a real merge. merge_alert_pipeline_test.go pins the live chain.
 func mergeAlertPositiveSignal(f MergeRuleFacts) bool {
 	return strings.EqualFold(f.ReviewDecision, "REVIEW_REQUIRED") ||
 		strings.EqualFold(f.MergeableState, "blocked")

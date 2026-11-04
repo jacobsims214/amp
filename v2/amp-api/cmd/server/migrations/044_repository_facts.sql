@@ -208,14 +208,20 @@ CREATE TABLE IF NOT EXISTS github_pull_facts (
     base_branch   TEXT NOT NULL DEFAULT '',
     state         TEXT NOT NULL DEFAULT 'unknown',
     -- GitHub's reviewDecision: whether an approval is still outstanding.
+    -- Read over GraphQL (repository.pullRequest.reviewDecision) — REST
+    -- `pulls/{n}` does not carry it — and stored in this closed vocabulary.
+    -- 'unknown' is an answer in its own right: the decision was not read, or
+    -- GitHub has not computed it yet. It is never 'none' unless GitHub
+    -- actually said no review is required.
     review_decision TEXT NOT NULL DEFAULT 'unknown',
     -- Who GitHub has asked. An over-approximation on its own — code owners are
     -- requested for review even with no rule protecting the branch — so it
     -- only counts alongside a rules read.
     requested_reviewers TEXT[] NOT NULL DEFAULT '{}',
     requested_teams     TEXT[] NOT NULL DEFAULT '{}',
-    -- GitHub's mergeable_state; 'blocked' is the fallback positive signal when
-    -- the rules could not be read. Anything unrecognised stays 'unknown'.
+    -- GitHub's mergeable_state from the REST pull read; 'blocked' is the
+    -- fallback positive signal when the rules could not be read. Anything
+    -- unrecognised stays 'unknown'.
     mergeable_state TEXT NOT NULL DEFAULT 'unknown',
     completeness  TEXT NOT NULL DEFAULT 'unknown',
     fetched_at    TIMESTAMPTZ,

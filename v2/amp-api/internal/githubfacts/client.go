@@ -27,6 +27,7 @@
 package githubfacts
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -69,13 +70,22 @@ const (
 // says which fact its failure left unknown.
 type Op string
 
-// The four reads Facts makes. OpPull happens only when a PR number is given;
-// OpRules and OpProtection happen only when a target branch is known.
+// The reads Facts makes. OpPull happens only when a PR number is given;
+// OpReviewDecision only when the pull read answered; OpRules and OpProtection
+// only when a target branch is known.
 const (
 	OpRepo       Op = "repo"       // GET /repos/{owner}/{repo} → .default_branch
 	OpPull       Op = "pull"       // GET /repos/{owner}/{repo}/pulls/{n}
 	OpRules      Op = "rules"      // GET /repos/{owner}/{repo}/rules/branches/{branch}
 	OpProtection Op = "protection" // GET /repos/{owner}/{repo}/branches/{branch}/protection
+	// OpReviewDecision is the one read that is not REST: the PR's
+	// reviewDecision only exists on GitHub's GraphQL PullRequest, and REST
+	// `pulls/{n}` does not carry it (verified live 2026-11-04: the response
+	// has neither `review_decision` nor a review-decision field of any
+	// other name). It is a separate Read so a failure there leaves only the
+	// decision unknown — the base, reviewers and mergeable state the REST
+	// read already established keep their answers.
+	OpReviewDecision Op = "review_decision" // POST /graphql → reviewDecision
 )
 
 // Source says where the branch the rules were read for came from.
@@ -259,6 +269,22 @@ type PullFacts struct {
 	RequestedReviewers []string // requested user logins
 	RequestedTeams     []string // requested team slugs
 	Merged             bool     // merged_at was set
+
+	// ReviewDecision is GitHub's own verdict on whether an approval is still
+	// outstanding: "REVIEW_REQUIRED", "APPROVED", "CHANGES_REQUESTED", or ""
+	// when GitHub has not computed it (it does so asynchronously right after a
+	// PR opens) or the read that fetches it failed. It is the classifier's
+	// primary §3.3 positive signal, so "" is unknown and never "no review
+	// needed". ReviewDecisionKnown says which of the two it is.
+	ReviewDecision      string
+	ReviewDecisionKnown bool
+
+	// MergeableState is the PR's mergeable_state from the same REST read:
+	// "blocked", "clean", "unknown", … "blocked" is the classifier's second
+	// §3.3 positive signal — but only ever paired with a requested reviewer,
+	// because required status checks block too (§1c). Empty means the REST
+	// read did not answer (Known is false then).
+	MergeableState string
 }
 
 // RulesFacts is what the target branch's rules read established.
@@ -478,6 +504,13 @@ func (c *Client) Facts(ctx context.Context, req Request) (*Facts, error) {
 
 	if req.PR > 0 {
 		f.Reads = append(f.Reads, c.readPull(ctx, repoPath, req.PR, f))
+		if f.Pull.Known {
+			// Only worth asking once the pull read has confirmed the PR exists
+			// and this credential can see it: a 404'd pull read makes the
+			// GraphQL answer equally unknowable, and one failed read is
+			// enough to record.
+			f.Reads = append(f.Reads, c.readReviewDecision(ctx, slug, req.PR, f))
+		}
 	}
 
 	f.Target, f.TargetSource = targetFor(f, req.Target)
@@ -519,7 +552,16 @@ func targetFor(f *Facts, hint string) (string, Source) {
 func completeness(f *Facts, req Request) Completeness {
 	required := []Op{OpRepo, OpRules, OpProtection}
 	if req.PR > 0 {
+		// The review decision is part of what the request asked for when it
+		// asked for a PR: the classifier's §3.3 fallback reads it, so a read
+		// that left it unknown may not report Complete. It is not required
+		// when the pull read itself failed — that read's failure is already
+		// what makes the facts Partial or Unknown, and the decision was never
+		// attempted.
 		required = append(required, OpPull)
+		if f.Pull.Known {
+			required = append(required, OpReviewDecision)
+		}
 	}
 	answered := 0
 	for _, op := range required {
@@ -564,6 +606,9 @@ func (c *Client) readPull(ctx context.Context, repoPath string, number int, f *F
 		// merged_at is null until the PR merges; a merged PR requires
 		// nobody's approval.
 		MergedAt *string `json:"merged_at"`
+		// mergeable_state comes from this same answer, so it costs no extra
+		// request. It is "unknown" until GitHub computes it.
+		MergeableState string `json:"mergeable_state"`
 	}
 	r := c.get(ctx, OpPull, repoPath+"/pulls/"+strconv.Itoa(number), &body)
 	if !r.OK {
@@ -572,6 +617,7 @@ func (c *Client) readPull(ctx context.Context, repoPath string, number int, f *F
 	f.Pull.Known = true
 	f.Pull.Base = body.Base.Ref
 	f.Pull.Merged = body.MergedAt != nil
+	f.Pull.MergeableState = body.MergeableState
 	for _, rv := range body.RequestedReviewers {
 		if rv.Login != "" {
 			f.Pull.RequestedReviewers = append(f.Pull.RequestedReviewers, rv.Login)
@@ -583,6 +629,95 @@ func (c *Client) readPull(ctx context.Context, repoPath string, number int, f *F
 		}
 	}
 	return r
+}
+
+// readReviewDecision reads the PR's reviewDecision over GraphQL, the only
+// surface that carries it. It is a separate Op so a GraphQL outage, a token
+// without GraphQL access or an uncomputed decision leaves only this fact
+// unknown: the REST pull read's base, reviewers and mergeable state stay
+// usable, exactly as Completeness's per-read accounting requires.
+//
+// An answer of null is a real GitHub answer — it has not computed the decision
+// yet (observed on live PRs right after they open) — so ReviewDecisionKnown is
+// true and the decision is "". The classifier reads that as unknown, never as
+// "no review needed".
+func (c *Client) readReviewDecision(ctx context.Context, slug string, number int, f *Facts) Read {
+	owner, repo, _ := strings.Cut(slug, "/")
+	// The query is a constant with $owner/$repo/$number variables: no value is
+	// ever interpolated into the document, so a slug cannot shape the query.
+	const query = `query AMPPullReviewDecision($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) { reviewDecision }
+  }
+}`
+	var body graphQLBody[struct {
+		Repository *struct {
+			PullRequest *struct {
+				ReviewDecision *string `json:"reviewDecision"`
+			} `json:"pullRequest"`
+		} `json:"repository"`
+	}]
+	payload := struct {
+		Query     string `json:"query"`
+		Variables struct {
+			Owner  string `json:"owner"`
+			Repo   string `json:"repo"`
+			Number int    `json:"number"`
+		} `json:"variables"`
+	}{Query: query}
+	payload.Variables.Owner, payload.Variables.Repo, payload.Variables.Number = owner, repo, number
+
+	// A GraphQL error array is a refused query, and the read loop turns it into
+	// a failed Read — that is where the credential is in hand to scrub GitHub's
+	// message before a caller reads it.
+	r := c.post(ctx, OpReviewDecision, "/graphql", payload, &body)
+	if !r.OK {
+		return r
+	}
+	if body.Data == nil || body.Data.Repository == nil || body.Data.Repository.PullRequest == nil {
+		// The repository or the PR is not visible to this token. That is the
+		// same absence a REST 404 reports, so it is classified the same way:
+		// never "no review needed".
+		r.OK = false
+		r.Err = &Error{Op: OpReviewDecision, Kind: KindNotFound, Status: r.Status,
+			Message: "the pull request was not visible to this credential"}
+		return r
+	}
+	f.Pull.ReviewDecisionKnown = true
+	if d := body.Data.Repository.PullRequest.ReviewDecision; d != nil {
+		f.Pull.ReviewDecision = *d
+	}
+	return r
+}
+
+// graphQLBody is the envelope every GraphQL answer arrives in: `data`, or the
+// `errors` array GitHub fills instead — with HTTP 200, so a 2xx is not by itself
+// an answer. Decoding into it lets the read loop report a refused query as a
+// failed Read through graphQLRefusal, where the credential is available to
+// scrub GitHub's message exactly as a REST error's is.
+type graphQLBody[T any] struct {
+	Data   *T `json:"data"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+}
+
+// graphQLRefusalReporter is implemented by a decoded body that can say whether
+// GraphQL refused the request inside an otherwise successful response.
+type graphQLRefusalReporter interface {
+	graphQLRefusal() string
+}
+
+// graphQLRefusal reports GraphQL's own reason for refusing, or "" when it did
+// not refuse.
+func (b *graphQLBody[T]) graphQLRefusal() string {
+	if len(b.Errors) == 0 {
+		return ""
+	}
+	if b.Errors[0].Message == "" {
+		return "GitHub refused the query"
+	}
+	return b.Errors[0].Message
 }
 
 func (c *Client) readRules(ctx context.Context, repoPath, branch string, f *Facts) Read {
@@ -674,6 +809,19 @@ func (c *Client) readProtection(ctx context.Context, repoPath, branch string, f 
 // get performs one read, with the single bounded retry for a short
 // rate-limit answer. On success it decodes into out.
 func (c *Client) get(ctx context.Context, op Op, path string, out any) Read {
+	return c.request(ctx, op, http.MethodGet, path, nil, out)
+}
+
+// post performs one GraphQL read. GitHub serves GraphQL from the same API
+// root as REST (`https://api.github.com/graphql`), so the base URL a test
+// points at its stub covers both and no second host needs configuring.
+func (c *Client) post(ctx context.Context, op Op, path string, payload, out any) Read {
+	return c.request(ctx, op, http.MethodPost, path, payload, out)
+}
+
+// request is the one read loop both verbs share: the single bounded retry for
+// a short rate-limit answer, then decoding into out.
+func (c *Client) request(ctx context.Context, op Op, method, path string, payload, out any) Read {
 	r := Read{Op: op}
 
 	var token string
@@ -689,7 +837,7 @@ func (c *Client) get(ctx context.Context, op Op, path string, out any) Read {
 	}
 
 	for attempt := 1; ; attempt++ {
-		status, header, body, err := c.do(ctx, token, path)
+		status, header, body, err := c.do(ctx, token, method, path, payload)
 		r.Status = status
 		if err != nil {
 			r.Err = transportError(op, err)
@@ -700,6 +848,16 @@ func (c *Client) get(ctx context.Context, op Op, path string, out any) Read {
 				if derr := json.Unmarshal(body, out); derr != nil {
 					r.Err = &Error{Op: op, Kind: KindInvalid, Status: status,
 						Message: "the response body could not be decoded"}
+					return r
+				}
+			}
+			// GraphQL answers 200 and then refuses in the body, so a refusal is
+			// reported from here. The message is a body a remote server wrote,
+			// so it is scrubbed of the credential like every other message this
+			// package reports.
+			if refusal, ok := out.(graphQLRefusalReporter); ok {
+				if reason := refusal.graphQLRefusal(); reason != "" {
+					r.Err = &Error{Op: op, Kind: KindInvalid, Status: status, Message: redact(reason, token)}
 					return r
 				}
 			}
@@ -727,16 +885,27 @@ func (c *Client) get(ctx context.Context, op Op, path string, out any) Read {
 }
 
 // do sends one request and reads at most MaxBody of the answer.
-func (c *Client) do(ctx context.Context, token, path string) (int, http.Header, []byte, error) {
+func (c *Client) do(ctx context.Context, token, method, path string, payload any) (int, http.Header, []byte, error) {
 	reqCtx := ctx
 	if c.timeout > 0 {
 		var cancel context.CancelFunc
 		reqCtx, cancel = context.WithTimeout(ctx, c.timeout)
 		defer cancel()
 	}
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, c.baseURL+path, nil)
+	var requestBody io.Reader
+	if payload != nil {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		requestBody = bytes.NewReader(encoded)
+	}
+	req, err := http.NewRequestWithContext(reqCtx, method, c.baseURL+path, requestBody)
 	if err != nil {
 		return 0, nil, nil, err
+	}
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", apiVersion)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,10 +21,29 @@ import (
 // properties of the HTTP layer, so the wire is what the tests read.
 
 type stub struct {
-	mu     sync.Mutex
-	routes []route
-	paths  []string // RequestURI of every request, in order
-	auth   []string // Authorization header of every request
+	mu      sync.Mutex
+	routes  []route
+	paths   []string // RequestURI of every request, in order
+	auth    []string // Authorization header of every request
+	methods []string // method of every request, in order
+	bodies  []string // body of every request, in order
+	// graphql answers /graphql when a test sets it; defaultGraphQL otherwise.
+	graphql func(http.ResponseWriter, *http.Request)
+}
+
+// onGraphQL replaces the default GraphQL answer for this stub.
+func (s *stub) onGraphQL(h func(http.ResponseWriter, *http.Request)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.graphql = h
+}
+
+// defaultGraphQL is GitHub's answer for a PR whose reviewDecision it has not
+// computed: 200, data present, decision null. That is a real answer, not a
+// failure, and it is the common case right after a PR opens.
+func defaultGraphQL(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":null}}}}`)
 }
 
 type route struct {
@@ -35,6 +55,10 @@ type route struct {
 func newStub(t *testing.T) (*stub, *httptest.Server) {
 	t.Helper()
 	s := &stub{}
+	// Every pull read now asks GraphQL for the review decision, so the stub
+	// answers /graphql by default: a test that is about something else does
+	// not have to know the read exists. A test that IS about the decision
+	// calls onGraphQL, which is checked before the route list.
 	srv := httptest.NewServer(s)
 	t.Cleanup(srv.Close)
 	return s, srv
@@ -45,8 +69,27 @@ func (s *stub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.paths = append(s.paths, r.RequestURI)
 	s.auth = append(s.auth, r.Header.Get("Authorization"))
+	s.methods = append(s.methods, r.Method)
+	var body []byte
+	if r.Body != nil {
+		body, _ = io.ReadAll(io.LimitReader(r.Body, 1<<16))
+		r.Body.Close()
+	}
+	s.bodies = append(s.bodies, string(body))
+	graphql := s.graphql
 	routes := append([]route(nil), s.routes...)
 	s.mu.Unlock()
+
+	// The GraphQL read is one route for every query in this package, so a
+	// single knob covers it whether or not a test registers a route.
+	if escaped == "/graphql" {
+		if graphql != nil {
+			graphql(w, r)
+			return
+		}
+		defaultGraphQL(w, r)
+		return
+	}
 
 	for _, rt := range routes {
 		// Matching on the escaped path is half of what the encoding test
@@ -90,6 +133,18 @@ func (s *stub) auths() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.auth...)
+}
+
+func (s *stub) httpMethods() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.methods...)
+}
+
+func (s *stub) requestBodies() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.bodies...)
 }
 
 // count returns how many requests reached exactly path.
@@ -348,6 +403,9 @@ func TestBranchNameIsEscaped(t *testing.T) {
 	want := []string{
 		"/repos/jacobsims214/amp",
 		"/repos/jacobsims214/amp/pulls/109",
+		// The review decision rides its own GraphQL read (REST `pulls/{n}`
+		// does not carry it); it is in this list because a PR read asks for it.
+		"/graphql",
 		"/repos/jacobsims214/amp/rules/branches/fix%2Factionable-merge-workflow",
 		"/repos/jacobsims214/amp/branches/fix%2Factionable-merge-workflow/protection",
 	}
@@ -1000,5 +1058,214 @@ func TestRulesPartialMatchesTheClassifierContract(t *testing.T) {
 	nf := &Facts{Reads: []Read{{Op: OpRepo, OK: true}, {Op: OpRules, Err: &Error{Op: OpRules, Kind: KindNoTarget}}}}
 	if !nf.RulesPartial() {
 		t.Fatal("an unread rules set reported rules as complete")
+	}
+}
+
+// ---- the review decision: the §3.3 signal REST does not carry ----
+
+// The review decision lives only on GraphQL's PullRequest type. These tests pin
+// the four ways that read can end and what each leaves behind, because the
+// classifier turns "REVIEW_REQUIRED" or "BLOCKED" into a person's work and must
+// never get there from a read that failed or an answer GitHub has not computed.
+
+// decisionStub registers the three REST answers a PR read needs and the PR body
+// with a mergeable state, so each test only has to say what GraphQL does.
+func decisionStub(t *testing.T, mergeableState string) (*stub, *httptest.Server) {
+	t.Helper()
+	s, srv := newStub(t)
+	s.json("/repos/jacobsims214/amp", 200, repoBody)
+	s.json("/repos/jacobsims214/amp/pulls/9", 200, `{
+		"number": 9,
+		"base": {"ref": "main"},
+		"requested_reviewers": [{"login": "jacobsims214"}],
+		"requested_teams": [],
+		"merged_at": null,
+		"mergeable_state": "`+mergeableState+`"
+	}`)
+	s.json("/repos/jacobsims214/amp/rules/branches/main", 200, rulesBody)
+	s.json("/repos/jacobsims214/amp/branches/main/protection", 200, protectedBody)
+	return s, srv
+}
+
+// TestFactsReadsReviewDecisionAndMergeableState is the fix's headline: both
+// §3.3 signals arrive from one Facts call, and the decision costs one GraphQL
+// request whose body asks for that one field.
+func TestFactsReadsReviewDecisionAndMergeableState(t *testing.T) {
+	s, srv := decisionStub(t, "blocked")
+	s.onGraphQL(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":"REVIEW_REQUIRED"}}}}`)
+	})
+
+	f, err := clientFor(srv, "ghp_testtoken").Facts(context.Background(), Request{Slug: "jacobsims214/amp", PR: 9})
+	if err != nil {
+		t.Fatalf("Facts: %v", err)
+	}
+	if !f.Pull.ReviewDecisionKnown || f.Pull.ReviewDecision != "REVIEW_REQUIRED" {
+		t.Fatalf("ReviewDecision = %q known=%v, want REVIEW_REQUIRED", f.Pull.ReviewDecision, f.Pull.ReviewDecisionKnown)
+	}
+	if f.Pull.MergeableState != "blocked" {
+		t.Fatalf("MergeableState = %q, want blocked from the REST pull body", f.Pull.MergeableState)
+	}
+	// Everything answered, so the facts are complete — and the decision counts
+	// as answered, or a request that asked for a PR would never be Complete.
+	if f.Completeness != Complete {
+		t.Fatalf("Completeness = %q, want complete (reads: %v)", f.Completeness, f.Reads)
+	}
+	if !f.ReadOK(OpReviewDecision) {
+		t.Fatalf("the decision read is not reported OK: %v", f.Reads)
+	}
+
+	// The decision went over POST /graphql, as a document with variables rather
+	// than an interpolated query, and the token went in a header.
+	paths := s.requests()
+	if len(paths) != 5 {
+		t.Fatalf("requests = %v, want repo, pull, graphql, rules, protection", paths)
+	}
+	if paths[2] != "/graphql" {
+		t.Fatalf("request 2 = %q, want /graphql", paths[2])
+	}
+	if methods := s.httpMethods(); len(methods) != 5 || methods[2] != http.MethodPost {
+		t.Fatalf("methods = %v, want a POST for the decision read", methods)
+	}
+	body := s.requestBodies()[2]
+	for _, want := range []string{`"query"`, "reviewDecision", `"variables"`, `"owner":"jacobsims214"`, `"repo":"amp"`, `"number":9`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("GraphQL body is missing %s: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "ghp_testtoken") {
+		t.Fatalf("token reached the GraphQL body: %s", body)
+	}
+	if auths := s.auths(); auths[2] != "Bearer ghp_testtoken" {
+		t.Errorf("GraphQL Authorization = %q, want the bearer header", auths[2])
+	}
+}
+
+// TestFactsNullReviewDecisionIsUnknownNotNone: GitHub returns reviewDecision
+// null until it has computed the decision. That is an answer — the read
+// happened — but the decision is unknown, and it must never be read as "no
+// review is required".
+func TestFactsNullReviewDecisionIsUnknownNotNone(t *testing.T) {
+	s, srv := decisionStub(t, "unknown")
+	s.onGraphQL(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":{"repository":{"pullRequest":{"reviewDecision":null}}}}`)
+	})
+
+	f, err := clientFor(srv, "ghp_testtoken").Facts(context.Background(), Request{Slug: "jacobsims214/amp", PR: 9})
+	if err != nil {
+		t.Fatalf("Facts: %v", err)
+	}
+	if !f.ReadOK(OpReviewDecision) {
+		t.Fatalf("a null decision was reported as a failed read: %v", f.Reads)
+	}
+	if !f.Pull.ReviewDecisionKnown {
+		t.Fatal("ReviewDecisionKnown = false; null is an answer, just not a decision")
+	}
+	if f.Pull.ReviewDecision != "" {
+		t.Fatalf("ReviewDecision = %q, want empty (unknown), never a value", f.Pull.ReviewDecision)
+	}
+	if f.Completeness != Complete {
+		t.Fatalf("Completeness = %q, want complete: the read answered", f.Completeness)
+	}
+}
+
+// TestFactsGraphQLErrorLeavesOnlyDecisionUnknown: GitHub answers 200 with an
+// errors array when it refuses a query. The REST read's facts must survive — a
+// refused decision read says nothing about the base or the requested reviewers
+// — and the facts must not be Complete. The message is scrubbed like every
+// other message this package reports.
+func TestFactsGraphQLErrorLeavesOnlyDecisionUnknown(t *testing.T) {
+	s, srv := decisionStub(t, "blocked")
+	s.onGraphQL(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"errors":[{"message":"Resource not accessible: ghp_testtoken"}]}`)
+	})
+
+	f, err := clientFor(srv, "ghp_testtoken").Facts(context.Background(), Request{Slug: "jacobsims214/amp", PR: 9})
+	if err != nil {
+		t.Fatalf("Facts: %v", err)
+	}
+	if f.Completeness == Complete {
+		t.Fatalf("Completeness = %q, want partial: the decision read was refused", f.Completeness)
+	}
+	if f.Completeness != Partial {
+		t.Fatalf("Completeness = %q, want partial", f.Completeness)
+	}
+	r, ok := f.ReadFor(OpReviewDecision)
+	if !ok || r.OK {
+		t.Fatalf("decision read = %+v ok=%v, want a failed read", r, ok)
+	}
+	if r.Err == nil || r.Err.Kind != KindInvalid {
+		t.Fatalf("decision read error = %v, want kind invalid", r.Err)
+	}
+	if strings.Contains(r.Err.Error(), "ghp_testtoken") {
+		t.Fatalf("the token survived in the error: %v", r.Err)
+	}
+	if !strings.Contains(r.Err.Error(), "Resource not accessible") {
+		t.Errorf("GitHub's reason was dropped: %v", r.Err)
+	}
+	// The REST facts still stand: they are what a partial read is for.
+	if f.Pull.ReviewDecisionKnown {
+		t.Error("ReviewDecisionKnown = true after a refused read")
+	}
+	if f.Pull.MergeableState != "blocked" || f.Pull.Base != "main" {
+		t.Errorf("pull facts were lost with the decision read: %+v", f.Pull)
+	}
+	if len(f.Pull.RequestedReviewers) != 1 {
+		t.Errorf("requested reviewers were lost: %v", f.Pull.RequestedReviewers)
+	}
+}
+
+// TestFactsReviewDecisionUnreachable: a transport failure on the decision read
+// is the same story as a refusal — only the decision is unknown, and the facts
+// are Partial rather than Complete.
+func TestFactsReviewDecisionUnreachable(t *testing.T) {
+	s, srv := decisionStub(t, "clean")
+	s.onGraphQL(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprint(w, `{"message":"Server Error"}`)
+	})
+
+	f, err := clientFor(srv, "ghp_testtoken").Facts(context.Background(), Request{Slug: "jacobsims214/amp", PR: 9})
+	if err != nil {
+		t.Fatalf("Facts: %v", err)
+	}
+	if f.Completeness != Partial {
+		t.Fatalf("Completeness = %q, want partial (reads: %v)", f.Completeness, f.Reads)
+	}
+	if f.Pull.ReviewDecisionKnown {
+		t.Error("ReviewDecisionKnown = true after a 502")
+	}
+	if f.Pull.MergeableState != "clean" {
+		t.Errorf("MergeableState = %q, want clean from the REST read", f.Pull.MergeableState)
+	}
+}
+
+// TestFactsNoReviewDecisionReadWhenPullFails: when the pull read itself 404s,
+// asking GraphQL about the same PR would fail for the same reason. The client
+// does not send it, so one failed read records the whole pull as unknown.
+func TestFactsNoReviewDecisionReadWhenPullFails(t *testing.T) {
+	s, srv := newStub(t)
+	s.json("/repos/jacobsims214/amp", 200, repoBody)
+	s.json("/repos/jacobsims214/amp/pulls/9", 404, `{"message":"Not Found"}`)
+	s.json("/repos/jacobsims214/amp/rules/branches/main", 200, rulesBody)
+	s.json("/repos/jacobsims214/amp/branches/main/protection", 200, protectedBody)
+
+	f, err := clientFor(srv, "ghp_testtoken").Facts(context.Background(), Request{Slug: "jacobsims214/amp", PR: 9})
+	if err != nil {
+		t.Fatalf("Facts: %v", err)
+	}
+	if _, ok := f.ReadFor(OpReviewDecision); ok {
+		t.Fatalf("a decision read was attempted after the pull 404: %v", f.Reads)
+	}
+	for _, p := range s.requests() {
+		if p == "/graphql" {
+			t.Fatalf("GraphQL was called after the pull read failed: %v", s.requests())
+		}
+	}
+	if f.Completeness == Complete {
+		t.Fatal("facts reported complete with an unread pull request")
 	}
 }

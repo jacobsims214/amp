@@ -91,8 +91,12 @@ func (f factsView) view() GitHubFactsView {
 	if !f.pullTrusted && f.pullBase == "" {
 		v.Pull = GitHubPullFactsView{Unknown: "the pull request's facts have not been read"}
 	} else {
+		// The coordinator's pullView copies each field from the row onto the
+		// view, and the projection reads the view — so the helper must fill
+		// BOTH, or a field the projection now reads could silently stay empty.
 		v.Pull = GitHubPullFactsView{BaseBranch: f.pullBase, RequestedReviewers: f.requestedBy,
 			ReadAt: f.pullReadAt, Fresh: f.pullTrusted, Trusted: f.pullTrusted,
+			ReviewDecision: f.reviewState, MergeableState: f.mergeable,
 			Facts: &repository.GitHubPullFacts{Number: 7, BaseBranch: f.pullBase, State: f.pullState,
 				ReviewDecision: f.reviewState, MergeableState: f.mergeable,
 				RequestedReviewers: f.requestedBy, FetchedAt: &f.pullReadAt}}

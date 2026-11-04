@@ -158,10 +158,13 @@ func mergeAlertInputFromView(v GitHubFactsView, in MergeAlertInput) MergeAlertIn
 
 	// The PR-level signals stand in for a rules read that could not be
 	// complete, so they are only evidence when the pull read itself was
-	// verified and fresh.
+	// verified and fresh. They come from two reads of their own (mergeable
+	// state from REST `pulls/{n}`, the review decision from GraphQL), so each
+	// can independently be 044's "unknown" while the other is a real answer —
+	// which the classifier handles: unknown is not a positive signal.
 	if v.Pull.Trusted && v.Pull.Facts != nil {
-		in.Rules.ReviewDecision = v.Pull.Facts.ReviewDecision
-		in.Rules.MergeableState = v.Pull.Facts.MergeableState
+		in.Rules.ReviewDecision = v.Pull.ReviewDecision
+		in.Rules.MergeableState = v.Pull.MergeableState
 		in.Rules.RequestedReviewers = v.Pull.RequestedReviewers
 		if v.Pull.Facts.State == "merged" {
 			in.Merged = true

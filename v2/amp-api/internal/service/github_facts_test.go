@@ -185,6 +185,10 @@ func (s *memGitHubFactStore) UpsertGitHubPullFacts(_ context.Context, k reposito
 	if w.VerifiedAt != nil {
 		cur.BaseBranch, cur.State = w.BaseBranch, w.State
 		cur.RequestedReviewers, cur.RequestedTeams = w.RequestedReviewers, w.RequestedTeams
+		// 044's upsert replaces these on a verified read (see
+		// github_pull_facts' ON CONFLICT), so the fake must too: a fake that
+		// dropped them would let a broken write path pass.
+		cur.ReviewDecision, cur.MergeableState = w.ReviewDecision, w.MergeableState
 		cur.Completeness = w.Completeness
 		cur.FetchedAt = w.VerifiedAt
 		cur.LastErrorClass, cur.LastErrorAt = "", nil
@@ -253,6 +257,7 @@ func (s *memGitHubFactStore) seedPull(projectID int, slug string, n int, w repos
 	if w.VerifiedAt != nil {
 		cur.BaseBranch, cur.State = w.BaseBranch, w.State
 		cur.RequestedReviewers, cur.RequestedTeams = w.RequestedReviewers, w.RequestedTeams
+		cur.ReviewDecision, cur.MergeableState = w.ReviewDecision, w.MergeableState
 		cur.Completeness, cur.FetchedAt = w.Completeness, w.VerifiedAt
 	} else {
 		cur.LastErrorClass = w.FailureClass
@@ -335,9 +340,14 @@ func okFacts(req githubfacts.Request) *githubfacts.Facts {
 		githubfacts.Read{Op: githubfacts.OpRules, OK: true, Status: 200},
 		githubfacts.Read{Op: githubfacts.OpProtection, OK: true, Status: 200})
 	if req.PR > 0 {
-		f.Pull = githubfacts.PullFacts{Known: true, Base: target, RequestedReviewers: []string{"octocat"}}
+		f.Pull = githubfacts.PullFacts{Known: true, Base: target, RequestedReviewers: []string{"octocat"},
+			// Both §3.3 signals answered, so the pull row is Complete; a
+			// test that wants them unknown says so in its own answer.
+			MergeableState: "clean", ReviewDecision: "APPROVED", ReviewDecisionKnown: true}
 		f.Target, f.TargetSource = target, githubfacts.SourcePull
-		f.Reads = append(f.Reads, githubfacts.Read{Op: githubfacts.OpPull, OK: true, Status: 200})
+		f.Reads = append(f.Reads,
+			githubfacts.Read{Op: githubfacts.OpPull, OK: true, Status: 200},
+			githubfacts.Read{Op: githubfacts.OpReviewDecision, OK: true, Status: 200})
 	}
 	return f
 }
