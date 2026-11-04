@@ -149,10 +149,25 @@ done with the PR link also records that PR as merged on the tickets that produce
 ### In the app
 
 - **Board:** a human ticket shows **Person · Judgment** (or its reason) in place of an agent.
-- **Ticket panel:** says who does it and why; for its owner, **Start** and **Mark done…**.
+- **Ticket panel:** an open human ticket opens on its brief, not its history. The panel at the
+  top says, in order:
+  - **what to do**, headed by the reason as a verb (**Decide**, **Sign off**, **Review**, **Do with
+    your access**, **Get from someone outside**, **Do offline**, **Do**) and who does it;
+  - where it sits (epic › story), its reason, and who planned it;
+  - **What you need to do** (the description) and **Done when** (the acceptance criteria, as a
+    checklist when they're written as a list). When both are empty it says **The planner left no
+    instructions**, names who to ask, and offers **Edit** to whoever can change the plan;
+  - **Unblocks N**: the open tickets that depend on it, each a link, or **Nothing waits on this**;
+  - for its owner, **Start** and **Mark done…**.
+
+  The rules (agents never pick it up or mark it done) are in the heading's tooltip.
   - To change who does it: **Edit → Done by** (an agent or a person). You can't change it while
     work is in progress.
-  - Every change is on the ticket's history.
+  - Every change is on the ticket's history. Comments there, an agent's question, and a run's
+    note are shown as markdown (lists, code, links).
+  - The open tab is in the link (`&tab=details` or `&tab=history`), and **Copy link** in the
+    panel's header copies a link to the ticket on that tab. A ticket that isn't started, and an
+    open human ticket, open on Details; other tickets open on History.
 - **New ticket:** choose **Done by: A person**, then the reason and the owner.
 - **Reports → People in the loop:**
   - agents vs people: tickets, how long each **waited to start** (ready → started) and **took

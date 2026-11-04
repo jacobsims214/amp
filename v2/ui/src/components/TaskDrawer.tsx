@@ -1,10 +1,14 @@
-import { useEffect, useMemo, useState } from 'react'
-import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, UserRound, ShieldCheck, ShieldAlert, ArrowRight, GitMerge, Check, RotateCcw } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
+import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, UserRound, ShieldCheck, ShieldAlert, ArrowRight, GitMerge, Check, RotateCcw, Link2 } from 'lucide-react'
+import { Link, useLocation, useSearchParams } from 'react-router-dom'
 import { HUMAN_REASONS, isHuman, reasonHint, reasonLabel } from '../lib/human'
 import { approvalOf, approvalOwner, formatWhen, isRelayed, isYours, relayedFor } from '../lib/approval'
-import { projectLink } from '../lib/projectLink'
+import { projectLink, type ProjectView } from '../lib/projectLink'
+import { softBreaks } from '../lib/brief'
+import { useSearchParam } from '../hooks/useSearchParam'
+import { useProjectPlan, type ProjectPlan } from '../hooks/useProjectPlan'
 import { HumanActions } from './human/HumanActions'
+import { HumanWork } from './human/HumanWork'
 import { mergeStatusText } from '../lib/humanActions'
 import { effectiveMetadata, integrationBranch, mergedIntoIntegration, waitsForMerge } from '../lib/merge'
 import { api } from '../api/client'
@@ -18,7 +22,7 @@ import { displayState } from '../lib/ticketState'
 import { ConfirmDeleteModal } from './ConfirmDeleteModal'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
 import { activityActor, canPlanTask, canTakeOverTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
-import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata, Epic, Story, HumanReason, Run } from '../types'
+import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata, HumanReason, Run } from '../types'
 import { DependencyPicker } from './DependencyPicker'
 import { MetadataEditor } from './MetadataEditor'
 import { metadataPatch } from '../lib/metadata'
@@ -87,15 +91,34 @@ const ACTION_LABEL: Record<string, string> = {
   returned: 'returned to ready',
 }
 
+type Tab = 'history' | 'details'
+
+/**
+ * The tab a ticket opens on when the URL doesn't name one: a ticket nobody
+ * has started opens on what it asks for, and so does an open human ticket
+ * (its owner needs the brief, not "Created · Started"); one in flight or
+ * done opens on what happened.
+ */
+function defaultTabFor(t: Pick<Task, 'state' | 'performer'>): Tab {
+  return t.state === 'backlog' || (isHuman(t) && t.state !== 'completed') ? 'details' : 'history'
+}
+
+/** The views that open a ticket from ?focus= (lib/projectLink.ts); links from any other view go to the Board. */
+const FOCUS_VIEWS: ProjectView[] = ['board', 'plan', 'mission']
+function focusView(pathname: string): ProjectView {
+  const v = pathname.match(/^\/project\/[^/]+\/([^/?#]+)/)?.[1] as ProjectView | undefined
+  return v && FOCUS_VIEWS.includes(v) ? v : 'board'
+}
+
 const inputCls =
   'w-full bg-bg border border-line rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-3 ' +
   'focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-all font-[inherit]'
 
 export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAccess = null, openReassign = false, onTaskUpdated, notStartedFlagMinutes }: Props) {
-  const [history, setHistory] = useState<ActivityLog[]>([])
-  const [comments, setComments] = useState<Comment[]>([])
-  const [tab, setTab] = useState<'history' | 'details'>('details')
-  const [loading, setLoading] = useState(false)
+  // History and comments, tagged with the ticket they were read for: until
+  // the first read for this ticket answers, the History tab shows a skeleton;
+  // a reread (state or owner changed) keeps the rows on screen meanwhile.
+  const [log, setLog] = useState<{ taskId: number; history: ActivityLog[]; comments: Comment[] } | null>(null)
   const [editing, setEditing] = useState(false)
   const [editForm, setEditForm] = useState({ name: '', description: '', acceptance_criteria: '', assigned_to: '', priority: '1',
     performer: 'agent' as 'agent' | 'human', human_reason: 'other' as HumanReason })
@@ -104,18 +127,51 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   const [deleting, setDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState<string | null>(null)
   const [editError, setEditError] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
   const people = useMemo(() => peopleById(members), [members])
+  // The project's tickets, epics and stories, read once per drawer: the human
+  // panel (what this unblocks) and the Details tab (pickers) share them.
+  const plan = useProjectPlan(task?.project_id)
+  const location = useLocation()
+  const [searchParams] = useSearchParams()
+
+  // The tab lives in the URL (?tab=), so a link or a reload opens the same
+  // tab. Without one, the default is fixed when the ticket opens, so a state
+  // change while it's open (Start, Mark done) doesn't move the reader.
+  const [opened, setOpened] = useState<{ id: number; tab: Tab } | null>(null)
+  if (task && opened?.id !== task.id) setOpened({ id: task.id, tab: defaultTabFor(task) })
+  const defaultTab: Tab = task ? (opened?.id === task.id ? opened.tab : defaultTabFor(task)) : 'details'
+  const [tabParam, setTabParam] = useSearchParam('tab', defaultTab)
+  const tab: Tab = tabParam === 'history' || tabParam === 'details' ? tabParam : defaultTab
+
+  // ?tab= belongs to the open ticket: closing the drawer or switching tickets
+  // drops it. (Views that focus with ?focus= already drop it; this covers the
+  // rest, e.g. the DAG.)
+  const lastId = useRef<number | null>(task?.id ?? null)
+  useEffect(() => {
+    const prev = lastId.current
+    lastId.current = task?.id ?? null
+    if (prev != null && prev !== lastId.current && searchParams.has('tab')) setTabParam(null)
+  }, [task?.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!task) return
-    setLoading(true)
+    const id = task.id
+    let live = true
     setEditing(false)
-    Promise.all([api.getHistory(task.id), api.getComments(task.id)])
-      .then(([h, c]) => { setHistory(h); setComments(c) })
-      .finally(() => setLoading(false))
+    Promise.all([api.getHistory(id), api.getComments(id)])
+      .then(([history, comments]) => { if (live) setLog({ taskId: id, history, comments }) })
+      .catch(() => { if (live) setLog(prev => prev?.taskId === id ? prev : { taskId: id, history: [], comments: [] }) })
+    return () => { live = false }
     // Reload when ownership or state changes too, so the history shows the
     // assignment or transition that just happened.
-  }, [task?.id, task?.owner_user_id, task?.state])
+  }, [task?.id, task?.owner_user_id, task?.state]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!copied) return
+    const t = setTimeout(() => setCopied(false), 1500)
+    return () => clearTimeout(t)
+  }, [copied])
 
   // Escape closes the drawer, unless a confirm dialog or an edit is open.
   useEffect(() => {
@@ -126,12 +182,6 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [task, editing, showDeleteConfirm, onClose])
-
-  // A ticket nobody has started opens on what it asks for; one in flight or
-  // done opens on what happened.
-  useEffect(() => {
-    if (task) setTab(task.state === 'backlog' ? 'details' : 'history')
-  }, [task?.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleEditSave = async () => {
     setEditSaving(true)
@@ -174,6 +224,30 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   const canWork = canWorkTask(task, meId, myAccess)
   // Editing the plan (text, dependencies, story) is wider than working it.
   const canPlan = canPlanTask(task, meId, myAccess)
+  const history = log?.taskId === task.id ? log : null
+  const view = focusView(location.pathname)
+  const ticketHref = (id: number) => projectLink(task.project_id, view, id)
+  // The human panel leads with the brief, so Details doesn't repeat it.
+  const showHumanWork = isHuman(task) && task.state !== 'completed' && displayState(task) !== 'flag'
+
+  const startEdit = () => {
+    setEditForm({
+      name: task.name,
+      description: task.description || '',
+      acceptance_criteria: task.acceptance_criteria || '',
+      assigned_to: task.assigned_to || '',
+      priority: task.priority || '1',
+      performer: task.performer ?? 'agent',
+      human_reason: task.human_reason ?? 'other',
+    })
+    setEditError(null)
+    setEditing(true)
+  }
+
+  const copyLink = () => {
+    const url = `${window.location.origin}${ticketHref(task.id)}&tab=${tab}`
+    navigator.clipboard?.writeText(url).then(() => setCopied(true)).catch(() => {})
+  }
 
   return (
     <>
@@ -206,20 +280,15 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
             <h2 className="text-[17px] font-semibold text-ink leading-snug m-0">{task.name}</h2>
           </div>
           <div className="flex items-center gap-0.5 flex-shrink-0">
+            <button type="button" onClick={copyLink}
+              className="amp-btn amp-btn-ghost amp-btn-sm"
+              title={copied ? 'Copied' : 'Copy a link to this ticket'} aria-label="Copy link"
+            >
+              {copied ? <Check size={13} className="text-success-ink" aria-hidden="true" /> : <Link2 size={13} className="text-ink-2" aria-hidden="true" />}
+              {copied && <span className="text-[11px] text-success-ink" role="status">Copied</span>}
+            </button>
             {canPlan && <button
-              onClick={() => {
-                setEditForm({
-                  name: task.name,
-                  description: task.description || '',
-                  acceptance_criteria: task.acceptance_criteria || '',
-                  assigned_to: task.assigned_to || '',
-                  priority: task.priority || '1',
-                  performer: task.performer ?? 'agent',
-                  human_reason: task.human_reason ?? 'other',
-                })
-                setEditError(null)
-                setEditing(true)
-              }}
+              onClick={startEdit}
               className="amp-btn amp-btn-ghost amp-btn-sm"
               title="Edit task" aria-label="Edit task"
             >
@@ -291,7 +360,9 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
           {task.blocked_by_ids?.length ? (
             <div className="flex items-center gap-1.5 text-xs text-danger-ink">
               <AlertCircle size={11} />
-              <span>Waiting on #{task.blocked_by_ids.join(', #')}</span>
+              <span>Waiting on {task.blocked_by_ids.map((id, i) => (
+                <Fragment key={id}>{i > 0 && ', '}<Link to={ticketHref(id)} className="underline underline-offset-2 hover:text-ink">#{id}</Link></Fragment>
+              ))}</span>
             </div>
           ) : null}
           {task.state === 'completed' && task.completed_at && (
@@ -331,7 +402,10 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
         {displayState(task) === 'flag' && (
           <div className="px-6 py-4 border-b border-line" style={{ background: 'color-mix(in srgb, var(--st-flag) 6%, var(--surface))', boxShadow: 'inset 3px 0 0 var(--st-flag)' }}>
             <HumanActions key={`flag-${task.id}`} task={task} kind="answer" canAct={canWork}
-              onChanged={t => { if (t) { if (onTaskUpdated) onTaskUpdated(t); else onRefresh?.() } else onRefresh?.(); api.getComments(task.id).then(setComments).catch(() => {}) }} />
+              onChanged={t => {
+                if (t) { if (onTaskUpdated) onTaskUpdated(t); else onRefresh?.() } else onRefresh?.()
+                api.getComments(task.id).then(comments => setLog(prev => prev?.taskId === task.id ? { ...prev, comments } : prev)).catch(() => {})
+              }} />
           </div>
         )}
 
@@ -342,8 +416,9 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
         )}
 
         {/* A person's own ticket: they start and finish it here */}
-        {isHuman(task) && task.state !== 'completed' && displayState(task) !== 'flag' && (
-          <HumanWork key={`human-${task.id}`} task={task} meId={meId} people={people}
+        {showHumanWork && (
+          <HumanWork key={`human-${task.id}`} task={task} meId={meId} people={people} plan={plan}
+            canPlan={canPlan} onEdit={() => { startEdit(); setTabParam('details') }} ticketHref={ticketHref}
             onChanged={t => { if (onTaskUpdated) onTaskUpdated(t); else onRefresh?.() }} />
         )}
 
@@ -368,7 +443,8 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
           {(['history', 'details'] as const).map(t => (
             <button
               key={t}
-              onClick={() => setTab(t)}
+              onClick={() => setTabParam(t)}
+              aria-pressed={tab === t}
               className={`px-6 py-3 text-xs font-semibold capitalize transition-all border-b-2 -mb-px cursor-pointer ${
                 tab === t
                   ? 'border-primary text-link'
@@ -443,15 +519,14 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
                 </button>
               </div>
             </div>
-          ) : loading ? (
-            <div className="flex justify-center py-10">
-              <Loader2 size={20} className="text-ink-2 animate-spin" />
-            </div>
           ) : tab === 'details' ? (
-            <DetailsTab task={task} onClose={onClose} onRefresh={onRefresh} canWork={canWork} canPlan={canPlan}
+            // Details needs nothing from the history read: it renders at once.
+            <DetailsTab task={task} plan={plan} hideBrief={showHumanWork} onClose={onClose} onRefresh={onRefresh} canWork={canWork} canPlan={canPlan}
               onUpdated={t => (onTaskUpdated ? onTaskUpdated(t) : onRefresh?.())} />
+          ) : history ? (
+            <HistoryTab history={history.history} comments={history.comments} people={people} />
           ) : (
-            <HistoryTab history={history} comments={comments} people={people} />
+            <HistorySkeleton />
           )}
         </div>
       </div>
@@ -632,26 +707,13 @@ export function ApprovalLine({ task, people, meId }: { task: Task; people: Map<n
 // Where a ticket sits in the plan: its story (movable) and the tickets it
 // waits on (editable). Changes apply immediately; the server validates them
 // (no cycles, same project) and moves the ticket between ready and blocked.
-function TaskPlacement({ task, canEdit, onUpdated }: {
-  task: Task; canEdit: boolean; onUpdated: (t: Task) => void
+function TaskPlacement({ task, plan, canEdit, onUpdated }: {
+  task: Task; plan: ProjectPlan; canEdit: boolean; onUpdated: (t: Task) => void
 }) {
-  const [tasks, setTasks] = useState<Task[]>([])
-  const [epics, setEpics] = useState<Epic[]>([])
-  const [stories, setStories] = useState<Story[]>([])
+  const { tasks, epics, stories } = plan
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [warnings, setWarnings] = useState<string[]>([])
-
-  useEffect(() => {
-    let cancelled = false
-    Promise.all([api.listTasks(task.project_id), api.listEpics(task.project_id)])
-      .then(async ([ts, es]) => {
-        const ss = (await Promise.all(es.map(e => api.listStories(e.id)))).flat()
-        if (!cancelled) { setTasks(ts); setEpics(es); setStories(ss) }
-      })
-      .catch(() => {})
-    return () => { cancelled = true }
-  }, [task.project_id])
 
   const run = async (fn: () => Promise<{ task: Task; warnings?: string[] | null }>) => {
     setBusy(true); setError(null); setWarnings([])
@@ -755,8 +817,8 @@ function TaskMetadata({ task, canEdit, onSaved }: { task: Task; canEdit: boolean
   )
 }
 
-function DetailsTab({ task, onClose, onRefresh, canWork, canPlan, onUpdated }: {
-  task: Task; onClose: () => void; onRefresh?: () => void; canWork: boolean; canPlan: boolean; onUpdated: (t: Task) => void
+function DetailsTab({ task, plan, hideBrief, onClose, onRefresh, canWork, canPlan, onUpdated }: {
+  task: Task; plan: ProjectPlan; hideBrief: boolean; onClose: () => void; onRefresh?: () => void; canWork: boolean; canPlan: boolean; onUpdated: (t: Task) => void
 }) {
   const [editingSchedule, setEditingSchedule] = useState(false)
   const [scheduleValue, setScheduleValue] = useState('')
@@ -781,7 +843,7 @@ function DetailsTab({ task, onClose, onRefresh, canWork, canPlan, onUpdated }: {
 
   return (
     <div className="space-y-5">
-      {task.description && (
+      {task.description && !hideBrief && (
         <div>
           <div className="amp-label mb-2">Description</div>
           <div className="bg-surface-2 p-4 border border-line">
@@ -789,7 +851,7 @@ function DetailsTab({ task, onClose, onRefresh, canWork, canPlan, onUpdated }: {
           </div>
         </div>
       )}
-      {task.acceptance_criteria && (
+      {task.acceptance_criteria && !hideBrief && (
         <div>
           <div className="amp-label mb-2">Acceptance criteria</div>
           <div className="bg-surface-2 p-4 border border-line">
@@ -808,7 +870,7 @@ function DetailsTab({ task, onClose, onRefresh, canWork, canPlan, onUpdated }: {
         )}
       </div>
 
-      <TaskPlacement key={`p-${task.id}`} task={task} canEdit={canPlan} onUpdated={onUpdated} />
+      <TaskPlacement key={`p-${task.id}`} task={task} plan={plan} canEdit={canPlan} onUpdated={onUpdated} />
 
       <TaskMetadata key={task.id} task={task} canEdit={canPlan} onSaved={onRefresh} />
 
@@ -874,6 +936,26 @@ function DetailsTab({ task, onClose, onRefresh, canWork, canPlan, onUpdated }: {
   )
 }
 
+/** The History tab before its first read answers: rows shaped like the real ones, no spinner. */
+function HistorySkeleton() {
+  return (
+    <div className="space-y-0 animate-pulse" data-testid="history-skeleton" aria-busy="true" aria-label="Loading history">
+      {[0, 1, 2, 3].map(i => (
+        <div key={i} className="flex gap-3">
+          <div className="flex flex-col items-center flex-shrink-0">
+            <span className="mt-1.5 block w-1.5 h-1.5 rounded-full bg-line-str" />
+            {i < 3 && <div className="w-px flex-1 bg-line-sub mt-1.5" />}
+          </div>
+          <div className="pb-5 flex-1 min-w-0 grid gap-1.5">
+            <div className="h-2.5 w-2/5 bg-surface-3" />
+            <div className="h-2.5 w-4/5 bg-surface-2" />
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function HistoryTab({ history, comments, people }: { history: ActivityLog[]; comments: Comment[]; people: Map<number, Person> }) {
   if (history.length === 0 && comments.length === 0) {
     return (
@@ -928,12 +1010,16 @@ function HistoryTab({ history, comments, people }: { history: ActivityLog[]; com
               )}
               <span className="text-xs text-ink-3 ml-auto flex-shrink-0 tabular-nums">{relativeTime(entry.created_at)}</span>
             </div>
-            {entry.detail && (
-              <div className={`text-xs rounded-xl px-3.5 py-2.5 leading-relaxed whitespace-pre-wrap ${
-                entry.action === 'comment'
-                  ? `bg-bg border text-ink ${relayed ? 'border-dashed border-line-str' : 'border-line-sub'}`
-                  : 'text-ink-2'
-              }`}>
+            {/* A comment is a person's or agent's own words, written as markdown
+                (line breaks kept); AMP's own notes stay plain text. */}
+            {entry.detail && entry.action === 'comment' && (
+              <div className={`rounded-xl px-3.5 py-2.5 bg-bg border text-ink ${relayed ? 'border-dashed border-line-str' : 'border-line-sub'}`}
+                data-testid="history-comment">
+                <Markdown size="compact">{softBreaks(entry.detail)}</Markdown>
+              </div>
+            )}
+            {entry.detail && entry.action !== 'comment' && (
+              <div className="text-xs rounded-xl px-3.5 py-2.5 leading-relaxed whitespace-pre-wrap text-ink-2">
                 {entry.detail}
               </div>
             )}
@@ -950,31 +1036,6 @@ function MetaItem({ label, value }: { label: string; value: string }) {
     <div className="bg-bg rounded-xl p-3 border border-line-sub">
       <div className="text-xs text-ink-3 font-medium mb-0.5">{label}</div>
       <div className="text-sm text-ink font-semibold truncate">{value}</div>
-    </div>
-  )
-}
-
-/** A human ticket's panel: what kind of human work it is, who does it, and
- *  for its owner the same Start and Mark done… as My work (HumanActions). */
-function HumanWork({ task, meId, people, onChanged }: {
-  task: Task; meId?: number; people: Map<number, Person>; onChanged: (t: Task) => void
-}) {
-  const owner = task.owner_user_id != null ? lookupPerson(people, task.owner_user_id) : null
-  // Its owner does it; an unassigned one is claimed by whoever starts it. Local dev has no ownership.
-  const mine = meId === undefined || task.owner_user_id == null || task.owner_user_id === meId
-  return (
-    <div className="px-6 py-4 border-b border-line grid gap-2.5" style={{ background: 'var(--surface-2)', boxShadow: 'inset 3px 0 0 var(--ink)' }}>
-      <span className="amp-label flex items-center gap-1.5"><UserRound size={12} />
-        {owner ? `${owner.name} does this` : 'A person does this'} · {reasonLabel(task.human_reason)}</span>
-      <p className="m-0 text-[13px] leading-relaxed text-ink-2">
-        {reasonHint(task.human_reason)}. Agents never pick it up, and they can't mark it done: only {owner ? owner.name : 'its owner'} can, here in AMP. The work that depends on it starts then.
-      </p>
-      {!mine && task.state !== 'blocked'
-        ? <span className="text-[12.5px] text-ink-2">Only {owner ? owner.name : 'its owner'} starts and finishes it.</span>
-        : <HumanActions task={task} kind="do" canAct={mine} onChanged={t => { if (t) onChanged(t) }} />}
-      {task.state === 'in_progress' && task.dispatched_at && (
-        <span className="text-[12px] text-ink-3">Started {relativeTime(task.dispatched_at)}</span>
-      )}
     </div>
   )
 }
