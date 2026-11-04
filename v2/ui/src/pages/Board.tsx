@@ -29,6 +29,7 @@ import { lookupPerson, ownerFilterNarrows, peopleById, personName, taskMatchesOw
 import type { Task, TaskState, Epic, Story, ProjectMember, ProjectAccess, Metadata, HumanReason } from '../types'
 import { HUMAN_REASONS } from '../lib/human'
 import { BandLoader } from '../components/brand/BandLoader'
+import { LoadError } from '../components/ui/LoadError'
 import { ApprovalLink } from '../components/ApprovalLink'
 import { usePlanApproval } from '../hooks/usePlanApproval'
 import { awaitingApproval } from '../lib/approval'
@@ -327,8 +328,8 @@ export function Board() {
 
   if (error) {
     return (
-      <div className="flex items-center justify-center h-full text-danger-ink text-sm" style={{ background: 'var(--bg)' }}>
-        {error}
+      <div className="flex items-center justify-center h-full p-6" style={{ background: 'var(--bg)' }}>
+        <LoadError message={error} onRetry={refresh} className="max-w-xl" />
       </div>
     )
   }

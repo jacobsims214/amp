@@ -22,6 +22,14 @@ AMP restarted, or the harness started while AMP was unreachable. Restart the har
 should stop and say so; they must never work around it through the web UI's API, someone else's
 token, or AMP's source.
 
+## A page says it "took longer than 12 seconds"
+
+The Board and Day reports stop waiting after 12 seconds and show the message with a **Retry**
+button, instead of a loader that never finishes. Usually AMP's server isn't running or isn't
+reachable from the browser (with `npm run dev`, the UI proxies `/api` to `:3001`). Start it and
+press Retry. If it keeps happening with AMP up, check that only a few AMP tabs are open: each tab
+holds one live-update connection, and browsers allow six per host over HTTP/1.1.
+
 ## "Forbidden" on dispatch or complete
 
 The ticket isn't yours. AMP only lets the owner's agent run a ticket. Ask its owner, or have a
