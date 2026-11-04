@@ -14,7 +14,8 @@ import { BarChart } from '../components/ui/BarChart'
 import { PageHeader, Panel } from '../components/ui/PageHeader'
 import { QUIET_MS, silentFor } from '../lib/ticketState'
 import type { Artifact, DayReport, MyWork as MyWorkData, ProjectRef, ProjectWait, VelocityDay, WaitCounts, WaitItem, WaitKind, WorkTask } from '../types'
-import { BandLoader } from '../components/brand/BandLoader'
+import { SkeletonReadouts, SkeletonRegion, SkeletonSection } from '../components/ui/Skeleton'
+import { useDelayedFlag } from '../hooks/useDelayedFlag'
 import { isHuman } from '../lib/human'
 import { needsLine } from '../lib/humanActions'
 import { expiresIn } from '../lib/artifacts'
@@ -223,6 +224,12 @@ export function MyWork() {
   // (or, from older APIs, an error). Say why instead of showing zeros.
   const noWork = authLoading ? null : noMyWorkReason(me) ?? (isNoUserError(error) ? 'no-user' : null)
 
+  // A first load: identity or the list hasn't answered, and nothing went wrong yet.
+  // Never zeros or green in the meantime: the summary waits for both.
+  const firstLoad = (authLoading || !work) && !error && !noWork
+  // Tier 1: the header is up at once; the summary's shapes show only if the load runs long.
+  const showSkeleton = useDelayedFlag(firstLoad, undefined, 400)
+
   const counts = work?.counts ?? ZERO
   const cards = work?.projects ?? []
   const waitingCards = cards.filter(p => p.counts.waiting > 0)
@@ -264,7 +271,17 @@ export function MyWork() {
       <div className="p-4 sm:p-7 sm:pt-5 grid gap-4">
         {noWork && <MyWorkUnavailable reason={noWork} email={me?.email} />}
         {!noWork && error && <MyWorkLoadError error={error} onRetry={() => { setError(null); loadWork() }} />}
-        {(authLoading || !work) && !error && !noWork && <div className="flex justify-center py-16"><BandLoader label="Loading your work" /></div>}
+        {firstLoad && (
+          <SkeletonRegion label="Loading your work" className="grid gap-4">
+            {showSkeleton && <>
+              <SkeletonReadouts cells={7} />
+              <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)]">
+                <div className="grid gap-4 min-w-0"><SkeletonSection /><SkeletonSection /></div>
+                <div className="grid gap-4 min-w-0"><SkeletonSection rows={2} /></div>
+              </div>
+            </>}
+          </SkeletonRegion>
+        )}
         {work && !authLoading && !error && !noWork && <>
           <div className="amp-panel amp-panel-top grid grid-cols-3 md:grid-cols-7" aria-label="Waiting on you, across your projects">
             <div className="col-span-3 md:col-span-1 px-4 py-3 grid gap-1.5 border-b md:border-b-0 border-line"

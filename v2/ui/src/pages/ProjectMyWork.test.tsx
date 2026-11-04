@@ -147,6 +147,7 @@ describe('My work tab: states', () => {
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveTextContent("Couldn't load My work: boom")
     expect(alert).toHaveTextContent('no counts are shown')
+    expect(screen.queryByRole('status', { name: 'Loading My work' })).toBeNull()
     expect(screen.queryByRole('group', { name: /waiting on you/i })).toBeNull()
     server.use(http.get('*/api/projects/2/my-work', () => HttpResponse.json(data)))
     await userEvent.click(within(alert).getByRole('button', { name: 'Try again' }))
@@ -281,6 +282,30 @@ describe('badges', () => {
     expect(tab).toHaveAttribute('href', '/project/2/my-work')
     expect(tab.querySelector('span')).toHaveClass('bg-accent')
     expect(screen.getByRole('link', { name: 'Mission' })).toHaveAttribute('href', '/project/2/mission')
+  })
+})
+
+describe('My work tab: loading', () => {
+  it('draws the project nav at once and the list skeleton only once the load runs past 250ms', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(r => { release = r })
+    server.use(http.get('*/api/projects/2/my-work', async () => { await gate; return HttpResponse.json(data) }))
+    at('/project/2/my-work')
+    expect(screen.getByRole('link', { name: 'Mission' })).toBeInTheDocument()
+    const region = screen.getByRole('status', { name: 'Loading My work' })
+    expect(region).toHaveAttribute('aria-busy', 'true')
+    expect(document.querySelector('.amp-band-loader')).toBeNull()
+    expect(region.querySelector('.amp-skel')).toBeNull()
+    await waitFor(() => expect(region.querySelector('.amp-skel')).not.toBeNull())
+    release()
+    await screen.findByRole('region', { name: 'Waiting on you' })
+    expect(screen.queryByRole('status', { name: 'Loading My work' })).toBeNull()
+  })
+
+  it('shows no skeleton for a fast load', async () => {
+    at('/project/2/my-work')
+    await screen.findByRole('region', { name: 'Waiting on you' })
+    expect(document.querySelector('.amp-skel')).toBeNull()
   })
 })
 

@@ -224,6 +224,19 @@ body {
 @keyframes amp-lamp { 0% { background: var(--lamp); } 62% { background: var(--line-sub); } }
 .amp-band-loader-cap { font-family: var(--font-data); font-size: 11px; color: var(--ink-3); letter-spacing: .04em; }
 
+/* Loading tiers. 0: the launch screen, cold boot only. 1: skeletons, a page that
+   knows its layout but not its data. 2: the progress band, data on screen that
+   is refetching. Any indicator waits ~250ms first (useDelayedFlag). */
+.amp-skel { display: block; border-radius: var(--radius);
+  background: linear-gradient(90deg, var(--surface-3) 0 35%, var(--surface-2) 50%, var(--surface-3) 65% 100%) 0 0 / 300% 100%;
+  animation: amp-skel-sweep 1.4s ease-in-out infinite; }
+@keyframes amp-skel-sweep { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.amp-skel-card { padding: 9px 10px 10px 12px; border-radius: var(--radius); box-shadow: inset 3px 0 0 var(--line); }
+.amp-progress-band { position: absolute; inset: 0; width: 40%;
+  background: linear-gradient(90deg, var(--band-4) 0 25%, var(--band-3) 25% 50%, var(--band-2) 50% 75%, var(--band-1) 75%);
+  animation: amp-progress-run 1.2s cubic-bezier(.4,0,.2,1) infinite; }
+@keyframes amp-progress-run { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+
 /* GO stamp: a passing plan check stamps in and the bands draw under it. */
 .amp-go-stamp { position: relative; animation: amp-stamp 420ms cubic-bezier(.2,1.4,.4,1) both; }
 .amp-go-stamp::after { content: ""; position: absolute; left: -1px; right: -1px; bottom: -5px; height: 2px;
@@ -243,4 +256,12 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+}
+/* With motion cut, loaders hold a static, lit state instead of ending on blank
+   grey: the band strip stays lit, skeletons stay a flat fill, the progress band
+   stays a full-width strip. */
+@media (prefers-reduced-motion: reduce) {
+  .amp-band-loader-seg i { animation: none !important; background: var(--lamp); opacity: .55; }
+  .amp-skel { animation: none !important; background: var(--surface-3); }
+  .amp-progress-band { animation: none !important; width: 100%; opacity: .55; }
 }

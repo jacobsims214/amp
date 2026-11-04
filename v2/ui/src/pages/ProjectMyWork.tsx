@@ -23,7 +23,8 @@ import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { ChevronRight, X } from 'lucide-react'
 import { api } from '../api/client'
 import { ProjectNav } from '../components/ProjectNav'
-import { BandLoader } from '../components/brand/BandLoader'
+import { SkeletonReadouts, SkeletonRegion, SkeletonSection } from '../components/ui/Skeleton'
+import { useDelayedFlag } from '../hooks/useDelayedFlag'
 import { ApproveCard } from '../components/approve/ApproveCard'
 import { ApproveView, type AlsoAwaiting } from '../components/approve/ApproveView'
 import { HumanActions } from '../components/human/HumanActions'
@@ -162,6 +163,12 @@ export function ProjectMyWork() {
   })
   useEffect(() => () => { if (sseTimer.current) clearTimeout(sseTimer.current) }, [])
 
+  // Tier 1: the nav is up at once; the list's shapes show only if the first load runs long.
+  // A reload keeps the loaded list on screen (data stays until the new one lands).
+  // An error about the identity waits for the identity before it says which case.
+  const firstLoad = !data && (!error || waitingForIdentity)
+  const showSkeleton = useDelayedFlag(firstLoad, undefined, 400)
+
   const name = project?.name ?? 'this project'
   const items = useMemo(() => (data ? itemsOf(data) : []), [data])
   const approveItems = items.filter(i => i.kind === 'approve')
@@ -208,7 +215,17 @@ export function ProjectMyWork() {
       <div className="pmw px-7 pt-5 pb-12 max-md:px-4 max-w-[1240px] grid gap-[22px]">
         {noWork && <MyWorkUnavailable reason={noWork} projectId={pid} email={me?.email} />}
         {!noWork && !waitingForIdentity && error && <MyWorkLoadError error={error} onRetry={() => load()} />}
-        {!data && (!error || waitingForIdentity) && <div className="py-16 flex justify-center"><BandLoader label="Loading My work" /></div>}
+        {firstLoad && (
+          <SkeletonRegion label="Loading My work" className="grid gap-[22px]">
+            {showSkeleton && <>
+              <SkeletonReadouts cells={7} />
+              <div className="pmw-layout">
+                <div className="grid gap-2 min-w-0"><SkeletonSection rows={3} /></div>
+                <div className="pmw-side min-w-0"><SkeletonSection rows={3} /></div>
+              </div>
+            </>}
+          </SkeletonRegion>
+        )}
         {data && !noUser && <Body data={data} items={items} name={name} pid={pid} focusId={focusId} setFocus={setFocus}
           onReview={approveParam.open} onChanged={changed} readOnly={readOnly} who={who} />}
       </div>

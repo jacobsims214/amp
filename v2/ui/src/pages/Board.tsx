@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect } from 'react'
 import { useParams } from 'react-router-dom'
 import { useFocusParam } from '../hooks/useFocusParam'
-import { RefreshCw, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users, ListChecks } from 'lucide-react'
+import { RefreshCw, RotateCw, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users, ListChecks } from 'lucide-react'
 import { useBoardData } from '../hooks/useBoardData'
 import { useSSE } from '../hooks/useSSE'
 import { useAuth } from '../hooks/useAuth'
@@ -28,7 +28,9 @@ import { withClears } from '../lib/clear'
 import { lookupPerson, ownerFilterNarrows, peopleById, personName, taskMatchesOwner, type Person } from '../lib/people'
 import type { Task, TaskState, Epic, Story, ProjectMember, ProjectAccess, Metadata, HumanReason } from '../types'
 import { HUMAN_REASONS } from '../lib/human'
-import { BandLoader } from '../components/brand/BandLoader'
+import { SkeletonCard, SkeletonRegion, Skeleton } from '../components/ui/Skeleton'
+import { ProgressBand } from '../components/ui/ProgressBand'
+import { useDelayedFlag } from '../hooks/useDelayedFlag'
 import { LoadError } from '../components/ui/LoadError'
 import { ApprovalLink } from '../components/ApprovalLink'
 import { usePlanApproval } from '../hooks/usePlanApproval'
@@ -74,7 +76,9 @@ export function Board() {
   const { projectId } = useParams<{ projectId: string }>()
   const pid = Number(projectId)
 
-  const { epics, stories, tasks, loading, error, refresh, applyTask, applyEpic, applyStory } = useBoardData(pid)
+  const { epics, stories, tasks, loading, refreshing, error, refresh, applyTask, applyEpic, applyStory } = useBoardData(pid)
+  // Tier 2: a refetch keeps the board mounted; the Refresh icon turns once it runs long.
+  const spinRefresh = useDelayedFlag(refreshing, undefined, 400)
   const { me } = useAuth()
   const meId = me?.user_id
   // Track the selected task by id so the drawer reflects live updates
@@ -318,15 +322,10 @@ export function Board() {
     } finally { setTaskSaving(false) }
   }
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-full" style={{ background: 'var(--bg)' }}>
-        <BandLoader label="Loading the board" />
-      </div>
-    )
-  }
-
-  if (error) {
+  // A failed first load has nothing to keep on screen. A failed refetch keeps the
+  // board and says so in a line under the header.
+  const hasBoard = epics.length > 0 || tasks.length > 0
+  if (error && !loading && !hasBoard) {
     return (
       <div className="flex items-center justify-center h-full p-6" style={{ background: 'var(--bg)' }}>
         <LoadError message={error} onRetry={refresh} className="max-w-xl" />
@@ -392,14 +391,30 @@ export function Board() {
             </div>
 
             <button
+              type="button"
               onClick={refresh}
+              aria-label="Refresh the board"
+              title="Refresh the board"
+              aria-busy={refreshing}
               className="p-1.5 text-ink-3 hover:text-ink transition-colors cursor-pointer rounded-lg hover:bg-surface-3"
             >
-              <RefreshCw size={13} />
+              <RefreshCw size={13} className={spinRefresh ? 'animate-spin' : undefined} />
             </button>
           </>
         }
       />
+      <ProgressBand active={refreshing} />
+
+      {error && hasBoard && (
+        <div role="alert" className="px-5 py-2 flex-shrink-0 flex items-center gap-3 text-[12.5px] text-danger-ink border-b border-line-sub">
+          Couldn't refresh the board: {error.replace(/\.$/, '')}. Showing what was loaded.
+          <button type="button" className="amp-btn amp-btn-sm ml-auto" onClick={refresh}>
+            <RotateCw size={12} aria-hidden="true" />Retry
+          </button>
+        </div>
+      )}
+
+      {loading ? <BoardSkeleton /> : <>
 
       {awaiting.length > 0 && (
         <div className="px-5 pt-3 flex-shrink-0">
@@ -678,6 +693,7 @@ export function Board() {
           </div>
         )}
       </div>
+      </>}
 
       {/* Task drawer */}
       <TaskDrawer
@@ -848,6 +864,48 @@ export function Board() {
         </CrudModal>
       )}
     </div>
+  )
+}
+
+/**
+ * Tier 1: the board's first load. The column heads are real (they never depend
+ * on data); each column holds a few card shapes. Nothing shows for a fast load.
+ */
+function BoardSkeleton() {
+  const show = useDelayedFlag(true, undefined, 400)
+  return (
+    <SkeletonRegion label="Loading tickets" className="flex-1 overflow-hidden flex flex-col">
+      {/* where the filter bar lands */}
+      <div className="px-5 py-3 flex-shrink-0 flex gap-2" style={{ borderBottom: '1px solid var(--line-sub)' }}>
+        {show && <><Skeleton w={180} h={26} /><Skeleton w={96} h={26} /><Skeleton w={96} h={26} /></>}
+        {!show && <span className="h-[26px]" />}
+      </div>
+      <div style={{ minWidth: LABEL_COL + COLUMNS.length * TASK_COL }}>
+        <div className="flex" style={{ background: 'var(--surface)', borderBottom: '1px solid var(--line)' }}>
+          <div className="flex-shrink-0 px-3 py-3 border-r border-line-sub" style={{ width: LABEL_COL }} />
+          {COLUMNS.map(col => (
+            <div key={col.state} className="flex-1 px-3 py-3 border-r border-line last:border-r-0 flex items-center gap-2"
+              style={{ minWidth: TASK_COL, boxShadow: `inset 0 3px 0 ${col.topBorder}` }}>
+              <i className="inline-block w-2 h-2" style={{ background: col.color }} aria-hidden="true" />
+              <span className="font-label text-[11px] font-semibold uppercase tracking-[0.14em] text-ink">{col.label}</span>
+            </div>
+          ))}
+        </div>
+        {show && (
+          <div className="flex" data-testid="board-skeleton">
+            <div className="flex-shrink-0 px-3 py-3 border-r border-line-sub grid gap-2 content-start" style={{ width: LABEL_COL }}>
+              <Skeleton w="70%" h={12} />
+              <Skeleton w="45%" h={9} />
+            </div>
+            {COLUMNS.map(col => (
+              <div key={col.state} className="flex-1 p-2 border-r border-line-sub last:border-r-0 grid gap-1.5 content-start" style={{ minWidth: TASK_COL }}>
+                <SkeletonCard /><SkeletonCard /><SkeletonCard />
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </SkeletonRegion>
   )
 }
 

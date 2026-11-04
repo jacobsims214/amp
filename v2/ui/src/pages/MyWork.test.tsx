@@ -1,6 +1,6 @@
 // Top-level My work is a summary (KB decisions/human-work-ux.md §3): no action
 // buttons, every row a link into /project/:id/my-work?focus=<ticket id>.
-import { render, screen, within } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { MemoryRouter } from 'react-router-dom'
@@ -215,6 +215,30 @@ describe('top-level My work: a dispatched ticket no worker started', () => {
   })
 })
 
+describe('top-level My work loading', () => {
+  it('draws the header at once and the summary skeleton only once the load runs past 250ms', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(r => { release = r })
+    server.use(http.get('*/api/my-work', async () => { await gate; return HttpResponse.json(payload) }))
+    const { container } = renderMyWork()
+    expect(screen.getByRole('heading', { name: 'My work', level: 1 })).toBeInTheDocument()
+    expect(screen.getByRole('status', { name: 'Loading your work' })).toHaveAttribute('aria-busy', 'true')
+    expect(container.querySelector('.amp-band-loader')).toBeNull()
+    expect(container.querySelector('.amp-skel')).toBeNull()
+    await waitFor(() => expect(container.querySelector('.amp-skel')).not.toBeNull())
+    release()
+    await screen.findByRole('heading', { name: 'AMP v2' })
+    expect(screen.queryByRole('status', { name: 'Loading your work' })).toBeNull()
+    server.resetHandlers()
+  })
+
+  it('shows no skeleton for a fast load', async () => {
+    const { container } = renderMyWork()
+    await screen.findByRole('heading', { name: 'AMP v2' })
+    expect(container.querySelector('.amp-skel')).toBeNull()
+  })
+})
+
 // The server answers an empty list when there's no AMP user, and a load can
 // fail: neither may read as "0 waiting" or "in all 0 projects" (critique #1).
 const EMPTY: MyWorkData = { ...busy, owned: [], counts: counts({}), projects: [], clear_projects: [], projects_total: 0, agents_in_progress: 0, done_24h: 0 }
@@ -245,6 +269,7 @@ describe('top-level My work: no zeros when there is nothing to count', () => {
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveTextContent("Couldn't load My work: database is down")
     expect(alert).toHaveTextContent('no counts are shown')
+    expect(screen.queryByRole('status', { name: 'Loading your work' })).toBeNull()
     expect(screen.queryByLabelText('Waiting on you, across your projects')).toBeNull()
     expect(screen.queryByText('No project needs you right now.')).toBeNull()
     await userEvent.click(within(alert).getByRole('button', { name: 'Try again' }))
