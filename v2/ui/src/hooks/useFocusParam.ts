@@ -11,7 +11,7 @@ function parseId(v: string | null): number | null {
 
 /**
  * The focused ticket on a project route, kept in `?focus=<ticket id>`
- * (KB decisions/human-work-ux.md §3).
+ * (v2/docs/url-state.md).
  *
  * - `?ticket=` and `?task=` are aliases: they're read at once and rewritten
  *   to `?focus=` with replace, so old links keep working.

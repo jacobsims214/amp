@@ -1,7 +1,9 @@
 import { useEffect, useState } from 'react'
+import { useLocation } from 'react-router-dom'
 import { api } from '../api/client'
 import type { Project } from '../types'
 import { PageHeader } from './ui/PageHeader'
+import { viewLink } from '../lib/projectLink'
 import { projectCounts, useWaitCounts } from '../lib/waitCounts'
 
 export type ProjectView = 'mission' | 'my-work' | 'board' | 'plan' | 'kb' | 'dag' | 'report' | 'artifacts' | 'settings'
@@ -17,16 +19,16 @@ interface ProjectNavProps {
   meta?: React.ReactNode
 }
 
-const TABS: { view: ProjectView; label: string; path: (id: number) => string }[] = [
-  { view: 'mission',  label: 'Mission',     path: id => `/project/${id}/mission` },
-  { view: 'my-work',  label: 'My work',     path: id => `/project/${id}/my-work` },
-  { view: 'board',    label: 'Board',       path: id => `/project/${id}/board` },
-  { view: 'plan',     label: 'Flight plan', path: id => `/project/${id}/plan` },
-  { view: 'dag',      label: 'Graph',       path: id => `/project/${id}/dag` },
-  { view: 'report',   label: 'Reports',     path: id => `/project/${id}/report` },
-  { view: 'artifacts', label: 'Artifacts',  path: id => `/project/${id}/artifacts` },
-  { view: 'kb',       label: 'Library',     path: id => `/project/${id}/kb` },
-  { view: 'settings', label: 'Settings',    path: id => `/project/${id}/settings` },
+const TABS: { view: ProjectView; label: string }[] = [
+  { view: 'mission',  label: 'Mission' },
+  { view: 'my-work',  label: 'My work' },
+  { view: 'board',    label: 'Board' },
+  { view: 'plan',     label: 'Flight plan' },
+  { view: 'dag',      label: 'Graph' },
+  { view: 'report',   label: 'Reports' },
+  { view: 'artifacts', label: 'Artifacts' },
+  { view: 'kb',       label: 'Library' },
+  { view: 'settings', label: 'Settings' },
 ]
 
 /** The header of every project page: project name and code, its views, and
@@ -35,6 +37,9 @@ export function ProjectNav({ projectId, rightSlot, project: given, meta }: Proje
   const [loaded, setProject] = useState<Project | null>(null)
   const project = given ?? loaded
   const waiting = projectCounts(useWaitCounts(), projectId)?.waiting
+  // Switching views keeps the open ticket (?focus=) where the view honors it.
+  const { search } = useLocation()
+  const path = (view: ProjectView) => viewLink(projectId, view, search)
 
   useEffect(() => {
     api.getProject(projectId).then(setProject).catch(() => null)
@@ -47,8 +52,8 @@ export function ProjectNav({ projectId, rightSlot, project: given, meta }: Proje
       meta={meta}
       actions={rightSlot}
       tabs={TABS.map(t => t.view === 'my-work'
-        ? { to: t.path(projectId), label: t.label, count: waiting, hot: (waiting ?? 0) > 0, countLabel: waiting != null ? 'waiting on you' : undefined }
-        : { to: t.path(projectId), label: t.label })}
+        ? { to: path(t.view), label: t.label, count: waiting, hot: (waiting ?? 0) > 0, countLabel: waiting != null ? 'waiting on you' : undefined }
+        : { to: path(t.view), label: t.label })}
     />
   )
 }
