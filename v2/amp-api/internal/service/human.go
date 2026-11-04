@@ -130,10 +130,13 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 		details["merge_for"] = forID
 		switch {
 		case run.PRURL == "":
+			// The person said the step is done, not that they merged
+			// anything: no merge is claimed on their behalf.
 			details["merge_inferred"] = false
 		case !s.mergedNow(ctx, forID):
-			details["merge_recorded"] = false
-		default:
+			// The merge this step tracks is still owed, and the person says
+			// they merged it: recording it is the same act as finishing the
+			// step, so the ticket stops waiting and its dependents start.
 			rec, err := s.MarkTaskMerged(ctx, p, forID, domain.MergeSourceUI, "")
 			if err != nil {
 				slog.Warn("record the merge a linked step finished", "task_id", taskID, "merge_for", forID, "err", err)
@@ -141,6 +144,11 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 			} else {
 				details["merge_recorded"] = !rec.AlreadyRecorded
 			}
+		default:
+			// Already recorded — by this run's textual bridge above, by
+			// GitHub, by CI, or by someone's Mark merged. Nothing is left to
+			// record; keep the detail key so the audit row still says so.
+			details["merge_recorded"] = false
 		}
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "task.human.complete", ProjectID: intRef(t.ProjectID), TargetType: "task", TargetID: idStr(taskID),
