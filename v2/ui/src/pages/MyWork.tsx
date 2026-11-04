@@ -14,7 +14,8 @@ import { BarChart } from '../components/ui/BarChart'
 import { PageHeader, Panel } from '../components/ui/PageHeader'
 import { QUIET_MS, silentFor } from '../lib/ticketState'
 import type { Artifact, DayReport, MyWork as MyWorkData, ProjectRef, ProjectWait, VelocityDay, WaitCounts, WaitItem, WaitKind, WorkTask } from '../types'
-import { BandLoader } from '../components/brand/BandLoader'
+import { SkeletonReadouts, SkeletonRegion, SkeletonSection } from '../components/ui/Skeleton'
+import { useDelayedFlag } from '../hooks/useDelayedFlag'
 import { isHuman, reasonLabel } from '../lib/human'
 import { expiresIn } from '../lib/artifacts'
 import { MySessionsPanel } from '../components/remote/MySessionsPanel'
@@ -178,6 +179,9 @@ export function MyWork() {
     api.expiringArtifacts(14).then(setExpiring).catch(() => {})
   }, [])
 
+  // Tier 1: the header is up at once; the summary's shapes show only if the load runs long.
+  const showSkeleton = useDelayedFlag(!work && !error, undefined, 400)
+
   const counts = work?.counts ?? ZERO
   const cards = work?.projects ?? []
   const waitingCards = cards.filter(p => p.counts.waiting > 0)
@@ -217,7 +221,17 @@ export function MyWork() {
         meta="A summary across your projects. Each row opens the item in that project's My work." />
       <div className="p-4 sm:p-7 sm:pt-5 grid gap-4">
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
-        {!work && !error && <div className="flex justify-center py-16"><BandLoader label="Loading your work" /></div>}
+        {!work && !error && (
+          <SkeletonRegion label="Loading your work" className="grid gap-4">
+            {showSkeleton && <>
+              <SkeletonReadouts cells={7} />
+              <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)]">
+                <div className="grid gap-4 min-w-0"><SkeletonSection /><SkeletonSection /></div>
+                <div className="grid gap-4 min-w-0"><SkeletonSection rows={2} /></div>
+              </div>
+            </>}
+          </SkeletonRegion>
+        )}
         {work && <>
           <div className="amp-panel amp-panel-top grid grid-cols-3 md:grid-cols-7" aria-label="Waiting on you, across your projects">
             <div className="col-span-3 md:col-span-1 px-4 py-3 grid gap-1.5 border-b md:border-b-0 border-line"

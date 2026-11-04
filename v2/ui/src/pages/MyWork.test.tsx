@@ -1,6 +1,6 @@
 // Top-level My work is a summary (KB decisions/human-work-ux.md §3): no action
 // buttons, every row a link into /project/:id/my-work?focus=<ticket id>.
-import { render, screen, within } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { MemoryRouter } from 'react-router-dom'
@@ -166,5 +166,29 @@ describe('top-level My work: a dispatched ticket no worker started', () => {
     expect(amp.textContent).toMatch(/Start 1/)
     expect(within(amp).getByText('Dispatched to amp:amp-worker-frontend 32 min ago; no worker has started it')).toBeInTheDocument()
     expect(within(amp).getByRole('link', { name: /#2803/ })).toHaveAttribute('href', '/project/2/my-work?focus=2803')
+  })
+})
+
+describe('top-level My work loading', () => {
+  it('draws the header at once and the summary skeleton only once the load runs past 250ms', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(r => { release = r })
+    server.use(http.get('*/api/my-work', async () => { await gate; return HttpResponse.json(payload) }))
+    const { container } = renderMyWork()
+    expect(screen.getByRole('heading', { name: 'My work', level: 1 })).toBeInTheDocument()
+    expect(screen.getByRole('status', { name: 'Loading your work' })).toHaveAttribute('aria-busy', 'true')
+    expect(container.querySelector('.amp-band-loader')).toBeNull()
+    expect(container.querySelector('.amp-skel')).toBeNull()
+    await waitFor(() => expect(container.querySelector('.amp-skel')).not.toBeNull())
+    release()
+    await screen.findByRole('heading', { name: 'AMP v2' })
+    expect(screen.queryByRole('status', { name: 'Loading your work' })).toBeNull()
+    server.resetHandlers()
+  })
+
+  it('shows no skeleton for a fast load', async () => {
+    const { container } = renderMyWork()
+    await screen.findByRole('heading', { name: 'AMP v2' })
+    expect(container.querySelector('.amp-skel')).toBeNull()
   })
 })
