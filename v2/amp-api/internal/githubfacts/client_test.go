@@ -950,3 +950,55 @@ func TestRuleParametersZeroValues(t *testing.T) {
 		t.Fatalf("unknown rules yield %+v, want nothing", got)
 	}
 }
+
+// TestRulesPartialMatchesTheClassifierContract pins the one mapping the
+// merge-alert classifier depends on (MergeRuleFacts.Partial, AMP #3133):
+// partial is "the rules answered but absence cannot be proven". Getting it
+// wrong in the quiet direction would let a member-token 404 on classic
+// protection read as "nothing requires anyone".
+func TestRulesPartialMatchesTheClassifierContract(t *testing.T) {
+	tests := []struct {
+		name  string
+		repo  int  // HTTP status for the repo read
+		rules int  // for the rules read
+		prot  int  // for the classic protection read
+		want  bool // RulesPartial
+	}{
+		{name: "all three answered", repo: 200, rules: 200, prot: 200, want: false},
+		{name: "classic protection unreadable", repo: 200, rules: 200, prot: 404, want: true},
+		{name: "rules unreadable", repo: 200, rules: 500, prot: 200, want: true},
+		{name: "both unreadable", repo: 200, rules: 500, prot: 404, want: true},
+		// A failed repo read does not make the RULES partial: they answered,
+		// and Completeness separately carries that the default branch did
+		// not.
+		{name: "repo unreadable, rules fine", repo: 500, rules: 200, prot: 200, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, srv := newStub(t)
+			s.json("/repos/acme/widgets", tt.repo, repoBody)
+			s.json("/repos/acme/widgets/rules/branches/main", tt.rules, `[]`)
+			s.json("/repos/acme/widgets/branches/main/protection", tt.prot, `{"message":"Branch not protected"}`)
+
+			f, err := clientFor(srv, "ghp_testtoken").Facts(context.Background(), Request{Slug: "acme/widgets", Target: "main"})
+			if err != nil {
+				t.Fatalf("Facts: %v", err)
+			}
+			if got := f.RulesPartial(); got != tt.want {
+				t.Fatalf("RulesPartial = %v, want %v (reads: %v)", got, tt.want, f.Reads)
+			}
+			// The same shape the classifier reads: partial facts are never
+			// Complete facts.
+			if tt.want && f.Completeness == Complete {
+				t.Fatal("partial rules reported as complete facts")
+			}
+		})
+	}
+
+	// A rules read that never happened (no target) is partial too — it
+	// certainly cannot prove the absence of a rule.
+	nf := &Facts{Reads: []Read{{Op: OpRepo, OK: true}, {Op: OpRules, Err: &Error{Op: OpRules, Kind: KindNoTarget}}}}
+	if !nf.RulesPartial() {
+		t.Fatal("an unread rules set reported rules as complete")
+	}
+}

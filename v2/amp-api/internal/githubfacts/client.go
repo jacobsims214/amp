@@ -236,6 +236,21 @@ func (f *Facts) ReadOK(op Op) bool {
 	return ok && r.OK
 }
 
+// RulesPartial is the merge-alert classifier's MergeRuleFacts.Partial: true
+// when the rules read answered but cannot prove the ABSENCE of a rule that
+// needs someone. That is the case whenever the branch's evaluated rules
+// answered but classic protection did not (a member token gets 404 for "not
+// protected" and "no permission" alike), or when either read failed. Partial
+// is never read as "no rule": the classifier turns it into unknown unless a
+// positive PR-level signal stands in for it (decisions/repo-default-branch.md
+// §1b, §5).
+//
+// This lives here, next to the reads, so the mapping onto the classifier's
+// evidence is written once and no caller can invert the safety rule by hand.
+func (f *Facts) RulesPartial() bool {
+	return !f.ReadOK(OpRules) || !f.ReadOK(OpProtection)
+}
+
 // PullFacts is what the PR read established. Known says the read answered;
 // nothing in it is usable until it does.
 type PullFacts struct {
