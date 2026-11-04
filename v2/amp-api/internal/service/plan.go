@@ -829,6 +829,42 @@ func longestChain(tasks []domain.Task) int {
 
 // ---- Batch creation ----
 
+// mergeTarget resolves one batch spec's merge_for before anything is created,
+// and returns the link it means:
+//   - target: what it names, for error messages — "ref build", "ticket 42",
+//     or "" for no link;
+//   - j: the spec index it names when it is a ref in this batch, else -1;
+//   - id: the ticket id it names as a ticket (0 when it is a batch ref, whose
+//     ticket doesn't exist yet).
+//
+// A value that is neither a ref in the batch nor a ticket id is an error
+// naming what the caller wrote, so a broken link never reaches CreateTask as
+// an id of 0 the caller never wrote (AMP #3218).
+func mergeTarget(v any, byRef map[string]int) (target string, j, id int, err error) {
+	if v == nil {
+		return "", -1, 0, nil
+	}
+	if ref, isStr := v.(string); isStr {
+		if ref = strings.TrimSpace(ref); ref != "" {
+			if i, inBatch := byRef[ref]; inBatch {
+				return "ref " + ref, i, 0, nil
+			}
+			// Not a ref, so it has to be a ticket id, written "42" or "#42".
+			id, err := domain.ParseMergeFor(ref)
+			if err != nil || id == 0 {
+				return "", -1, 0, fmt.Errorf("merge_for names %q, which is neither a ref in this batch nor a ticket id", ref)
+			}
+			return fmt.Sprintf("ticket %d", id), -1, id, nil
+		}
+		return "", -1, 0, nil // empty: no link
+	}
+	id, err = domain.ParseMergeFor(v)
+	if err != nil {
+		return "", -1, 0, err
+	}
+	return fmt.Sprintf("ticket %d", id), -1, id, nil
+}
+
 // TaskSpec is one ticket in a batch: Ref names it within the batch, and
 // DependsOn lists the refs (or "#id" / id of existing tickets) it waits on.
 type TaskSpec struct {
@@ -955,29 +991,52 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 	}
 
 	// merge_for may name a ref in this batch, so a merge step and the ticket
-	// whose PR it tracks can be planned in one call (AMP #3009). Two steps on
-	// one ticket is refused before anything is created, as CreateTask would
-	// refuse the second.
-	mergeRef := map[int]int{}  // spec index -> spec index it tracks
-	mergeFrom := map[int]int{} // spec index -> spec index tracking it
-	for i, sp := range specs {
-		if v, ok := sp.Metadata[domain.MetaMergeFor]; ok && v != nil {
-			ref, isRef := v.(string)
-			if !isRef {
-				continue
-			}
-			if j, ok := byRef[strings.TrimSpace(ref)]; ok && strings.TrimSpace(ref) != "" {
-				mergeRef[i], mergeFrom[j] = j, i
-			}
-		}
+	// whose PR it tracks can be planned in one call (AMP #3009). Every way a
+	// link can be wrong is refused HERE, before the creation loop below: a
+	// refusal from inside that loop leaves behind the tickets it already
+	// created — a plan half made that the caller has to clean up by hand —
+	// and a ref link the loop can't resolve reaches it as ids[j] == 0, which
+	// CreateTask then reports as "got 0" (AMP #3218).
+	mergeRef := map[int]int{}        // spec index -> spec index of the ticket whose merge it tracks
+	mergeID := map[int]int{}         // spec index -> id of the ticket whose merge it tracks, when one exists already
+	mergeFrom := map[string]string{} // merge target -> ref of the step already tracking it
+	// pos is where each spec sits in the creation order, so a ref link can be
+	// checked against the ids that exist when its step is created.
+	pos := make([]int, len(specs))
+	for p, i := range order {
+		pos[i] = p
 	}
-	for i := range mergeRef {
-		if mergeRef[i] == i {
-			return nil, nil, authz.BadRequest("%q can't track its own merge", specs[i].Ref)
+	for i, sp := range specs {
+		target, j, id, err := mergeTarget(sp.Metadata[domain.MetaMergeFor], byRef)
+		if err != nil {
+			return nil, nil, authz.BadRequest("%q: %v", sp.Ref, err)
 		}
-		if specs[i].Performer != domain.PerformerHuman {
-			return nil, nil, authz.BadRequest("%q: merge_for belongs on a person's merge step (performer \"human\")", specs[i].Ref)
+		if target == "" {
+			continue // no link at all
 		}
+		if prev, dup := mergeFrom[target]; dup {
+			return nil, nil, authz.BadRequest("two steps in this batch track the same merge (%q and %q, both merge_for %s); "+
+				"one step per merge", prev, sp.Ref, strings.TrimPrefix(target, "ref "))
+		}
+		mergeFrom[target] = sp.Ref
+		if sp.Performer != domain.PerformerHuman {
+			return nil, nil, authz.BadRequest("%q: merge_for belongs on a person's merge step (performer \"human\")", sp.Ref)
+		}
+		if j < 0 {
+			// A ticket id: CreateTask checks it against the project, and a step
+			// that doesn't exist yet can't name itself by id.
+			mergeID[i] = id
+			continue
+		}
+		if j == i {
+			return nil, nil, authz.BadRequest("%q can't track its own merge", sp.Ref)
+		}
+		if pos[j] > pos[i] {
+			return nil, nil, authz.BadRequest("%q: merge_for is the ref %q, whose ticket is created after the step, so there is no ticket "+
+				"to link yet; list %q before %q, or make %q depend on %q (a merge step comes after the work it merges)",
+				sp.Ref, specs[j].Ref, specs[j].Ref, sp.Ref, sp.Ref, specs[j].Ref)
+		}
+		mergeRef[i] = j
 	}
 
 	ids := make([]int, len(specs))
@@ -989,9 +1048,15 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 			deps = append(deps, ids[j])
 		}
 		meta := sp.Metadata
-		if j, ok := mergeRef[i]; ok {
-			// Dependencies are resolved by now, so the ref is a ticket id.
-			meta = domain.Metadata{domain.MetaMergeFor: ids[j]}
+		// Store the link as the ticket id, whatever the caller wrote: a batch
+		// ref resolved to the ticket just created, or the id it named. The
+		// pre-creation pass refused every link whose target isn't created
+		// before its step, so ids[mergeRef[i]] exists here.
+		if forID, linked := mergeRef[i]; linked {
+			mergeID[i] = ids[forID]
+		}
+		if forID, linked := mergeID[i]; linked {
+			meta = domain.Metadata{domain.MetaMergeFor: forID}
 			for k, v := range sp.Metadata {
 				if k != domain.MetaMergeFor {
 					meta[k] = v

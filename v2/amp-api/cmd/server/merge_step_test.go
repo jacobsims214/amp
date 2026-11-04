@@ -657,3 +657,118 @@ func TestMergeStep_StateChangeCompletionRetriggers(t *testing.T) {
 		t.Fatalf("the step after a state-change completion of its prerequisite = %s, want completed", st)
 	}
 }
+
+// A batch that can't be created as a whole is rejected before it creates
+// anything (AMP #3218). Both promises pinned here were broken: two steps
+// tracking one ticket were caught only by the database, after the earlier
+// tickets were created (leaving a partial batch behind), and a merge_for ref
+// naming a ticket created later in the batch reached its step as "0" — a
+// value the caller never wrote.
+func TestMergeStep_BatchMergeForRejectedBeforeAnythingIsCreated(t *testing.T) {
+	w := newRBACWorld(t)
+	ms := w.s
+
+	countTickets := func() int {
+		t.Helper()
+		list, err := ms.repo.ListTasks(context.Background(), ms.projectID, "")
+		if err != nil {
+			t.Fatalf("list tickets: %v", err)
+		}
+		return len(list)
+	}
+	step := func(ref, forRef string) map[string]any {
+		return map[string]any{"ref": ref, "story_id": float64(ms.storyID), "name": "Merge PR: " + ref,
+			"performer": "human", "human_reason": "review", "owner": w.bob.Email,
+			"metadata": map[string]any{domain.MetaMergeFor: forRef}}
+	}
+	build := map[string]any{"ref": "build", "story_id": float64(ms.storyID), "name": "build"}
+	// A step listed before the ticket its ref names: no dependency edge, so
+	// the creation order puts the step first.
+	forward := map[string]any{"ref": "forward", "story_id": float64(ms.storyID), "name": "Merge PR: forward",
+		"performer": "human", "human_reason": "review", "owner": w.bob.Email,
+		"metadata": map[string]any{domain.MetaMergeFor: "later"}}
+	later := map[string]any{"ref": "later", "story_id": float64(ms.storyID), "name": "later"}
+
+	for _, bad := range []struct {
+		name  string
+		tasks []any
+		want  []string
+	}{
+		{"two steps tracking one ref", []any{build, step("m1", "build"), step("m2", "build")},
+			[]string{"one step per merge", `"m1"`, `"m2"`, "merge_for build"}},
+		{"a forward-referenced merge_for ref", []any{forward, later},
+			[]string{`"later"`, "created after the step"}},
+	} {
+		before := countTickets()
+		errMsg := ms.callExpectError(t, "amp_create_tasks", map[string]any{"project_id": float64(ms.projectID), "tasks": bad.tasks})
+		for _, sub := range bad.want {
+			if !strings.Contains(errMsg, sub) {
+				t.Fatalf("%s: error %q lacks %q", bad.name, errMsg, sub)
+			}
+		}
+		if strings.Contains(errMsg, "got 0") {
+			t.Fatalf("%s: the error blames a 0 the caller never wrote: %q", bad.name, errMsg)
+		}
+		if after := countTickets(); after != before {
+			t.Fatalf("%s: a refused batch created %d ticket(s) anyway", bad.name, after-before)
+		}
+	}
+
+	// The same plan with the tracked ticket before its step works, and both
+	// links resolve to the tickets created in the batch.
+	res := ms.call(t, "amp_create_tasks", map[string]any{"project_id": float64(ms.projectID), "tasks": []any{
+		build, step("m1", "build"), later, step("m2", "later")}})
+	got := map[string]int{}
+	for _, c := range res["created"].([]any) {
+		m := c.(map[string]any)
+		got[m["ref"].(string)] = int(m["id"].(float64))
+	}
+	if len(got) != 4 {
+		t.Fatalf("created = %v", res)
+	}
+	if v := mergeForOf(t, ms, got["m1"]); v != got["build"] {
+		t.Fatalf("m1's merge_for = %d, want %d", v, got["build"])
+	}
+	if v := mergeForOf(t, ms, got["m2"]); v != got["later"] {
+		t.Fatalf("m2's merge_for = %d, want %d", v, got["later"])
+	}
+}
+
+// The batch handler's merge_for check and its message have to agree: a value
+// it refuses must not be one its message offers, and a value it accepts must
+// be one CreateTasks can resolve. AMP #3218 fixed a message that offered "a
+// ticket id (a number)" while the check above it refused every number.
+func TestMergeStep_BatchMergeForMessageMatchesTheCheck(t *testing.T) {
+	w := newRBACWorld(t)
+	ms := w.s
+	// One tracked ticket per accepted spelling: a ticket's merge takes one
+	// step, so three spellings need three tickets.
+	targets := []int{
+		mkIn(t, ms, ms.storyID, "msg build"),
+		mkIn(t, ms, ms.storyID, "msg deploy"),
+		mkIn(t, ms, ms.storyID, "msg docs"),
+	}
+	base := func(ref string, v any) map[string]any {
+		return map[string]any{"project_id": float64(ms.projectID), "tasks": []any{map[string]any{
+			"ref": ref, "story_id": float64(ms.storyID), "name": "Merge PR: msg",
+			"performer": "human", "human_reason": "review", "owner": w.bob.Email,
+			"metadata": map[string]any{domain.MetaMergeFor: v}}}}
+	}
+	// A number, its digits, and "#N" all name a ticket id, and all work.
+	spellings := []any{float64(targets[0]), fmt.Sprint(targets[1]), "#" + fmt.Sprint(targets[2])}
+	for i, v := range spellings {
+		res := ms.call(t, "amp_create_tasks", base(fmt.Sprintf("m%d", i), v))
+		created := res["created"].([]any)[0].(map[string]any)
+		if got, want := mergeForOf(t, ms, int(created["id"].(float64))), targets[i]; got != want {
+			t.Fatalf("merge_for %v created a step linked to %d, want %d", v, got, want)
+		}
+	}
+	// A value that is neither a ref nor a ticket id is refused, and the
+	// message names what is accepted rather than what it refuses.
+	errMsg := ms.callExpectError(t, "amp_create_tasks", base("bad", true))
+	for _, sub := range []string{"ref in this batch", "ticket id"} {
+		if !strings.Contains(errMsg, sub) {
+			t.Fatalf("error %q lacks %q", errMsg, sub)
+		}
+	}
+}

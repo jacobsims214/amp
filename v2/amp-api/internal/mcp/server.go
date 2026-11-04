@@ -2500,17 +2500,24 @@ func optNewMetadata(args map[string]interface{}) (domain.Metadata, error) {
 }
 
 // optNewMetadataAllowMergeForRef is optNewMetadata for amp_create_tasks, where
-// merge_for may name a ref in the same batch (AMP #3009): a non-numeric value
-// is left as the string it is, for CreateTasks to resolve into a ticket id.
-// Everywhere else a ref would be meaningless, so it is refused there.
+// merge_for may name a ref in the same batch (AMP #3009): a string is left as
+// it is, for CreateTasks to resolve into a ticket id; a number is a ticket id
+// and passes through as one. Everywhere else a ref would be meaningless, so
+// it is refused there (optNewMetadata). The message names both accepted
+// spellings, and the check accepts both — a message offering an option the
+// check refuses is what AMP #3218 fixed here.
 func optNewMetadataAllowMergeForRef(args map[string]interface{}) (domain.Metadata, error) {
 	p, err := optMetadataPatch(args)
 	if err != nil || p == nil {
 		return nil, err
 	}
 	if v, ok := p[domain.MetaMergeFor]; ok && v != nil {
-		if _, isStr := v.(string); !isStr {
-			return nil, fmt.Errorf("merge_for must be a ticket id (a number) or a ref in this batch")
+		// A number must be a real ticket id; a string is either its digits
+		// or a ref this batch resolves. Anything else (a bool, a fraction) is
+		// refused here, where the caller can still fix the argument.
+		_, isStr := v.(string)
+		if _, err := domain.ParseMergeFor(v); err != nil && !isStr {
+			return nil, fmt.Errorf("merge_for must be a ref in this batch (a string) or a ticket id (a number, or its digits as a string)")
 		}
 	}
 	return domain.Metadata(p).Clean()
