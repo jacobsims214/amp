@@ -24,6 +24,13 @@ describe('classifyHref', () => {
     expect(classifyHref('/project/3/kb', origin)).toEqual({ kind: 'internal', to: '/project/3/kb' })
     expect(classifyHref('https://amp.example/project/158/board?focus=34#x', origin)).toEqual({ kind: 'internal', to: '/project/158/board?focus=34#x' })
   })
+  it('marks /sessions/, /api/ and /home as full page loads', () => {
+    expect(classifyHref('/sessions/abc', origin)).toEqual({ kind: 'internal', to: '/sessions/abc', fullLoad: true })
+    expect(classifyHref('/project/../sessions/abc', origin)).toEqual({ kind: 'internal', to: '/sessions/abc', fullLoad: true })
+    expect(classifyHref('https://amp.example/api/audit/verify?org_id=3', origin)).toEqual({ kind: 'internal', to: '/api/audit/verify?org_id=3', fullLoad: true })
+    expect(classifyHref('/home/harness/', origin)).toEqual({ kind: 'internal', to: '/home/harness/', fullLoad: true })
+    expect(classifyHref('/sessions', origin)).toEqual({ kind: 'internal', to: '/sessions' })
+  })
   it('treats other http(s) and mailto as external', () => {
     expect(classifyHref('https://github.com/x', origin)).toEqual({ kind: 'external', href: 'https://github.com/x' })
     expect(classifyHref('mailto:a@b.example', origin)).toEqual({ kind: 'external', href: 'mailto:a@b.example' })
@@ -55,6 +62,21 @@ describe('Markdown links', () => {
     expect(a).not.toHaveAttribute('target')
     await userEvent.click(a)
     expect(screen.getByTestId('where')).toHaveTextContent('/project/3/kb')
+  })
+
+  it('does not route a /sessions/ link client-side, so the session page gets its strict CSP', async () => {
+    inRouter(<Markdown>{'[s](/sessions/abc)'}</Markdown>)
+    const a = screen.getByRole('link', { name: 's' })
+    expect(a).toHaveAttribute('href', '/sessions/abc')
+    expect(a).not.toHaveAttribute('target')
+    // Runs after react-router's handler: a <Link> would have called preventDefault.
+    let routed: boolean | undefined
+    const onClick = (e: MouseEvent) => { routed = e.defaultPrevented; e.preventDefault() }
+    document.addEventListener('click', onClick)
+    await userEvent.click(a)
+    document.removeEventListener('click', onClick)
+    expect(routed).toBe(false)
+    expect(screen.getByTestId('where')).toHaveTextContent(/^\/$/)
   })
 
   it('renders an absolute URL on this origin as an in-app link to its path and query', async () => {

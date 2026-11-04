@@ -10,7 +10,7 @@ const LINK = 'text-ink underline underline-offset-2 hover:text-accent'
 
 /**
  * A markdown link: AMP routes open in-app (react-router, so the SPA keeps its
- * state), other http(s)/mailto links open in a new tab without opener or
+ * state; /sessions/, /api/ and /home get a full page load), other http(s)/mailto links open in a new tab without opener or
  * referrer, and anything else (javascript:, data:, bare relative paths) is
  * shown as its text only.
  */
@@ -20,7 +20,8 @@ function MarkdownLink({ href, ticketRef, children }: { href?: string; ticketRef?
   const data = ticketRef ? { 'data-ticket-ref': ticketRef } : {}
   if (target.kind === 'blocked') return <span className="text-ink">{children}</span>
   if (target.kind === 'internal') {
-    return inRouter
+    // fullLoad paths (/sessions/, /api/, /home) need a real page load.
+    return inRouter && !target.fullLoad
       ? <Link to={target.to} className={LINK} {...data}>{children}</Link>
       : <a href={target.to} className={LINK} {...data}>{children}</a>
   }
