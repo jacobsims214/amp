@@ -676,6 +676,54 @@ export interface GitHubHookInfo {
   setup?: { payload_url?: string; content_type?: string; events?: string }
 }
 
+/**
+ * A project's GitHub API credential as the API can report it (AMP #3154/#3155).
+ * There is deliberately no token field: the token is write-only, so nothing
+ * here could carry one even if the server started sending it. `rotated_at`
+ * is null on a first attach and set when the token was replaced.
+ */
+export interface GitHubCredential {
+  id: number
+  project_id: number
+  host: string
+  label: string
+  created_by?: number
+  created_at: string
+  rotated_at?: string
+}
+
+/**
+ * Why a project's GitHub credential is unusable or unconfigurable right now,
+ * as a class from a closed list rather than a message — the token never
+ * appears in one. Unknown values are rendered as a generic notice, never
+ * echoed as a server message.
+ *
+ * `no_encryption_key`: this server has no AMP_SECRETS_KEY, so a token can't
+ * be attached and one already stored can't be opened.
+ */
+export type GitHubCredentialError = 'no_encryption_key'
+
+/**
+ * What an attach (PUT) or rotate (POST) sends. The token is the only secret
+ * field; it lives in this request body for one call and is never kept.
+ */
+export interface GitHubCredentialChange {
+  token: string
+  label?: string
+  host?: string
+}
+
+/** GET /projects/:id/github-credential (project owners). */
+export interface GitHubCredentialInfo {
+  configured: boolean
+  host: string
+  credential?: GitHubCredential
+  /** this server has a key to seal a token with */
+  encrypted: boolean
+  /** absent or '' when nothing is wrong; see GitHubCredentialError */
+  last_error?: string
+}
+
 export interface AmpUser {
   id: number
   subject: string
