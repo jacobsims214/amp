@@ -8,7 +8,10 @@ import { useAuth } from '../hooks/useAuth'
 import { TaskCard } from '../components/TaskCard'
 import { TaskDrawer } from '../components/TaskDrawer'
 import { FilterBar } from '../components/FilterBar'
-import { DEFAULT_FILTER, type FilterState } from '../lib/boardFilter'
+import { useBoardFilterParam } from '../hooks/useBoardFilterParam'
+import { flagParam, useSearchParamState } from '../hooks/useSearchParamState'
+import { FocusNotFound } from '../components/FocusNotFound'
+import { useFocusFallback } from '../hooks/useFocusFallback'
 import { HandoverBar } from '../components/HandoverBar'
 import { CrudModal } from '../components/CrudModal'
 import { MetadataEditor } from '../components/MetadataEditor'
@@ -63,6 +66,9 @@ const labelCls = 'text-xs font-medium text-ink-2 block mb-1.5'
 const EMPTY_TASK_FORM = { name: '', description: '', acceptance_criteria: '', assigned_to: 'amp-worker', priority: '1', owner: '', dependency_ids: [] as number[],
   performer: 'agent' as 'agent' | 'human', human_reason: 'review' as HumanReason }
 
+/** Done epics are hidden unless the URL says `done=show`. */
+const HIDE_DONE = flagParam(true, 'hide', 'show')
+
 export function Board() {
   const { projectId } = useParams<{ projectId: string }>()
   const pid = Number(projectId)
@@ -75,10 +81,14 @@ export function Board() {
   // ?focus=ID (or the old ?task=) opens that ticket's drawer; it stays in the URL until closed.
   const [selectedTaskId, setSelectedTaskId] = useFocusParam()
   const selectedTask = selectedTaskId === null ? null : tasks.find(t => t.id === selectedTaskId) ?? null
-  const [filter, setFilter] = useState<FilterState>(DEFAULT_FILTER)
+  // A focused ticket from another project redirects there; a missing one says so.
+  const focusMissing = useFocusFallback(pid, 'board', selectedTaskId, tasks, loading)
+  // Filters live in the URL (status, q, epic, owner, done), so a filtered
+  // board can be shared, reloaded and walked back through.
+  const [filter, setFilter] = useBoardFilterParam()
   const [collapsedEpics, setCollapsedEpics] = useState<Set<number>>(new Set())
   const [collapsedStories, setCollapsedStories] = useState<Set<number>>(new Set())
-  const [hideCompleted, setHideCompleted] = useState(true)
+  const [hideCompleted, setHideCompleted] = useSearchParamState('done', HIDE_DONE)
   const [liveStatus, setLiveStatus] = useState<'connected' | 'disconnected'>('disconnected')
 
   // Project members: names for owners/creators, the owner filter, and assignment.
@@ -363,7 +373,7 @@ export function Board() {
             {/* Hide/show completed epics */}
             {completedEpicIds.size > 0 && (
               <button
-                onClick={() => setHideCompleted(h => !h)}
+                onClick={() => setHideCompleted(!hideCompleted)}
                 className={`amp-btn ${hideCompleted ? 'amp-btn-primary' : ''}`} aria-pressed={hideCompleted}
               >
                 {hideCompleted ? <Eye size={12} /> : <EyeOff size={12} />}
@@ -396,6 +406,12 @@ export function Board() {
         </div>
       )}
 
+      {focusMissing != null && (
+        <div className="px-5 pt-3 flex-shrink-0">
+          <FocusNotFound id={focusMissing} onDismiss={() => setSelectedTaskId(null)} />
+        </div>
+      )}
+
       {/* Filter bar */}
       <div className="px-5 py-3 flex-shrink-0" style={{ borderBottom: '1px solid var(--line-sub)', background: 'var(--bg)' }}>
         <FilterBar
@@ -417,7 +433,7 @@ export function Board() {
         {ownerNarrows && ownerTasks.length === 0 && tasks.length > 0 && (
           <div className="mt-2.5 flex items-center gap-3 flex-wrap text-[12.5px] text-ink-2">
             <span>You don't own any of this project's {tasks.length} tickets.</span>
-            <button type="button" className="amp-btn amp-btn-sm" onClick={() => setFilter(f => ({ ...f, owner: 'everyone' }))}>
+            <button type="button" className="amp-btn amp-btn-sm" onClick={() => setFilter({ ...filter, owner: 'everyone' })}>
               Show everyone's
             </button>
           </div>

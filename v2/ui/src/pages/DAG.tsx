@@ -24,6 +24,10 @@ import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
 import { useAuth } from '../hooks/useAuth'
 import { TaskDrawer } from '../components/TaskDrawer'
+import { FocusNotFound } from '../components/FocusNotFound'
+import { useFocusParam } from '../hooks/useFocusParam'
+import { useFocusFallback } from '../hooks/useFocusFallback'
+import { flagParam, idParam, useSearchParamState, usePatchSearchParams } from '../hooks/useSearchParamState'
 import { ProjectNav } from '../components/ProjectNav'
 import {
   buildGraph, chainOf, countStates, ticketNodeId, STORY_H, STORY_W, TICKET_H, TICKET_W, type StateCounts,
@@ -158,6 +162,12 @@ const ClusterNode = memo(function ClusterNode({ data }: NodeProps<Node<ClusterDa
 const nodeTypes = { ticket: TicketNode, story: StoryNode, cluster: ClusterNode }
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
+const EPIC = idParam
+const SELECTED = idParam
+const HIDE_DONE = flagParam(false, 'hide', 'show')
+const MINE_ONLY = flagParam(false, 'mine', 'all')
+const CHAIN = flagParam(false)
+
 export function DAGView() {
   return (
     <ReactFlowProvider>
@@ -174,26 +184,40 @@ function DAGCanvas() {
   const meId = me?.user_id
   const flow = useReactFlow()
 
-  const [epicFilter, setEpicFilter] = useState<number | null>(null)
-  const [hideDone, setHideDone] = useState(false)
-  const [mineOnly, setMineOnly] = useState(false)
+  // In the URL (v2/docs/url-state.md), with the Board's names where they
+  // mean the same: epic=<id>, done=hide, owner=mine; plus sel=<id> for the
+  // selected node and chain=1 to show only its chain. ?focus= opens the drawer.
+  const [epicFilter, setEpicFilter] = useSearchParamState('epic', EPIC)
+  const [hideDone, setHideDone] = useSearchParamState('done', HIDE_DONE)
+  const [mineOnly, setMineOnly] = useSearchParamState('owner', MINE_ONLY)
   const [expandedSet, setExpanded] = useState<Set<number> | null>(null) // null: the default for the project's size
-  const [selectedId, setSelectedId] = useState<number | null>(null)
-  const [focusChain, setFocusChain] = useState(false)
+  const [selectedId, setSelectedId] = useSearchParamState('sel', SELECTED)
+  const [focusChain, setFocusChain] = useSearchParamState('chain', CHAIN)
+  const patchParams = usePatchSearchParams()
+  const clearSelection = () => patchParams({ sel: null, chain: null })
   const [changes, setChanges] = useState<Changes>('off')
   const [query, setQuery] = useState('')
-  const [drawerTask, setDrawerTask] = useState<Task | null>(null)
+  // The drawer's ticket is read live from tasks, so it shows updates as on the Board.
+  const [focusId, setFocusId] = useFocusParam()
+  const focusMissing = useFocusFallback(pid, 'dag', focusId, tasks, loading)
 
   const taskById = useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks])
+  const drawerTask = focusId != null ? taskById.get(focusId) ?? null : null
   const epicColor = useMemo(() => {
     const m = new Map(epics.map((e, i) => [e.id, EPIC_PALETTE[i % EPIC_PALETTE.length]]))
     return (id: number) => m.get(id) ?? EPIC_PALETTE[0]
   }, [epics])
 
-  const expanded = useMemo(
-    () => expandedSet ?? new Set(tasks.length <= EXPAND_ALL_UP_TO ? stories.map(s => s.id) : []),
-    [expandedSet, tasks.length, stories],
-  )
+  // The ticket a link arrived on (?sel= or ?focus=): its story starts
+  // expanded and the first framing centres on it.
+  const [arrivalId] = useState(() => selectedId ?? focusId)
+  const arrivalStory = arrivalId != null ? taskById.get(arrivalId)?.story_id : undefined
+  const defaultExpanded = useMemo(() => {
+    const s = new Set(tasks.length <= EXPAND_ALL_UP_TO ? stories.map(x => x.id) : [])
+    if (arrivalStory != null) s.add(arrivalStory)
+    return s
+  }, [tasks.length, stories, arrivalStory])
+  const expanded = expandedSet ?? defaultExpanded
 
   // Recent changes (refetched as tickets change while it's on).
   const [fetched, setActivity] = useState<ActivityLog[]>([])
@@ -226,17 +250,17 @@ function DAGCanvas() {
     [epics, stories, tasks, visible, effectiveExpanded],
   )
 
-  const openTicket = useCallback((t: Task) => setDrawerTask(t), [])
+  const openTicket = useCallback((t: Task) => setFocusId(t.id), [setFocusId])
   const expandStory = useCallback((id: number) => setExpanded(prev => {
-    const s = new Set(prev ?? (tasks.length <= EXPAND_ALL_UP_TO ? stories.map(x => x.id) : []))
+    const s = new Set(prev ?? defaultExpanded)
     s.add(id)
     return s
-  }), [tasks.length, stories])
+  }), [defaultExpanded])
   const collapseStory = useCallback((id: number) => setExpanded(prev => {
-    const s = new Set(prev ?? (tasks.length <= EXPAND_ALL_UP_TO ? stories.map(x => x.id) : []))
+    const s = new Set(prev ?? defaultExpanded)
     s.delete(id)
     return s
-  }), [tasks.length, stories])
+  }), [defaultExpanded])
 
   const markOf = useCallback((id: number): Mark => {
     if (selectedId == null || !chain) return null
@@ -284,9 +308,11 @@ function DAGCanvas() {
   // just a beat for React Flow to take in the new nodes.
   const shape = `${[...visible].length}|${[...effectiveExpanded].sort().join(',')}|${focusChain}`
   const frameTicket = useRef<number | null>(null)
+  const arrived = useRef(false)
   const [jumps, setJumps] = useState(0)
   useEffect(() => {
     if (!nodes.length) return
+    if (!arrived.current) { arrived.current = true; frameTicket.current ??= arrivalId }
     const t = setTimeout(() => {
       const id = frameTicket.current
       frameTicket.current = null
@@ -298,7 +324,7 @@ function DAGCanvas() {
   }, [shape, jumps])
 
   const jumpTo = (t: Task) => {
-    setSelectedId(t.id)
+    setSelectedId(t.id, { push: true })
     setQuery('')
     if (!expanded.has(t.story_id)) expandStory(t.story_id)
     frameTicket.current = t.id
@@ -349,17 +375,17 @@ function DAGCanvas() {
           )}
         </div>
 
-        <select value={epicFilter ?? ''} onChange={e => setEpicFilter(e.target.value ? Number(e.target.value) : null)}
+        <select value={epicFilter ?? ''} onChange={e => setEpicFilter(e.target.value ? Number(e.target.value) : null, { push: true })}
           className="bg-bg border border-line rounded-lg px-2 py-1 text-xs text-ink focus:outline-none cursor-pointer">
           <option value="">All epics</option>
           {epics.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
         </select>
         {meId != null && (
-          <button onClick={() => setMineOnly(v => !v)} className={pill(mineOnly)} title="Only tickets you own">
+          <button onClick={() => setMineOnly(!mineOnly)} className={pill(mineOnly)} title="Only tickets you own">
             <User size={12} />Mine
           </button>
         )}
-        <button onClick={() => setHideDone(v => !v)} className={pill(hideDone)}>
+        <button onClick={() => setHideDone(!hideDone)} className={pill(hideDone)}>
           {hideDone ? <EyeOff size={12} /> : <Eye size={12} />}Hide done
         </button>
 
@@ -402,7 +428,8 @@ function DAGCanvas() {
               onNodeClick={(_, n) => {
                 if (n.type === 'ticket') {
                   const id = Number(n.id.slice(1))
-                  setSelectedId(cur => (cur === id ? null : id))
+                  if (selectedId === id) clearSelection()
+                  else setSelectedId(id, { push: true })
                 }
               }}
               onPaneClick={() => { if (!focusChain) setSelectedId(null) }}
@@ -418,6 +445,12 @@ function DAGCanvas() {
             </ReactFlow>
           )}
 
+          {focusMissing != null && (
+            <div className="absolute left-1/2 -translate-x-1/2 top-3 z-10 w-[min(520px,calc(100%-24px))]">
+              <FocusNotFound id={focusMissing} onDismiss={() => setFocusId(null)} />
+            </div>
+          )}
+
           {/* Selected ticket */}
           {selected && chain && (
             <div className="absolute left-1/2 -translate-x-1/2 bottom-4 flex items-center gap-3 px-4 py-2.5 rounded-xl shadow-2xl"
@@ -427,13 +460,13 @@ function DAGCanvas() {
               <span className="text-xs" style={{ color: sc(selected.state).text }}>{sc(selected.state).label}</span>
               <span className="text-xs text-link">waits on {chain.up.size}</span>
               <span className="text-xs text-violet">{chain.down.size} wait on it</span>
-              <button onClick={() => setFocusChain(v => !v)} className={pill(focusChain)} title="Show only this chain">
+              <button onClick={() => setFocusChain(!focusChain)} className={pill(focusChain)} title="Show only this chain">
                 <Crosshair size={12} />Focus chain
               </button>
               <button onClick={() => openTicket(selected)} className={pill(false)}>
                 <ExternalLink size={12} />Open
               </button>
-              <button onClick={() => { setSelectedId(null); setFocusChain(false) }} className="text-ink-2 hover:text-ink cursor-pointer" title="Clear">
+              <button onClick={clearSelection} className="text-ink-2 hover:text-ink cursor-pointer" title="Clear">
                 <X size={14} />
               </button>
             </div>
@@ -467,7 +500,7 @@ function DAGCanvas() {
         )}
       </div>
 
-      <TaskDrawer task={drawerTask} onClose={() => setDrawerTask(null)} onRefresh={refresh} />
+      <TaskDrawer task={drawerTask} onClose={() => setFocusId(null)} onRefresh={refresh} />
     </div>
   )
 }

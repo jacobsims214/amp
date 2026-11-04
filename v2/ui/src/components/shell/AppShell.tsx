@@ -9,21 +9,22 @@ import { remoteAvailable, useRemote } from '../../remote/remote-context'
 import type { Project } from '../../types'
 import { refreshWaitCounts, useWaitCounts } from '../../lib/waitCounts'
 import { Avatar } from '../ui/Avatar'
+import { viewLink, type ProjectView } from '../../lib/projectLink'
 
 // The frame around every page: one sidebar to get anywhere, the page beside
 // it. The current project's views sit under it in the sidebar, so nothing
 // needs a back button.
 
-const PROJECT_VIEWS: { to: (id: string) => string; label: string; icon: React.ReactNode; badge?: boolean }[] = [
-  { to: id => `/project/${id}/mission`, label: 'Mission', icon: <Radar size={14} /> },
-  { to: id => `/project/${id}/my-work`, label: 'My work', icon: <Inbox size={14} />, badge: true },
-  { to: id => `/project/${id}/board`, label: 'Board', icon: <LayoutGrid size={14} /> },
-  { to: id => `/project/${id}/plan`, label: 'Flight plan', icon: <Rows3 size={14} /> },
-  { to: id => `/project/${id}/dag`, label: 'Graph', icon: <GitBranch size={14} /> },
-  { to: id => `/project/${id}/report`, label: 'Reports', icon: <Activity size={14} /> },
-  { to: id => `/project/${id}/artifacts`, label: 'Artifacts', icon: <Shapes size={14} /> },
-  { to: id => `/project/${id}/kb`, label: 'Library', icon: <BookOpen size={14} /> },
-  { to: id => `/project/${id}/settings`, label: 'Settings', icon: <Settings size={14} /> },
+const PROJECT_VIEWS: { view: ProjectView; label: string; icon: React.ReactNode; badge?: boolean }[] = [
+  { view: 'mission', label: 'Mission', icon: <Radar size={14} /> },
+  { view: 'my-work', label: 'My work', icon: <Inbox size={14} />, badge: true },
+  { view: 'board', label: 'Board', icon: <LayoutGrid size={14} /> },
+  { view: 'plan', label: 'Flight plan', icon: <Rows3 size={14} /> },
+  { view: 'dag', label: 'Graph', icon: <GitBranch size={14} /> },
+  { view: 'report', label: 'Reports', icon: <Activity size={14} /> },
+  { view: 'artifacts', label: 'Artifacts', icon: <Shapes size={14} /> },
+  { view: 'kb', label: 'Library', icon: <BookOpen size={14} /> },
+  { view: 'settings', label: 'Settings', icon: <Settings size={14} /> },
 ]
 
 function navCls({ isActive }: { isActive: boolean }) {
@@ -112,7 +113,7 @@ export function AppShell() {
                 {current.code.length <= 8 && <span className="amp-num text-[10.5px] text-ink-3 border border-line px-1 py-px ml-auto shrink-0">{current.code}</span>}
               </div>
               {PROJECT_VIEWS.map(v => (
-                <NavLink key={v.label} to={v.to(currentId!)} className={p => `${navCls(p)} pl-5`} aria-label={v.badge ? badged(v.label, waitIn(currentId!)) : undefined}>
+                <NavLink key={v.label} to={viewLink(currentId!, v.view, location.search)} className={p => `${navCls(p)} pl-5`} aria-label={v.badge ? badged(v.label, waitIn(currentId!)) : undefined}>
                   {v.icon}{v.label}{v.badge && <Badge n={waitIn(currentId!)} />}
                 </NavLink>
               ))}

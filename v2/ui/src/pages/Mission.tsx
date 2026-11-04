@@ -15,6 +15,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { useFocusParam } from '../hooks/useFocusParam'
+import { FocusNotFound } from '../components/FocusNotFound'
+import { useFocusFallback } from '../hooks/useFocusFallback'
 import { ChevronRight } from 'lucide-react'
 import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
@@ -198,6 +200,7 @@ export function Mission() {
   const [lastSeen, setLastSeen] = useState<Map<number, number>>(new Map())
   const [now, setNow] = useState(Date.now)
   const selected = selectedId == null ? null : tasks.find(t => t.id === selectedId) ?? null
+  const focusMissing = useFocusFallback(pid, 'mission', selectedId, tasks, loading)
 
   // Latest activity; refreshed shortly after tickets change.
   const loadActivity = useCallback(() => {
@@ -277,6 +280,7 @@ export function Mission() {
       <ProjectNav projectId={pid} currentView="mission" />
       <div className="p-7 pt-5 grid gap-4">
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
+        {focusMissing != null && <FocusNotFound id={focusMissing} onDismiss={() => setSelectedId(null)} />}
         {yours && <WaitingStrip projectId={pid} counts={yours} />}
         <Readouts wrap items={[
           { label: 'In progress', value: counts.prog, sub: quiet ? `${quiet} quiet · may have stalled` : runningSub, alarm: quiet > 0, color: 'var(--st-prog)' },
