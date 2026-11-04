@@ -10,7 +10,8 @@ import { AuthContext } from '../contexts/auth-context'
 import { RemoteProvider } from '../remote/RemoteProvider'
 import { httpTransport } from '../remote/transport'
 import { unpairedCrypto } from '../remote/crypto'
-import type { MyWork as MyWorkData, WaitCounts, WaitItem, WorkTask } from '../types'
+import type { Me, MyWork as MyWorkData, WaitCounts, WaitItem, WorkTask } from '../types'
+import userEvent from '@testing-library/user-event'
 
 const hourAgo = new Date(Date.now() - 3_600_000).toISOString()
 const counts = (c: Partial<WaitCounts>): WaitCounts => {
@@ -66,9 +67,9 @@ beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }))
 afterEach(() => { payload = busy })
 afterAll(() => server.close())
 
-function renderMyWork() {
+function renderMyWork(me: Me = { subject: 's', email: 'jo@example.com', name: 'Jo', roles: [], user_id: 7 }) {
   return render(
-    <AuthContext.Provider value={{ me: { subject: 's', email: 'jo@example.com', name: 'Jo', roles: [], user_id: 7 }, loading: false, error: null, isAdmin: false }}>
+    <AuthContext.Provider value={{ me, loading: false, error: null, isAdmin: false }}>
       <RemoteProvider deps={{ transport: httpTransport, crypto: unpairedCrypto, mock: false }}>
         <MemoryRouter><MyWork /></MemoryRouter>
       </RemoteProvider>
@@ -211,5 +212,43 @@ describe('top-level My work: a dispatched ticket no worker started', () => {
     expect(amp.textContent).toMatch(/Start 1/)
     expect(within(amp).getByText('Launch its run, or return #2803 to ready · dispatched to amp:amp-worker-frontend 32 min ago, no worker has started it')).toBeInTheDocument()
     expect(within(amp).getByRole('link', { name: /#2803/ })).toHaveAttribute('href', '/project/2/my-work?focus=2803')
+  })
+})
+
+// The server answers an empty list when there's no AMP user, and a load can
+// fail: neither may read as "0 waiting" or "in all 0 projects" (critique #1).
+const EMPTY: MyWorkData = { ...busy, owned: [], counts: counts({}), projects: [], clear_projects: [], projects_total: 0, agents_in_progress: 0, done_24h: 0 }
+
+describe('top-level My work: no zeros when there is nothing to count', () => {
+  it('sign-in off (local dev): explains it and points at a project, with no counts', async () => {
+    payload = EMPTY
+    renderMyWork({ subject: 'local-dev', email: 'local-dev@amp.local', name: 'Local Dev', roles: [] })
+    const panel = await screen.findByRole('region', { name: 'My work is off: sign-in is turned off' })
+    expect(panel).toHaveTextContent('Sign-in is turned off on this AMP')
+    expect(within(panel).getByRole('link', { name: /Open a project/ })).toHaveAttribute('href', '/projects')
+    expect(screen.queryByLabelText('Waiting on you, across your projects')).toBeNull()
+    expect(screen.queryByText(/in all 0 projects/)).toBeNull()
+    expect(screen.queryByText('No project needs you right now.')).toBeNull()
+  })
+
+  it('signed out: says so and offers Sign in', async () => {
+    payload = EMPTY
+    renderMyWork({ subject: 'oidc|abc', email: 'jo@example.com', name: 'Jo', roles: [] })
+    const panel = await screen.findByRole('region', { name: 'My work: not signed in' })
+    expect(within(panel).getByRole('link', { name: /Sign in/ }).getAttribute('href')).toMatch(/^\/oauth2\/start\?rd=/)
+    expect(screen.queryByLabelText('Waiting on you, across your projects')).toBeNull()
+  })
+
+  it('a failed load shows the error and Try again, never the zero tiles', async () => {
+    server.use(http.get('*/api/my-work', () => HttpResponse.json({ error: 'database is down' }, { status: 500 }), { once: true }))
+    renderMyWork()
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent("Couldn't load My work: database is down")
+    expect(alert).toHaveTextContent('no counts are shown')
+    expect(screen.queryByLabelText('Waiting on you, across your projects')).toBeNull()
+    expect(screen.queryByText('No project needs you right now.')).toBeNull()
+    await userEvent.click(within(alert).getByRole('button', { name: 'Try again' }))
+    expect(await screen.findByLabelText('Waiting on you, across your projects')).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).toBeNull()
   })
 })

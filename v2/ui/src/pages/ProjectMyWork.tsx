@@ -37,6 +37,9 @@ import { KIND_LABEL, needsLine } from '../lib/humanActions'
 import { startItemText } from '../lib/dispatchState'
 import { projectLink } from '../lib/projectLink'
 import { refreshWaitCounts } from '../lib/waitCounts'
+import { isNoUserError, noMyWorkReason } from '../lib/myWorkAccess'
+import { useAuth } from '../hooks/useAuth'
+import { MyWorkLoadError, MyWorkUnavailable } from '../components/human/MyWorkUnavailable'
 import type { DepSummary, DoneItem, Project, ProjectMyWork as Data, ProjectWaitItem, Task, WaitKind } from '../types'
 import './projectMyWork.css'
 
@@ -133,6 +136,10 @@ export function ProjectMyWork() {
   const data = loaded?.key === key ? loaded.data : null
   const [project, setProject] = useState<Project | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const { me } = useAuth()
+  // "My work needs a signed-in AMP user": say why (sign-in off, or signed out)
+  // and what to do, not the server's words and a Try again that repeats them.
+  const noWork = isNoUserError(error) ? noMyWorkReason(me) ?? 'no-user' : null
 
   const load = useCallback(() => {
     return api.projectMyWork(pid, { user })
@@ -196,14 +203,10 @@ export function ProjectMyWork() {
         meta={readOnly ? "Someone else's list: what waits on them here. The actions are theirs." : "What in this project waits on you, and what's coming. Do it here."}
         rightSlot={<span className="max-md:hidden"><Link to={projectLink(pid, 'board')} className="amp-btn amp-btn-ghost amp-btn-sm">Everyone's work on the Board</Link></span>} />
       <div className="pmw px-7 pt-5 pb-12 max-md:px-4 max-w-[1240px] grid gap-[22px]">
-        {error && (
-          <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink flex items-center gap-3" role="alert">
-            Couldn't load My work: {error}
-            <button type="button" className="amp-btn amp-btn-sm ml-auto" onClick={() => load()}>Try again</button>
-          </div>
-        )}
+        {noWork && <MyWorkUnavailable reason={noWork} projectId={pid} />}
+        {!noWork && error && <MyWorkLoadError error={error} onRetry={() => load()} />}
         {!data && !error && <div className="py-16 flex justify-center"><BandLoader label="Loading My work" /></div>}
-        {data && <Body data={data} items={items} name={name} pid={pid} focusId={focusId} setFocus={setFocus}
+        {data && !noWork && <Body data={data} items={items} name={name} pid={pid} focusId={focusId} setFocus={setFocus}
           onReview={approveParam.open} onChanged={changed} readOnly={readOnly} who={who} />}
       </div>
     </div>

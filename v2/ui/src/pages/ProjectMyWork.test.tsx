@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { createMemoryRouter, RouterProvider, useLocation } from 'react-router-dom'
+import { AuthContext } from '../contexts/auth-context'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ProjectMyWork } from './ProjectMyWork'
 import { ProjectLanding } from './ProjectLanding'
@@ -12,7 +13,7 @@ import { ProjectNav } from '../components/ProjectNav'
 import { fixedTab, landingPath, landingTab } from '../lib/landing'
 import { resetWaitCounts } from '../lib/waitCounts'
 import { doItem, myWork, task } from '../test/myWorkFixture'
-import type { MyWorkCounts, ProjectMyWork as Data, Task } from '../types'
+import type { Me, MyWorkCounts, ProjectMyWork as Data, Task } from '../types'
 
 let data: Data = myWork('busy')
 let counts: MyWorkCounts = { counts: { waiting: 5, approve: 1, answer: 1, merge: 1, start: 1, do: 1, coming_up: 1 }, projects: { 2: { waiting: 5, approve: 1, answer: 1, merge: 1, start: 1, do: 1, coming_up: 1 } } }
@@ -51,14 +52,14 @@ function Where() {
   return <span data-testid="where">{l.pathname + l.search}</span>
 }
 
-function at(url: string) {
+function at(url: string, me: Me | null = null) {
   const router = createMemoryRouter([
     { path: '/project/:projectId', element: <><ProjectLanding /><Where /></> },
     { path: '/project/:projectId/my-work', element: <><ProjectMyWork /><Where /></> },
     { path: '/project/:projectId/mission', element: <><ProjectNav projectId={2} currentView="mission" /><p>Mission page</p><Where /></> },
     { path: '/project/:projectId/board', element: <><p>Board page</p><Where /></> },
   ], { initialEntries: [url] })
-  render(<RouterProvider router={router} />)
+  render(<AuthContext.Provider value={{ me, loading: false, error: null, isAdmin: false }}><RouterProvider router={router} /></AuthContext.Provider>)
   return router
 }
 const where = () => screen.getByTestId('where').textContent
@@ -143,7 +144,36 @@ describe('My work tab: states', () => {
   it('shows an error with Try again', async () => {
     server.use(http.get('*/api/projects/2/my-work', () => HttpResponse.json({ error: 'boom' }, { status: 500 })))
     at('/project/2/my-work')
-    expect(await screen.findByRole('alert')).toHaveTextContent("Couldn't load My work")
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent("Couldn't load My work: boom")
+    expect(alert).toHaveTextContent('no counts are shown')
+    expect(screen.queryByRole('group', { name: /waiting on you/i })).toBeNull()
+    server.use(http.get('*/api/projects/2/my-work', () => HttpResponse.json(data)))
+    await userEvent.click(within(alert).getByRole('button', { name: 'Try again' }))
+    expect(await screen.findByRole('region', { name: 'Waiting on you' })).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('no AMP user, sign-in off: explains local dev and points at the Board, with no Try again', async () => {
+    server.use(http.get('*/api/projects/2/my-work', () => HttpResponse.json({ error: 'My work needs a signed-in AMP user' }, { status: 400 })))
+    at('/project/2/my-work', { subject: 'local-dev', email: 'local-dev@amp.local', name: 'Local Dev', roles: [] })
+    const panel = await screen.findByRole('region', { name: 'My work is off: sign-in is turned off' })
+    expect(panel).toHaveTextContent('Sign-in is turned off on this AMP')
+    expect(panel).toHaveTextContent('OIDC_ISSUER_URL')
+    expect(panel).not.toHaveTextContent('needs a signed-in AMP user')
+    expect(within(panel).getByRole('link', { name: /Open the Board/ })).toHaveAttribute('href', '/project/2/board')
+    expect(within(panel).queryByRole('link', { name: /Sign in/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('no AMP user, signed out: a Sign in link that comes back here', async () => {
+    server.use(http.get('*/api/projects/2/my-work', () => HttpResponse.json({ error: 'My work needs a signed-in AMP user' }, { status: 400 })))
+    at('/project/2/my-work', { subject: 'oidc|abc', email: 'jo@example.com', name: 'Jo', roles: [] })
+    const panel = await screen.findByRole('region', { name: 'My work: not signed in' })
+    expect(within(panel).getByRole('link', { name: /Sign in/ }).getAttribute('href')).toMatch(/^\/oauth2\/start\?rd=/)
+    expect(within(panel).getByRole('link', { name: /Open the Board/ })).toHaveAttribute('href', '/project/2/board')
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull()
   })
 })
 

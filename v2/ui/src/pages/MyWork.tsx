@@ -5,7 +5,7 @@
  * the action lives. The counts come from the server's one "waiting on you"
  * classifier (GET /api/my-work, KB architecture/waiting-on-you.md).
  */
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { ChevronRight } from 'lucide-react'
 import { api } from '../api/client'
@@ -21,6 +21,8 @@ import { expiresIn } from '../lib/artifacts'
 import { MySessionsPanel } from '../components/remote/MySessionsPanel'
 import { remoteAvailable, useRemote } from '../remote/remote-context'
 import { projectLink } from '../lib/projectLink'
+import { isNoUserError, noMyWorkReason } from '../lib/myWorkAccess'
+import { MyWorkLoadError, MyWorkUnavailable } from '../components/human/MyWorkUnavailable'
 
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone
 const ymd = (d: Date) => d.toLocaleDateString('en-CA', { timeZone: TZ })
@@ -197,7 +199,7 @@ function Velocity({ days }: { days: VelocityDay[] }) {
 }
 
 export function MyWork() {
-  const { me } = useAuth()
+  const { me, loading: authLoading } = useAuth()
   const remote = useRemote()
   const [work, setWork] = useState<MyWorkData | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -205,13 +207,21 @@ export function MyWork() {
   const [draft, setDraft] = useState<DayReport | null>(null)
   const [expiring, setExpiring] = useState<Artifact[]>([])
 
-  useEffect(() => {
+  const loadWork = useCallback(() => {
     api.myWork().then(setWork).catch(e => setError(e instanceof Error ? e.message : 'Failed to load'))
+  }, [])
+
+  useEffect(() => {
+    loadWork()
     const to = new Date(), from = new Date(Date.now() - 13 * 86_400_000)
     api.velocity({ from: ymd(from), to: ymd(to), tz: TZ }).then(setVelocity).catch(() => {})
     api.dayReportDraft(ymd(to), TZ).then(setDraft).catch(() => {})
     api.expiringArtifacts(14).then(setExpiring).catch(() => {})
-  }, [])
+  }, [loadWork])
+
+  // No AMP user to collect a list for: the server answers with an empty list
+  // (or, from older APIs, an error). Say why instead of showing zeros.
+  const noWork = authLoading ? null : noMyWorkReason(me) ?? (isNoUserError(error) ? 'no-user' : null)
 
   const counts = work?.counts ?? ZERO
   const cards = work?.projects ?? []
@@ -252,9 +262,10 @@ export function MyWork() {
       <PageHeader crumb="Overview" title="My work"
         meta="A summary across your projects. Each row opens the item in that project's My work." />
       <div className="p-4 sm:p-7 sm:pt-5 grid gap-4">
-        {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
-        {!work && !error && <div className="flex justify-center py-16"><BandLoader label="Loading your work" /></div>}
-        {work && <>
+        {noWork && <MyWorkUnavailable reason={noWork} />}
+        {!noWork && error && <MyWorkLoadError error={error} onRetry={() => { setError(null); loadWork() }} />}
+        {(authLoading || !work) && !error && !noWork && <div className="flex justify-center py-16"><BandLoader label="Loading your work" /></div>}
+        {work && !authLoading && !error && !noWork && <>
           <div className="amp-panel amp-panel-top grid grid-cols-3 md:grid-cols-7" aria-label="Waiting on you, across your projects">
             <div className="col-span-3 md:col-span-1 px-4 py-3 grid gap-1.5 border-b md:border-b-0 border-line"
               style={counts.waiting ? { background: 'var(--st-flag)', color: '#fff' } : undefined}>
