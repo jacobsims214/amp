@@ -48,6 +48,9 @@ const (
 	// PurposeGitHubHookSecret is a project's inbound GitHub webhook
 	// secret (AMP #2479).
 	PurposeGitHubHookSecret = "project_github_hooks.secret"
+	// PurposeGitHubCredential is a project's GitHub API token, the one the
+	// repository-facts reader authenticates with (AMP #3154).
+	PurposeGitHubCredential = "project_github_credentials.sealed_secret"
 )
 
 // ErrNoKey: there is no current key to seal with.
