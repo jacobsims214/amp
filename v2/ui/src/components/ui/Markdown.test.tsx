@@ -29,6 +29,13 @@ describe('classifyHref', () => {
     expect(classifyHref('/project/../sessions/abc', origin)).toEqual({ kind: 'internal', to: '/sessions/abc', fullLoad: true })
     expect(classifyHref('https://amp.example/api/audit/verify?org_id=3', origin)).toEqual({ kind: 'internal', to: '/api/audit/verify?org_id=3', fullLoad: true })
     expect(classifyHref('/home/harness/', origin)).toEqual({ kind: 'internal', to: '/home/harness/', fullLoad: true })
+    // react-router matches case-insensitively on the decoded path: these must not route client-side.
+    expect(classifyHref('/SESSIONS/abc', origin)).toMatchObject({ kind: 'internal', fullLoad: true })
+    expect(classifyHref('/%73essions/abc', origin)).toMatchObject({ kind: 'internal', fullLoad: true })
+    expect(classifyHref('/Api/x', origin)).toMatchObject({ kind: 'internal', fullLoad: true })
+    expect(classifyHref('https://amp.example/%53essions/abc', origin)).toMatchObject({ kind: 'internal', fullLoad: true })
+    // Undecodable paths fail closed.
+    expect(classifyHref('/%E0%A4%A/x', origin)).toMatchObject({ kind: 'internal', fullLoad: true })
     expect(classifyHref('/sessions', origin)).toEqual({ kind: 'internal', to: '/sessions' })
   })
   it('treats other http(s) and mailto as external', () => {

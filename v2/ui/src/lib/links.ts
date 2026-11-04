@@ -17,11 +17,28 @@ export type LinkTarget =
   | { kind: 'blocked' }
 
 /** Paths served by a full page load, never by client-side routing. */
-const FULL_LOAD = /^\/(sessions\/|api\/|home(\/|$))/
+const FULL_LOAD = /^\/(sessions\/|api\/|home(\/|$))/i
+
+/**
+ * Whether a path must get a full page load. react-router matches routes
+ * case-insensitively on the decoded path, so test the same thing it routes on:
+ * '/SESSIONS/1' and '/%73essions/1' would otherwise reach the Session page
+ * client-side, without its strict CSP. Fail closed: a path that can't be
+ * decoded gets a full load.
+ */
+export function needsFullLoad(pathname: string): boolean {
+  let decoded: string
+  try {
+    decoded = decodeURIComponent(pathname)
+  } catch {
+    return true
+  }
+  return FULL_LOAD.test(decoded) || FULL_LOAD.test(pathname)
+}
 
 function internal(u: URL): LinkTarget {
   const to = `${u.pathname}${u.search}${u.hash}`
-  return FULL_LOAD.test(u.pathname) ? { kind: 'internal', to, fullLoad: true } : { kind: 'internal', to }
+  return needsFullLoad(u.pathname) ? { kind: 'internal', to, fullLoad: true } : { kind: 'internal', to }
 }
 
 export function classifyHref(href: string | null | undefined, origin: string = window.location.origin): LinkTarget {
@@ -39,7 +56,7 @@ export function classifyHref(href: string | null | undefined, origin: string = w
     if (u.origin !== new URL(origin).origin) return { kind: 'blocked' }
     // Keep the path as written unless it needs a full load (checked on the
     // normalised path, so '/x/../sessions/1' is caught too).
-    return FULL_LOAD.test(u.pathname) ? internal(u) : { kind: 'internal', to: h }
+    return needsFullLoad(u.pathname) ? internal(u) : { kind: 'internal', to: h }
   }
   const safe = safeUrl(h)
   if (!safe) return { kind: 'blocked' }
