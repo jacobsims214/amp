@@ -10,7 +10,8 @@ import { AuthContext } from '../contexts/auth-context'
 import { RemoteProvider } from '../remote/RemoteProvider'
 import { httpTransport } from '../remote/transport'
 import { unpairedCrypto } from '../remote/crypto'
-import type { MyWork as MyWorkData, WaitCounts, WaitItem, WorkTask } from '../types'
+import type { Me, MyWork as MyWorkData, WaitCounts, WaitItem, WorkTask } from '../types'
+import userEvent from '@testing-library/user-event'
 
 const hourAgo = new Date(Date.now() - 3_600_000).toISOString()
 const counts = (c: Partial<WaitCounts>): WaitCounts => {
@@ -66,9 +67,9 @@ beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }))
 afterEach(() => { payload = busy })
 afterAll(() => server.close())
 
-function renderMyWork() {
+function renderMyWork(me: Me = { subject: 's', email: 'jo@example.com', name: 'Jo', roles: [], user_id: 7 }) {
   return render(
-    <AuthContext.Provider value={{ me: { subject: 's', email: 'jo@example.com', name: 'Jo', roles: [], user_id: 7 }, loading: false, error: null, isAdmin: false }}>
+    <AuthContext.Provider value={{ me, loading: false, error: null, isAdmin: false }}>
       <RemoteProvider deps={{ transport: httpTransport, crypto: unpairedCrypto, mock: false }}>
         <MemoryRouter><MyWork /></MemoryRouter>
       </RemoteProvider>
@@ -139,6 +140,51 @@ describe('top-level My work summary', () => {
     expect(screen.queryAllByRole('button')).toHaveLength(0)
   })
 
+  it('each row\'s sub-line leads with what it needs from you (needsLine)', async () => {
+    renderMyWork()
+    const amp = await screen.findByRole('article', { name: /AMP v2/ })
+    const sub = (title: string) => within(amp).getByText(title).closest('a')?.lastElementChild?.textContent
+    expect(sub('#2473 Review the mockup')).toBe('Answer: Which one? · waiting 1h')
+    expect(sub('#2471 Merge PR #88: Board Mine filter')).toBe('Merge PR #88, 2 tickets wait · done 1h ago')
+    expect(sub('#2470 Merge: My Work questions')).toBe('Merge its work · done 1h ago')
+    expect(sub('#2481 Rotate the Dex secret')).toBe('Do with your access: open the ticket for the brief · ready for 1h')
+    expect(sub('#2482 Second thing')).toBe('Do: open the ticket for the brief · started 1h ago')
+  })
+
+  it('lists plans waiting for approval above the project cards, across projects (#72)', async () => {
+    const plan = (pid: number, code: string, name: string, epic: number, ids: number[]) =>
+      item({ kind: 'approve', key: `approve:${epic}`, project_id: pid, project_code: code, project_name: name, task_ids: ids, name: `Plan ${epic}`, epic_id: epic, count: ids.length })
+    payload = {
+      ...busy,
+      counts: counts({ approve: 3, answer: 3 }),
+      projects: [
+        { project_id: 2, project_code: 'AMPV2', project_name: 'AMP v2', agents_in_progress: 0, more: 0, counts: counts({ answer: 3 }),
+          rows: [item({ task_id: 1 }), item({ task_id: 2 }), item({ task_id: 3 })] },
+        { project_id: 3, project_code: 'CORE', project_name: 'Core API', agents_in_progress: 0, more: 0, counts: counts({ approve: 2 }),
+          rows: [plan(3, 'CORE', 'Core API', 50, [10, 11]), plan(3, 'CORE', 'Core API', 51, [12])] },
+      ],
+    }
+    renderMyWork()
+    const panel = await screen.findByRole('region', { name: 'Plans waiting for your approval' })
+    const links = within(panel).getAllByRole('link')
+    expect(links.map(a => a.getAttribute('href'))).toEqual(['/project/3/my-work?focus=10', '/project/3/my-work?focus=12'])
+    expect(within(panel).getByText('Core API: Plan 50')).toBeInTheDocument()
+    expect(within(panel).getByText(/^Review and approve 2 tickets · planned/)).toBeInTheDocument()
+    // The server counts 3; only 2 are in the cards, so the panel says one is elsewhere.
+    expect(within(panel).getByText(/\+1 more plan not listed here/)).toBeInTheDocument()
+    // It comes before the project cards, even though Core API's card is second.
+    const cards = screen.getByRole('article', { name: /AMP v2/ })
+    expect(panel.compareDocumentPosition(cards) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(screen.queryAllByRole('button')).toHaveLength(0)
+  })
+
+  it('shows no approval panel when no plan waits on you', async () => {
+    payload = { ...busy, counts: counts({ answer: 1 }), projects: [busy.projects![1]] }
+    renderMyWork()
+    await screen.findByRole('article', { name: /Core API/ })
+    expect(screen.queryByRole('region', { name: 'Plans waiting for your approval' })).toBeNull()
+  })
+
   it('still renders against an older server without the summary', async () => {
     payload = { owned: [], flags: [], agents: [], done_24h: 0 }
     renderMyWork()
@@ -164,7 +210,45 @@ describe('top-level My work: a dispatched ticket no worker started', () => {
     renderMyWork()
     const amp = await screen.findByRole('article', { name: /AMP v2/ })
     expect(amp.textContent).toMatch(/Start 1/)
-    expect(within(amp).getByText('Dispatched to amp:amp-worker-frontend 32 min ago; no worker has started it')).toBeInTheDocument()
+    expect(within(amp).getByText('Launch its run, or return #2803 to ready · dispatched to amp:amp-worker-frontend 32 min ago, no worker has started it')).toBeInTheDocument()
     expect(within(amp).getByRole('link', { name: /#2803/ })).toHaveAttribute('href', '/project/2/my-work?focus=2803')
+  })
+})
+
+// The server answers an empty list when there's no AMP user, and a load can
+// fail: neither may read as "0 waiting" or "in all 0 projects" (critique #1).
+const EMPTY: MyWorkData = { ...busy, owned: [], counts: counts({}), projects: [], clear_projects: [], projects_total: 0, agents_in_progress: 0, done_24h: 0 }
+
+describe('top-level My work: no zeros when there is nothing to count', () => {
+  it('sign-in off (local dev): explains it and points at a project, with no counts', async () => {
+    payload = EMPTY
+    renderMyWork({ subject: 'local-dev', email: 'local-dev@amp.local', name: 'Local Dev', roles: [] })
+    const panel = await screen.findByRole('region', { name: 'My work is off: sign-in is turned off' })
+    expect(panel).toHaveTextContent('Sign-in is turned off on this AMP')
+    expect(within(panel).getByRole('link', { name: /Open a project/ })).toHaveAttribute('href', '/projects')
+    expect(screen.queryByLabelText('Waiting on you, across your projects')).toBeNull()
+    expect(screen.queryByText(/in all 0 projects/)).toBeNull()
+    expect(screen.queryByText('No project needs you right now.')).toBeNull()
+  })
+
+  it('signed out: says so and offers Sign in', async () => {
+    payload = EMPTY
+    renderMyWork({ subject: 'oidc|abc', email: 'jo@example.com', name: 'Jo', roles: [] })
+    const panel = await screen.findByRole('region', { name: 'My work: not signed in' })
+    expect(within(panel).getByRole('link', { name: /Sign in/ }).getAttribute('href')).toMatch(/^\/oauth2\/start\?rd=/)
+    expect(screen.queryByLabelText('Waiting on you, across your projects')).toBeNull()
+  })
+
+  it('a failed load shows the error and Try again, never the zero tiles', async () => {
+    server.use(http.get('*/api/my-work', () => HttpResponse.json({ error: 'database is down' }, { status: 500 }), { once: true }))
+    renderMyWork()
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent("Couldn't load My work: database is down")
+    expect(alert).toHaveTextContent('no counts are shown')
+    expect(screen.queryByLabelText('Waiting on you, across your projects')).toBeNull()
+    expect(screen.queryByText('No project needs you right now.')).toBeNull()
+    await userEvent.click(within(alert).getByRole('button', { name: 'Try again' }))
+    expect(await screen.findByLabelText('Waiting on you, across your projects')).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).toBeNull()
   })
 })

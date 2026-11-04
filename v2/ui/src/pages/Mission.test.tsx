@@ -9,7 +9,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { Mission } from './Mission'
 import { AuthContext } from '../contexts/auth-context'
 import { resetWaitCounts } from '../lib/waitCounts'
-import type { MyWorkCounts, PeopleWaiting, ProjectAccess, Task } from '../types'
+import type { Me, MyWorkCounts, PeopleWaiting, ProjectAccess, Task } from '../types'
 
 const ME = 7
 const at = '2026-10-27T10:00:00Z'
@@ -73,13 +73,13 @@ afterEach(async () => {
 })
 afterAll(() => { server.close(); vi.unstubAllGlobals() })
 
-async function open() {
+async function open(me: Me | null = { user_id: ME, email: 'jacob@x.io' } as never, loading = false) {
   // The strip reads the shared counts store, which AppShell fills; do it here.
   const { refreshWaitCounts } = await import('../lib/waitCounts')
   await refreshWaitCounts()
   const router = createMemoryRouter([{ path: '/project/:projectId/mission', element: <Mission /> }], { initialEntries: ['/project/2/mission'] })
   render(
-    <AuthContext.Provider value={{ me: { user_id: ME, email: 'jacob@x.io' } as never, loading: false, error: null, isAdmin: false }}>
+    <AuthContext.Provider value={{ me, loading, error: null, isAdmin: false }}>
       <RouterProvider router={router} />
     </AuthContext.Provider>,
   )
@@ -98,6 +98,34 @@ describe('Mission (informational)', () => {
     await open()
     expect(await screen.findByText('Nothing waits on you here')).toBeInTheDocument()
     expect(screen.getByText('Nothing waits on you here').closest('a')).toHaveAttribute('href', '/project/2/my-work')
+  })
+
+  it('without an AMP user (sign-in off): no counts, no green, and where to look instead', async () => {
+    counts = { counts: { waiting: 0, approve: 0, answer: 0, merge: 0, start: 0, do: 0, coming_up: 0 }, projects: {} }
+    await open({ subject: 'local-dev', email: 'local-dev@amp.local', name: 'Local Dev', roles: [] })
+    expect(screen.queryByText('Nothing waits on you here')).toBeNull()
+    const strip = screen.getByRole('status')
+    expect(strip).toHaveTextContent('Waiting on you: not counted')
+    expect(strip).toHaveTextContent('Sign-in is off on this AMP')
+    expect(within(strip).getByRole('link', { name: /Board/ })).toHaveAttribute('href', '/project/2/board')
+    expect(within(strip).getByRole('link', { name: /Why/ })).toHaveAttribute('href', '/project/2/my-work')
+    // The readouts keep the project's numbers but never claim "0 for you".
+    expect(screen.getByText('Questions').parentElement).not.toHaveTextContent('for you')
+    expect(screen.getByText('Merge needed').parentElement).not.toHaveTextContent('yours')
+  })
+
+  it('identity still loading: no strip yet, so local dev never flashes green', async () => {
+    counts = { counts: { waiting: 0, approve: 0, answer: 0, merge: 0, start: 0, do: 0, coming_up: 0 }, projects: {} }
+    await open(null, true)
+    expect(screen.queryByText('Nothing waits on you here')).toBeNull()
+    expect(screen.queryByText('Waiting on you: not counted')).toBeNull()
+    expect(screen.getByText('Questions').parentElement).not.toHaveTextContent('for you')
+  })
+
+  it('signed out: says so, not "Nothing waits on you here"', async () => {
+    await open({ subject: 'oidc|abc', email: 'jo@example.com', name: 'Jo', roles: [] })
+    expect(screen.queryByText('Nothing waits on you here')).toBeNull()
+    expect(screen.getByRole('status')).toHaveTextContent('You are not signed in as an AMP user')
   })
 
   it('readouts: Questions N · M for you, Merge needed N · M yours', async () => {
