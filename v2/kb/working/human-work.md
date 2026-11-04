@@ -14,8 +14,9 @@ Merging a pull request is **not** a human ticket. A ticket that finishes with a 
 **Merge needed**, and the work after it waits for the merge on its own
 (`working/merging-and-ci.md`). It reaches you as a **Merge** item, never as a Do item, and it's
 gone the moment the merge is recorded — by you, by CI, or by GitHub. Nothing asks you to
-acknowledge a merge that already happened, and work that landed on an integration branch asks you
-for nothing at all.
+acknowledge a merge that already happened, and a merge onto an integration branch is not a chore:
+whether it reaches your list at all depends on whether AMP could read that branch's rules (see
+**Merge** below, and `working/merging-and-ci.md`).
 
 ## Waiting on you
 
@@ -41,8 +42,8 @@ the ticket can be dispatched again.
 **Merge** is one item per PR, never one per step. It clears the moment the merge is recorded,
 however it was recorded, so a merge GitHub or CI already recorded never becomes a question for
 you. A plan's `merge_for` step for that PR is folded into the item (see below) rather than counted
-as a second thing to do, and work that landed on an integration branch is not a Merge item at
-all: it asks nothing of anyone.
+as a second thing to do. A merge onto an integration branch asks you for no acknowledgement; it
+only appears as an item when AMP couldn't verify the branch's rules, and then it says so.
 
 **Coming up** lists your human tickets that can't start yet: they wait on other work, a
 schedule, or plan approval. They're shown but not counted, and move into Do when they're ready.
@@ -64,15 +65,28 @@ project, and every action happens in place:
   you read every ticket and approve all or some of them.
 - **Answer**: the question, suggested answers when the question offers a choice, a text box and
   **Send answer**.
-- **Merge**: one item per PR. The PR, the branch it came from and the target as the run reported
-  it (or an explicit **target & rules: unknown** — AMP reads no repository settings and never
-  assumes `main`), why you're being asked, and only the tickets that really wait on it. **Review
-  PR ↗** always; **Mark merged** and **Not needed** where they do something. When the plan has a
-  merge step for that PR it's folded in here as **Tracked by #N**, with its open prerequisites
-  listed and **Mark merged** withheld until they're met — one click then records the merge and
-  completes the step. When nothing waits on the merge, **Mark merged** is still there but quiet:
-  GitHub or CI records it by itself. A PR closed without merging offers **Reopen ticket** and
-  **Not needed**.
+- **Merge**: one item per PR, saying what its evidence is. `PR #N · head branch → main` names the
+  target GitHub's own read of the pull request reported (that outranks a run's `base_branch`,
+  which is only a hint and is shown as such), and **target not verified** where nothing reported
+  one — never a guessed `main`. **Why you're asked** is the classifier's reason with a chip
+  naming its evidence: `default: main · detected from GitHub` when the PR targets the
+  repository's detected default branch; a warning chip (`default: main · rules: unknown`, or
+  `default branch & rules: unknown`) when the read was missing, stale, partial or ambiguous, so
+  the item is shown rather than hidden; and on a rule alert a box holding **the exact
+  requirement** (the ruleset and what it demands). A rule alert offers **Review and approve
+  PR #N ↗** and nothing else — no **Mark merged**, no **Not needed**: what's owed is your approval
+  on GitHub, and the webhook records the merge after it. (AMP can't yet tell whose approval a
+  rule wants, so a demanding rule it can't attribute lands on the warning chip today.) Every
+  other arm carries **Review PR ↗**, plus **Mark merged** and **Not needed** where they do
+  something. Only the tickets that really wait are counted next to the item. Two arms never become
+  an item at all, because the server drops them before they reach your list: a PR onto a
+  non-default branch where complete, fresh evidence proves no rule requires anyone (agent
+  organization, nothing to acknowledge), and a PR GitHub already reports merged (nothing is asked;
+  its ticket still reads **Merge needed** until the merge is recorded). When the plan has a merge
+  step for that PR it's folded in here as **Tracked by #N**, with its open prerequisites listed and
+  **Mark merged** withheld until they're met — one click then records the merge and completes the
+  step. When nothing waits on the merge, **Mark merged** is still there but quiet: GitHub or CI
+  records it by itself. A PR closed without merging offers **Reopen ticket** and **Not needed**.
 - **Start**: the ticket, the agent it went to and how long ago, and **Return to ready** to clear
   the dispatch and dispatch it again. Leaving it alone returns it by itself.
 - **Do**: **Start**, then **Mark done…**, which takes a note, a link and the hours you spent.
