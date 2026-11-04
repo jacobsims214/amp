@@ -325,6 +325,54 @@ func TestMergeStep_FinishingTheStepRecordsTheMerge(t *testing.T) {
 	}
 }
 
+// The reverse bridge records the merge the step owes even when the PR link the
+// person pastes matches nothing: the legacy textual bridge (#2475) only finds
+// a ticket by the exact PR URL or branch on its runs, so a typo, a retargeted
+// PR or a link the person copied from somewhere else leaves it with no hit.
+// merge_for is what says which merge this step tracks, so the person's "I
+// merged it" must still be enough — otherwise finishing the step leaves the
+// tracked ticket Merge-needed forever while dependents keep waiting (AMP
+// #3216, the inverted arms in CompleteHumanTask).
+func TestMergeStep_FinishingTheStepRecordsTheMergeThePRLinkDoesNotMatch(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	alice := w.s.as(w.alice)
+
+	build, step, deploy := mergeStepChain(t, w, "unmatched", w.bob.Email)
+	finishWith(t, alice, build, map[string]any{"pr_url": "https://github.example/acme/pull/" + uniq("one")})
+	if ms := mergeStateOf(t, alice, build); ms != domain.MergeNeeded {
+		t.Fatalf("build before the step = %q, want needed", ms)
+	}
+	// bob merged it and pastes a PR URL that is not the one on build's run, so
+	// the textual bridge finds nothing to mark: only the merge_for link can
+	// record this merge.
+	other := "https://github.example/acme/pull/" + uniq("other")
+	ra.want(t, 200, "bob", http.MethodPost, fmt.Sprintf("/api/tasks/%d/start", step), nil)
+	ra.want(t, 200, "bob", http.MethodPost, fmt.Sprintf("/api/tasks/%d/complete", step), map[string]any{"note": "merged it", "pr_url": other})
+
+	if ms := mergeStateOf(t, alice, build); ms != domain.MergeMerged {
+		t.Fatalf("build after the step was finished with a non-matching PR link = %q, want merged", ms)
+	}
+	if st := stateOf(t, alice, deploy); st != "backlog" {
+		t.Fatalf("deploy after the step was finished = %s, want backlog", st)
+	}
+	// The audit row says the recording happened here rather than by the
+	// textual bridge, which is what makes this the reverse bridge's test.
+	out := ra.want(t, 200, "owner", http.MethodGet,
+		fmt.Sprintf("/api/audit?project_id=%d&action=task.human.complete&target_id=%d", w.s.projectID, step), nil)
+	entries := out["entries"].([]any)
+	if len(entries) == 0 {
+		t.Fatalf("no audit row for the step's completion")
+	}
+	details := entries[0].(map[string]any)["details"].(map[string]any)
+	if got, _ := details["merge_recorded"].(bool); !got {
+		t.Fatalf("the audit row says the merge was not recorded here: %v", details)
+	}
+	if got := int(details["merge_for"].(float64)); got != build {
+		t.Fatalf("the audit row names merge_for %d, want %d", got, build)
+	}
+}
+
 // A ticket with no link is untouched: a merge report completes no unlinked
 // step, and it edits nothing else about the ticket.
 func TestMergeStep_LegacyTicketsUnchanged(t *testing.T) {
