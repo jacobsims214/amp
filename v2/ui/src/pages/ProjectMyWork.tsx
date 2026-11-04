@@ -319,7 +319,10 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
   )
   // A Merge card whose plan step still gates it is inert (artifact #27 state 4):
   // shown so the sequencing is visible, but nothing is asked of the person yet.
-  const gated = kind === 'merge' && mergeCardState(it) === 'gated-waiting'
+  // An `internal` item is inert too (state 6): it is agent organization, never a
+  // merge chore — the server drops those items, so this only ever catches a
+  // server that sends one anyway, and keeps the card from offering an action.
+  const gated = kind === 'merge' && (mergeCardState(it) === 'gated-waiting' || it.alert === 'internal')
   const frame = `pmw-item k-${kind}${gated ? ' inert' : ''}${focused ? ' focus' : ''}`
   if (kind === 'approve') {
     return (
@@ -356,6 +359,8 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
           {t ? <HumanActions task={t} kind={kind} canAct={!readOnly} prUrl={it.pr_url} branch={it.branch}
             baseBranch={it.base_branch} targetSource={it.target_source}
             holdingUp={it.holding_up} notWaiting={it.not_waiting} trackedBy={it.tracked_by}
+            alert={it.alert} alertReason={it.alert_reason} rule={it.rule} reviewUrl={it.review_url}
+            defaultBranch={it.default_branch}
             minutes={it.not_started_minutes} onChanged={() => onChanged()} />
             : <span className="text-[12.5px] text-ink-2">{it.question ?? ''}</span>}
         </div>

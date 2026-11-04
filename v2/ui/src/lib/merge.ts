@@ -1,4 +1,4 @@
-import type { Metadata, MergeStepFold, Run, Task, WaitItem } from '../types'
+import type { MergeAlertKind, MergeClassifier, Metadata, MergeStepFold, Run, Task, WaitItem } from '../types'
 
 /**
  * The merge signal on a done ticket (#2475, decisions/human-work-ux.md §4).
@@ -91,12 +91,17 @@ export function mergedIntoIntegration(
  * merge goes, who really waits, and whether the plan's step is due is derived
  * here, so ProjectMyWork, HumanActions and the TaskDrawer can't disagree.
  *
- * The one fact AMP cannot compute is whether the target is the repository's
- * default branch or covered by a review rule: amp-api holds no repository
- * metadata (no slug, default branch, branch protection or CODEOWNERS) and has
- * no host API client. So `targetSource: 'unknown'` is shown as unknown — with
- * a warning and a resolution path — never assumed to be "main" (which would
- * over-alert) and never assumed internal (which would hide a real merge).
+ * The one fact AMP cannot compute on its own is whether the target is the
+ * repository's default branch or covered by a review rule: this module holds
+ * no repository metadata and no host API client. The server classifies it
+ * instead (AMP #3133/#3158), and `mergeAlertView` is the UI half of that
+ * contract: each item carries the arm (`alert`), its one-line `alert_reason`,
+ * the `rule` detail, the `review_url` where a rule's approval happens, and the
+ * `default_branch` it judged against. A server without the classifier sends
+ * none of them, and then the card keeps the older, explicitly unverified
+ * behaviour: `target_source: 'unknown'` is shown as unknown — with a warning
+ * and a resolution path — never assumed to be "main" (which would over-alert)
+ * and never assumed internal (which would hide a real merge).
  */
 
 export interface MergeRoute {
@@ -112,15 +117,18 @@ export interface MergeRoute {
 
 /**
  * Where a Merge item goes: PR number, head, and target — or an explicit
- * unknown. The target is only a branch a run reported (`target_source: "run"`);
- * there is no fallback value, because AMP has nothing to fall back to (above).
- * A base_branch that arrived without that provenance is not trusted.
+ * unknown. The target is only a branch a run reported (`target_source: "run"`)
+ * or GitHub's own pull read established (`"detected"`); there is no fallback
+ * value, because AMP has nothing to fall back to (above). A base_branch that
+ * arrived without that provenance is not trusted.
  */
 export function mergeRoute(
   it: Pick<WaitItem, 'pr_url' | 'branch' | 'base_branch' | 'target_source'>,
 ): MergeRoute {
   const m = it.pr_url?.match(/\/pull\/(\d+)/)
-  const target = it.target_source === 'run' ? it.base_branch?.trim() || null : null
+  const target = it.target_source === 'run' || it.target_source === 'detected'
+    ? it.base_branch?.trim() || null
+    : null
   return {
     pr: m ? `PR #${m[1]}` : 'PR',
     head: it.branch?.trim() || null,
@@ -198,17 +206,20 @@ export function mergeCardState(
   return (it.holding_up?.length ?? 0) > 0 ? 'waiting' : 'quiet'
 }
 
-/** How prominent Mark merged is: the card's action, a quiet manual record, or absent. */
+/**
+ * How prominent Mark merged is: the card's action, a quiet manual record, or absent.
+ *
+ * `alert` is the classifier's arm, and it can take the button away entirely: a
+ * rule alert's action is the review on GitHub, and the merge is recorded by the
+ * webhook afterwards, so offering Mark merged here would invite a click that
+ * skips the approval the rule demands (approved artifact #27 v2 state 3). An
+ * internal item never offers it either (state 6) — it is agent organization,
+ * not a merge chore, and the backend never sends one anyway.
+ */
 export type MarkMergedRank = 'primary' | 'secondary' | null
 
-/**
- * Mark merged is never offered where it would do nothing: not on a closed PR,
- * and not while the plan's step is still gated (the backend refuses a merge
- * report on a step waiting on prerequisites, so the button would be a lie).
- * With nothing waiting it stays, demoted: a real merge still has to be
- * recorded, but it isn't what the person must do next.
- */
-export function markMergedRank(s: MergeCardState): MarkMergedRank {
+export function markMergedRank(s: MergeCardState, alert?: MergeAlertKind): MarkMergedRank {
+  if (alert === 'rule' || alert === 'internal' || alert === 'none') return null
   switch (s) {
     case 'abandoned': return null
     case 'gated-waiting': return null
@@ -234,26 +245,108 @@ export function hasMergeContract(it: Pick<WaitItem, 'target_source'>): boolean {
 }
 
 /**
- * Why this PR is on the person's list. Artifact #27 v2's alert policy is
- * "targets the detected default branch, or a repository rule requires your
- * approval" — and AMP can compute neither, because it holds no repository
- * metadata. So a card states the facts it has and says plainly what it could
- * not verify. It never claims the default branch, and never renders unknown as
- * "internal, nothing to do" (which would silently hide a real merge).
+ * Why this PR is on the person's list, for a server that sends no classifier
+ * (pre-#3158, or the TaskDrawer's ticket with no WaitItem). Artifact #27 v2's
+ * policy is "targets the detected default branch, or a repository rule
+ * requires your approval" — a pre-classifier server can compute neither, so the
+ * card states the facts it has and says plainly what it could not verify. It
+ * never claims the default branch, and never renders unknown as "internal,
+ * nothing to do" (which would silently hide a real merge).
+ *
+ * When the classifier DID decide, `mergeAlertView` carries its reason instead:
+ * the policy owns that sentence, and a second copy here could disagree with it.
  */
 export function mergeWhyText(it: Pick<WaitItem, 'base_branch' | 'target_source'>): string {
-  if (it.target_source === 'run' && it.base_branch?.trim()) {
-    return `Its run reported ${it.base_branch.trim()} as the target. AMP reads no repository settings, so it can't confirm that this is the default branch or that a rule requires your approval.`
+  if ((it.target_source === 'run' || it.target_source === 'detected') && it.base_branch?.trim()) {
+    const where = it.base_branch.trim()
+    return it.target_source === 'detected'
+      ? `GitHub reports that this PR targets ${where}. AMP shows it here on that basis alone.`
+      : `Its run reported ${where} as the target. AMP reads no repository settings, so it can't confirm that this is the default branch or that a rule requires your approval.`
   }
   return "AMP couldn't verify this PR's target or whether a repository rule requires your approval, so it's shown rather than hidden."
 }
 
-/** The chip that names where the target (and so the policy) stands: never assumed, never hidden. */
+/**
+ * The chip that names where the target (and so the policy) stands, for a
+ * server that sends no classifier: never assumed, never hidden. With the
+ * classifier present, `mergeAlertView`'s own chip says it more precisely.
+ */
 export function mergeTargetChip(it: Pick<WaitItem, 'target_source'>): { text: string; warn: boolean } {
+  if (it.target_source === 'detected') return { text: 'target: as GitHub reports it', warn: false }
   return it.target_source === 'run'
     ? { text: 'target: as its run reported it', warn: false }
     : { text: 'target & rules: unknown — AMP reads no repository settings', warn: true }
 }
+
+/**
+ * The classifier block for one Merge card (AMP #3158's projection of #3133's
+ * policy, approved artifact #27 v2). The arm decides what the card says and
+ * which action it offers; the wording of *why* is the server's, so the policy
+ * and the card cannot drift apart.
+ *
+ *   default_branch  state 1/2: "why you're asked" is the detected target, with
+ *                   a plain chip naming that it was detected. Ordinary action.
+ *   rule            state 3: the exact rule in a rule box, and the GitHub review
+ *                   link as THE action. `markMergedRank` returns null for this
+ *                   arm: the approval, not a recorded merge, is what is owed.
+ *   unknown         state 9: the warn chip, the reason, and the card as built.
+ *                   Never silence, and never "internal, nothing to do".
+ *   internal, none  ask nobody. `alert` is absent from the projection for
+ *                   `internal` (the server drops it) and `none` means merged;
+ *                   the card grows no alert chrome and no Mark merged, and the
+ *                   UI does not invent a row for either.
+ *
+ * `null` means the server did not classify this item at all (a pre-#3158
+ * server, or a Ticket with no WaitItem): the card keeps its older, explicitly
+ * unverified behaviour.
+ */
+export type MergeAlertView =
+  | { kind: 'default_branch'; reason: string; chip: { text: string; warn: false } }
+  | { kind: 'rule'; reason: string; rule: string; reviewUrl: string | null; chip: { text: string; warn: false } }
+  | { kind: 'unknown'; reason: string; chip: { text: string; warn: true } }
+  | { kind: 'silent'; reason: string; chip: null }
+
+export function mergeAlertView(it: MergeClassifier): MergeAlertView | null {
+  const reason = it.alert_reason?.trim() ?? ''
+  const db = it.default_branch?.trim() ?? ''
+  switch (it.alert) {
+    case 'default_branch':
+      return {
+        kind: 'default_branch',
+        reason: reason || `the PR targets ${db || 'the default branch'}, the repository's default branch`,
+        // The chip names the fact AND its source, which is the whole point of
+        // the arm: this is a read from the repository, not a guess from a label.
+        chip: { text: db ? `default: ${db} · detected from GitHub` : 'default branch · detected from GitHub', warn: false },
+      }
+    case 'rule':
+      return {
+        kind: 'rule',
+        reason,
+        rule: it.rule?.trim() ?? '',
+        reviewUrl: it.review_url?.trim() || null,
+        chip: { text: db ? `rules read from GitHub · default: ${db}` : 'rules read from GitHub', warn: false },
+      }
+    case 'unknown':
+      return {
+        kind: 'unknown',
+        reason: reason || 'the repository\'s default branch or rules could not be read',
+        // "Unknown" is the honest state, so the chip warns: it is never read as
+        // "internal, nothing to do" (artifact #27 state 9).
+        chip: { text: db ? `default: ${db} · rules: unknown` : 'default branch & rules: unknown', warn: true },
+      }
+    case 'internal':
+    case 'none':
+      return { kind: 'silent', reason, chip: null }
+  }
+  return null
+}
+
+/**
+ * A rule alert's guard: the action happens on GitHub, and the merge is recorded
+ * afterwards, so there is no Mark merged and no acknowledgement to owe.
+ */
+export const MERGE_RULE_GUARD =
+  'The action happens on GitHub. Once you approve and the PR merges, the webhook records it and this card clears itself — no Mark merged, no acknowledgement.'
 
 /**
  * Mark merged's guard copy: the click records a merge the person made

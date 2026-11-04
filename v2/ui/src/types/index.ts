@@ -865,7 +865,7 @@ export interface PeopleWaiting {
 }
 
 /** One thing waiting on you (Waiting on you): "approve:<epic id>" (one per epic) or "task:<ticket id>". */
-export interface WaitItem {
+export interface WaitItem extends MergeClassifier {
   kind: WaitKind | 'coming_up'
   key: string
   project_id: number
@@ -911,8 +911,40 @@ export interface WaitItem {
   start_at?: string
 }
 
-/** Where a Merge card's target branch came from (service.MergeTargetRun / MergeTargetUnknown). */
-export type MergeTargetSource = 'run' | 'unknown'
+/**
+ * Where a Merge card's target branch came from (service.MergeTargetRun /
+ * MergeTargetDetected / MergeTargetUnknown). "detected" is GitHub's own pull
+ * read: it outranks a run's report, because what someone typed or the harness
+ * guessed is not what the repository says (AMP #3158).
+ */
+export type MergeTargetSource = 'run' | 'detected' | 'unknown'
+
+/**
+ * The merge-alert classifier's arms (service.MergeAlert*, AMP #3133/#3158):
+ * default_branch and rule ask the person for a real reason; unknown is the
+ * honest watch (evidence missing, stale, partial or ambiguous); internal is
+ * agent organization and asks nobody; none is work already merged.
+ */
+export type MergeAlertKind = 'default_branch' | 'rule' | 'internal' | 'unknown' | 'none'
+
+/**
+ * The merge-alert classifier's fields on a merge item (REST `WaitItem` and MCP
+ * `PersonWait` both carry them). Absent on a pre-#3158 server
+ * (`classification_made: false` there): then the card keeps its older,
+ * explicitly unverified behaviour instead of guessing an arm.
+ */
+export interface MergeClassifier {
+  /** which arm decided this item reaches the person; absent when nothing was classified */
+  alert?: MergeAlertKind
+  /** one line saying why, in the terms the card shows (artifact #27 v2 states 3 and 9) */
+  alert_reason?: string
+  /** the rule-box detail for a rule alert: which ruleset demands what, and why it is this person */
+  rule?: string
+  /** where the person acts on a rule alert: the PR on GitHub, where the review happens */
+  review_url?: string
+  /** the repository's detected default branch this was classified against; "" when it could not be read */
+  default_branch?: string
+}
 
 /**
  * The plan's human merge step folded into a Merge card (AMP #3009's `merge_for`,

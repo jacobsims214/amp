@@ -50,6 +50,11 @@
 .pmw-chip.warn { color: var(--warning-ink); border-color: var(--warning); background: color-mix(in srgb, var(--warning) 8%, var(--surface)); }
 .pmw-waiters { margin: 8px 0 0; font-size: 13px; line-height: 1.5; color: var(--ink-2); }
 .pmw-waiters b { color: var(--ink); font-weight: 600; }
+/* A rule alert's rule box (approved artifact #27 v2 state 3): sunken, labelled,
+   and readable — the exact requirement the repository imposes, in its terms. */
+.pmw-rule-box { display: grid; gap: 3px; margin: 10px 0 2px; padding: 9px 12px; background: var(--surface-3); border: 1px solid var(--line); border-radius: var(--radius); }
+.pmw-rule-box > .amp-label { color: var(--ink-2); }
+.pmw-rule-box p { margin: 0; font-size: 13px; line-height: 1.5; color: var(--ink-2); }
 .pmw-step-wait { display: grid; gap: 6px; margin-top: 10px; padding: 9px 12px; background: var(--surface-3); border: 1px solid var(--line); border-radius: var(--radius); }
 .pmw-step-ready { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin: 10px 0 0; font-size: 13px; line-height: 1.45; color: var(--ink-2); }
 .pmw-step-ready > .amp-label { flex-shrink: 0; color: var(--teal); }

@@ -32,6 +32,19 @@ export const mergeItem = (over: Partial<ProjectWaitItem> = {}): ProjectWaitItem 
   ...over,
 })
 /**
+ * A Merge card carrying the merge-alert classifier's verdict (AMP #3158): the
+ * arm decided server-side, plus the facts behind it. `mergeItem` without these
+ * fields is a pre-#3158 server, which the card must keep rendering the old way.
+ */
+export const alertMergeItem = (over: Partial<ProjectWaitItem> = {}): ProjectWaitItem => mergeItem({
+  alert: 'default_branch',
+  alert_reason: "the PR targets main, the repository's default branch",
+  default_branch: 'main',
+  target_source: 'detected',
+  base_branch: 'main',
+  ...over,
+})
+/**
  * A linked Merge card: the plan's human merge step folds into it (#3009/#3011,
  * artifact #27 states 4–5). Not ready by default, so a test that wants the
  * ready state passes `tracked_by: {... step, ready: true}`.

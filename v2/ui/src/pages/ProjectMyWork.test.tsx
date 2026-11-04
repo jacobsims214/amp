@@ -11,7 +11,7 @@ import { ProjectLanding } from './ProjectLanding'
 import { ProjectNav } from '../components/ProjectNav'
 import { fixedTab, landingPath, landingTab } from '../lib/landing'
 import { resetWaitCounts } from '../lib/waitCounts'
-import { linkedMergeItem, legacyMergeItem, mergeItem, myWork, task } from '../test/myWorkFixture'
+import { alertMergeItem, linkedMergeItem, legacyMergeItem, mergeItem, myWork, task } from '../test/myWorkFixture'
 import type { MyWorkCounts, ProjectMyWork as Data } from '../types'
 
 let data: Data = myWork('busy')
@@ -335,5 +335,95 @@ describe('My work tab: merge card states', () => {
     expect(within(quiet).getByRole('button', { name: /mark merged/i })).not.toHaveClass('amp-btn-primary')
     expect(within(quiet).getByTestId('merge-waiters')).toHaveTextContent('Nothing waits on this merge')
     expect(within(quiet).getByText(/#2492 opted out/)).toBeInTheDocument()
+  })
+})
+
+// The classifier's arms end to end (AMP #3158, approved artifact #27 v2). The
+// server decides the arm; the page must render it and never invent one: no
+// default branch from a branch name, no Mark merged where a rule demands an
+// approval on GitHub, and no internal work as a merge chore.
+describe('My work tab: the merge classifier\'s arms', () => {
+  const mergeList = () => screen.findByRole('region', { name: 'Waiting on you' })
+  const pr = 'https://github.com/o/r/pull/96'
+
+  it('default branch: the reason and its source, and the ordinary Mark merged', async () => {
+    data = myWork('busy', {
+      items: { approve: [], answer: [], merge: [alertMergeItem({ pr_url: pr, branch: 'feat/usage-caps' })], start: [], do: [] },
+      counts: { waiting: 1, approve: 0, answer: 0, merge: 1, start: 0, do: 0, coming_up: 0 },
+    })
+    at('/project/2/my-work')
+    const card = within(await mergeList()).getByRole('article', { name: /Merge: #2471/ })
+    expect(within(card).getByTestId('merge-why')).toHaveTextContent("the PR targets main, the repository's default branch")
+    expect(within(card).getByTestId('merge-chip')).toHaveTextContent('default: main · detected from GitHub')
+    expect(within(card).getByTestId('merge-chip')).not.toHaveClass('warn')
+    expect(within(card).getByTestId('merge-route')).toHaveTextContent('PR #96 · feat/usage-caps → main')
+    expect(within(card).getByRole('button', { name: /mark merged/i })).toHaveClass('amp-btn-primary')
+    expect(within(card).queryByTestId('merge-rule')).toBeNull()
+  })
+
+  it('rule: the rule box, the GitHub review as the primary action, and NO Mark merged anywhere', async () => {
+    data = myWork('busy', {
+      items: { approve: [], answer: [], merge: [alertMergeItem({
+        pr_url: pr, branch: 'amp-2955', base_branch: 'feat/billing',
+        alert: 'rule', alert_reason: 'the PR targets feat/billing, and a rule requires your approval',
+        rule: 'organization ruleset billing: 1 approving review, a code owner\'s approval — you are a code owner of the changed paths',
+        review_url: pr,
+      })], start: [], do: [] },
+      counts: { waiting: 1, approve: 0, answer: 0, merge: 1, start: 0, do: 0, coming_up: 0 },
+    })
+    at('/project/2/my-work')
+    const list = await mergeList()
+    const card = within(list).getByRole('article', { name: /Merge: #2471/ })
+    expect(within(card).getByTestId('merge-rule')).toHaveTextContent('you are a code owner of the changed paths')
+    const review = within(card).getByTestId('merge-review')
+    expect(review).toHaveTextContent('Review and approve PR #96')
+    expect(review).toHaveClass('amp-btn-primary')
+    // The ticket says it outright: rule cards lack Mark merged.
+    expect(within(list).queryAllByRole('button', { name: /mark merged/i })).toHaveLength(0)
+    expect(within(card).queryByRole('button', { name: /not needed/i })).toBeNull()
+    // And the card is not inert: it is the person's, it is just a review.
+    expect(card).not.toHaveClass('inert')
+  })
+
+  it('unknown: the warning chip and the card as built, never hidden', async () => {
+    data = myWork('busy', {
+      items: { approve: [], answer: [], merge: [alertMergeItem({
+        pr_url: pr, branch: 'amp-2960', base_branch: 'trunk', target_source: 'unknown',
+        alert: 'unknown', alert_reason: "the repository's default branch could not be read", default_branch: '',
+        holding_up: [2975],
+      })], start: [], do: [] },
+      counts: { waiting: 1, approve: 0, answer: 0, merge: 1, start: 0, do: 0, coming_up: 0 },
+    })
+    at('/project/2/my-work')
+    const card = within(await mergeList()).getByRole('article', { name: /Merge: #2471/ })
+    expect(within(card).getByTestId('merge-why')).toHaveTextContent("the repository's default branch could not be read")
+    expect(within(card).getByTestId('merge-chip')).toHaveClass('warn')
+    expect(within(card).getByTestId('merge-chip')).toHaveTextContent('default branch & rules: unknown')
+    // The run's hint never becomes a claimed target on an unknown verdict.
+    expect(within(card).getByTestId('merge-route')).toHaveTextContent('target not verified')
+    expect(within(card).queryByText(/→ trunk/)).toBeNull()
+    expect(within(card).getByTestId('merge-waiters')).toHaveTextContent('1 ticket waits on this merge: #2975.')
+    expect(within(card).getByRole('button', { name: /mark merged/i })).toBeInTheDocument()
+  })
+
+  it('internal: an inert card with no action, never a merge chore', async () => {
+    // The server drops internal items; this is the belt-and-braces case where
+    // one arrives anyway. It must offer nothing a person could click.
+    data = myWork('busy', {
+      items: { approve: [], answer: [], merge: [alertMergeItem({
+        pr_url: pr, branch: 'amp-2968', base_branch: 'feat/harness-home-page',
+        alert: 'internal', alert_reason: "feat/harness-home-page is not the repository's default branch (main), and no rule requires your approval",
+        holding_up: [2302],
+      })], start: [], do: [] },
+      counts: { waiting: 1, approve: 0, answer: 0, merge: 1, start: 0, do: 0, coming_up: 0 },
+    })
+    at('/project/2/my-work')
+    const list = await mergeList()
+    const card = within(list).getByRole('article', { name: /Merge: #2471/ })
+    expect(card).toHaveClass('inert')
+    expect(within(card).queryByRole('button', { name: /mark merged/i })).toBeNull()
+    expect(within(card).queryByRole('button', { name: /not needed/i })).toBeNull()
+    expect(within(card).queryByTestId('merge-chip')).toBeNull()
+    expect(within(card).queryByTestId('merge-rule')).toBeNull()
   })
 })

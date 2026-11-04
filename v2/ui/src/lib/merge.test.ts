@@ -2,12 +2,12 @@
 // waiting on you: no Board badge, no Merge kind, no Merge needed readout.
 import { describe, expect, it } from 'vitest'
 import {
-  effectiveMetadata, hasMergeContract, integrationBranch, markMergedRank, mergeBadge, mergeCardState, MERGE_MARK_GUARD,
-  mergedIntoIntegration, mergePrerequisites, mergeRoute, mergeRouteText, mergeTargetChip, mergeWaiters, mergeWhyText,
-  needsMerge, runWentTo, waitsForMerge,
+  effectiveMetadata, hasMergeContract, integrationBranch, markMergedRank, mergeAlertView, mergeBadge, mergeCardState,
+  MERGE_MARK_GUARD, MERGE_RULE_GUARD, mergedIntoIntegration, mergePrerequisites, mergeRoute, mergeRouteText, mergeTargetChip,
+  mergeWaiters, mergeWhyText, needsMerge, runWentTo, waitsForMerge,
 } from './merge'
 import { actionKindOf, mergeStatusText } from './humanActions'
-import type { Task } from '../types'
+import type { MergeClassifier, Task } from '../types'
 
 const done = (over: Partial<Task> = {}) => ({ state: 'completed' as const, merge_state: 'none' as const, ...over })
 const run = (branch: string, over: object = {}) => ({ outcome: 'completed' as const, branch, ...over })
@@ -139,6 +139,25 @@ describe('markMergedRank: one action per PR, never a dead one', () => {
     expect(markMergedRank('abandoned')).toBeNull()
     expect(markMergedRank('gated-waiting')).toBeNull()
   })
+
+  // AMP #3158: the classifier's arm can take the action away altogether.
+  it('offers no Mark merged on a rule alert: the owed act is the review on GitHub', () => {
+    // Every card state, so the arm outranks the state rather than merely
+    // winning in one combination.
+    for (const s of ['waiting', 'gated-ready', 'quiet'] as const) expect(markMergedRank(s, 'rule')).toBeNull()
+  })
+
+  it('offers no Mark merged on internal or already-merged work', () => {
+    expect(markMergedRank('waiting', 'internal')).toBeNull()
+    expect(markMergedRank('waiting', 'none')).toBeNull()
+  })
+
+  it('leaves a default-branch or unknown alert the ordinary action', () => {
+    expect(markMergedRank('waiting', 'default_branch')).toBe('primary')
+    expect(markMergedRank('waiting', 'unknown')).toBe('primary')
+    // Absent classifier (the TaskDrawer, a pre-#3158 server): unchanged.
+    expect(markMergedRank('waiting', undefined)).toBe('primary')
+  })
 })
 
 describe('mergePrerequisites', () => {
@@ -210,5 +229,111 @@ describe('hasMergeContract', () => {
     expect(hasMergeContract({ target_source: 'run' })).toBe(true)
     expect(hasMergeContract({ target_source: 'unknown' })).toBe(true)
     expect(hasMergeContract({})).toBe(false)
+  })
+})
+
+// The merge-alert classifier's projection (AMP #3158; policy #3133; approved
+// artifact #27 v2 states 1/2, 3, 6, 9). The server decides the arm; the card
+// must render THAT arm and nothing it infers from a branch label — no "main"
+// from a name, no "internal, nothing to do" from silence, and no Mark merged
+// where a repository rule demands an approval on GitHub first.
+describe('mergeAlertView: the four arms, as the card renders them', () => {
+  const item = (over: MergeClassifier = {}): MergeClassifier => ({
+    alert: 'default_branch', alert_reason: 'the PR targets main, the repository\'s default branch', default_branch: 'main', ...over,
+  })
+
+  it('default branch: the reason and the source are the server\'s, and the chip says it was detected', () => {
+    const v = mergeAlertView(item())
+    expect(v?.kind).toBe('default_branch')
+    expect(v?.reason).toBe("the PR targets main, the repository's default branch")
+    expect(v?.chip).toEqual({ text: 'default: main · detected from GitHub', warn: false })
+  })
+
+  it('rule: the exact requirement, the GitHub review URL, and a plain (not warning) chip', () => {
+    const v = mergeAlertView(item({
+      alert: 'rule',
+      alert_reason: 'the PR targets feat/billing, and a rule requires your approval',
+      rule: 'organization ruleset "billing": 1 approving review, a code owner\'s approval — you are a code owner of the changed paths',
+      review_url: 'https://github.com/o/r/pull/96',
+    }))
+    expect(v).toEqual({
+      kind: 'rule',
+      reason: 'the PR targets feat/billing, and a rule requires your approval',
+      rule: 'organization ruleset "billing": 1 approving review, a code owner\'s approval — you are a code owner of the changed paths',
+      reviewUrl: 'https://github.com/o/r/pull/96',
+      chip: { text: 'rules read from GitHub · default: main', warn: false },
+    })
+    // Mark merged is never offered here, whatever the card state.
+    expect(markMergedRank(mergeCardState({ merge_state: 'needed', target_source: 'detected', holding_up: [2] }), 'rule')).toBeNull()
+  })
+
+  it('unknown: an honest warning chip, never "internal, nothing to do"', () => {
+    const v = mergeAlertView(item({ alert: 'unknown', alert_reason: "the repository's default branch could not be read", default_branch: '' }))
+    expect(v?.kind).toBe('unknown')
+    expect(v?.reason).toBe("the repository's default branch could not be read")
+    expect(v?.chip).toEqual({ text: 'default branch & rules: unknown', warn: true })
+  })
+
+  it('unknown still warns when the default branch WAS read but the rules were not', () => {
+    const v = mergeAlertView(item({ alert: 'unknown', alert_reason: 'the rules on feat/x have not been read', default_branch: 'main' }))
+    expect(v?.chip).toEqual({ text: 'default: main · rules: unknown', warn: true })
+  })
+
+  it('internal and none are silent: no alert chrome, no action', () => {
+    expect(mergeAlertView({ alert: 'internal' })).toEqual({ kind: 'silent', reason: '', chip: null })
+    expect(mergeAlertView({ alert: 'none' })).toEqual({ kind: 'silent', reason: '', chip: null })
+  })
+
+  // The line between "classified unknown" and "not classified" is the whole
+  // reason this returns null rather than a fifth kind: silence from a
+  // pre-#3158 server is not evidence of anything, and the old copy — which
+  // says AMP could not verify the target — is the truthful thing to show.
+  it('is null when the server classified nothing, so the card keeps its unverified copy', () => {
+    expect(mergeAlertView({})).toBeNull()
+    expect(mergeAlertView({ alert_reason: 'left over from something else' })).toBeNull()
+  })
+
+  it('falls back to a truthful reason rather than an empty line', () => {
+    expect(mergeAlertView({ alert: 'default_branch', default_branch: 'trunk' })?.reason)
+      .toBe("the PR targets trunk, the repository's default branch")
+    expect(mergeAlertView({ alert: 'unknown' })?.reason)
+      .toBe("the repository's default branch or rules could not be read")
+  })
+
+  it('leaves a rule alert\'s detail empty when the server sent none, so no empty box is drawn', () => {
+    const v = mergeAlertView({ alert: 'rule' })
+    expect(v?.kind).toBe('rule')
+    expect(v?.kind === 'rule' && v.rule).toBe('')
+  })
+})
+
+describe('a detected target is trusted; a hint is not', () => {
+  it('shows the target GitHub reported, with detector provenance', () => {
+    const r = mergeRoute({ pr_url: 'https://github.com/o/r/pull/94', branch: 'feat/x', base_branch: 'main', target_source: 'detected' })
+    expect(r).toEqual({ pr: 'PR #94', head: 'feat/x', target: 'main', known: true })
+  })
+
+  it('still refuses a target with no provenance, and unknown with a branch name', () => {
+    expect(mergeRoute({ pr_url: 'https://github.com/o/r/pull/94', base_branch: 'main', target_source: undefined }).known).toBe(false)
+    expect(mergeRoute({ pr_url: 'https://github.com/o/r/pull/94', base_branch: 'main', target_source: 'unknown' }).target).toBeNull()
+  })
+
+  it('has a plain chip for a detected target and the old warning when there is no classifier', () => {
+    expect(mergeTargetChip({ target_source: 'detected' })).toEqual({ text: 'target: as GitHub reports it', warn: false })
+    expect(mergeTargetChip({ target_source: 'unknown' })).toEqual({ text: 'target & rules: unknown — AMP reads no repository settings', warn: true })
+  })
+
+  it('the legacy why-line names the detection instead of claiming AMP verified nothing', () => {
+    expect(mergeWhyText({ base_branch: 'main', target_source: 'detected' }))
+      .toBe('GitHub reports that this PR targets main. AMP shows it here on that basis alone.')
+  })
+})
+
+describe('the rule card\'s guard copy', () => {
+  it('says the action happens on GitHub and no Mark merged is owed', () => {
+    expect(MERGE_RULE_GUARD).toContain('The action happens on GitHub')
+    expect(MERGE_RULE_GUARD).toContain('no Mark merged')
+    // The default-branch guard is unchanged: it still records, never merges.
+    expect(MERGE_MARK_GUARD).toContain('only after you merged it on GitHub')
   })
 })
