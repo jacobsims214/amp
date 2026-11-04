@@ -100,6 +100,7 @@ func newRBACWorld(t *testing.T) *rbacWorld {
 		Name: "rbac " + sfx, Code: "rbac-" + sfx, OrgID: &w.org.ID, TeamID: &w.core.ID,
 	})
 	must(err)
+	planApprovalOff(t, repo, proj.ID)
 	must(repo.SetProjectTeam(ctx, proj.ID, w.devs.ID, domain.ProjectTeamMember))
 	must(repo.SetProjectTeam(ctx, proj.ID, w.ops.ID, domain.ProjectTeamMember))
 	epic, err := repo.CreateEpic(ctx, domain.CreateEpicRequest{ProjectID: proj.ID, Name: "shared epic", Priority: "1"})
@@ -529,7 +530,7 @@ func TestRBAC_OnlyTheOwnerWorksATicket(t *testing.T) {
 	w.as(w.orgadmin).call(t, "amp_block_task", map[string]interface{}{"task_id": float64(tid), "reason": "org admin override"})
 	// The owner-team member can still take it over explicitly, then work it.
 	w.as(w.owner).call(t, "amp_assign_task", map[string]interface{}{"task_id": float64(tid), "user": "me"})
-	w.as(w.owner).call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(tid)})
+	w.as(w.owner).finish(t, tid)
 }
 
 func TestRBAC_DeleteTicket(t *testing.T) {

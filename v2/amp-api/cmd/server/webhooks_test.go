@@ -13,12 +13,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/service"
 	"github.com/simstech/amp-api/internal/webhook"
 )
@@ -87,6 +89,7 @@ func startWebhooks(t *testing.T, w *rbacWorld, opts webhook.Options) {
 		opts.Backoff = []time.Duration{50 * time.Millisecond}
 	}
 	d := webhook.New(w.s.repo, opts)
+	d.OnSystemAudit(service.New(w.s.repo, nil, nil).RecordSystem)
 	w.s.hub.AddSink(d.Event)
 	t.Cleanup(service.OnAudit(d.Audit))
 	ctx, cancel := context.WithCancel(context.Background())
@@ -129,13 +132,34 @@ func TestWebhooks_ProjectEventsAreSignedAndFiltered(t *testing.T) {
 		"project_id": float64(w.s.projectID), "story_id": float64(w.s.storyID), "name": "Ship <it>", "description": "d", "acceptance_criteria": "a",
 	}))
 	owner.call(t, "amp_dispatch_task", map[string]any{"task_id": float64(id), "agent_id": "worker"})
-	owner.call(t, "amp_complete_task", map[string]any{"task_id": float64(id)})
+	owner.finish(t, id)
 
-	got := rc.wait(t, "created and completed", func(g []received) bool { return len(g) >= 2 })
-	time.Sleep(100 * time.Millisecond) // anything else would have arrived by now
-	got = rc.wait(t, "", func([]received) bool { return true })
-	if ev := events(got); len(ev) != 2 || ev[0] != "task.created" || ev[1] != "task.completed" {
-		t.Fatalf("events = %v (dispatch is filtered out)", ev)
+	rc.wait(t, "created and completed", func(g []received) bool { return len(g) >= 2 })
+	hookID := int(hook["id"].(float64))
+	deliveriesURL := fmt.Sprintf("/api/webhooks/%d/deliveries", hookID)
+	// The dispatcher matches events in order, one at a time, so once task.completed was sent
+	// the earlier task.dispatched was matched too: had it passed the filter, it would be a
+	// delivery row here. Every row is recorded as delivered only after the receiver answered,
+	// so wait for that rather than for time to pass.
+	var deliveries []any
+	eventually(t, "both deliveries to be recorded as delivered", func() bool {
+		deliveries = ra.want(t, 200, "owner", "GET", deliveriesURL, nil)["deliveries"].([]any)
+		for _, d := range deliveries {
+			if d.(map[string]any)["status"] != "delivered" {
+				return false
+			}
+		}
+		return len(deliveries) >= 2
+	})
+	if len(deliveries) != 2 {
+		t.Errorf("deliveries = %v (dispatch is filtered out)", deliveries)
+	}
+	// Deliveries are sent a few at once, so they can arrive in either order.
+	got := rc.wait(t, "", func([]received) bool { return true })
+	ev := events(got)
+	sort.Strings(ev)
+	if len(ev) != 2 || ev[0] != "task.completed" || ev[1] != "task.created" {
+		t.Fatalf("events = %v, want task.created and task.completed once each (dispatch is filtered out)", events(got))
 	}
 	for _, r := range got {
 		// Checked the way a receiver would, without AMP's code.
@@ -158,12 +182,7 @@ func TestWebhooks_ProjectEventsAreSignedAndFiltered(t *testing.T) {
 		}
 	}
 
-	hookID := int(hook["id"].(float64))
-	deliveries := ra.want(t, 200, "owner", "GET", fmt.Sprintf("/api/webhooks/%d/deliveries", hookID), nil)["deliveries"].([]any)
-	if len(deliveries) != 2 || deliveries[0].(map[string]any)["status"] != "delivered" {
-		t.Errorf("deliveries = %v", deliveries)
-	}
-	ra.want(t, 403, "alice", "GET", fmt.Sprintf("/api/webhooks/%d/deliveries", hookID), nil)
+	ra.want(t, 403, "alice", "GET", deliveriesURL, nil)
 
 	// Rotating the secret changes the signature; turning it off stops it.
 	newSecret := ra.want(t, 200, "owner", "POST", fmt.Sprintf("/api/webhooks/%d/rotate-secret", hookID), nil)["webhook"].(map[string]any)["secret"].(string)
@@ -210,7 +229,7 @@ func TestWebhooks_OrgWebhookSlackAndAudit(t *testing.T) {
 	id := taskID(t, owner.call(t, "amp_create_task", map[string]any{
 		"project_id": float64(w.s.projectID), "story_id": float64(w.s.storyID), "name": "Ship <it>", "description": "d", "acceptance_criteria": "a",
 	}))
-	owner.call(t, "amp_complete_task", map[string]any{"task_id": float64(id)})
+	owner.finish(t, id)
 
 	got := rc.wait(t, "audit entry and completion", func(g []received) bool {
 		ev := strings.Join(events(g), " ")
@@ -279,10 +298,70 @@ func TestWebhooks_RetriesAndAutoDisable(t *testing.T) {
 	if got.Active || got.ConsecutiveFailures != 2 || !strings.Contains(got.LastError, "HTTP 500") {
 		t.Errorf("after two failed deliveries: active=%v failures=%d last_error=%q", got.Active, got.ConsecutiveFailures, got.LastError)
 	}
+	// The SIEM stream can't stop unnoticed (#2439 M4): turning the webhook
+	// off is audited, and so are dropped deliveries, at most one entry an
+	// hour per webhook (counting the drops since the last one).
+	var disabled, dropped []domain.AuditEntry
+	eventually(t, "webhook.disable and webhook.delivery.dropped entries", func() bool {
+		disabled, _ = w.s.repo.ListAudit(context.Background(), domain.AuditFilter{ProjectID: w.s.projectID, Action: "webhook.disable"})
+		dropped, _ = w.s.repo.ListAudit(context.Background(), domain.AuditFilter{ProjectID: w.s.projectID, Action: "webhook.delivery.dropped"})
+		return len(disabled) > 0 && len(dropped) > 0
+	})
+	hookTarget := fmt.Sprint(hookID)
+	if len(disabled) != 1 || disabled[0].TargetID != hookTarget || disabled[0].ActorType != domain.AuditActorSystem ||
+		disabled[0].Details["consecutive_failures"] != float64(2) {
+		t.Errorf("webhook.disable entries = %+v", disabled)
+	}
+	if len(dropped) != 1 || dropped[0].TargetID != hookTarget || dropped[0].Details["dropped"] != float64(1) {
+		t.Errorf("webhook.delivery.dropped entries (two drops within the hour) = %+v", dropped)
+	}
 	ra.want(t, 400, "owner", "POST", fmt.Sprintf("/api/webhooks/%d/test", hookID), nil)
 	ra.want(t, 200, "owner", "PATCH", fmt.Sprintf("/api/webhooks/%d", hookID), map[string]any{"active": true})
 	if got, _ := w.s.repo.GetWebhook(context.Background(), hookID); got.ConsecutiveFailures != 0 {
 		t.Errorf("re-enabling kept %d failures", got.ConsecutiveFailures)
+	}
+}
+
+// Audit webhooks get an entry's request context (IP, user agent, session
+// and token ids, before/after, the raw X-Forwarded-For) only when they opt
+// in with include_context; existing and new webhooks default to off
+// (#2439 M2).
+func TestWebhooks_AuditContextIsOptIn(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	allowPrivateWebhooks(t)
+	plain, withContext := newReceiver(t), newReceiver(t)
+	hooks := fmt.Sprintf("/api/orgs/%d/webhooks", w.org.ID)
+	h := ra.want(t, 200, "orgadmin", "POST", hooks, map[string]any{"url": plain.srv.URL, "events": []string{"audit.org.rename"}})["webhook"].(map[string]any)
+	if h["include_context"] != false {
+		t.Fatalf("new webhook include_context = %v", h["include_context"])
+	}
+	h2 := ra.want(t, 200, "orgadmin", "POST", hooks, map[string]any{"url": withContext.srv.URL, "events": []string{"audit.org.rename"}})["webhook"].(map[string]any)
+	ra.want(t, 200, "orgadmin", "PATCH", fmt.Sprintf("/api/webhooks/%d", int(h2["id"].(float64))), map[string]any{"include_context": true})
+
+	tok := int64(77)
+	org := w.org.ID
+	if _, err := w.s.repo.InsertAudit(context.Background(), domain.AuditEntry{Action: "org.rename", OrgID: &org, ActorEmail: "a@x",
+		Summary: "renamed", SourceIP: "203.0.113.9", UserAgent: "secret-agent/1", SessionID: "sess-abc", TokenID: &tok,
+		Before: map[string]any{"name": "Old"}, After: map[string]any{"name": "New"},
+		Details: map[string]any{"xff": "198.51.100.7, 10.244.0.5", "keep": "yes"}}); err != nil {
+		t.Fatal(err)
+	}
+	startWebhooks(t, w, webhook.Options{AllowPrivateNetworks: true})
+	got := plain.wait(t, "the entry without context", func(g []received) bool { return len(g) >= 1 })[0].body
+	for _, leak := range []string{"203.0.113.9", "secret-agent", "sess-abc", `"token_id"`, `"before"`, `"after"`, "198.51.100.7"} {
+		if strings.Contains(got, leak) {
+			t.Errorf("a webhook that didn't opt in got %s: %s", leak, got)
+		}
+	}
+	if !strings.Contains(got, `"keep":"yes"`) || !strings.Contains(got, `"summary":"renamed"`) {
+		t.Errorf("the rest of the entry is missing: %s", got)
+	}
+	full := withContext.wait(t, "the entry with context", func(g []received) bool { return len(g) >= 1 })[0].body
+	for _, want := range []string{"203.0.113.9", "secret-agent", "sess-abc", `"token_id":77`, `"before"`, `"after"`, "198.51.100.7"} {
+		if !strings.Contains(full, want) {
+			t.Errorf("an opted-in webhook is missing %s: %s", want, full)
+		}
 	}
 }
 

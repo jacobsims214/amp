@@ -1,0 +1,22 @@
+{
+  "_meta": {
+    "generator": "v2/testdata/remote-control/gen_vectors.py",
+    "protocol": "v2/docs/remote-control/protocol.md",
+    "protocol_version": 1
+  },
+  "description": "fingerprint = base64url(SHA-256(public_raw)) no padding (43 chars), used as harness_id and device_id. fingerprint_display = first 8 bytes of SHA-256(public_raw), upper-case hex, groups of 4 joined by '-'.",
+  "cases": [
+    {
+      "public_raw_b64u": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8",
+      "sha256_hex": "29cae6b500c266cb5b73af64a0bc1725642fc2f41b640b9f64133109f7d5e836",
+      "fingerprint": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+      "fingerprint_display": "29CA-E6B5-00C2-66CB"
+    },
+    {
+      "public_raw_b64u": "BOXV9BkDJ0hi2xzrV6sXLcp_zjyplXQ3P-w2JNb4vdok_OFQPMoA6uNSJ774mnyYxIee90qeY7dDFJWJdgFm_L4",
+      "sha256_hex": "5f93e9d865dbe8d12bdc9874e6a032e2a9cf3fda0e04a85296dc52e7220f131b",
+      "fingerprint": "X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs",
+      "fingerprint_display": "5F93-E9D8-65DB-E8D1"
+    }
+  ]
+}

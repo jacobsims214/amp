@@ -30,15 +30,35 @@ type restAs struct {
 
 func newRestAs(t *testing.T, w *rbacWorld) *restAs {
 	t.Helper()
+	return newRestAsWith(t, w, nil)
+}
+
+// newRestAsWith is newRestAs with the handler configured by configure first
+// (nil: as main() leaves it by default).
+func newRestAsWith(t *testing.T, w *rbacWorld, configure func(*api.RestHandler)) *restAs {
+	t.Helper()
 	mux := http.NewServeMux()
-	api.NewRestHandler(w.s.reg, w.s.repo, w.s.hub, w.s.kb).Register(mux)
+	h := api.NewRestHandler(w.s.reg, w.s.repo, w.s.hub, w.s.kb)
+	if configure != nil {
+		configure(h)
+	}
+	h.Register(mux)
 	ra := &restAs{w: w, ids: map[string]*auth.Identity{
 		"owner": w.owner, "alice": w.alice, "bob": w.bob, "lead": w.lead, "carol": w.carol,
 		"dave": w.dave, "orgadmin": w.orgadmin, "outsider": w.outsider, "root": w.root,
 	}}
 	ra.server = httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		if ident, ok := ra.ids[r.Header.Get("X-Test-As")]; ok {
-			r = r.WithContext(auth.WithIdentity(r.Context(), ident))
+			// The web UI's session on the REST listener, unless the test
+			// says the request came another way (X-Test-Channel: an MCP-
+			// audience token, an API token).
+			c := *ident
+			c.Listener, c.Channel = "rest", auth.ChannelUI
+			if ch := r.Header.Get("X-Test-Channel"); ch != "" {
+				c.Channel = ch
+				c.APIToken = ch == auth.ChannelToken
+			}
+			r = r.WithContext(auth.WithIdentity(r.Context(), &c))
 		}
 		mux.ServeHTTP(rw, r)
 	}))
@@ -47,6 +67,13 @@ func newRestAs(t *testing.T, w *rbacWorld) *restAs {
 }
 
 func (ra *restAs) do(t *testing.T, who, method, path string, body any) (int, map[string]any) {
+	t.Helper()
+	return ra.doVia(t, "", who, method, path, body)
+}
+
+// doVia is do over a channel other than the web UI (auth.ChannelToken,
+// auth.ChannelRESTOther); "" is the UI.
+func (ra *restAs) doVia(t *testing.T, channel, who, method, path string, body any) (int, map[string]any) {
 	t.Helper()
 	var rd *strings.Reader
 	if body != nil {
@@ -59,6 +86,9 @@ func (ra *restAs) do(t *testing.T, who, method, path string, body any) (int, map
 	req.Header.Set("Content-Type", "application/json")
 	if who != "" {
 		req.Header.Set("X-Test-As", who)
+	}
+	if channel != "" {
+		req.Header.Set("X-Test-Channel", channel)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

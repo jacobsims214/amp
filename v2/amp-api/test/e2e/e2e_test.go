@@ -747,6 +747,18 @@ func TestE2E(t *testing.T) {
 		pool := mk(adminTok, "pool ticket", "none")
 		adminOwn := mk(adminTok, "admin's ticket", "")
 		handoff := mk(adminTok, "to hand off", "")
+		// New projects require plan approval, and only a person in the web
+		// UI gives it: over MCP it's refused with the Flight plan link, so
+		// the admin approves through the UI session.
+		if _, err := e.tool(t, adminTok, "amp_approve_plan", map[string]any{"project_id": pid}); err == nil || !strings.Contains(err.Error(), "approve_url") {
+			t.Fatalf("plan approved over MCP: %v", err)
+		}
+		if _, err := e.tool(t, adminTok, "amp_dispatch_task", map[string]any{"task_id": handoff, "agent_id": "x"}); err == nil || !strings.Contains(err.Error(), "approved") {
+			t.Fatalf("unapproved ticket dispatched: %v", err)
+		}
+		approve := func() { admin.must(t, 200, "POST", fmt.Sprintf("/api/projects/%d/approve-plan", pid), nil) }
+		approve()
+		t.Log("plan approval only through the UI session ✓")
 
 		// The teammate only sees projects they're on, and only their own work by default.
 		projects, _ := e.mustTool(t, mateTok, "amp_list_projects", nil)["projects"].([]any)
@@ -794,6 +806,7 @@ func TestE2E(t *testing.T) {
 		projTeams(map[string]any{"action": "link", "team_id": teamID, "role": "member"})
 		takeover := mk(adminTok, "take me over", "")
 		running := mk(adminTok, "admin is on it", "")
+		approve()
 		e.mustTool(t, adminTok, "amp_dispatch_task", map[string]any{"task_id": running, "agent_id": "admin-agent"})
 		if _, err := e.tool(t, mateTok, "amp_assign_task", map[string]any{"task_id": running, "user": "me"}); err == nil || !strings.Contains(err.Error(), "in progress") {
 			t.Fatalf("teammate took over an in-progress ticket: %v", err)

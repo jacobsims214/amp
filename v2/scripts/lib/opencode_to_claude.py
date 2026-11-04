@@ -56,7 +56,7 @@ from pathlib import Path
 # --------------------------------------------------------------------------
 
 PLUGIN_NAME = "amp"
-PLUGIN_VERSION = "2.0.0"
+PLUGIN_VERSION = "2.1.0"
 MCP_SERVER_NAME = "amp"
 
 # openrouter model -> Claude Code model tier. Empty: every Claude Code agent

@@ -14,6 +14,9 @@ import "github.com/hibiken/asynq"
 const (
 	TypeKBWriteDoc  = "kb:write_doc"
 	TypeKBDeleteDoc = "kb:delete_doc"
+	// TypeKBIndexDoc brings one doc's search index entry in line with its
+	// Postgres row (the source of truth): it carries no content.
+	TypeKBIndexDoc = "kb:index_doc"
 
 	// QueueName is the single asynq queue everything here uses. A dedicated
 	// name (rather than "default") makes it easy to spot in asynqmon and to
@@ -21,7 +24,10 @@ const (
 	QueueName = "kb-index"
 )
 
-// WriteDocPayload mirrors kb.Service.WriteDoc's arguments exactly.
+// WriteDocPayload mirrors kb.Service.WriteDoc's arguments exactly. New code
+// enqueues it only for KBs not stored in Postgres (the global KB, or a
+// service with no store); for the others it is read only to drain tasks
+// queued before the Postgres store existed.
 type WriteDocPayload struct {
 	ProjectID int    `json:"project_id"`
 	Scope     string `json:"scope,omitempty"` // "" = project (tasks queued before scopes)
@@ -41,6 +47,16 @@ type DeleteDocPayload struct {
 	ProjectID int    `json:"project_id"`
 	Scope     string `json:"scope,omitempty"`
 	ScopeID   int    `json:"scope_id,omitempty"`
+	Path      string `json:"path"`
+}
+
+// IndexDocPayload names the doc to (re)index. The worker reads the doc's
+// current row from Postgres, so jobs applied out of order still index the
+// latest version, and a deleted row removes the doc from the index.
+type IndexDocPayload struct {
+	ProjectID int    `json:"project_id"`
+	Scope     string `json:"scope"`
+	ScopeID   int    `json:"scope_id"`
 	Path      string `json:"path"`
 }
 

@@ -147,4 +147,14 @@ spec:
     kind: Issuer
   duration: 2160h
   renewBefore: 360h
+  {{- if eq $issuerName "amp-ca-issuer" }}
+  # cert-manager's default usages add no ExtendedKeyUsage. macOS (and so any client using the
+  # platform verifier, e.g. the Rust amp-harness) rejects a TLS server certificate without
+  # serverAuth EKU ("invalid peer certificate: EkuError"); OpenSSL/Node clients don't check it.
+  # Let's Encrypt always issues serverAuth, so this only applies to the private CA.
+  usages:
+    - server auth
+    - digital signature
+    - key encipherment
+  {{- end }}
 {{- end }}

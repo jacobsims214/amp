@@ -20,8 +20,13 @@ How you get there is up to you. The guidance below covers what each step involve
 
 If you don't already have a name and code from the user, infer them from the directory name and ask for confirmation. The code is the ticket prefix — refs read `CODE-149` everywhere (reports, commits, branches) — so keep it to 2–6 letters, like `NWC` for Northwind Commerce, not the full name.
 
+You also need the URL of the user's AMP server for `amp_api`. AMP is self-hosted, so there is no default — never guess one or fill in a placeholder:
+
+- If the harness's AMP MCP config already points at a server (e.g. the `amp` entry in `opencode.json`, `.mcp.json` or the plugin's MCP settings), take the base URL from there and confirm it with the user: "Your AMP server is `<url>` — is that right?"
+- Otherwise, ask the user for it. For a local dev instance it's usually something like `http://localhost:8000`; mention that only as an example, not as the answer.
+
 ```json
-{ "project_id": <id>, "project_name": "<name>", "project_code": "<code>", "amp_api": "http://localhost:8000" }
+{ "project_id": <id>, "project_name": "<name>", "project_code": "<code>", "amp_api": "<the AMP server URL the user confirmed>" }
 ```
 
 Write that to `.amp.json` in the current directory. Commit it — everyone working here shares the same project.

@@ -24,8 +24,8 @@ AMP is deploying to namespace {{ .Values.global.namespace }}.
 
 6. Queue monitoring (asynqmon, admin-only): needs its own DNS record —
      https://{{ include "amp.asynqmonDomain" . }}
-   pointing at the same place as {{ .Values.global.domain }} (same Envoy
-   LoadBalancer IP / same Cloudflare proxy setup). Locally, add
+   pointing at the same place as {{ .Values.global.domain }} (the same Envoy
+   address, through whatever you run in front of it). Locally, add
    "127.0.0.1 {{ include "amp.asynqmonDomain" . }}" to /etc/hosts alongside
    the main domain entry.
 

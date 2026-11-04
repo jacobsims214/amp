@@ -25,7 +25,8 @@ Load the **amp-execution** skill first — it defines how to read your ticket, l
 the KB, and complete the task.
 
 Then load whichever of these fit the specific work, on demand:
-- the **git-workflow** skill — commit/branch/PR conventions
+- the **git-workflow** skill — commit/branch/PR conventions (only when your work is in git; outside
+  git there is nothing to commit, see `amp-execution` Step 6)
 - the **amp-kb** skill — only once you're ready to write a KB doc, not before
 - the **amp-init** skill — only if you're bootstrapping a brand-new project
 

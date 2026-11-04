@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -111,13 +112,17 @@ func (h *RestHandler) events(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *RestHandler) Register(mux *http.ServeMux) {
+	h.register(&deniedMux{mux: mux, h: h})
+}
+
+func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("/api/projects", h.projects)
 	mux.HandleFunc("/api/projects/", h.projectSub)
 	mux.HandleFunc("/api/epics/", h.epicSub)
 	mux.HandleFunc("/api/stories/", h.storySub)
 	mux.HandleFunc("/api/tasks/", h.taskSub)
 	mux.HandleFunc("/api/kb/", h.kbDoc)
-	mux.HandleFunc("/api/events", h.events)
+	mux.mux.HandleFunc("/api/events", h.events) // SSE: streams, never a 403 after it starts
 	mux.HandleFunc("/api/orgs", h.orgs)
 	mux.HandleFunc("/api/orgs/", h.orgSub)
 	mux.HandleFunc("/api/teams/", h.teamSub)
@@ -127,15 +132,22 @@ func (h *RestHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/tokens/", h.tokenSub)
 	mux.HandleFunc("/api/agents", h.agents)
 	mux.HandleFunc("/api/audit", h.audit)
+	mux.HandleFunc("/api/audit/verify", h.auditVerify)
+	mux.HandleFunc("/api/audit/export", h.auditExport)
+	mux.HandleFunc("/api/webhooks", h.instanceWebhooks)
 	mux.HandleFunc("/api/webhooks/", h.webhookSub)
 	mux.HandleFunc("/api/day-reports", h.dayReports)
 	mux.HandleFunc("/api/day-reports/", h.dayReports)
 	mux.HandleFunc("/api/velocity", h.velocity)
 	mux.HandleFunc("/api/my-work", h.myWork)
+	mux.HandleFunc("/api/my-work/", h.myWork)
 	mux.HandleFunc("/api/trace", h.trace)
 	mux.HandleFunc("/api/trace/merged", h.traceMerged)
 	mux.HandleFunc("/api/metadata/", h.metadata)
 	mux.HandleFunc("/api/artifacts/", h.artifactSub)
+	// GitHub's deliveries: no AMP session, authenticated by their HMAC
+	// signature only (main leaves this prefix out of the auth middleware).
+	mux.mux.HandleFunc(GitHubHookPrefix, h.githubHook)
 }
 
 // ---- /api/me ----
@@ -189,6 +201,14 @@ func (h *RestHandler) me(w http.ResponseWriter, r *http.Request) {
 	if ident.LocalDev {
 		resp["roles"] = []string{domain.RoleAdmin}
 	}
+	// What this AMP and the caller's orgs let the UI offer (additive: an old
+	// UI ignores it; a UI talking to an old API treats it as unavailable).
+	rc, err := h.remoteCapability(r)
+	if err != nil {
+		jsonErr(w, err, 500)
+		return
+	}
+	resp["capabilities"] = map[string]any{"remote_control": rc}
 	jsonOK(w, resp)
 }
 
@@ -355,28 +375,87 @@ func (h *RestHandler) agents(w http.ResponseWriter, r *http.Request) {
 }
 
 // /api/audit?org_id=&project_id=&actor_id=&action=&before=&limit=
+//
+//	&actor=&actor_type=&target_type=&target_id=&ip=&outcome=&client=&from=&to=
+//
 // Global admins read everything; org owners/admins their org; project
-// owners their project.
+// owners their project. Filters: service.ParseAuditFilter.
 func (h *RestHandler) audit(w http.ResponseWriter, r *http.Request) {
 	pr, ok := h.principal(w, r)
 	if !ok {
 		return
 	}
-	q := r.URL.Query()
-	num := func(k string) int {
-		n, _ := strconv.Atoi(q.Get(k))
-		return n
+	f, err := service.ParseAuditFilter(r.URL.Query().Get)
+	if err != nil {
+		fail(w, err, 400)
+		return
 	}
-	before, _ := strconv.ParseInt(q.Get("before"), 10, 64)
-	entries, err := h.svc.Audit(r.Context(), pr, domain.AuditFilter{
-		OrgID: num("org_id"), ProjectID: num("project_id"), ActorUserID: num("actor_id"),
-		Action: q.Get("action"), BeforeID: before, Limit: num("limit"),
-	})
+	entries, err := h.svc.Audit(r.Context(), pr, f)
 	if err != nil {
 		fail(w, err, 500)
 		return
 	}
 	jsonOK(w, map[string]interface{}{"entries": entries})
+}
+
+// GET /api/audit/export?format=csv|ndjson&<the /api/audit filters>
+// streams every matching entry (no row cap), newest first, as a download,
+// and records an audit.export row. Same access as /api/audit.
+func (h *RestHandler) auditExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	pr, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	f, err := service.ParseAuditFilter(q.Get)
+	if err != nil {
+		fail(w, err, 400)
+		return
+	}
+	format := q.Get("format")
+	if format == "" {
+		format = service.AuditExportCSV
+	}
+	ex := newAuditExporter(w, format, f)
+	_, err = h.svc.ExportAudit(r.Context(), pr, f, format, ex.write)
+	switch {
+	case err == nil:
+		ex.finish()
+	case !ex.started:
+		// Refused (or failed) before the first row: an ordinary error.
+		fail(w, err, 500)
+	default:
+		// Part way through: the status is already sent, so cut the
+		// connection rather than hand over a short file that looks whole.
+		slog.Error("audit export failed part way", "rows", ex.rows, "err", err)
+		panic(http.ErrAbortHandler)
+	}
+}
+
+// GET /api/audit/verify?org_id= recomputes the audit hash chain of an org
+// (its owners and admins, and global admins), or of every chain (no org_id:
+// global admins), and checks the signed checkpoints. 200 with the report
+// whether or not it found problems: "ok" says which.
+func (h *RestHandler) auditVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	pr, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	orgID, _ := strconv.Atoi(r.URL.Query().Get("org_id"))
+	report, err := h.svc.VerifyAudit(r.Context(), pr, orgID)
+	if err != nil {
+		fail(w, err, 500)
+		return
+	}
+	jsonOK(w, report)
 }
 
 // ---- /api/projects ----
@@ -495,17 +574,15 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = pid // Actor is now spawned and loading from DB
 
-		// Re-index all KB docs: for each bundle.KBDocs, call WriteDoc
+		// Recreate the KB docs, keeping their annotations and dates.
 		for _, doc := range bundle.KBDocs {
 			if h.kb == nil {
 				slog.Warn("knowledge base not configured; skipping the bundle's KB docs", "docs", len(bundle.KBDocs))
 				break
 			}
-			// Convert []string tags to []string (already in correct format)
-			_, err := h.kb.WriteDoc(r.Context(), kb.Project(newProject.ID), doc.Path, doc.Title, doc.Content, doc.Author, doc.Tags, "", doc.Annotations)
-			if err != nil {
+			if err := h.kb.ImportDoc(r.Context(), kb.Project(newProject.ID), doc); err != nil {
 				// Log but continue — don't fail the entire import if one doc fails
-				slog.Warn("failed to write KB doc during import", "path", doc.Path, "err", err)
+				slog.Warn("failed to import KB doc", "path", doc.Path, "err", err)
 			}
 		}
 
@@ -658,18 +735,29 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case "approve-plan":
-		// POST: a person approves the project's plan as it stands now.
+		// POST: a person approves tickets in the project's plan (per ticket,
+		// AMP #2198). Optional body {"task_ids": [...], "as_of": RFC 3339,
+		// "on_behalf": bool}. No task_ids: the caller's own awaiting tickets
+		// (everyone's with on_behalf). as_of: only tickets planned at or
+		// before it. Others' tickets need on_behalf and lead access. See
+		// service.ApproveRequest / ApproveResult and KB
+		// architecture/plan-approval.md.
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", 405)
 			return
 		}
-		proj, err := h.svc.ApprovePlan(r.Context(), pr, projectID)
+		var body service.ApproveRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+			jsonErr(w, fmt.Errorf("approve-plan body: want {\"task_ids\": [ticket ids], \"as_of\": RFC 3339 timestamp, \"on_behalf\": bool}, all optional (as_of must be an RFC 3339 timestamp): %w", err), 400)
+			return
+		}
+		// ApproveTickets publishes project.updated itself.
+		res, err := h.svc.ApproveTickets(r.Context(), pr, projectID, body)
 		if err != nil {
 			fail(w, err, 500)
 			return
 		}
-		h.hub.Publish(domain.Event{Type: domain.EventProjectUpdated, ProjectID: projectID, Payload: proj, At: time.Now()})
-		jsonOK(w, map[string]interface{}{"project": proj})
+		jsonOK(w, res)
 		return
 
 	case "report":
@@ -698,6 +786,25 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jsonOK(w, report)
+		return
+
+	case "my-work":
+		h.projectMyWork(w, r, pr, projectID)
+		return
+
+	case "waiting-on-people":
+		// Mission's Waiting on people: each person's counts by kind and
+		// ticket ids, from the same WaitingOn as My work and MCP. Any member.
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET required", 405)
+			return
+		}
+		out, err := h.svc.ProjectWaitingOnPeople(r.Context(), pr, projectID)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, out)
 		return
 
 	case "plan-check":
@@ -746,6 +853,14 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 
 	case "webhooks":
 		h.webhookCollection(w, r, pr, nil, &projectID)
+		return
+
+	case "github-hook":
+		sub := ""
+		if len(parts) > 2 {
+			sub = parts[2]
+		}
+		h.projectGitHubHook(w, r, pr, projectID, sub)
 		return
 
 	case "reset":
@@ -817,35 +932,18 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Fetch KB docs and add them to the bundle
-		// (none when the knowledge base isn't configured)
-		var docSummaries []kb.DocSummary
+		// Every live KB doc, with annotations and original dates (none when
+		// the knowledge base isn't configured). A failed read fails the export
+		// rather than leave docs out of it.
+		kbDocs := []domain.ExportKBDoc{}
 		if h.kb != nil {
-			if docSummaries, err = h.kb.ListDocs(r.Context(), kb.Project(projectID), ""); err != nil {
+			if kbDocs, err = h.kb.ExportDocs(r.Context(), kb.Project(projectID)); err != nil {
 				jsonErr(w, err, 500)
 				return
 			}
 		}
-
-		kbDocs := make([]domain.ExportKBDoc, 0, len(docSummaries))
-		for _, summary := range docSummaries {
-			doc, err := h.kb.GetDoc(r.Context(), kb.Project(projectID), summary.Path)
-			if err != nil {
-				// Log but continue — don't fail the entire export if one doc is missing
-				slog.Warn("failed to fetch KB doc for export", "path", summary.Path, "err", err)
-				continue
-			}
-			kbDocs = append(kbDocs, domain.ExportKBDoc{
-				Path:    doc.Path,
-				Title:   doc.Title,
-				Content: doc.Content,
-				Tags:    doc.Tags,
-				Author:  doc.Author,
-				// Annotations travel with the doc.
-				Annotations: doc.Annotations,
-			})
-		}
 		bundle.KBDocs = kbDocs
+		h.svc.RecordProjectExport(r.Context(), pr, projectID, bundle)
 
 		// Set Content-Disposition header for file download
 		filename := fmt.Sprintf("amp-export-%s-%s.json", bundle.Project.Code, time.Now().Format("2006-01-02"))
@@ -1050,6 +1148,7 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 				jsonErr(w, err, 400)
 				return
 			}
+			h.svc.ReconcileMergeMetadata(r.Context(), pr, epic.ProjectID, req.Metadata)
 			updated, err := h.repo.GetEpic(r.Context(), epicID)
 			if err != nil {
 				jsonErr(w, err, 500)
@@ -1065,7 +1164,7 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 
 		case http.MethodDelete:
 			if err := h.svc.DeleteEpic(r.Context(), pr, epic); err != nil {
-				jsonErr(w, err, 500)
+				fail(w, err, 500)
 				return
 			}
 			jsonOK(w, map[string]interface{}{"epic_id": epicID, "deleted": true})
@@ -1195,6 +1294,7 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 			jsonErr(w, err, 400)
 			return
 		}
+		h.svc.ReconcileMergeMetadata(r.Context(), pr, story.ProjectID, req.Metadata)
 		updated, err := h.repo.GetStory(r.Context(), storyID)
 		if err != nil {
 			jsonErr(w, err, 500)
@@ -1205,7 +1305,7 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodDelete:
 		if err := h.svc.DeleteStory(r.Context(), pr, story); err != nil {
-			jsonErr(w, err, 500)
+			fail(w, err, 500)
 			return
 		}
 		jsonOK(w, map[string]interface{}{"story_id": storyID, "deleted": true})
@@ -1290,12 +1390,9 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 				jsonErr(w, err, 400)
 				return
 			}
-			req.TaskID = taskID
-			replyCh := make(chan actor.ReplySimple, 1)
-			h.registry.System().Root.Send(pid, &actor.MsgUpdateTask{Req: req, ReplyCh: replyCh})
-			reply := actor.Await(r.Context(), replyCh)
-			if reply.Err != nil {
-				jsonErr(w, reply.Err, 400)
+			// Off the web UI, a person's ticket isn't switched to agent work.
+			if err := h.svc.UpdateTask(r.Context(), pr, task, req); err != nil {
+				fail(w, err, 400)
 				return
 			}
 			updated, err := h.repo.GetTask(r.Context(), taskID)
@@ -1307,7 +1404,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 
 		case http.MethodDelete:
 			if _, err := h.svc.DeleteTask(r.Context(), pr, task); err != nil {
-				jsonErr(w, err, 500)
+				fail(w, err, 500)
 				return
 			}
 			h.hub.Publish(domain.Event{
@@ -1325,6 +1422,41 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch parts[1] {
+	case "merge":
+		// POST /tasks/{id}/merge {merge_commit?}: Mark merged (recorded once;
+		// a repeat returns the first record). POST /tasks/{id}/merge/not-needed:
+		// the work won't be merged, release what waits on it (AMP #2475).
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		var rec service.MergeRecord
+		var err error
+		switch {
+		case len(parts) == 2:
+			var body struct {
+				MergeCommit string `json:"merge_commit"`
+			}
+			if r.ContentLength != 0 {
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					jsonErr(w, err, 400)
+					return
+				}
+			}
+			rec, err = h.svc.MarkTaskMerged(r.Context(), pr, taskID, "", body.MergeCommit)
+		case len(parts) == 3 && parts[2] == "not-needed":
+			rec, err = h.svc.MarkMergeNotNeeded(r.Context(), pr, taskID)
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			fail(w, err, 400)
+			return
+		}
+		jsonOK(w, rec)
+		return
+
 	case "runs":
 		if r.Method == http.MethodPost {
 			// Record a run (e.g. a person marking the work merged).
@@ -1376,11 +1508,37 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		if body.AgentID == "" {
 			body.AgentID = "amp-worker"
 		}
-		if _, err := h.svc.Dispatch(r.Context(), pr, taskID, body.AgentID); err != nil {
+		t, err := h.svc.Dispatch(r.Context(), pr, taskID, body.AgentID)
+		if err != nil {
 			fail(w, err, 400)
 			return
 		}
-		jsonOK(w, map[string]interface{}{"task_id": taskID, "dispatched_to": body.AgentID})
+		// The dispatch_id is what a REST caller hands to its worker to start
+		// the ticket (AMP #2801): without it the worker can only claim by
+		// ownership, and the ticket stays "not started" for the watchdog.
+		jsonOK(w, map[string]interface{}{"task_id": taskID, "dispatched_to": body.AgentID,
+			"state": t.State, "phase": t.Phase, "dispatch_id": t.DispatchID})
+
+	case "return":
+		// POST /tasks/{id}/return {reason}: a person sends a dispatched ticket
+		// no worker has started back to ready (AMP #2801). The watchdog does
+		// this by itself past the project's not_started_return_minutes;
+		// My work offers it earlier. A started ticket is refused: its run is
+		// live, so it is blocked or closed out instead.
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		var body struct {
+			Reason string `json:"reason"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		t, err := h.svc.ReturnTask(r.Context(), pr, taskID, body.Reason, "", false)
+		if err != nil {
+			fail(w, err, 400)
+			return
+		}
+		jsonOK(w, map[string]any{"task": t})
 
 	case "start":
 		// POST: a person starts their own human ticket.
@@ -1417,11 +1575,10 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			jsonOK(w, map[string]interface{}{"task_id": taskID, "state": "completed", "task": t, "run": run})
 			return
 		}
-		replyCh := make(chan actor.ReplySimple, 1)
-		h.registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: taskID, By: pr.UserRef(), ReplyCh: replyCh})
-		reply := actor.Await(r.Context(), replyCh)
-		if reply.Err != nil {
-			jsonErr(w, reply.Err, 400)
+		// A person in the web UI completes any ticket they can work; other
+		// callers (API tokens, MCP-audience tokens) only dispatched work.
+		if _, err := h.svc.CompleteTask(r.Context(), pr, taskID); err != nil {
+			fail(w, err, 400)
 			return
 		}
 		jsonOK(w, map[string]interface{}{"task_id": taskID, "state": "completed"})
@@ -1471,6 +1628,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			if req.Author == "" || req.Author == "user" {
 				req.Author = pr.Email
 			}
+			req.Author = h.svc.CommentAuthor(r.Context(), pr, req.Author)
 			replyCh := make(chan actor.ReplyAddComment, 1)
 			h.registry.System().Root.Send(pid, &actor.MsgAddComment{Req: req, ReplyCh: replyCh})
 			reply := actor.Await(r.Context(), replyCh)
@@ -1543,6 +1701,31 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonOK(w, map[string]interface{}{"task": updated})
 
+	case "reopen":
+		// POST /tasks/{id}/reopen: a done ticket goes back to ready (or
+		// waiting, when a dependency is open). My work's "Reopen ticket" on
+		// a PR closed without merging (AMP #2483); the same as setting the
+		// state to backlog in the web UI.
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		cur, err := h.svc.Repo.GetTask(r.Context(), taskID)
+		if err != nil {
+			jsonErr(w, err, 404)
+			return
+		}
+		if cur.State != domain.TaskStateCompleted {
+			jsonErr(w, fmt.Errorf("ticket %d isn't done (it is %s); only a done ticket is reopened", taskID, cur.State), 409)
+			return
+		}
+		t, err := h.svc.SetTaskState(r.Context(), pr, taskID, domain.TaskStateBacklog, "")
+		if err != nil {
+			fail(w, err, 400)
+			return
+		}
+		jsonOK(w, map[string]any{"task": t})
+
 	case "start_at":
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", 405)
@@ -1576,7 +1759,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 // the ticket is "work" on it.
 func taskActionFor(method, sub string) authz.TaskAction {
 	switch {
-	case method == http.MethodGet, sub == "comments", sub == "history", sub == "runs", sub == "assign", sub == "dispatch":
+	case method == http.MethodGet, sub == "comments", sub == "history", sub == "runs", sub == "assign", sub == "dispatch", sub == "merge":
 		return authz.TaskRead
 	case sub == "" && method == http.MethodDelete:
 		return authz.TaskDelete
@@ -1617,7 +1800,13 @@ func jsonOK(w http.ResponseWriter, v interface{}) {
 func jsonErr(w http.ResponseWriter, err error, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+	body := map[string]string{"error": err.Error()}
+	// A stable code next to the message, when the error has one (additive:
+	// clients that read only "error" are unaffected).
+	if c := authz.CodeOf(err); c != "" {
+		body["code"] = c
+	}
+	json.NewEncoder(w).Encode(body)
 }
 
 func errorf(msg string) error {
@@ -1660,7 +1849,7 @@ var _ = context.Background
 // GET  /api/kb/doc?KB&path=P              → full doc
 // POST /api/kb/doc?KB                     → write doc (body: {path,title,content,tags,author,reason})
 // DELETE /api/kb/doc?KB&path=P            → delete doc
-// GET  /api/kb/list?KB&tag=T              → list doc summaries
+// GET  /api/kb/list?KB&tag=T&limit=L&offset=O → list doc summaries (all unless limit is given)
 // GET  /api/kb/search?KB&q=Q              → search results
 // GET  /api/kb/tags?KB                    → tag counts
 // POST /api/kb/annotate?KB                → annotate a doc (body: {path,text})
@@ -1800,6 +1989,7 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 				jsonErr(w, err, 500)
 				return
 			}
+			h.svc.AuditKB(r.Context(), pr, "kb.write", k, body.Path, map[string]any{"reason": strings.TrimSpace(body.Reason)})
 			jsonOK(w, doc)
 
 		case http.MethodDelete:
@@ -1812,10 +2002,11 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 				jsonErr(w, errDesignSystemDoc, 409)
 				return
 			}
-			if err := h.kb.DeleteDoc(r.Context(), sc, path); err != nil {
+			if err := h.kb.DeleteDoc(r.Context(), sc, path, pr.Email); err != nil {
 				jsonErr(w, err, 500)
 				return
 			}
+			h.svc.AuditKB(r.Context(), pr, "kb.delete", k, path, nil)
 			jsonOK(w, map[string]interface{}{"deleted": true, "path": path})
 
 		default:
@@ -1823,13 +2014,21 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case "list":
+		// The UI's KB page builds its tree from every doc, so with no limit
+		// REST lists the whole KB; limit and offset page it like amp_kb_list.
 		tag := r.URL.Query().Get("tag")
-		docs, err := h.kb.ListDocs(r.Context(), sc, tag)
+		limit, _ := strconv.Atoi(q.Get("limit"))
+		offset, _ := strconv.Atoi(q.Get("offset"))
+		docs, total, err := h.kb.ListDocsPage(r.Context(), sc, tag, limit, offset)
 		if err != nil {
 			jsonErr(w, err, 500)
 			return
 		}
-		jsonOK(w, map[string]interface{}{"docs": docs, "count": len(docs)})
+		out := map[string]interface{}{"docs": docs, "count": len(docs), "total": total}
+		if next := max(offset, 0) + len(docs); len(docs) > 0 && next < total {
+			out["next_offset"] = next
+		}
+		jsonOK(w, out)
 
 	case "search":
 		if q.Get("q") == "" {

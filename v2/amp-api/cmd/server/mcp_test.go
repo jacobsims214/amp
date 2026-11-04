@@ -56,7 +56,22 @@ func (s *mcpStack) callCtx() context.Context {
 	if ident == nil {
 		ident = &auth.Identity{Subject: "local-dev", LocalDev: true}
 	}
-	return auth.WithIdentity(context.Background(), ident)
+	// Tool calls arrive on the MCP listener, as an agent's would: never the
+	// web UI (auth.ChannelUI), whoever the identity is.
+	c := *ident
+	c.Listener, c.Channel = "mcp", auth.ChannelMCP
+	return auth.WithIdentity(context.Background(), &c)
+}
+
+// planApprovalOff turns the project's plan approval off, as a person would
+// in the web UI. New projects require approval (migration 023); tests that
+// aren't about approval dispatch freely, as before.
+func planApprovalOff(t *testing.T, repo *repository.Repo, projectID int) {
+	t.Helper()
+	off := false
+	if _, err := repo.UpdateProject(context.Background(), projectID, domain.ProjectSettings{RequirePlanApproval: &off}); err != nil {
+		t.Fatalf("plan approval off: %v", err)
+	}
 }
 
 // setupMCP boots the full stack and returns an mcpStack scoped to a fresh project.
@@ -73,6 +88,9 @@ func setupMCP(t *testing.T) *mcpStack {
 	if err := repo.RunMigrations(ctx, migrations); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
+	// Every test server encrypts webhook secrets with the same key, so a
+	// webhook another test left behind can still be delivered (#2441).
+	repo.SetSecretsKeys(defaultTestSecretsKeys(t))
 
 	sseHub := hub.New()
 	system := protoactor.NewActorSystem()
@@ -89,6 +107,7 @@ func setupMCP(t *testing.T) *mcpStack {
 	if err != nil {
 		t.Fatalf("create project: %v", err)
 	}
+	planApprovalOff(t, repo, proj.ID)
 
 	// Pre-create a default epic and story so tests don't all have to do it.
 	epic, err := repo.CreateEpic(ctx, domain.CreateEpicRequest{
@@ -113,6 +132,9 @@ func setupMCP(t *testing.T) *mcpStack {
 
 	// Wire the MCP server — enable tool capabilities (same as production).
 	kbSvc := testKB()
+	if kbSvc != nil {
+		kbSvc.SetStore(repo) // as main.go wires it
+	}
 	mcpHandler := mcp.NewServer(reg, repo, sseHub, kbSvc)
 	srv := mcpserver.NewMCPServer("amp-api-test", "2.0.0", append([]mcpserver.ServerOption{mcpserver.WithToolCapabilities(false)}, mcpHandler.ServerOptions()...)...)
 	mcpHandler.Register(srv)
@@ -702,4 +724,22 @@ func TestToolSchemasDeclareRequired(t *testing.T) {
 	if !strings.Contains(msg, "task_id") {
 		t.Errorf("missing task_id error: %q", msg)
 	}
+}
+
+// finish completes ticket id the way an agent must: a question is answered
+// (relayed), a ready ticket is dispatched, and only then is it completed.
+// Agents can't complete a ticket that was never dispatched.
+func (s *mcpStack) finish(t *testing.T, id int) {
+	t.Helper()
+	task := planTask(t, s, id)
+	if task["state"] == "blocked" {
+		if reason, _ := task["block_reason"].(string); reason != "" && !strings.HasPrefix(reason, "scheduled:") {
+			s.call(t, "amp_answer_question", map[string]interface{}{"task_id": float64(id), "answer": "go ahead"})
+			task = planTask(t, s, id)
+		}
+	}
+	if task["state"] == "backlog" {
+		s.call(t, "amp_dispatch_task", map[string]interface{}{"task_id": float64(id), "agent_id": "amp-worker"})
+	}
+	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(id)})
 }

@@ -3,9 +3,12 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"slices"
+	"sort"
 	"time"
 
 	"github.com/simstech/amp-api/internal/domain"
+	"github.com/simstech/amp-api/internal/service"
 )
 
 // HumanStaleAfter is how long a person's ready or started ticket can go
@@ -13,29 +16,77 @@ import (
 // days, not the minutes after which an agent's ticket is quiet.
 const HumanStaleAfter = 48 * time.Hour
 
-// PersonWait is a human ticket a person can do now, and what waits on it.
+// PersonWait is one item in amp_list_tasks' waiting_on_people ("Waiting on
+// you", KB decisions/human-work-ux.md §1 and §5): something a person has to
+// do next, of one of four kinds (approve, answer, merge, do), or, in
+// coming_up, a human ticket of theirs that isn't actionable yet.
+//
+// The fields before Kind are the original shape (when the list only held
+// human tickets) and keep their meaning, so older managers still parse it:
+// id is a ticket (for approve, the first of the epic's tickets awaiting
+// approval), owner is who it waits on.
 type PersonWait struct {
 	ID           int    `json:"id"`
 	Name         string `json:"name"`
-	Reason       string `json:"reason"`
-	Owner        string `json:"owner"` // email, or "nobody" when unassigned
-	State        string `json:"state"` // ready | in_progress
+	Reason       string `json:"reason"` // the human ticket's reason, else the kind
+	Owner        string `json:"owner"`  // email, or "nobody" when unassigned
+	State        string `json:"state"`  // do: ready | in_progress; answer: question; merge: completed; approve: awaiting_approval; coming_up: waiting | scheduled | awaiting_approval
 	WaitingHours int    `json:"waiting_hours"`
-	HoldingUp    []int  `json:"holding_up,omitempty"` // open tickets that can't start until it's done
-	Stale        bool   `json:"stale,omitempty"`      // no activity for HumanStaleAfter
+	HoldingUp    []int  `json:"holding_up,omitempty"` // open tickets that can't start until it's done (transitively)
+	Stale        bool   `json:"stale,omitempty"`      // do: no activity for HumanStaleAfter
+
+	Kind        string    `json:"kind"`     // approve | answer | merge | do | coming_up
+	TaskIDs     []int     `json:"task_ids"` // every ticket in the item (approve: all awaiting in the epic)
+	OwnerUserID *int      `json:"owner_user_id,omitempty"`
+	Since       time.Time `json:"since"`
+	// approve
+	EpicID   int    `json:"epic_id,omitempty"`
+	EpicName string `json:"epic_name,omitempty"`
+	Count    int    `json:"count,omitempty"`
+	// answer
+	Question string `json:"question,omitempty"`
+	// start (AMP #2801): the agent it was dispatched to and how long it has
+	// waited for a worker to start it.
+	AgentID           string `json:"agent_id,omitempty"`
+	NotStartedMinutes int    `json:"not_started_minutes,omitempty"`
+	// merge: needed (Merge needed) or abandoned (PR closed without merging)
+	MergeState string `json:"merge_state,omitempty"`
+	PRURL      string `json:"pr_url,omitempty"`
+	Branch     string `json:"branch,omitempty"`
+	// merge (AMP #3011): where the merge would land as the run reported it,
+	// and where that came from. base_branch empty + target_source "unknown"
+	// means AMP could not verify the target — never "main".
+	BaseBranch   string `json:"base_branch,omitempty"`
+	TargetSource string `json:"target_source,omitempty"`
+	// TrackedBy: the plan's human merge step folded into this Merge card
+	// (merge_for), with the readiness the backend's bridges enforce, so the
+	// card never offers Mark merged for a step it would refuse to close.
+	TrackedBy *service.MergeStepFold `json:"tracked_by,omitempty"`
+	// NotWaiting: open dependents that opted out with waits_for_merge: false —
+	// they are not counted in holding_up because this merge doesn't hold them.
+	NotWaiting []int `json:"not_waiting,omitempty"`
+	// coming_up: what it still waits on
+	WaitsOn          []int      `json:"waits_on,omitempty"`
+	AwaitingApproval bool       `json:"awaiting_approval,omitempty"`
+	StartAt          *time.Time `json:"start_at,omitempty"`
 }
 
-// waitingOnPeople lists the project's human tickets a person can act on now
-// (ready or started) that matter to the caller: in their view, or holding up
-// a ticket that is. all is every ticket in the project; view is the caller's.
-func (s *Server) waitingOnPeople(ctx context.Context, projectID int, all, view []domain.Task) ([]PersonWait, error) {
-	out := []PersonWait{}
+// waitingOnPeople is what the project waits on people for, from the one
+// definition (service.WaitingOnPeople: WaitingOn run for everyone with work
+// in it, shared with the REST endpoint Mission reads), and the
+// human tickets coming up for them. Only items that matter to the caller are
+// kept: one of the item's tickets is in their view, or holds up one that is.
+// all is every ticket in the project; view is the caller's.
+//
+// Unowned human tickets that are ready or started are kept as kind "do" with
+// owner "nobody", as the list always showed them: WaitingOn is owner-only.
+func (s *Server) waitingOnPeople(ctx context.Context, projectID int, all, view []domain.Task) (items, comingUp []PersonWait, err error) {
+	items, comingUp = []PersonWait{}, []PersonWait{}
+	byID := map[int]*domain.Task{}
 	dependents := map[int][]int{}
-	open := map[int]bool{}
-	for _, t := range all {
-		if t.State != domain.TaskStateCompleted {
-			open[t.ID] = true
-		}
+	for i := range all {
+		t := &all[i]
+		byID[t.ID] = t
 		for _, d := range t.DependencyIDs {
 			dependents[d] = append(dependents[d], t.ID)
 		}
@@ -44,75 +95,279 @@ func (s *Server) waitingOnPeople(ctx context.Context, projectID int, all, view [
 	for _, t := range view {
 		inView[t.ID] = true
 	}
-	var cands []domain.Task
-	for _, t := range all {
-		if t.IsHuman() && (t.State == domain.TaskStateBacklog || t.State == domain.TaskStateInProgress) {
-			cands = append(cands, t)
+	// Everything open downstream of id, transitively.
+	held := map[int][]int{}
+	holding := func(id int) []int {
+		if out, ok := held[id]; ok {
+			return out
 		}
+		var out []int
+		seen := map[int]bool{}
+		queue := append([]int(nil), dependents[id]...)
+		for len(queue) > 0 {
+			d := queue[0]
+			queue = queue[1:]
+			if seen[d] {
+				continue
+			}
+			seen[d] = true
+			if t := byID[d]; t != nil && t.State != domain.TaskStateCompleted {
+				out = append(out, d)
+			}
+			queue = append(queue, dependents[d]...)
+		}
+		held[id] = out
+		return out
 	}
-	if len(cands) == 0 {
-		return out, nil
+	relevant := func(ids []int) bool {
+		for _, id := range ids {
+			if inView[id] || slices.ContainsFunc(holding(id), func(d int) bool { return inView[d] }) {
+				return true
+			}
+		}
+		return false
 	}
+
 	emails := map[int]string{}
 	if members, err := s.svc.ProjectMembers(ctx, projectID); err == nil {
 		for _, m := range members {
 			emails[m.UserID] = m.Email
 		}
 	}
-	ids := make([]int, len(cands))
-	for i, t := range cands {
-		ids[i] = t.ID
+	email := func(id *int) string {
+		if id == nil {
+			return "nobody"
+		}
+		if e := emails[*id]; e != "" {
+			return e
+		}
+		return fmt.Sprintf("user %d", *id)
 	}
-	last, err := s.repo.LastActivity(ctx, ids)
+
+	// The same per-person WaitingOn as GET /api/projects/{id}/waiting-on-people.
+	everyone, err := s.svc.WaitingOnPeople(ctx, projectID, all)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, w := range everyone {
+		who := w.UserID
+		for _, it := range w.Items {
+			if !relevant(it.TaskIDs) {
+				continue
+			}
+			items = append(items, s.personWait(it, &who, email(&who), holding))
+		}
+		for _, it := range w.ComingUp {
+			if !relevant(it.TaskIDs) {
+				continue
+			}
+			p := s.personWait(it, &who, email(&who), holding)
+			p.AwaitingApproval, p.StartAt = it.AwaitingApproval, it.StartAt
+			if t := byID[it.TaskID]; t != nil {
+				p.WaitsOn = t.BlockedByIDs
+			}
+			switch {
+			case p.AwaitingApproval:
+				p.State = "awaiting_approval"
+			case p.StartAt != nil:
+				p.State = "scheduled"
+			default:
+				p.State = "waiting"
+			}
+			comingUp = append(comingUp, p)
+		}
+	}
+
+	// Unowned human tickets a person could pick up now.
+	requireApproval := false
+	if p, err := s.repo.GetProject(ctx, projectID); err == nil {
+		requireApproval = p.RequirePlanApproval
+	}
+	for i := range all {
+		t := &all[i]
+		if !t.IsHuman() || t.OwnerUserID != nil || !relevant([]int{t.ID}) {
+			continue
+		}
+		var since time.Time
+		switch {
+		case t.State == domain.TaskStateInProgress:
+			since = t.CreatedAt
+			if t.DispatchedAt != nil {
+				since = *t.DispatchedAt
+			} else if t.ReadyAt != nil {
+				since = *t.ReadyAt
+			}
+		case t.State == domain.TaskStateBacklog && !(requireApproval && !t.Approved()):
+			since = t.CreatedAt
+			if t.ReadyAt != nil {
+				since = *t.ReadyAt
+			}
+		default:
+			continue
+		}
+		items = append(items, s.personWait(service.WaitItem{Kind: service.WaitDo, Key: fmt.Sprintf("task:%d", t.ID), TaskID: t.ID,
+			TaskIDs: []int{t.ID}, Name: t.Name, State: string(t.State), Since: since, HumanReason: t.HumanReason}, nil, "nobody", holding))
+	}
+
+	rank := map[string]int{service.WaitApprove: 0, service.WaitAnswer: 1, service.WaitMerge: 2, service.WaitStart: 3, service.WaitDo: 4}
+	sort.SliceStable(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		if rank[a.Kind] != rank[b.Kind] {
+			return rank[a.Kind] < rank[b.Kind]
+		}
+		if !a.Since.Equal(b.Since) {
+			return a.Since.Before(b.Since)
+		}
+		return a.ID < b.ID
+	})
+	sort.SliceStable(comingUp, func(i, j int) bool {
+		if !comingUp[i].Since.Equal(comingUp[j].Since) {
+			return comingUp[i].Since.Before(comingUp[j].Since)
+		}
+		return comingUp[i].ID < comingUp[j].ID
+	})
+
+	// Stale: a person's to do with no activity for HumanStaleAfter.
+	var dos []int
+	for _, p := range items {
+		if p.Kind == service.WaitDo {
+			dos = append(dos, p.ID)
+		}
+	}
+	if len(dos) > 0 {
+		last, err := s.repo.LastActivity(ctx, dos)
+		if err != nil {
+			return nil, nil, err
+		}
+		for i := range items {
+			p := &items[i]
+			if p.Kind != service.WaitDo {
+				continue
+			}
+			seenAt := last[p.ID]
+			if seenAt.IsZero() {
+				seenAt = p.Since
+			}
+			p.Stale = time.Since(seenAt) > HumanStaleAfter
+		}
+	}
+	return items, comingUp, nil
+}
+
+// personWait turns one WaitingOn item into its waiting_on_people entry.
+func (s *Server) personWait(it service.WaitItem, owner *int, ownerEmail string, holding func(int) []int) PersonWait {
+	p := PersonWait{ID: it.TaskID, Name: it.Name, Reason: it.HumanReason, Owner: ownerEmail, Kind: it.Kind,
+		TaskIDs: it.TaskIDs, OwnerUserID: owner, Since: it.Since, WaitingHours: int(time.Since(it.Since).Hours())}
+	if p.Reason == "" {
+		p.Reason = it.Kind
+	}
+	if p.TaskIDs == nil {
+		p.TaskIDs = []int{}
+	}
+	switch it.Kind {
+	case service.WaitApprove:
+		if len(it.TaskIDs) > 0 {
+			p.ID = it.TaskIDs[0]
+		}
+		p.State = "awaiting_approval"
+		p.EpicID, p.EpicName, p.Count = it.EpicID, it.EpicName, it.Count
+		p.Name = fmt.Sprintf("Approve plan: %s (%d %s)", it.Name, it.Count, plural(it.Count, "ticket", "tickets"))
+	case service.WaitAnswer:
+		p.State = "question"
+		p.Question = it.Question
+	case service.WaitMerge:
+		p.State = "completed"
+		p.MergeState, p.PRURL, p.Branch = it.MergeState, it.PRURL, it.Branch
+		p.BaseBranch, p.TargetSource = it.BaseBranch, it.TargetSource
+		p.TrackedBy, p.NotWaiting = it.TrackedBy, it.NotWaiting
+	case service.WaitStart:
+		p.State = domain.PhaseNotStarted
+		p.AgentID, p.NotStartedMinutes = it.AgentID, it.NotStartedMinutes
+		p.Reason = service.WaitStart
+	case service.WaitDo:
+		p.State = "ready"
+		if it.State == string(domain.TaskStateInProgress) {
+			p.State = "in_progress"
+		}
+	}
+	// A person's own start item says what to do, not "start" bare.
+	if it.Kind == service.WaitStart {
+		p.Question = fmt.Sprintf("Dispatched to %s %d min ago and no worker has started it: start the worker now, or undo the dispatch.",
+			nameOr(it.AgentID, "an agent"), it.NotStartedMinutes)
+	}
+	if it.Kind != service.WaitApprove {
+		p.HoldingUp = holding(p.ID)
+	}
+	// A Merge item counts only dependents that actually wait for the merge
+	// (AMP #3011): the transitive set above includes ones that started already
+	// with waits_for_merge: false, and a card that says "3 tickets wait" when
+	// two of them didn't is the overstatement
+	// discoveries/merge-actions-user-journey.md names. service fills this from
+	// repository.TrueWaiters, so the count is what the action unblocks.
+	if it.Kind == service.WaitMerge {
+		p.HoldingUp = it.HoldingUp
+	}
+	return p
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// notStartedList is amp_list_tasks' not_started: dispatched tickets no worker
+// has started, once the project's not_started_flag_minutes have passed
+// (AMP #2801). It reads the project and keeps only what the caller's view
+// covers, so it says the same thing the tickets do; 0 turns the flag off.
+func (s *Server) notStartedList(ctx context.Context, projectID int, view []domain.Task) ([]map[string]interface{}, error) {
+	out := []map[string]interface{}{}
+	minutes, _ := s.watchdogMinutes(ctx, projectID)
+	if minutes <= 0 {
+		return out, nil
+	}
+	rows, err := s.repo.NotStarted(ctx, projectID, time.Duration(minutes)*time.Minute)
 	if err != nil {
 		return nil, err
 	}
-	for _, t := range cands {
-		// Everything open downstream of it, transitively.
-		var holding []int
-		relevant := inView[t.ID]
-		seen := map[int]bool{}
-		queue := append([]int(nil), dependents[t.ID]...)
-		for len(queue) > 0 {
-			id := queue[0]
-			queue = queue[1:]
-			if seen[id] {
-				continue
-			}
-			seen[id] = true
-			if open[id] {
-				holding = append(holding, id)
-				relevant = relevant || inView[id]
-			}
-			queue = append(queue, dependents[id]...)
-		}
-		if !relevant {
+	seen := make(map[int]bool, len(view))
+	for _, t := range view {
+		seen[t.ID] = true
+	}
+	for _, n := range rows {
+		if !seen[n.ID] {
 			continue
 		}
-		w := PersonWait{ID: t.ID, Name: t.Name, Reason: t.HumanReason, Owner: "nobody", HoldingUp: holding, State: "ready"}
-		if t.OwnerUserID != nil {
-			w.Owner = emails[*t.OwnerUserID]
-			if w.Owner == "" {
-				w.Owner = fmt.Sprintf("user %d", *t.OwnerUserID)
-			}
+		out = append(out, map[string]interface{}{
+			"id": n.ID, "name": n.Name, "agent_id": n.AgentID, "minutes": n.Minutes,
+		})
+	}
+	return out, nil
+}
+
+// returnedList is amp_list_tasks' returned: tickets sent back to ready before
+// a worker started them, still not dispatched again (AMP #2801). It reads the
+// project, then keeps only what the caller's view covers, like every other
+// bucket.
+func (s *Server) returnedList(ctx context.Context, projectID int, view []domain.Task) ([]map[string]interface{}, error) {
+	out := []map[string]interface{}{}
+	rows, err := s.repo.Returned(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[int]bool, len(view))
+	for _, t := range view {
+		seen[t.ID] = true
+	}
+	for _, r := range rows {
+		if !seen[r.ID] {
+			continue
 		}
-		since := t.ReadyAt
-		if t.State == domain.TaskStateInProgress {
-			w.State = "in_progress"
-			if t.DispatchedAt != nil {
-				since = t.DispatchedAt
-			}
-		}
-		if since == nil {
-			since = &t.CreatedAt
-		}
-		w.WaitingHours = int(time.Since(*since).Hours())
-		seenAt := last[t.ID]
-		if seenAt.IsZero() {
-			seenAt = *since
-		}
-		w.Stale = time.Since(seenAt) > HumanStaleAfter
-		out = append(out, w)
+		out = append(out, map[string]interface{}{
+			"id": r.ID, "name": r.Name, "agent_id": r.AgentID,
+			"returned_reason": r.ReturnedReason, "minutes": r.Minutes,
+		})
 	}
 	return out, nil
 }

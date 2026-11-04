@@ -25,7 +25,10 @@ func TestCodec_MessagesRoundTrip(t *testing.T) {
 			ReplyCh: make(chan ReplyCreateTask, 1)},
 		&MsgUpdateTask{Req: domain.UpdateTaskRequest{TaskID: 11, Description: "x", Clear: []string{"assigned_to"},
 			Metadata: domain.MetadataPatch{"gone": nil}}, ReplyCh: make(chan ReplySimple, 1)},
-		&MsgDispatchTask{TaskID: 2, AgentID: "claude", By: &by, Override: true, ReplyCh: make(chan ReplySimple, 1)},
+		&MsgDispatchTask{TaskID: 2, AgentID: "claude", By: &by, Override: true, DispatchID: "d_abc", ReplyCh: make(chan ReplySimple, 1)},
+		&MsgClaimStart{TaskID: 2, DispatchID: "d_abc", Post: "picked this up", ByUser: &by, ReplyCh: make(chan ReplyStart, 1)},
+		&MsgReturnTask{TaskID: 2, Reason: "worker died", By: &by, ByName: "harness", ReplyCh: make(chan ReplyGetTask, 1)},
+		&MsgCompleteTask{TaskID: 2, DispatchID: "d_abc", CloseoutReason: "worker died", CloseoutOK: true, ReplyCh: make(chan ReplyComplete, 1)},
 		&MsgAssignTask{TaskID: 2, ExpectOwner: nil, NewOwner: &owner, RequireIdle: true, By: &by, ByName: "dana", ReplyCh: make(chan ReplyGetTask, 1)},
 		&MsgSetTaskStartAt{TaskID: 2, StartAt: &start, ReplyCh: make(chan ReplySimple, 1)},
 		&MsgAddComment{Req: domain.AddCommentRequest{TaskID: 2, Author: "a", Body: "b", AuthorUserID: &by}, ReplyCh: make(chan ReplyAddComment, 1)},
@@ -67,7 +70,8 @@ func TestCodec_EveryOutsideMessageIsRegistered(t *testing.T) {
 		&MsgUpdateStory{}, &MsgCreateTask{}, &MsgGetTask{}, &MsgListTasks{}, &MsgDispatchTask{}, &MsgCompleteTask{},
 		&MsgBlockTask{}, &MsgAssignTask{}, &MsgUpdateTask{}, &MsgAddComment{}, &MsgGetComments{}, &MsgSetTaskState{},
 		&MsgSetTaskStartAt{}, &MsgReset{}, &MsgDeleteEpic{}, &MsgDeleteStory{}, &MsgDeleteTask{}, &MsgSetTaskDeps{},
-		&MsgReconcileDeps{}, &MsgMoveTask{}, &MsgMoveStory{}, &MsgPing{}} {
+		&MsgReconcileDeps{}, &MsgMoveTask{}, &MsgMoveStory{}, &MsgPing{}, &MsgClaimStart{}, &MsgReturnTask{},
+		&MsgSetMergeState{}, &MsgApproveTask{}} {
 		if _, err := encodeMsg(m); err != nil {
 			t.Errorf("%T: %v", m, err)
 		}
@@ -113,12 +117,12 @@ func TestCodec_RepliesAndErrors(t *testing.T) {
 		{errors.New("task 3 is already completed"), func(e error) bool { return authz.StatusOf(e, 500) == 500 }},
 	}
 	for _, c := range errs {
-		r := roundTrip(t, &MsgCompleteTask{ReplyCh: make(chan ReplySimple, 1)}, ReplySimple{Err: c.err}).Interface().(ReplySimple)
+		r := roundTrip(t, &MsgCompleteTask{ReplyCh: make(chan ReplyComplete, 1)}, ReplyComplete{Err: c.err}).Interface().(ReplyComplete)
 		if r.Err == nil || r.Err.Error() != c.err.Error() || !c.check(r.Err) {
 			t.Errorf("error %q came back as %#v", c.err, r.Err)
 		}
 	}
-	if r := roundTrip(t, &MsgCompleteTask{ReplyCh: make(chan ReplySimple, 1)}, ReplySimple{}).Interface().(ReplySimple); r.Err != nil {
+	if r := roundTrip(t, &MsgCompleteTask{ReplyCh: make(chan ReplyComplete, 1)}, ReplyComplete{}).Interface().(ReplyComplete); r.Err != nil {
 		t.Errorf("success came back as %v", r.Err)
 	}
 }

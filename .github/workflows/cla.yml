@@ -30,6 +30,11 @@ jobs:
           path-to-document: https://github.com/jacobsims214/amp/blob/main/CLA.md
           path-to-signatures: signatures/cla.json
           branch: cla-signatures
-          # The maintainer owns the copyright already; bots don't sign.
-          allowlist: jacobsims214,dependabot[bot],github-actions[bot],renovate[bot]
+          # The maintainer owns the copyright already; bots don't sign. Nor do the
+          # maintainer's own agents (amp-designer, amp-worker-backend, ...): they commit
+          # as `amp-<role> <amp-<role>@localhost>`, which is not a GitHub account, so the
+          # bot can neither allowlist it by name nor ask it to sign. The maintainer owns
+          # their output, so the `amp-*` pattern covers the whole family. Patterns support
+          # `*` (contributor-assistant/github-action, src/checkAllowList.ts).
+          allowlist: jacobsims214,dependabot[bot],github-actions[bot],renovate[bot],amp-*
           lock-pullrequest-aftermerge: false

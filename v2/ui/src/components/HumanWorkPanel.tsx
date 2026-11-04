@@ -33,8 +33,11 @@ export function HumanWorkPanel({ work, people, rangeLabel, onOpen }: {
       right={<span>wait = ready → started · {rangeLabel.toLowerCase()}</span>}>
       {human.tickets === 0 ? (
         <p className="m-0 px-4 py-4 text-[13px] text-ink-2 leading-relaxed">
-          When a step needs a person (a review and merge, a sign-off, access agents don't have, a decision), plan it as a ticket
-          done by a person. The agent work after it waits for them, and this panel shows what that waiting costs.
+          When a step needs a person (a sign-off, access agents don't have, a decision, a review of something that isn't code),
+          plan it as a ticket done by a person. The agent work after it waits for them, and this panel shows what that waiting costs.
+          A merge isn't a separate ticket to acknowledge: a done ticket shows Merge needed until its merge is
+          recorded. If the plan has to sequence a merge after other work, that step is linked to the PR with
+          merge_for and folds into the PR's Merge item, so one PR stays one thing to do.
         </p>
       ) : <>
         <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">

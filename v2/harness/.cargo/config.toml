@@ -1,0 +1,4 @@
+# Build output stays inside v2/harness (on the external drive in dev worktrees), never in /tmp (D13).
+# A relative target-dir here is resolved against v2/harness, the parent of this .cargo directory.
+[build]
+target-dir = "target"

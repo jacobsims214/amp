@@ -15,9 +15,10 @@ import (
 )
 
 // toolsListCacheTTLMs is the cache hint attached to tools/list results under
-// MCP 2026-07-28 (SEP-2549). The tool set is fixed per build and identical
-// for every caller, so it is safe to cache publicly; a deploy that changes
-// tools is picked up within this window.
+// MCP 2026-07-28 (SEP-2549). The list is filtered per caller (admin and
+// person-only tools are shown only to those who may use them), so it is
+// cached privately (CacheScopePrivate), never shared between callers. A
+// deploy that changes tools is picked up within this window.
 const toolsListCacheTTLMs = 5 * 60 * 1000
 
 // mcpHTTPConfig is everything the public MCP listener needs beyond the

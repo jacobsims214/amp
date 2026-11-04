@@ -27,6 +27,7 @@ import (
 	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/repository"
+	"github.com/simstech/amp-api/internal/reqctx"
 )
 
 // ---- Errors ----
@@ -35,6 +36,23 @@ import (
 type Error struct {
 	Status int
 	Msg    string
+	// Code is a stable machine-readable code, sent as the "code" member next
+	// to "error" when set (the remote control API's codes, protocol 9.1).
+	Code string
+}
+
+// Coded is an Error with a stable code.
+func Coded(status int, code, format string, a ...any) error {
+	return &Error{Status: status, Msg: fmt.Sprintf(format, a...), Code: code}
+}
+
+// CodeOf returns err's stable code, "" when it has none.
+func CodeOf(err error) string {
+	var ae *Error
+	if errors.As(err, &ae) {
+		return ae.Code
+	}
+	return ""
 }
 
 func (e *Error) Error() string { return e.Msg }
@@ -77,6 +95,54 @@ type Principal struct {
 	Agent bool
 	// ViaToken is set when the request authenticated with an API token.
 	ViaToken bool
+	// Channel is how the request reached AMP: auth.ChannelUI for a person in
+	// the web UI, otherwise mcp, token, rest-other, or empty (in-process).
+	// See RequireUI.
+	Channel string
+
+	// For the audit log: how the request authenticated (the auth.Auth*
+	// constants; empty for in-process callers such as background jobs),
+	// the API token's id, the Dex session id, and for an agent account the
+	// person who manages it.
+	AuthMethod string
+	TokenID    int64
+	SessionID  string
+	ManagedBy  *int
+	// Req is what the listener learned about the request (client IP, user
+	// agent, request id); nil for in-process callers. It rides on the
+	// Principal so it reaches the audit writer even where the request's
+	// context doesn't.
+	Req *reqctx.Info
+}
+
+// InUI reports whether p is a person acting in AMP's web UI: the only
+// caller that may approve a plan, approve an artifact, turn plan approval
+// off, or mark a person's own ticket done. Agent accounts never are.
+func (p Principal) InUI() bool { return p.Channel == auth.ChannelUI && !p.Agent }
+
+// Label names the caller for history rows and audit details: its email,
+// or "local-dev" when auth is off.
+func (p Principal) Label() string {
+	if p.Email != "" {
+		return p.Email
+	}
+	return "local-dev"
+}
+
+// RequireUI refuses unless p is a person in the web UI (InUI). what says
+// what was refused ("Plan approval"), link is the page where the person
+// does it; the message tells an agent to stop and ask its person.
+func RequireUI(p Principal, what, link string) error {
+	if p.InUI() {
+		return nil
+	}
+	return UIOnly(what, link)
+}
+
+// UIOnly is RequireUI's refusal: what is done by a person in the web UI, at link.
+func UIOnly(what, link string) error {
+	return Forbidden("%s is done by a person in the AMP web UI, not by an agent or over MCP: %s. "+
+		"Stop and ask your person to do it there.", what, link)
 }
 
 // HasUser reports whether the principal is a real AMP user (not local dev).
@@ -99,8 +165,9 @@ func FromContext(ctx context.Context) (Principal, error) {
 	if !ok {
 		return Principal{}, &Error{Status: 401, Msg: "not authenticated"}
 	}
+	req, _ := reqctx.FromContext(ctx)
 	if ident.LocalDev {
-		return Principal{Super: true, Email: ident.Email}, nil
+		return Principal{Super: true, Email: ident.Email, Channel: ident.Channel, AuthMethod: ident.AuthMethod, Req: req}, nil
 	}
 	if ident.User == nil {
 		return Principal{}, Forbidden("this token has no AMP user (missing email claim); sign in again")
@@ -111,6 +178,13 @@ func FromContext(ctx context.Context) (Principal, error) {
 		Super:    ident.HasRole(domain.RoleAdmin) && !ident.User.IsAgent(),
 		Agent:    ident.User.IsAgent(),
 		ViaToken: ident.APIToken,
+		Channel:  ident.Channel,
+
+		AuthMethod: ident.AuthMethod,
+		TokenID:    ident.TokenID,
+		SessionID:  ident.SessionID,
+		ManagedBy:  ident.User.ManagedBy,
+		Req:        req,
 	}, nil
 }
 

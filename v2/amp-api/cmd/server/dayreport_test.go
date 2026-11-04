@@ -38,6 +38,7 @@ func TestDayReports(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	planApprovalOff(t, repo, other.ID)
 	oe, _ := repo.CreateEpic(ctx, domain.CreateEpicRequest{ProjectID: other.ID, Name: "oe", Priority: "1"})
 	os_, _ := repo.CreateStory(ctx, domain.CreateStoryRequest{ProjectID: other.ID, EpicID: oe.ID, Name: "os", Priority: "1"})
 
@@ -64,7 +65,7 @@ func TestDayReports(t *testing.T) {
 	alice.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(done)})
 	alice.call(t, "amp_dispatch_task", map[string]interface{}{"task_id": float64(running), "agent_id": "a"})
 	alice.call(t, "amp_block_task", map[string]interface{}{"task_id": float64(stuck), "reason": "waiting on API keys"})
-	alice.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(elsewhere)})
+	alice.finish(t, elsewhere)
 	alice.call(t, "amp_add_task_comment", map[string]interface{}{"task_id": float64(bobs), "body": "reviewed, looks good"})
 
 	ref := func(code string, id int) string { return domain.TaskRef(code, id) }

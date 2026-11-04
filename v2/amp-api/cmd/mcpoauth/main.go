@@ -36,6 +36,7 @@ import (
 	dexapi "github.com/dexidp/dex/api/v2"
 	"github.com/google/uuid"
 	"github.com/simstech/amp-api/internal/dexclient"
+	"github.com/simstech/amp-api/internal/reqctx"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -83,7 +84,10 @@ func main() {
 	}
 
 	addr := envOrDefault("ADDR", ":8091")
-	httpSrv := &http.Server{Addr: addr, Handler: s.handler()}
+	// mcpoauth writes no audit rows yet (#2428 decides DCR auditing), but
+	// resolves the client the same way so its logs and any future rows
+	// carry a trusted address (AMP_TRUSTED_PROXIES; see internal/reqctx).
+	httpSrv := &http.Server{Addr: addr, Handler: reqctx.Middleware(reqctx.ListenerMCPOAuth, reqctx.FromEnv())(s.handler())}
 
 	go func() {
 		slog.Info("amp-mcp-oauth listening", "addr", addr, "self", s.selfURL, "dex", s.dexURL, "mcp", s.mcpURL, "audience", trust.audienceID)

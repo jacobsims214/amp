@@ -1,6 +1,6 @@
 {
   "name": "amp-opencode",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
   "description": "AMP for opencode: the manager/worker/reviewer agent team, skills, MCP servers and model settings in one plugin.",
   "main": "server.js",

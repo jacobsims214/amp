@@ -157,6 +157,12 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 	case *MsgDispatchTask:
 		a.routeTaskMsg(ctx, msg.TaskID, msg)
 
+	case *MsgClaimStart:
+		a.routeTaskMsg(ctx, msg.TaskID, msg)
+
+	case *MsgReturnTask:
+		a.routeTaskMsg(ctx, msg.TaskID, msg)
+
 	case *MsgCompleteTask:
 		// Route to the task, then fan MsgDepCompleted to ALL epics.
 		a.routeTaskMsg(ctx, msg.TaskID, msg)
@@ -176,6 +182,12 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 		a.routeTaskMsg(ctx, msg.TaskID, msg)
 
 	case *MsgSetTaskStartAt:
+		a.routeTaskMsg(ctx, msg.TaskID, msg)
+
+	case *MsgApproveTask:
+		a.routeTaskMsg(ctx, msg.TaskID, msg)
+
+	case *MsgSetMergeState:
 		a.routeTaskMsg(ctx, msg.TaskID, msg)
 
 	case *MsgAddComment:
@@ -256,7 +268,7 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 		// We Send (not request/reply) to each epic — the messages are queued and
 		// will be processed by the time the caller reads task state, because the
 		// caller's next message (MsgGetTask) goes through the same actor mailboxes.
-		depMsg := &MsgDepCompleted{CompletedTaskID: msg.CompletedTaskID}
+		depMsg := &MsgDepCompleted{CompletedTaskID: msg.CompletedTaskID, MergeWait: msg.MergeWait}
 		for _, pid := range a.epics {
 			ctx.Send(pid, depMsg)
 		}

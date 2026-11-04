@@ -75,14 +75,14 @@ var toolCatalog = map[string]toolInfo{
 	"amp_get_epic":              {title: "Get epic", readOnly: true, listing: hiddenAlias},
 	"amp_get_story":             {title: "Get story", readOnly: true, listing: hiddenAlias},
 	"amp_check_plan":            {title: "Check plan", keywords: "validate the plan before dispatching, find unconnected tickets", readOnly: true},
-	"amp_approve_plan":          {title: "Approve plan", keywords: "record that the user approved the plan", listing: personOnly},
+	"amp_approve_plan":          {title: "Plan approval status", keywords: "is the plan approved, where a person approves the plan (agents can't)"},
 	"amp_find_by_metadata":      {title: "Find by metadata", keywords: "find projects, epics, stories or tickets by metadata (jira key, cost center)", readOnly: true},
 	"amp_set_task_dependencies": {title: "Set ticket dependencies", keywords: "add or remove a dependency, what a ticket waits on, fix ticket order", idempotent: true},
 
 	// Tickets
 	"amp_create_tasks":       {title: "Create tickets", keywords: "create one or many tickets, plan a story's tickets with dependencies, new ticket"},
 	"amp_create_task":        {title: "Create ticket", listing: hiddenAlias},
-	"amp_list_tasks":         {title: "List tickets", keywords: "my tickets, what should I work on, the board, ready to dispatch, questions, blocked, in progress", readOnly: true},
+	"amp_list_tasks":         {title: "List tickets", keywords: "my tickets, what should I work on, the board, ready to dispatch, questions, blocked, in progress, not started, returned", readOnly: true},
 	"amp_get_task":           {title: "Get ticket", keywords: "read a ticket with its comments, history and runs", readOnly: true},
 	"amp_get_task_comments":  {title: "Get ticket comments", readOnly: true, listing: hiddenAlias},
 	"amp_get_ticket_history": {title: "Get ticket history", readOnly: true, listing: hiddenAlias},
@@ -91,9 +91,10 @@ var toolCatalog = map[string]toolInfo{
 	"amp_move_task":          {title: "Move ticket", keywords: "move a ticket to another story", idempotent: true},
 	"amp_delete_task":        {title: "Delete ticket", keywords: "remove a ticket (to the trash)", destructive: true},
 	"amp_assign_task":        {title: "Assign ticket", keywords: "assign, reassign or unassign a ticket, take one over (user='me')", idempotent: true},
-	"amp_claim_task":         {title: "Claim ticket", keywords: "take an unassigned ticket (never someone else's)", idempotent: true},
+	"amp_claim_task":         {title: "Claim ticket", keywords: "claim a ticket, take an unassigned ticket, the ticket you were dispatched for", idempotent: true},
+	"amp_return_task":        {title: "Return ticket", keywords: "release a dispatched ticket nobody started, or your own worker's ticket with its dispatch_id, worker died or timed out, undo a dispatch, back to ready"},
 	"amp_handover_tasks":     {title: "Hand over tickets", keywords: "move someone's open tickets to another person"},
-	"amp_dispatch_task":      {title: "Dispatch ticket", keywords: "start work on a ticket, hand a ticket to a worker agent, begin a ticket"},
+	"amp_dispatch_task":      {title: "Dispatch ticket", keywords: "start work on a ticket, hand a ticket to a worker agent, begin a ticket, worker_prompt to launch the worker"},
 	"amp_add_task_comment":   {title: "Comment on ticket", keywords: "comment on a ticket, post a progress update, log a note or finding"},
 	"amp_block_task":         {title: "Block ticket with a question", keywords: "ask the user a question, stop for a decision, flag a blocker, request review"},
 	"amp_answer_question":    {title: "Answer ticket question", keywords: "record the user's answer to a blocked ticket, unblock"},
@@ -103,6 +104,7 @@ var toolCatalog = map[string]toolInfo{
 	"amp_set_task_start_at":  {title: "Schedule ticket", keywords: "schedule a ticket to start later", idempotent: true},
 	"amp_list_unmerged":      {title: "List unmerged work", keywords: "done tickets whose PR or branch isn't merged", readOnly: true},
 	"amp_trace":              {title: "Trace code to tickets", keywords: "which ticket made this commit, branch or PR", readOnly: true},
+	"amp_report_merged":      {title: "Report merged", keywords: "CI merge report, mark a branch, PR or commit merged, record the merge commit"},
 	"amp_list_deleted_tasks": {title: "List trash", keywords: "deleted tickets, epics and stories", readOnly: true},
 	"amp_restore_tasks":      {title: "Restore from trash", keywords: "undelete tickets, epics or stories"},
 
@@ -120,12 +122,14 @@ var toolCatalog = map[string]toolInfo{
 	"amp_kb_list":               {title: "List KB docs", keywords: "list knowledge base documents", readOnly: true},
 	"amp_kb_write":              {title: "Write KB doc", keywords: "create or update a knowledge base document, save a finding", idempotent: true},
 	"amp_kb_delete":             {title: "Delete KB doc", destructive: true},
+	"amp_kb_list_deleted":       {title: "List deleted KB docs", keywords: "KB trash, deleted knowledge base documents, recover a doc deleted by mistake", readOnly: true},
+	"amp_kb_restore":            {title: "Restore KB doc", keywords: "undelete a knowledge base document from the KB trash"},
 	"amp_kb_annotate":           {title: "Annotate KB doc", keywords: "add a correction or note to a doc"},
 	"amp_kb_resolve_annotation": {title: "Resolve KB annotation", idempotent: true},
-	"amp_kb_status":             {title: "KB health", keywords: "stale docs, annotations, tag counts", readOnly: true},
+	"amp_kb_status":             {title: "KB health", keywords: "stale docs, annotations, tag counts, stored vs indexed docs, backfill", readOnly: true},
 	"amp_kb_sources":            {title: "List KBs for a project", keywords: "which knowledge bases: project, team, org", readOnly: true},
 	"amp_kb_tags":               {title: "KB tags", readOnly: true, listing: hiddenAlias},
-	"amp_kb_reindex":            {title: "Reindex KB", listing: hiddenAlias},
+	"amp_kb_reindex":            {title: "Reindex KB", keywords: "rebuild or re-embed a KB, search scores look huge or wrong, results look keyword-only, a doc is missing from search", idempotent: true},
 
 	// Artifacts and design
 	"amp_publish_artifact":      {title: "Publish artifact", keywords: "publish or upload a mockup, prototype, diagram, image, PDF or document for review"},
@@ -208,6 +212,7 @@ func (s *Server) ServerOptions() []server.ServerOption {
 	})
 	return []server.ServerOption{
 		server.WithToolHandlerMiddleware(Middleware()),
+		server.WithToolHandlerMiddleware(s.deniedMiddleware()),
 		server.WithHooks(hooks),
 	}
 }

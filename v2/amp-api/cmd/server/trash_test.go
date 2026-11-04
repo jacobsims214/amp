@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // Deleted tickets go to the trash and come back whole: text, comments,
@@ -168,4 +172,69 @@ func TestTrash_RestoreStoryAndEpic(t *testing.T) {
 	if g := out["groups"].([]any)[0].(map[string]any); g["restored"] == true {
 		t.Fatalf("a member restored someone else's deletion: %v", out)
 	}
+}
+
+// The trash keeps 30 days: the purge deletes deleted tickets, epics and
+// stories older than that and keeps newer ones, and running it again (as
+// another replica would) is harmless.
+func TestTrash_PurgeOld(t *testing.T) {
+	w := newRBACWorld(t)
+	root := w.s.as(w.root)
+	ctx := context.Background()
+	db, err := pgx.Connect(ctx, os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(ctx)
+
+	old, fresh := mkIn(t, root, w.s.storyID, "old"), mkIn(t, root, w.s.storyID, "fresh")
+	root.call(t, "amp_delete_task", map[string]any{"task_id": float64(old)})
+	root.call(t, "amp_delete_task", map[string]any{"task_id": float64(fresh)})
+	// Two deleted stories (made up: only the trash rows matter here).
+	for _, g := range []struct {
+		id  int
+		age string
+	}{{-old, "31 days"}, {-fresh, "29 days"}} {
+		if _, err := db.Exec(ctx, `INSERT INTO deleted_groups (kind, item_id, project_id, epic_id, name, snapshot, deleted_at)
+			VALUES ('story', $1, $2, $3, 'g', '{}', NOW() - $4::interval)`, g.id, w.s.projectID, w.s.epicID, g.age); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(ctx, `UPDATE deleted_tasks SET deleted_at = NOW() - INTERVAL '31 days' WHERE task_id = $1`, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `UPDATE deleted_tasks SET deleted_at = NOW() - INTERVAL '29 days' WHERE task_id = $1`, fresh); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := w.s.repo.PurgeTrash(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n < 2 {
+		t.Fatalf("purged %d rows, want at least the old ticket and the old story", n)
+	}
+	exists := func(q string, id int) bool {
+		var ok bool
+		if err := db.QueryRow(ctx, q, id).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	const taskQ = `SELECT EXISTS (SELECT 1 FROM deleted_tasks WHERE task_id = $1)`
+	const groupQ = `SELECT EXISTS (SELECT 1 FROM deleted_groups WHERE kind = 'story' AND item_id = $1)`
+	if exists(taskQ, old) || exists(groupQ, -old) {
+		t.Fatal("rows older than 30 days survived the purge")
+	}
+	if !exists(taskQ, fresh) || !exists(groupQ, -fresh) {
+		t.Fatal("rows younger than 30 days were purged")
+	}
+	// Idempotent: a second run (another replica) finds nothing old.
+	if _, err := w.s.repo.PurgeTrash(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(taskQ, fresh) {
+		t.Fatal("second purge removed the fresh ticket")
+	}
+	db.Exec(ctx, `DELETE FROM deleted_groups WHERE kind = 'story' AND item_id = $1`, -fresh)
 }

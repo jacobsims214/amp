@@ -1,0 +1,805 @@
+//! M2-6 (#2098): automatic run reporting (D8), in-process against the mock AMP on faux providers.
+//! Workers run through the supervisor with [`RunReporter`] as its hooks, in throwaway git repos
+//! (and a bare "remote") under cargo's target tmp dir (never /tmp: D13).
+//!
+//! Covers: a completed run carries model, tokens and git (pushed) without overwriting what
+//! the model set; a blocked run on an unpushed commit; calls on another ticket are left alone;
+//! `amp_session_usage` for a worker; abandoned runs (error, turn budget) reported with
+//! `amp_report_run` and a note; AMP refusing that report; a read-only worker reports no git; a
+//! worker stopped (cancelled, over its turn budget) after closing its ticket is not abandoned.
+
+mod common;
+
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+    time::Duration,
+};
+
+use amp_core::{
+    agent::{Runtime, RuntimeOptions},
+    faux::StepSpec,
+    project::ProjectMarker,
+    providers::StaticKeys,
+    run_report::RunReporter,
+    supervisor::{
+        ManagerContext, RunRequest, Supervisor, SupervisorConfig, WorkerHooks, WorkerOutcome,
+    },
+};
+use amp_mcp::{AmpMcpClient, ClientOptions};
+use common::{MockAmp, Running, spawn};
+use rpi_ai::{
+    providers::faux::{FauxBlock, FauxStep, faux_assistant_message},
+    types::{Context, StopReason},
+};
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+/// Workers on faux provider `wf`. rpi's faux provider estimates tokens but always reports a cost
+/// of 0 (the real providers price usage from models.toml), so these runs carry no `cost_usd`: the
+/// harness only passes on numbers the provider reported. The unit tests in amp-core's run_report
+/// cover the cost field.
+const CONFIG: &str = r#"
+[providers.wf]
+api = "faux"
+[providers.wf.models."wf-1"]
+
+[roles.manager]
+model = "wf/wf-1"
+[roles.worker-backend]
+model = "wf/wf-1"
+[roles.researcher]
+model = "wf/wf-1"
+"#;
+
+struct Fixture {
+    dir: PathBuf,
+    repo: PathBuf,
+    amp: Running,
+    rt: Arc<Runtime>,
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// A throwaway repo with `.amp.json` and one commit; with `remote`, a bare `origin` it is pushed
+/// to. Plus the faux config and a runtime on a fresh mock AMP.
+async fn fixture(name: &str, remote: bool) -> Fixture {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("amp-harness-run-report")
+        .join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(dir.join("home/.config/amp-harness")).unwrap();
+    std::fs::write(dir.join("home/.config/amp-harness/config.toml"), CONFIG).unwrap();
+    std::fs::write(
+        repo.join(".amp.json"),
+        json!({"project_id": 2, "project_name": "AMP v2"}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(repo.join("README.md"), "test repo\n").unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    if remote {
+        let bare = dir.join("remote.git");
+        git(&dir, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+        git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git(&repo, &["push", "-q", "-u", "origin", "main"]);
+    }
+    let repo = std::fs::canonicalize(&repo).unwrap();
+
+    let amp = spawn(MockAmp::new(), None).await;
+    let client = Arc::new(
+        AmpMcpClient::connect(ClientOptions::new(amp.url.clone()))
+            .await
+            .expect("connect to the mock AMP"),
+    );
+    let home = dir.join("home");
+    let env = {
+        let home = home.clone();
+        move |k: &str| match k {
+            "HOME" => Some(home.to_string_lossy().into_owned()),
+            "XDG_CONFIG_HOME" => Some(home.join(".config").to_string_lossy().into_owned()),
+            "XDG_STATE_HOME" => Some(home.join(".local/state").to_string_lossy().into_owned()),
+            _ => None,
+        }
+    };
+    let rt = Runtime::load(
+        client,
+        RuntimeOptions {
+            repo_root: Some(repo.clone()),
+            models: None,
+            keys: &StaticKeys::default(),
+            env: &env,
+            state_dir: None,
+        },
+    )
+    .expect("load the runtime");
+    Fixture {
+        dir,
+        repo,
+        amp,
+        rt: Arc::new(rt),
+    }
+}
+
+impl Fixture {
+    fn supervisor(&self, config: SupervisorConfig) -> Arc<Supervisor> {
+        let reporter = RunReporter::new(Arc::clone(&self.rt.mcp));
+        Supervisor::with_hooks(
+            Arc::clone(&self.rt),
+            ManagerContext {
+                role: "amp-manager".into(),
+                cwd: self.repo.clone(),
+                project: ProjectMarker::find_within(&self.repo, Some(&self.dir)).unwrap(),
+            },
+            config,
+            Some(reporter as Arc<dyn WorkerHooks>),
+        )
+    }
+
+    fn script(&self, steps: Vec<FauxStep>) {
+        self.rt
+            .providers
+            .faux_script("wf")
+            .expect("a faux provider")
+            .set_responses(steps);
+    }
+
+    fn calls(&self, tool: &str) -> Vec<Value> {
+        self.amp.mock.calls_to(tool)
+    }
+
+    fn worktree(&self, task_id: i64) -> PathBuf {
+        self.repo.join(".worktrees").join(task_id.to_string())
+    }
+}
+
+fn config() -> SupervisorConfig {
+    SupervisorConfig {
+        abort_grace: Duration::from_secs(5),
+        ..SupervisorConfig::default()
+    }
+}
+
+fn req(task_id: i64, agent: &str) -> RunRequest {
+    RunRequest {
+        task_id,
+        agent_id: agent.into(),
+        ..RunRequest::default()
+    }
+}
+
+fn template(text: &str, tool_calls: Value) -> FauxStep {
+    let spec: StepSpec =
+        serde_json::from_value(json!({"text": text, "tool_calls": tool_calls})).unwrap();
+    spec.to_step()
+}
+
+/// A step that first does some git work in `dir` (what a worker's bash would do), then calls
+/// `tool` with `args`.
+fn git_then_call(
+    dir: PathBuf,
+    git_steps: Vec<Vec<&'static str>>,
+    tool: &'static str,
+    args: Value,
+) -> FauxStep {
+    FauxStep::factory(move |_ctx: &Context| {
+        for step in &git_steps {
+            if step[0] == "WRITE" {
+                std::fs::write(dir.join(step[1]), step[2]).unwrap();
+            } else {
+                git(&dir, step);
+            }
+        }
+        faux_assistant_message(
+            vec![
+                FauxBlock::text("Working."),
+                FauxBlock::tool_call(tool, args.clone()),
+            ],
+            StopReason::ToolUse,
+        )
+    })
+}
+
+fn num(v: &Value) -> i64 {
+    v.as_i64().unwrap_or_else(|| panic!("not a number: {v}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_completed_run_carries_model_tokens_cost_and_pushed_git_without_overwriting() {
+    let f = fixture("completed", true).await;
+    let sup = f.supervisor(config());
+    let wt = f.worktree(2085);
+    f.script(vec![
+        // Commit and push the ticket branch, then ask for the session's usage.
+        git_then_call(
+            wt.clone(),
+            vec![
+                vec!["WRITE", "work.txt", "done\n"],
+                vec!["add", "work.txt"],
+                vec!["commit", "-q", "-m", "work (#2085)"],
+                vec!["push", "-q", "-u", "origin", "amp-2085"],
+            ],
+            "amp_session_usage",
+            json!({}),
+        ),
+        // The model reports its own model name and a PR, and nothing else.
+        template(
+            "usage: {{last_tool_result}}",
+            json!([{"name": "amp_complete_task", "arguments": {
+                "task_id": 2085, "model": "claude-x", "pr_url": "https://example.com/pr/1"}}]),
+        ),
+        template("Finished #2085.", json!([])),
+    ]);
+
+    let r = sup
+        .run_ticket(req(2085, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Completed, "{r:?}");
+
+    let complete = f.calls("amp_complete_task");
+    assert_eq!(complete.len(), 1, "{complete:?}");
+    let c = &complete[0];
+    assert_eq!(c["task_id"], 2085);
+    assert_eq!(c["model"], "claude-x", "the model's own value is kept");
+    assert_eq!(c["pr_url"], "https://example.com/pr/1");
+    // Usage up to and including the message that made the call: more than nothing, no more than
+    // the whole run (the final "Finished" message comes after).
+    let (input, output) = (num(&c["input_tokens"]), num(&c["output_tokens"]));
+    assert!(input > 0 && output > 0, "{c}");
+    assert!(
+        input <= r.usage.input_tokens && output < r.usage.output_tokens,
+        "{c} vs {r:?}"
+    );
+    assert!(
+        c["cache_read_tokens"].is_i64() && c["cache_write_tokens"].is_i64(),
+        "{c}"
+    );
+    assert!(c.get("cost_usd").is_none(), "faux reports no cost: {c}");
+    // Git from the worktree: its branch, the commit just made, and it is on its upstream.
+    assert_eq!(c["branch"], "amp-2085");
+    assert_eq!(c["commit"], git(&wt, &["rev-parse", "HEAD"]));
+    assert_eq!(c["pushed"], true);
+
+    // A closed ticket needs no amp_report_run.
+    assert!(f.calls("amp_report_run").is_empty());
+    // AMP #2802: the harness started the ticket for its worker, with the dispatch token, so the
+    // run says so. A completed run has nothing to hand back, so that is the only note.
+    assert_eq!(r.notes.len(), 1, "{:?}", r.notes);
+    assert!(r.notes[0].contains("started #2085"), "{:?}", r.notes);
+    assert!(f.calls("amp_return_task").is_empty(), "nothing to return");
+
+    // The worker's amp_session_usage answered with its configured model and live usage.
+    let transcript = std::fs::read_to_string(r.session_file.as_ref().unwrap()).unwrap();
+    assert!(
+        transcript.contains(r#"\"model\":\"wf/wf-1\""#),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("fills these"),
+        "the worker is told it's automatic"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blocked_run_on_an_unpushed_commit_and_other_tickets_are_left_alone() {
+    let f = fixture("blocked", true).await;
+    let sup = f.supervisor(config());
+    let wt = f.worktree(2085);
+    f.script(vec![
+        // A local commit only, then a call about some other ticket.
+        git_then_call(
+            wt.clone(),
+            vec![
+                vec!["WRITE", "wip.txt", "wip\n"],
+                vec!["add", "wip.txt"],
+                vec!["commit", "-q", "-m", "wip"],
+            ],
+            "amp_complete_task",
+            json!({"task_id": 9999}),
+        ),
+        template(
+            "Need an answer.",
+            json!([{"name": "amp_block_task", "arguments": {
+                "task_id": "#2085", "reason": "A or B?", "input_tokens": 5, "branch": ""}}]),
+        ),
+        template("Asked.", json!([])),
+    ]);
+
+    let r = sup
+        .run_ticket(req(2085, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Blocked, "{r:?}");
+
+    assert_eq!(
+        f.calls("amp_complete_task"),
+        vec![json!({"task_id": 9999})],
+        "a call on another ticket is not filled in"
+    );
+    let block = f.calls("amp_block_task");
+    assert_eq!(block.len(), 1);
+    let b = &block[0];
+    assert_eq!(b["reason"], "A or B?");
+    assert_eq!(b["input_tokens"], 5, "the model's number is kept");
+    assert!(num(&b["output_tokens"]) > 0, "{b}");
+    assert_eq!(b["model"], "wf/wf-1", "the configured provider/model");
+    assert_eq!(b["branch"], "amp-2085", "an empty string is filled");
+    assert_eq!(b["commit"], git(&wt, &["rev-parse", "HEAD"]));
+    assert_eq!(b["pushed"], false, "the commit is only local");
+    assert!(f.calls("amp_report_run").is_empty());
+}
+
+/// #3005: the #2966 shape end to end. A worker that changes nothing completes from a worktree cut
+/// off a pushed `main`, so its branch sits on a commit `origin/main` contains. Before #3005 both
+/// pushed-inference paths called that `pushed=true`, and a branch name took it into Merge needed
+/// — a gate for work that does not exist. Now it reports no git fields at all, the way a worker
+/// with no worktree does; a run that did commit still reports theirs (the test just above and
+/// `a_completed_run_carries_model_tokens_cost_and_pushed_git_without_overwriting`); and the
+/// worker's own fields survive untouched, which is the escape hatch for a push by refspec.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unchanged_run_reports_no_git_fields_even_on_a_pushed_main() {
+    let f = fixture("unchanged", true).await;
+    let sup = f.supervisor(config());
+    let wt = f.worktree(2966);
+    f.script(vec![
+        // Look at the worktree, change nothing in it, and complete.
+        template(
+            "Nothing to change.",
+            json!([{"name": "amp_complete_task", "arguments": {"task_id": 2966}}]),
+        ),
+        template("Finished #2966.", json!([])),
+    ]);
+
+    let r = sup
+        .run_ticket(req(2966, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Completed, "{r:?}");
+    assert_eq!(
+        git(&wt, &["rev-parse", "HEAD"]),
+        git(&f.repo, &["rev-parse", "HEAD"]),
+        "the run committed nothing"
+    );
+    // What the old inference would have said, so the test fails if the check is ever dropped.
+    assert!(
+        !git(
+            &wt,
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--contains",
+                "HEAD",
+                "--format=%(refname)",
+                "refs/remotes"
+            ]
+        )
+        .is_empty(),
+        "HEAD is contained in a remote-tracking ref: the #2966 false positive"
+    );
+
+    let complete = f.calls("amp_complete_task");
+    assert_eq!(complete.len(), 1, "{complete:?}");
+    let c = &complete[0];
+    for field in ["branch", "commit", "pushed"] {
+        assert!(c.get(field).is_none(), "{field} inferred: {c}");
+    }
+    assert_eq!(c["model"], "wf/wf-1", "the usage fields are still filled");
+    assert!(num(&c["input_tokens"]) > 0, "{c}");
+}
+
+/// #3005: the escape hatch. A run whose worktree changed nothing may still have pushed (a
+/// refspec push of pre-existing commits, #2966's worker pushing `feat/harness-home-page`). The
+/// harness stopped *inferring*; it never strips or overrides what the worker reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unchanged_run_keeps_the_destination_its_worker_reported() {
+    let f = fixture("unchanged-reported", true).await;
+    let sup = f.supervisor(config());
+    f.script(vec![
+        template(
+            "Pushed by refspec, nothing here.",
+            json!([{"name": "amp_complete_task", "arguments": {
+                "task_id": 2966, "branch": "feat/elsewhere", "commit": "3dea037",
+                "pushed": true, "base_branch": "feat/actionable-merge-workflow"}}]),
+        ),
+        template("Finished #2966.", json!([])),
+    ]);
+
+    let r = sup
+        .run_ticket(req(2966, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Completed, "{r:?}");
+    let complete = f.calls("amp_complete_task");
+    assert_eq!(complete.len(), 1, "{complete:?}");
+    assert_eq!(complete[0]["branch"], "feat/elsewhere");
+    assert_eq!(complete[0]["commit"], "3dea037");
+    assert_eq!(complete[0]["pushed"], true);
+    assert_eq!(
+        complete[0]["base_branch"], "feat/actionable-merge-workflow",
+        "a destination the harness could never infer is left alone"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_runs_are_reported_with_usage_git_and_a_note() {
+    let f = fixture("abandoned", false).await;
+
+    // 1. The script runs out after one tool call: the run fails (outcome error).
+    let sup = f.supervisor(config());
+    f.script(vec![template(
+        "Looking.",
+        json!([{"name": "bash", "arguments": {"command": "true"}}]),
+    )]);
+    let r = sup
+        .run_ticket(req(2085, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Error, "{r:?}");
+    let runs = f.calls("amp_report_run");
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let run = &runs[0];
+    assert_eq!(run["task_id"], 2085);
+    assert_eq!(run["outcome"], "abandoned");
+    assert_eq!(run["agent_id"], "amp:amp-worker-backend");
+    assert_eq!(run["model"], "wf/wf-1");
+    let note = run["run_note"].as_str().unwrap();
+    assert!(
+        note.starts_with("abandoned: error: ") && !note.starts_with("abandoned: error: error"),
+        "{note}"
+    );
+    assert!(!note.contains('\n'), "{note}");
+    assert_eq!(num(&run["input_tokens"]), r.usage.input_tokens);
+    assert_eq!(num(&run["output_tokens"]), r.usage.output_tokens);
+    assert!(run.get("cost_usd").is_none(), "faux reports no cost: {run}");
+    // AMP #3005: this run committed nothing, so it reports no git fields at all — not even its
+    // branch. A run that names a branch sits in `UnmergedWork` ("Merge needed") whatever
+    // `pushed` says, which is how a no-change run held the plan (#2966).
+    assert_eq!(
+        git(&f.worktree(2085), &["rev-parse", "HEAD"]),
+        git(&f.repo, &["rev-parse", "HEAD"]),
+        "the worktree made no commit"
+    );
+    for field in ["branch", "commit", "pushed"] {
+        assert!(run.get(field).is_none(), "{field}: {run}");
+    }
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.contains("reported the run to AMP")),
+        "{:?}",
+        r.notes
+    );
+    assert!(f.calls("amp_complete_task").is_empty());
+
+    // 2. The turn budget runs out.
+    let sup = f.supervisor(SupervisorConfig {
+        max_turns: 1,
+        ..config()
+    });
+    f.script(vec![
+        template(
+            "1",
+            json!([{"name": "bash", "arguments": {"command": "true"}}]),
+        ),
+        template(
+            "2",
+            json!([{"name": "bash", "arguments": {"command": "true"}}]),
+        ),
+        template("3", json!([])),
+    ]);
+    let r = sup
+        .run_ticket(req(2086, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::TurnBudget, "{r:?}");
+    let runs = f.calls("amp_report_run");
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1]["task_id"], 2086);
+    assert_eq!(runs[1]["outcome"], "abandoned");
+    assert!(
+        runs[1]["run_note"]
+            .as_str()
+            .unwrap()
+            .starts_with("abandoned: turn_budget: turn budget of 1 turns"),
+        "{}",
+        runs[1]
+    );
+
+    // 3. A read-only worker stops without closing its ticket: reported, but with no git fields
+    //    (it ran in the manager's checkout, which is not its work).
+    f.script(vec![template("Nothing to do.", json!([]))]);
+    let r = sup
+        .run_ticket(req(7, "researcher"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Stopped);
+    let runs = f.calls("amp_report_run");
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[2]["run_note"], "abandoned: stopped");
+    assert_eq!(runs[2]["agent_id"], "amp:amp-researcher");
+    for field in ["branch", "commit", "pushed"] {
+        assert!(runs[2].get(field).is_none(), "{field}: {}", runs[2]);
+    }
+
+    // 4. AMP refuses the report: the worker's report says so, nothing fails.
+    f.script(vec![template("Nothing.", json!([]))]);
+    let r = sup
+        .run_ticket(req(4041, "researcher"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Stopped);
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.contains("could not report the abandoned run") && n.contains("4041")),
+        "{:?}",
+        r.notes
+    );
+
+    // AMP #2802: every end that doesn't close the ticket hands it back, not just the chat's own
+    // stops. All four were dispatched and none closed its ticket, so each went back to ready
+    // through amp_return_task (the returned path: it clears the dispatch and records
+    // returned_reason, which is what the manager's `returned` list reads).
+    let returned: Vec<Value> = f.calls("amp_return_task");
+    let ids: Vec<i64> = returned
+        .iter()
+        .filter_map(|r| r["task_id"].as_i64())
+        .collect();
+    assert_eq!(ids, vec![2085, 2086, 7, 4041], "{returned:?}");
+    for r in &returned {
+        assert!(
+            r["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("returned to ready by amp-harness: abandoned:"),
+            "{r}"
+        );
+    }
+    // Their reasons name the outcome, so the ticket's history says what happened.
+    assert!(
+        returned[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("abandoned: error"),
+        "{}",
+        returned[0]
+    );
+    assert!(
+        returned[2]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("abandoned: stopped"),
+        "{}",
+        returned[2]
+    );
+    // Nothing needed the set-state fallback: none of these had claimed its ticket (the mock's
+    // amp_claim_task answers already_started, but the ticket stays returnable in this mock), so
+    // amp_return_task took them.
+    assert!(
+        f.calls("amp_set_task_state").is_empty(),
+        "no fallback needed"
+    );
+}
+
+/// #2225: a worker whose model repeats one call is stopped at the 5th identical call, and its
+/// abandoned run says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_stopped_for_repeating_one_call_records_an_abandoned_run_saying_why() {
+    let f = fixture("repeating", false).await;
+    let sup = f.supervisor(config());
+    let mut steps: Vec<FauxStep> = (0..8)
+        .map(|_| {
+            template(
+                "Looking.",
+                json!([{"name": "bash", "arguments": {"command": "ls"}}]),
+            )
+        })
+        .collect();
+    steps.push(template("never reached", json!([])));
+    f.script(steps);
+    let r = sup
+        .run_ticket(req(2225, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Stopped, "{r:?}");
+    let why = "the model kept repeating `bash ls` (5 identical calls in a row) and was stopped";
+    assert_eq!(r.error.as_deref(), Some(why), "{r:?}");
+    assert_eq!(r.tool_calls, 5, "nothing ran after the stop: {r:?}");
+    assert_eq!(r.tool_errors, 1, "{r:?}");
+    let runs = f.calls("amp_report_run");
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["task_id"], 2225);
+    assert_eq!(runs[0]["outcome"], "abandoned");
+    assert_eq!(runs[0]["run_note"], format!("abandoned: stopped: {why}"));
+    assert!(f.calls("amp_complete_task").is_empty());
+}
+
+/// A step that cancels `token` (as the manager's abort or Ctrl-C would, mid-turn), then starts a
+/// long bash call so the run is still going when the supervisor sees the cancel.
+fn cancel_then_sleep(token: CancellationToken) -> FauxStep {
+    FauxStep::factory(move |_ctx: &Context| {
+        token.cancel();
+        faux_assistant_message(
+            vec![
+                FauxBlock::text("Wrapping up."),
+                FauxBlock::tool_call("bash", json!({"command": "sleep 30"})),
+            ],
+            StopReason::ToolUse,
+        )
+    })
+}
+
+fn sleep_call() -> FauxStep {
+    template(
+        "One more thing.",
+        json!([{"name": "bash", "arguments": {"command": "sleep 30"}}]),
+    )
+}
+
+fn complete_call(task_id: i64) -> FauxStep {
+    template(
+        "Done.",
+        json!([{"name": "amp_complete_task", "arguments": {"task_id": task_id}}]),
+    )
+}
+
+// #2146: a worker stopped after its closing call succeeded keeps its outcome; reporting an
+// abandoned run as well would count the work as rework and its tokens twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_stopped_after_closing_its_ticket_is_not_abandoned() {
+    let f = fixture("stopped-after-close", false).await;
+
+    // 1. Completed, then cancelled during its final turn.
+    let sup = f.supervisor(config());
+    let signal = CancellationToken::new();
+    f.script(vec![complete_call(2087), cancel_then_sleep(signal.clone())]);
+    let r = sup
+        .run_ticket(req(2087, "worker-backend"), signal)
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Completed, "{r:?}");
+    assert_eq!(r.error, None, "{r:?}");
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.starts_with("stopped after closing its ticket: cancelled")),
+        "{:?}",
+        r.notes
+    );
+    assert_eq!(f.calls("amp_complete_task").len(), 1);
+    assert!(f.calls("amp_report_run").is_empty(), "no abandoned run");
+
+    // 2. Blocked, then over its turn budget on the next turn.
+    let sup = f.supervisor(SupervisorConfig {
+        max_turns: 1,
+        ..config()
+    });
+    f.script(vec![
+        template(
+            "Need an answer.",
+            json!([{"name": "amp_block_task", "arguments": {"task_id": 2088, "reason": "A or B?"}}]),
+        ),
+        sleep_call(),
+    ]);
+    let r = sup
+        .run_ticket(req(2088, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Blocked, "{r:?}");
+    assert_eq!(r.error, None, "{r:?}");
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.starts_with("stopped after closing its ticket: turn_budget")),
+        "{:?}",
+        r.notes
+    );
+    assert!(f.calls("amp_report_run").is_empty(), "no abandoned run");
+
+    // 3. Completed, then over its turn budget.
+    f.script(vec![complete_call(2089), sleep_call()]);
+    let r = sup
+        .run_ticket(req(2089, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Completed, "{r:?}");
+    assert!(f.calls("amp_report_run").is_empty(), "no abandoned run");
+
+    // 4. Cancelled before closing anything: still an abandoned run.
+    let sup = f.supervisor(config());
+    let signal = CancellationToken::new();
+    f.script(vec![cancel_then_sleep(signal.clone())]);
+    let r = sup
+        .run_ticket(req(2090, "worker-backend"), signal)
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Cancelled, "{r:?}");
+    let runs = f.calls("amp_report_run");
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["task_id"], 2090);
+    assert_eq!(runs[0]["outcome"], "abandoned");
+    assert!(
+        runs[0]["run_note"]
+            .as_str()
+            .unwrap()
+            .starts_with("abandoned: cancelled"),
+        "{}",
+        runs[0]
+    );
+    // #2204 + AMP #2802: the chat stopped it, so nobody is on the ticket: it is handed back to
+    // ready. AMP's own returned path takes it (amp_return_task), which also records why.
+    let released = f.calls("amp_return_task");
+    assert_eq!(released.len(), 1, "{released:?}");
+    assert_eq!(released[0]["task_id"], 2090);
+    assert!(
+        released[0]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("returned to ready by amp-harness: abandoned: cancelled"),
+        "{}",
+        released[0]
+    );
+    assert!(
+        f.calls("amp_set_task_state").is_empty(),
+        "the returned path took it"
+    );
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n == "returned #2090 to ready in AMP (nobody is working on it now)"),
+        "{:?}",
+        r.notes
+    );
+
+    // 5. Closing some other ticket does not close its own: cancelled after it is still abandoned.
+    let signal = CancellationToken::new();
+    f.script(vec![complete_call(9999), cancel_then_sleep(signal.clone())]);
+    let r = sup
+        .run_ticket(req(2091, "worker-backend"), signal)
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Cancelled, "{r:?}");
+    let runs = f.calls("amp_report_run");
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(runs[1]["task_id"], 2091);
+    assert_eq!(f.calls("amp_return_task")[1]["task_id"], 2091);
+
+    // 6. AMP refuses to take the ticket back: the report says so, nothing fails.
+    let signal = CancellationToken::new();
+    f.script(vec![cancel_then_sleep(signal.clone())]);
+    let r = sup
+        .run_ticket(req(4042, "worker-backend"), signal)
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Cancelled, "{r:?}");
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.starts_with("could not return #4042 to ready in AMP")
+                && n.contains("owned by someone else")),
+        "{:?}",
+        r.notes
+    );
+}

@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AMP Harness · The terminal cockpit built for AMP</title>
+<meta name="description" content="AMP Harness is AMP's own terminal chat and coding agent: a manager that plans on the AMP board and runs specialist workers on tickets, with any model provider, any MCP server, and every run reported. macOS and Linux.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/home/harness/harness.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="/home/" aria-label="AMP home">
+      <span class="mark" aria-hidden="true"><i class="b1"></i><i class="b2"></i><i class="b3"></i><i class="b4"></i></span>
+      <span class="word">AMP</span>
+      <span class="sub">Harness</span>
+    </a>
+    <nav class="nav-links" aria-label="Sections">
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+      <a href="#first-run">First run</a>
+      <a href="#enterprise">Enterprise</a>
+      <a href="#guide">Guide</a>
+      <a href="https://github.com/jacobsims214/amp">GitHub</a>
+      <a class="btn" href="#install">Install</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+  <section class="hero" aria-labelledby="hero-title">
+    <canvas id="stars" aria-hidden="true"></canvas>
+    <div class="wrap">
+      <div class="copyblock">
+        <div class="kicker label"><span class="dot" aria-hidden="true"></span>AMP Harness<span class="mono plain">· macOS and Linux · open source</span></div>
+        <h1 id="hero-title">The terminal cockpit <em>built for AMP</em></h1>
+        <p><b>amp-harness</b> is AMP's own terminal chat and coding agent. Run it in your project beside the AMP web UI: you talk to your manager agent, it plans on the board, runs specialist workers on your tickets and <b>reports every run by itself</b>.</p>
+        <div class="panel">
+          <div class="ph"><span class="label">Install · one line</span><button type="button" class="copy" data-copy="hero-install" aria-label="Copy the install command">Copy</button></div>
+<pre class="code w" id="hero-install">curl -fsSL https://raw.githubusercontent.com/jacobsims214/amp/main/v2/harness/install.sh | sh</pre>
+        </div>
+        <div class="pre">Latest release: <span class="mono">harness-v0.2.0</span>. Or <a href="#prerelease">build it from source</a>.</div>
+        <div class="ctas">
+          <a class="btn solid" href="#install">Install and set up</a>
+          <a class="btn" href="#features">What it does</a>
+        </div>
+      </div>
+      <figure class="shot" data-shot="hero-chat">
+        <a class="shot-link" href="chat-02-dispatch.webp" aria-label="Open full-size screenshot: the chat, with the manager dispatching workers">
+          <img src="chat-02-dispatch.webp" width="899" height="520" fetchpriority="high" alt="amp-harness 0.2.0 chat in a terminal. The header shows the AMP project, signed-in user, server and the manager's model. Asked to work the ready tickets, the manager dispatches tickets #650 and #651 to backend workers, and the Workers box shows both running with their time, tokens and cost.">
+        </a>
+      </figure>
+    </div>
+    <div class="bands-h" aria-hidden="true"></div>
+  </section>
+
+  <section id="what" aria-labelledby="what-title">
+    <div class="wrap split top">
+      <div class="head">
+        <span class="label">What it is</span>
+        <h2 id="what-title">AMP's own harness, flown from your terminal</h2>
+        <p class="lede">AMP stays harness-agnostic: Claude Code, opencode and any MCP client keep docking at the same board. AMP Harness is the built-in default. It already knows AMP's agents, skills, approvals and run records, so there is nothing to wire up.</p>
+        <p class="lede">One binary, written in Rust. Every setting has a command, so nobody has to edit a config file by hand.</p>
+      </div>
+      <div class="list">
+        <div><span class="label">You talk to</span><p>The manager. It turns a goal into epics, stories and tickets on the AMP board, then waits for you to approve the plan in the web UI.</p></div>
+        <div><span class="label">It runs</span><p>Specialist workers on each approved ticket: backend, frontend, docs, designer, reviewers, researchers, media and the KB curator, each on the model you chose for its role.</p></div>
+        <div><span class="label">It reports</span><p>Every worker's model, tokens, cost, branch and commit go on its ticket, so AMP's spend and trace views work with no extra step.</p></div>
+        <div><span class="label">Beside the UI</span><p>The web UI stays where people approve plans, answer questions and review artifacts. The chat links straight to each ticket and to the Flight plan page.</p></div>
+        <div><span class="label">Prefer another?</span><p>Keep it. The <a href="/home/#install">Claude Code and opencode plugins</a> bring the same agents and skills.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="features" class="bt" aria-labelledby="feat-title">
+    <div class="wrap">
+      <div class="head">
+        <span class="label">Out of the box</span>
+        <h2 id="feat-title">Everything a crew needs, in one binary</h2>
+        <p class="lede">What's in the harness today, before you configure anything. Each card ends with the command or the words you'd see.</p>
+      </div>
+      <div class="grid">
+        <div class="cell"><span class="tick b4" aria-hidden="true"></span><span class="n">01</span>
+          <h3>A chat in AMP's colors</h3>
+          <p>A full-screen terminal chat with AMP's dark and light themes. The header shows your server, you, the project and the ticket in flight; the status line shows questions, workers, plan approval and board counts, live.</p>
+          <div class="eg">/ticket · /questions · /plan · /workers · /open</div></div>
+        <div class="cell"><span class="tick b3" aria-hidden="true"></span><span class="n">02</span>
+          <h3>Manager plus specialists</h3>
+          <p>The manager dispatches specialist workers through AMP. Each worker that edits files gets its own git worktree and branch, so parallel tickets never touch each other's checkout.</p>
+          <div class="eg">ticket 2108 → <b>.worktrees/2108</b> on amp-2108</div></div>
+        <div class="cell"><span class="tick b2" aria-hidden="true"></span><span class="n">03</span>
+          <h3>Every run on the record</h3>
+          <p>The harness fills in each worker's model, tokens, cost, branch and commit on its ticket. A worker that stops without closing its ticket is recorded as abandoned, with the reason.</p>
+          <div class="eg">#2108 · worker-backend · 42,180 in · 18,044 out · pushed</div></div>
+        <div class="cell"><span class="tick b1" aria-hidden="true"></span><span class="n">04</span>
+          <h3>Your go, not the agent's</h3>
+          <p>Only a person approves a plan, in the web UI. The harness never lets an agent approve it; when the manager hits a step that's yours, it stops and links you to the Flight plan page.</p>
+          <div class="eg">⏸ Waiting for your approval · /open plan</div></div>
+        <div class="cell"><span class="tick b4" aria-hidden="true"></span><span class="n">05</span>
+          <h3>Any provider, a model per role</h3>
+          <p>OpenRouter, an Anthropic API key, OpenAI, or your own OpenAI-compatible endpoint (vLLM, Ollama, LM Studio, LiteLLM, a gateway). The manager, workers and reviewers can each run a different model and thinking level.</p>
+          <div class="eg">amp-harness models set reviewer anthropic/claude-opus-5-5</div></div>
+        <div class="cell"><span class="tick b3" aria-hidden="true"></span><span class="n">06</span>
+          <h3>Enterprise endpoints</h3>
+          <p>Your company's endpoint, however it signs in: API key as bearer or header, Azure OpenAI, Microsoft Entra ID, OAuth client credentials, or a token command (an SSO helper, Vault, <span class="mono">az</span>, <span class="mono">gcloud</span>). Custom CA, mTLS and proxies too.</p>
+          <div class="eg">auth = "azure-entra" · ca_file · client_cert · proxy</div></div>
+        <div class="cell"><span class="tick b2" aria-hidden="true"></span><span class="n">07</span>
+          <h3>Any MCP server</h3>
+          <p>Every transport: stdio, Streamable HTTP and legacy HTTP+SSE, with OAuth login. Choose which roles may use each server. Servers defined in a repo start only once you trust them.</p>
+          <div class="eg">amp-harness mcp add github https://… --roles 'worker-*'</div></div>
+        <div class="cell"><span class="tick b1" aria-hidden="true"></span><span class="n">08</span>
+          <h3>Bring your servers along</h3>
+          <p>Import the MCP servers you already set up, once, when you ask. Secret-looking values move to the keychain on the way in.</p>
+          <div class="chips" aria-label="Import sources"><span class="chip">Claude Code</span><span class="chip">opencode</span><span class="chip">VS Code</span><span class="chip">Cursor</span><span class="chip">Claude Desktop</span></div>
+          <div class="eg">amp-harness mcp import --from claude --dry-run</div></div>
+        <div class="cell"><span class="tick b4" aria-hidden="true"></span><span class="n">09</span>
+          <h3>Your own agents and skills</h3>
+          <p>AMP's 11 agents and 23 skills ship inside the binary. Override any of them, or add new ones, for yourself or for everyone who clones a repo.</p>
+          <div class="eg">amp-harness agents new sql-expert --from worker</div></div>
+        <div class="cell"><span class="tick b3" aria-hidden="true"></span><span class="n">10</span>
+          <h3>Live reload</h3>
+          <p>Change agents, skills, models or MCP servers from another terminal and the running chat picks it up: by itself a moment after the files settle, or at once with <span class="mono">/reload</span>.</p>
+          <div class="eg">agents: +sql-expert · mcp: +github ~fs</div></div>
+        <div class="cell"><span class="tick b2" aria-hidden="true"></span><span class="n">11</span>
+          <h3>Keys in your OS keychain</h3>
+          <p>Provider keys and logins are typed into a hidden prompt, checked with the provider and kept in the OS keychain. Never in a file, never as a command-line argument. CI uses environment variables.</p>
+          <div class="eg">amp-harness connect · /connect in the chat</div></div>
+        <div class="cell"><span class="tick b1" aria-hidden="true"></span><span class="n">12</span>
+          <h3>Doctor</h3>
+          <p>One command checks the server, your login, the project, every role's model and key, MCP servers, agents and skills, and says how to fix whatever fails.</p>
+          <div class="eg">amp-harness doctor · ok · warn · fail, with the fix</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="install" class="band-surface" aria-labelledby="install-title">
+    <div class="wrap">
+      <div class="head">
+        <span class="label">Install</span>
+        <h2 id="install-title">One line. Then it asks what it needs.</h2>
+        <p class="lede">The installer downloads the newest release for your platform, checks its SHA-256 and puts <code>amp-harness</code> in <code>~/.local/bin</code>, with no sudo. In a terminal it then offers to run setup.</p>
+      </div>
+      <div class="installs">
+        <div class="inst">
+          <h3>For yourself <small>the default roster</small></h3>
+          <div class="panel">
+            <div class="ph"><span class="label">Install · personal</span><button type="button" class="copy" data-copy="install-personal" aria-label="Copy the personal install command">Copy</button></div>
+<pre class="code w" id="install-personal">curl -fsSL https://raw.githubusercontent.com/jacobsims214/amp/main/v2/harness/install.sh | sh</pre>
+          </div>
+          <p>Setup signs you in to AMP, links the folder to a project and connects a model provider.</p>
+        </div>
+        <div class="inst">
+          <h3>With your company's preset <small>--preset</small></h3>
+          <div class="panel">
+            <div class="ph"><span class="label">Install · org preset</span><button type="button" class="copy" data-copy="install-preset" aria-label="Copy the org preset install command">Copy</button></div>
+<pre class="code w" id="install-preset">curl -fsSL https://raw.githubusercontent.com/jacobsims214/amp/main/v2/harness/install.sh | sh -s -- --preset https://intranet.example.com/amp-preset.toml</pre>
+          </div>
+          <p>Your admin's preset sets the AMP server, the model endpoint and each role's model. It holds no secrets: you're asked only for your own key and login. See <a href="#enterprise">enterprise rollout</a>.</p>
+        </div>
+      </div>
+      <div class="lines">
+        <div class="inst">
+          <h3>Upgrade</h3>
+          <p>Run the same line again. It replaces the binary in place, never over a running one, and keeps your config, keys and logins.</p>
+        </div>
+        <div class="inst">
+          <h3>Uninstall</h3>
+          <div class="panel">
+            <div class="ph"><span class="label">Uninstall</span><button type="button" class="copy" data-copy="install-uninstall" aria-label="Copy the uninstall command">Copy</button></div>
+<pre class="code w" id="install-uninstall">curl -fsSL https://raw.githubusercontent.com/jacobsims214/amp/main/v2/harness/install.sh | sh -s -- --uninstall</pre>
+          </div>
+          <p>Removes only the binary, and lists what it kept (config, keychain items, each project's <code>.amp.json</code>).</p>
+        </div>
+      </div>
+      <div class="prerelease" id="prerelease">
+        <div>
+          <h3>Build from source</h3>
+          <p>The one-liner downloads the newest published <code>harness-v*</code> release, 0.2.0 today. To build from a checkout instead, you need git and rustup.</p>
+          <p>Platforms: macOS 13 or newer (Apple silicon or Intel), and Linux on x86_64 or aarch64 with glibc 2.35 or newer. Alpine and other musl systems aren't supported yet.</p>
+        </div>
+        <div class="panel">
+          <div class="ph"><span class="label">Build from source</span><button type="button" class="copy" data-copy="install-source" aria-label="Copy the build-from-source commands">Copy</button></div>
+<pre class="code" id="install-source">git clone https://github.com/jacobsims214/amp.git && cd amp
+<span class="c"># release build, installed by install.sh</span>
+make -C v2/harness install</pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="first-run" class="dark" aria-labelledby="first-title">
+    <div class="wrap">
+      <div class="head">
+        <span class="label">First run</span>
+        <h2 id="first-title">Three steps to your first mission</h2>
+        <p class="lede">Setup asks only for what isn't done yet, and it's safe to run again. Running plain <code>amp-harness</code> in a new terminal does the same first run before the chat opens.</p>
+      </div>
+      <div class="steps">
+        <div class="step"><span class="lamp" aria-hidden="true"></span><span class="n">01</span>
+          <h3>Sign in to AMP</h3>
+          <p>Give setup your AMP server (<code>amp.example.com</code> or a full URL). It checks the server, then opens AMP's sign-in page in your browser. The login is kept in your OS keychain.</p>
+          <div class="term"><span class="p" aria-hidden="true">$ </span><b>amp-harness setup</b></div></div>
+        <div class="step"><span class="lamp" aria-hidden="true"></span><span class="n">02</span>
+          <h3>Link and connect</h3>
+          <ul>
+            <li>Link this folder to an AMP project, existing or new. Setup writes <code>.amp.json</code> at the repo root.</li>
+            <li>Pick a model provider: OpenRouter, Anthropic, OpenAI or your own endpoint. The key is typed hidden and checked.</li>
+          </ul></div>
+        <div class="step"><span class="lamp" aria-hidden="true"></span><span class="n">03</span>
+          <h3>Talk to the manager</h3>
+          <p>Run it in your project folder and say what you want built. Approve the plan in the web UI when it asks. If anything looks off, ask the doctor.</p>
+          <div class="term"><span class="p" aria-hidden="true">$ </span><b>amp-harness</b>
+<span class="p" aria-hidden="true">$ </span><b>amp-harness doctor</b></div></div>
+      </div>
+      <div class="shots">
+        <figure class="shot" data-shot="setup">
+          <a class="shot-link" href="setup-02-provider.webp" aria-label="Open full-size screenshot: Setup, step by step">
+            <img src="setup-02-provider.webp" width="899" height="520" loading="lazy" decoding="async" alt="The one-line installer downloading amp-harness 0.2.0, verifying its checksum and starting setup: setup confirms the AMP server, signs in, keeps the folder linked to project #183 Acme Notes, and asks which model provider the agents use: OpenRouter, Anthropic, OpenAI or your own OpenAI-compatible endpoint.">
+          </a>
+          <figcaption>Setup, step by step</figcaption>
+        </figure>
+        <figure class="shot" data-shot="workers">
+          <a class="shot-link" href="chat-03-workers-finished.webp" aria-label="Open full-size screenshot: Workers, live in the chat">
+            <img src="chat-03-workers-finished.webp" width="899" height="520" loading="lazy" decoding="async" alt="The amp-harness chat after two workers finish tickets #650 and #651, each with its run time and tokens. The manager carries on by itself, dispatches the next ticket, #652, and the Workers box shows it running.">
+          </a>
+          <figcaption>Workers, live in the chat</figcaption>
+        </figure>
+        <figure class="shot" data-shot="doctor">
+          <a class="shot-link" href="doctor-01-checks.webp" aria-label="Open full-size screenshot: Doctor, checking it all">
+            <img src="doctor-01-checks.webp" width="899" height="548" loading="lazy" decoding="async" alt="amp-harness doctor output: a list of checks for config, credentials, connection, versions, contract tools, project, roles, model providers, each MCP server, skills, agents and workspace isolation, ending in &quot;No failures (1 warning)&quot;. The warning about the file credential store comes with its fix.">
+          </a>
+          <figcaption>Doctor, checking it all</figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <section id="enterprise" aria-labelledby="ent-title">
+    <div class="wrap">
+      <div class="head">
+        <span class="label">Enterprise rollout</span>
+        <h2 id="ent-title">Your models, your endpoint, one preset</h2>
+        <p class="lede">Say your company serves two models, <code>engineer</code> and <code>orchestrator</code>, from an OpenAI-compatible endpoint at <code>api.example.com</code>. An admin writes one preset file; everyone installs with one line and is asked only for their own key. Nothing contacts OpenRouter.</p>
+      </div>
+      <div class="ent">
+        <ol>
+          <li><div><h3>Write the preset</h3><p>The AMP server, the endpoint, its models and which model each role runs on. A preset that holds anything secret-looking, an unknown key or a non-https URL is refused.</p></div></li>
+          <li><div><h3>Try it yourself</h3><p><code>amp-harness setup --preset ./enterprise-preset.toml</code>, then <code>amp-harness doctor</code>.</p></div></li>
+          <li><div><h3>Host it on https</h3><p>For example <code>https://intranet.example.com/amp-preset.toml</code>. Setup fetches it only over https.</p></div></li>
+          <li><div><h3>Send the install line</h3><p>The <a href="#install"><code>--preset</code> one-liner</a>. Each person signs in to AMP, links a project and types their own key. CI uses <code>--yes</code> with keys from the environment.</p></div></li>
+        </ol>
+        <div class="stack">
+          <div class="panel">
+            <div class="ph"><span class="label">enterprise-preset.toml</span><span class="mono sm">no secrets</span></div>
+<pre class="code">[preset]
+name = "Example Corp"
+
+[server]
+url = "https://amp.example.com"
+
+[providers.example]
+name = "Example AI"
+base_url = "https://api.example.com/v1"
+models = ["engineer", "orchestrator"]
+
+[roles]
+default = "example/engineer"
+manager = "example/orchestrator"
+reviewers = "example/orchestrator"</pre>
+          </div>
+          <div class="tbl-wrap">
+            <table class="roles">
+              <caption class="label">Who runs on what</caption>
+              <thead><tr><th scope="col">Role group</th><th scope="col">Model</th></tr></thead>
+              <tbody>
+                <tr><td>Manager <small>plans and dispatches</small></td><td class="m">example/orchestrator</td></tr>
+                <tr><td>Reviewers <small>review the work</small></td><td class="m">example/orchestrator</td></tr>
+                <tr><td>Workers <small>backend, frontend, docs, designer</small></td><td class="m">example/engineer</td></tr>
+                <tr><td>Helpers <small>research, media, KB upkeep</small></td><td class="m">example/engineer</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="guide" class="band-surface" aria-labelledby="guide-title">
+    <div class="wrap">
+      <div class="head">
+        <span class="label">The guide</span>
+        <h2 id="guide-title">Every setting, explained</h2>
+        <p class="lede">The harness pages of AMP's built-in guide. Any agent connected to AMP can read them to you, and walk you through each step.</p>
+      </div>
+      <nav class="guide" aria-label="AMP Harness guide pages">
+        <a href="https://github.com/jacobsims214/amp/blob/main/v2/kb/harness/start-here.md"><strong>Start here</strong><span>What the harness is and where everything lives</span><em>start-here</em></a>
+        <a href="https://github.com/jacobsims214/amp/blob/main/v2/kb/harness/install.md"><strong>Install, upgrade, uninstall</strong><span>The one-liner, the first run, building from source</span><em>install</em></a>
+        <a href="https://github.com/jacobsims214/amp/blob/main/v2/kb/harness/servers-and-login.md"><strong>Servers and login</strong><span>Point it at an AMP, switch servers, sign in</span><em>servers-and-login</em></a>
+        <a href="https://github.com/jacobsims214/amp/blob/main/v2/kb/harness/providers-and-keys.md"><strong>Providers and keys</strong><span>Model provider keys and your own endpoint</span><em>providers-and-keys</em></a>
+        <a href="https://github.com/jacobsims214/amp/blob/main/v2/kb/harness/models-per-role.md"><strong>Models per role</strong><span>Which model the manager, workers and reviewers run on</span><em>models-per-role</em></a>
+        <a href="https://github.com/jacobsims214/amp/blob/main/v2/kb/harness/agents-and-skills.md"><strong>Agents and skills</strong><span>Change the built-in ones or add your own</span><em>agents-and-skills</em></a>
+        <a href="https://github.com/jacobsims214/amp/blob/main/v2/kb/harness/mcp-servers.md"><strong>MCP servers</strong><span>stdio, http and sse servers, import, trust, roles</span><em>mcp-servers</em></a>
+        <a href="https://github.com/jacobsims214/amp/blob/main/v2/kb/harness/configuration.md"><strong>Configuration</strong><span>Which file a setting comes from, and reloading</span><em>configuration</em></a>
+        <a href="https://github.com/jacobsims214/amp/blob/main/v2/kb/harness/running-work.md"><strong>Running work</strong><span>Chat, headless runs, workers, approvals, limits</span><em>running-work</em></a>
+        <a href="https://github.com/jacobsims214/amp/blob/main/v2/kb/harness/troubleshooting.md"><strong>Troubleshooting</strong><span>Doctor, keychain, TLS and model problems</span><em>troubleshooting</em></a>
+        <a href="https://github.com/jacobsims214/amp/blob/main/v2/kb/harness/enterprise-provider.md"><strong>Enterprise provider</strong><span>Your company's endpoint, step by step, and team rollout</span><em>enterprise-provider</em></a>
+      </nav>
+    </div>
+  </section>
+
+  <section id="launch" class="dark launch" aria-labelledby="launch-title">
+    <div class="wrap">
+      <div class="head">
+        <span class="label">Ready for launch</span>
+        <h2 id="launch-title">Install it, sign in, fly your first ticket</h2>
+        <p class="lede">You need an AMP to connect to: sign in to yours, or launch your own from the Helm chart.</p>
+        <div class="ctas">
+          <a class="btn solid" href="#install">Install AMP Harness</a>
+          <a class="btn" href="/home/#self-host">Launch your own AMP</a>
+        </div>
+      </div>
+      <div class="side">
+        <p>Already on Claude Code or opencode? Keep it. AMP is harness-agnostic, and <a href="/home/#install">the plugins</a> bring the same crew.</p>
+        <p>The harness is open source under Apache-2.0, in the same repository as AMP: <a href="https://github.com/jacobsims214/amp/tree/main/v2/harness">v2/harness</a>.</p>
+      </div>
+    </div>
+  </section>
+</main>
+<footer>
+  <div class="wrap">
+    <span class="mark" aria-hidden="true"><i class="b1"></i><i class="b2"></i><i class="b3"></i><i class="b4"></i></span>
+    <span>AMP Harness · part of AMP, open-source mission control for humans and agents · Apache-2.0</span>
+    <a href="/home/">AMP home</a><a href="/oauth2/start?rd=%2F">Sign in</a><a href="https://github.com/jacobsims214/amp">GitHub</a><a href="https://github.com/jacobsims214/amp/blob/main/v2/kb/harness/start-here.md">Guide</a>
+  </div>
+</footer>
+
+<script src="/home/harness/harness.js" defer></script>
+</body>
+</html>

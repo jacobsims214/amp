@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect } from 'react'
-import { useParams, useSearchParams } from 'react-router-dom'
+import { useParams } from 'react-router-dom'
+import { useFocusParam } from '../hooks/useFocusParam'
 import { RefreshCw, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users, ListChecks } from 'lucide-react'
 import { useBoardData } from '../hooks/useBoardData'
 import { useSSE } from '../hooks/useSSE'
@@ -25,6 +26,9 @@ import { lookupPerson, ownerFilterNarrows, peopleById, personName, taskMatchesOw
 import type { Task, TaskState, Epic, Story, ProjectMember, ProjectAccess, Metadata, HumanReason } from '../types'
 import { HUMAN_REASONS } from '../lib/human'
 import { BandLoader } from '../components/brand/BandLoader'
+import { ApprovalLink } from '../components/ApprovalLink'
+import { usePlanApproval } from '../hooks/usePlanApproval'
+import { awaitingApproval } from '../lib/approval'
 
 // Label column width and task column min-width are tuned for responsiveness.
 // Label col: 180px | task col: 168px → total minimum = 180 + 5×168 = 1020px (fits 13" screens)
@@ -68,9 +72,8 @@ export function Board() {
   const meId = me?.user_id
   // Track the selected task by id so the drawer reflects live updates
   // (assign responses, SSE) instead of a stale snapshot.
-  const [searchParams] = useSearchParams()
-  // ?task=ID opens that ticket (links from artifacts and elsewhere).
-  const [selectedTaskId, setSelectedTaskId] = useState<number | null>(() => Number(searchParams.get('task')) || null)
+  // ?focus=ID (or the old ?task=) opens that ticket's drawer; it stays in the URL until closed.
+  const [selectedTaskId, setSelectedTaskId] = useFocusParam()
   const selectedTask = selectedTaskId === null ? null : tasks.find(t => t.id === selectedTaskId) ?? null
   const [filter, setFilter] = useState<FilterState>(DEFAULT_FILTER)
   const [collapsedEpics, setCollapsedEpics] = useState<Set<number>>(new Set())
@@ -82,8 +85,14 @@ export function Board() {
   const [members, setMembers] = useState<ProjectMember[]>([])
   const [myAccess, setMyAccess] = useState<ProjectAccess | null>(null)
   const [openReassign, setOpenReassign] = useState(false)
+  // The project's watchdog flag timeout (0 = off): past it the amber
+  // "Dispatched · not started" badge fills in (AMP #2801).
+  const [notStartedFlagMinutes, setNotStartedFlagMinutes] = useState<number | undefined>(undefined)
   const [teamAccessOpen, setTeamAccessOpen] = useState(false)
   const people = useMemo(() => peopleById(members), [members])
+  // Tickets waiting on approval: a one-line link to My work, where approving happens.
+  const approval = usePlanApproval(pid)
+  const awaiting = useMemo(() => awaitingApproval(tasks, approval.project), [tasks, approval.project])
   const ownersOf = (ids: number[] | undefined): Person[] =>
     (ids ?? []).map(id => lookupPerson(people, id)!)
 
@@ -92,7 +101,12 @@ export function Board() {
       .then(r => { setMembers(r.members); setMyAccess(r.my_access) })
       .catch(() => { /* names fall back to "User #id"; actions still surface API errors */ })
     api.getProject(pid)
-      .then(p => setOpenReassign(p.open_reassign ?? false))
+      .then(p => {
+        setOpenReassign(p.open_reassign ?? false)
+        // The flag timeout only decides how loud the amber badge is; the
+        // badge itself comes from the ticket's server-supplied phase.
+        setNotStartedFlagMinutes(p.not_started_flag_minutes)
+      })
       .catch(() => { /* the server still enforces the rule; this only shapes buttons */ })
   }, [pid])
 
@@ -376,6 +390,12 @@ export function Board() {
         }
       />
 
+      {awaiting.length > 0 && (
+        <div className="px-5 pt-3 flex-shrink-0">
+          <ApprovalLink projectId={pid} project={approval.project} awaiting={awaiting} people={people} meId={meId} />
+        </div>
+      )}
+
       {/* Filter bar */}
       <div className="px-5 py-3 flex-shrink-0" style={{ borderBottom: '1px solid var(--line-sub)', background: 'var(--bg)' }}>
         <FilterBar
@@ -622,6 +642,7 @@ export function Board() {
                                         dimmed={hasFilter && !filteredTaskIds.has(task.id)}
                                         isScheduled={col.state === 'scheduled'}
                                         owner={lookupPerson(people, task.owner_user_id)}
+                                        notStartedFlagMinutes={notStartedFlagMinutes}
                                       />
                                     ))}
                                     {colTasks.length === 0 && <div className="h-8" />}
@@ -651,6 +672,7 @@ export function Board() {
         myAccess={myAccess}
         openReassign={openReassign}
         onTaskUpdated={applyTask}
+        notStartedFlagMinutes={notStartedFlagMinutes}
       />
 
       {planCheckOpen && (

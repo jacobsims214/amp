@@ -8,6 +8,7 @@ import (
 
 	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/kb"
+	"github.com/simstech/amp-api/internal/repository"
 )
 
 // Shared knowledge bases (docs/kb-scopes-design.md), against the rbacWorld:
@@ -63,6 +64,12 @@ func TestKB_ScopeAccess(t *testing.T) {
 	wantErr(t, w.as(w.lead).callExpectError(t, "amp_kb_delete", kbArgs(org, "path", "p.md")), "only org owners and admins")
 	kbAllowed(t, w.as(w.orgadmin), "amp_kb_write", doc(map[string]interface{}{"scope": "org", "org_id": float64(w.org.ID)}, "reason", goodReason))
 	wantErr(t, w.as(w.outsider).callExpectError(t, "amp_kb_list", map[string]interface{}{"scope": "org", "org_id": float64(w.org.ID)}), "not found")
+
+	// Reindex needs write access to the KB it names, like amp_kb_write.
+	kbAllowed(t, w.as(w.alice), "amp_kb_reindex", inProject)
+	wantErr(t, w.as(w.alice).callExpectError(t, "amp_kb_reindex", org), "only org owners and admins")
+	kbAllowed(t, w.as(w.orgadmin), "amp_kb_reindex", map[string]interface{}{"scope": "org", "org_id": float64(w.org.ID)})
+	wantErr(t, w.as(w.outsider).callExpectError(t, "amp_kb_reindex", inProject), "not found")
 
 	// Team KB: "the team" for a project is the one of its teams you're on.
 	kbAllowed(t, w.as(w.alice), "amp_kb_write", doc(team, "reason", goodReason))
@@ -211,6 +218,32 @@ func TestKB_ScopesKeepDocumentsApart(t *testing.T) {
 	w.as(w.orgadmin).call(t, "amp_manage_teams", map[string]interface{}{"action": "delete", "team_id": float64(w.devs.ID)})
 	if n, _ := w.s.kb.CountDocs(ctx, kb.Team(w.devs.ID)); n != 0 {
 		t.Fatalf("Devs KB still has %d docs after the team was deleted", n)
+	}
+	// ...into the trash: the docs stay in Postgres, soft-deleted, for 30
+	// days, and the KB can be restored from there.
+	devsKB := repository.KBScope{Kind: "team", ID: w.devs.ID}
+	if trashed, err := w.s.repo.ListTrashedKBPaths(ctx, devsKB, "kb-drop"); err != nil || len(trashed) != 1 || trashed[0] != "team/deploy-runbook.md" {
+		t.Fatalf("Devs KB trash after the team was deleted = %v, %v", trashed, err)
+	}
+	if n, err := w.s.kb.RestoreKB(ctx, kb.Team(w.devs.ID), "root"); err != nil || n != 1 {
+		t.Fatalf("RestoreKB = %d, %v", n, err)
+	}
+	if hits, err := w.s.kb.Search(ctx, kb.Team(w.devs.ID), "blue-green", nil, 10, 0, 0); err != nil || len(hits) != 1 {
+		t.Fatalf("search of the restored Devs KB = %v, %v", hits, err)
+	}
+	w.s.kb.Drop(ctx, kb.Team(w.devs.ID)) //nolint:errcheck // clean up the restored index
+
+	// Archiving a project is not deleting it: its KB stays live (not in the
+	// trash, so the purge never takes it) and searchable after a restore.
+	w.as(w.root).call(t, "amp_archive_project", project)
+	if _, err := w.s.repo.GetKBDocument(ctx, repository.KBScope{Kind: "project", ID: w.s.projectID}, "project/notes.md"); err != nil {
+		t.Fatalf("project KB doc after archive: %v", err)
+	}
+	w.as(w.root).call(t, "amp_restore_project", project)
+	// (as root: alice reached the project through the deleted Devs team)
+	res = w.as(w.root).call(t, "amp_kb_search", map[string]interface{}{"project_id": pid, "query": "payments"})
+	if res["count"].(float64) != 1 {
+		t.Fatalf("project search after archive and restore = %v", res)
 	}
 }
 

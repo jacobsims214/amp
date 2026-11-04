@@ -1,7 +1,8 @@
 # AMP Execution Skill
 
 You have one job: execute the assigned task completely and correctly.
-Your task ID and project ID are in your dispatch prompt.
+Your task ID, project ID and **dispatch ID** are in your dispatch prompt (or your harness passes
+the dispatch ID in the context block it gives you).
 
 Your ticket's comments are the only place you log progress. Never use a built-in tool like
 `todowrite` (you shouldn't even have it — it's denied on this agent) or any other mechanism as a
@@ -9,7 +10,31 @@ substitute. Progress lives in `amp_add_task_comment`, nowhere else.
 
 ---
 
-## Step 0 — Read .amp.json
+## Step 0 — Claim your ticket (if you have a dispatch ID)
+
+A ticket is *dispatched* before a worker starts it, and until you claim it AMP shows it as
+"dispatched · not started". Claiming is what starts it:
+
+```
+amp_claim_task(task_id=YOUR_TASK_ID, dispatch_id="<your dispatch ID>")
+```
+
+- **Your prompt has a dispatch ID → claim first, before anything else.** It confirms the dispatch
+  is still current (a re-dispatched ticket has a new one, and a stale one is refused: "no longer
+  current … the ticket was returned and dispatched again"). The result's `next` tells you to read
+  the ticket and finish it yourself. `already_started: true` means you were resumed on a ticket
+  you already claimed: carry on.
+- **No dispatch ID** (an older manager, a harness that claims for you, or a ticket you were asked
+  to pick up by hand) → **skip the claim.** The first thing you write on the ticket — a comment, a
+  run, a block, or the completion — starts it for you, with `started_by: "inferred"`. That is the
+  supported fallback, not an error; don't stop because a claim was refused.
+- A ticket nobody claims within the project's timeout (10 minutes to flag, 30 to return) is
+  returned to ready by AMP. Never end a run silently: claim, then finish with `amp_complete_task`
+  or `amp_block_task` (Step 6 / Step 5), both passing your `dispatch_id`.
+
+---
+
+## Step 0.5 — Read .amp.json
 
 ```bash
 cat .amp.json
@@ -19,7 +44,7 @@ This gives you `project_id`. Every MCP call uses this value.
 
 ---
 
-## Step 0.5 — Search the KB before starting
+## Step 1 — Search the KB before starting
 
 Before reading the ticket, search the KB for relevant context:
 
@@ -31,7 +56,7 @@ amp_kb_search(project_id=PROJECT_ID, query="<task name + key terms>")
 - Nothing relevant → proceed
 
 Then search the team KB once for how this team works — branches, commits, pushing, review,
-secrets. Team conventions live there, not in the project KB:
+secrets (the git parts apply only when your work is in git; see Step 6). Team conventions live there, not in the project KB:
 
 ```
 amp_kb_search(project_id=PROJECT_ID, scope="team", query="conventions branches commits review")
@@ -58,7 +83,17 @@ amp_get_task(task_id=YOUR_TASK_ID, include=["comments"])
 **First, confirm this ticket is yours to work:** its `state` is `in_progress` and its
 `owner_user_id` is your user (`amp_whoami`). If it isn't — it's someone else's, or it was never
 dispatched — stop without touching any files and tell your manager. Another person's session may
-be running it; working it from here edits their files under your name.
+be running it; working it from here edits your files under your name.
+
+Its `phase` should already be `started` (from your claim in Step 0, or from the harness's claim on
+your behalf). If it still reads `not_started`, claim it with your dispatch ID before you write
+anything; with no dispatch ID, your first write starts it as `inferred`.
+
+**Check the `dispatch_id` too.** The ticket's `dispatch_id` is the one you were given, and the
+`next` on a mismatch is to go back to your manager rather than work a ticket someone else owns:
+a ticket that was returned and dispatched again has a new token, and yours would be stale. If you
+have no dispatch ID, the ticket simply starts on your first write (the fallback), and `started_by`
+will read `inferred` — that is normal for an older plugin.
 
 Read every field:
 - `description` — your complete instructions
@@ -177,9 +212,16 @@ First decide which kind of stop this is:
   dependency and re-dispatches.
 - **The next step is a person's job, not a question** (merging your PR, a prod deploy only they
   can run, a sign-off). Don't do it, and don't pretend it's done. Finish your part and complete
-  your ticket, and say in your completion comment what the person has to do next. The plan
-  usually has a human ticket for that step (a ticket done by a person, which agents never
-  dispatch). If it doesn't, say so in your final message so the orchestrator adds one.
+  your ticket, and say in your completion comment what the person has to do next. **Merging your
+  PR needs no ticket:** complete yours with `pr_url` and `branch` (Step 6), and AMP shows it as
+  Merge needed and holds the tickets after it until the merge is recorded. For any other step the
+  plan usually has a human ticket (a ticket done by a person, which agents never
+  dispatch). If it doesn't, say so in your final message so the orchestrator adds one. Only the
+  person marks a human ticket done, in AMP's web UI; never try to complete it or approve anything
+  (a plan, an artifact) yourself. AMP refuses those over MCP ("… is done by a person in the AMP
+  web UI …"): stop and pass the link on.
+- **Only your ticket.** Never comment on, complete or change the state of a ticket you weren't
+  dispatched to, even one that looks finished or stuck. Mention it in your final message.
 - **You need a person**: a decision only they can make, information you can't find, access or a
   credential you don't have, or requirements that contradict each other. Ask:
 
@@ -193,12 +235,16 @@ Recommendation: [what you'd do and why, if you have a view]
 Done so far: [what's already in place, so the next worker doesn't redo it]
 """, author="amp-worker")
 
-amp_block_task(task_id=YOUR_TASK_ID, reason="[the question in one line, with the options]")
+amp_block_task(task_id=YOUR_TASK_ID, dispatch_id="<your dispatch ID>", reason="[the question in one line, with the options]")
 ```
 
 The `reason` is what people see in AMP as the question to answer, so make it stand on its own:
 "Avalara or Stripe Tax? Both work in the sandbox; Stripe is cheaper under 10k invoices a month."
 — not "blocked" or "see comments".
+
+Pass your `dispatch_id` too if you have one: it says which run stopped. It is never required —
+the block starts the ticket by itself when your plugin doesn't claim — and it never changes the
+block into something else.
 
 Then **stop**. Do NOT call `amp_complete_task`. End your final message with:
 
@@ -220,6 +266,14 @@ undetected. If you cannot actually verify something (no build command applies, n
 programmatically), write "COULD NOT VERIFY: [why]" instead of asserting VERIFIED anyway — that's
 honest and still useful; a false VERIFIED is not.
 
+**Not all work is in git.** Business and ops work (research, a comparison doc, a customer email
+draft, a spreadsheet) often runs in a plain folder. If your working directory is not a git
+repository, or your harness says you have no branch of your own (AMP Harness: `git: none` or
+`git: not yours here` in your context), don't commit, branch, push or open a pull request. Under
+"Where it is" list the files you made or changed, with their full paths, and leave `branch`,
+`commit`, `pushed` and `pr_url` out of `amp_complete_task`. Everything else in this step still
+applies. The rest of this paragraph is for work in git.
+
 Commit your work, following the team's conventions from Step 0.5 (branch naming, commit
 format). Put the ticket ref (e.g. `NWC-149`) in the commit message, so `git log` leads back to AMP
 just as AMP leads to the commit. `git status` should show nothing of yours left uncommitted: changes left on disk are
@@ -227,6 +281,21 @@ invisible to everyone else, and the next agent in this checkout can't tell whose
 done in AMP but whose code exists only in one checkout blocks them without anyone noticing. If the
 conventions say to push (or open a PR), do it; if they say nothing, push the branch you committed
 on. If you can't push (no remote, no access), say so in the completion comment.
+
+**Report the branch and the PR, always.** When your work opened a pull request, pass `pr_url`
+and `branch` to `amp_complete_task` (and `pushed=true`). That's what marks your ticket **Merge
+needed**: the tickets that depend on yours then wait until the merge is recorded (by GitHub's
+webhook, CI's `amp_report_merged`, or the owner's Mark merged), instead of starting on code that
+isn't on the main line yet. Leave `pr_url` out and they start straight away. A PR you open after
+completing goes on `amp_report_run` with `pr_url`; it gates the dependents from then on. Never
+report your own PR as merged.
+
+**On an integration branch** (your ticket's `effective_metadata` has `integration_branch`, or your
+ticket says to merge into a shared branch): if you merged or pushed into that branch, report
+`branch=<integration branch>`. If you opened a PR into it, pass `pr_url`, your `branch` and
+`base_branch=<integration branch>`. Either way the tickets after yours start on completion, and the
+integration branch's own merge to main later marks yours merged. Only the ticket that opens the
+integration PR to main reports `base_branch=main`.
 
 Post a completion summary:
 
@@ -237,6 +306,7 @@ Work complete.
 Summary: [what was done]
 
 Where it is: [branch] @ [commit sha] — [pushed to origin / PR #N / NOT pushed: why]
+            (outside git: the folder and the files you made, with paths)
 
 Files changed:
 - [path]: [what and why]
@@ -256,14 +326,20 @@ capitalizes token spend from these numbers, and traces code back to tickets from
 ```
 amp_session_usage()          ← if your harness has it (opencode with the AMP plugin): your model,
                                tokens and cost for this session. Pass them straight through.
-amp_complete_task(task_id=YOUR_TASK_ID,
+amp_complete_task(task_id=YOUR_TASK_ID, dispatch_id="<your dispatch ID>",
   model="<the model you ran on>",
   input_tokens=…, output_tokens=…, cache_read_tokens=…, cost_usd=…,   ← only numbers your harness gave you
-  branch="<branch>", commit="<sha>", pushed=true|false, pr_url="<if one>")
+  branch="<branch>", commit="<sha>", pushed=true|false, pr_url="<if one>", base_branch="<if a PR")
 ```
 
+**Pass your `dispatch_id`.** It is what makes this *your* completion rather than a closeout:
+with it AMP records "completed by <you>"; without it, the completion is recorded as someone else
+closing the ticket (history `closed_out`, a `closeout:` run note), which is the wrong story about
+who did the work. If your prompt has no dispatch ID (an older plugin), there is nothing to pass:
+your completion ends the run your first activity started, and it is not labelled a closeout.
+
 Report what you know and leave the rest out — never estimate token counts. If your harness can't
-tell you your usage, still report the model and the git fields. The same fields go on
+tell you your usage, still report the model and (in git) the git fields. The same fields go on
 `amp_block_task` when you stop on a question.
 
 ---
@@ -271,10 +347,11 @@ tell you your usage, still report the model and the git fields. The same fields 
 ## MCP tools
 
 ```
+amp_claim_task {task_id, dispatch_id}   ← FIRST, if your prompt has a dispatch ID: starts the ticket
 amp_get_task {task_id, include: ["comments"]}   ← read before starting; answers to questions are in the comments
 amp_add_task_comment {task_id, body, author}
-amp_block_task {task_id, reason, …run fields}   ← only to ask a person a question (Step 5)
-amp_complete_task {task_id, model?, input_tokens?, output_tokens?, cache_read_tokens?, cost_usd?, branch?, commit?, pushed?, pr_url?}
+amp_block_task {task_id, dispatch_id?, reason, …run fields}   ← only to ask a person a question (Step 5)
+amp_complete_task {task_id, dispatch_id, model?, input_tokens?, output_tokens?, cache_read_tokens?, cost_usd?, branch?, commit?, pushed?, pr_url?, base_branch?}
 amp_report_run {task_id, outcome, …run fields}  ← a run that ended another way, or a PR opened later
 amp_session_usage {}                  ← opencode plugin: your own model/tokens/cost
 amp_get_task {task_id, include: ["history","runs"]}   ← what happened before you

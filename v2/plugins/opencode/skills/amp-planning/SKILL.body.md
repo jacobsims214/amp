@@ -221,9 +221,11 @@ architecture sketch, an API shape, a data model).
   unapproved design. Say in each build ticket's description: "Build to the approved artifact on
   #<design ticket>."
 - The designer publishes, blocks the ticket asking for review, and stops. Tell the user the
-  artifact's link. They review in AMP, or tell you in chat and you record it with
-  `amp_review_artifact`. Then dispatch the design ticket again: the designer revises (a new
-  version) or, once approved, completes it, which unblocks the build.
+  artifact's link. **Approving it is theirs to do, in AMP** (Approve on the artifact page):
+  `amp_review_artifact` with `approve=true` is refused over MCP. If they tell you in chat what to
+  change, you may record that with `amp_review_artifact(approve=false, note=…)`. Then dispatch the
+  design ticket again: the designer revises (a new version) or, once approved, completes it,
+  which unblocks the build.
 - Skip it for changes with one obvious answer (a bug fix, a field added to an existing form) or
   when the user says to go straight to code.
 
@@ -241,11 +243,29 @@ owned by the person who does it, that agents never dispatch. The agent work that
 `depends_on` it, so it waits for the person and starts the moment they mark it done in AMP. The
 chain of work stays unbroken, and the board shows exactly who the plan is waiting on.
 
+**Merging a PR is not a human ticket.** AMP gates on merges by itself. A ticket that completes
+with a pull request (or a pushed branch) is **Done · Merge needed**, and every ticket that
+`depends_on` it waits ("Waiting on merge of #30 (PR …)") until the merge is recorded. The merge is
+recorded once, by whichever comes first: the GitHub webhook, CI calling `amp_report_merged`, or
+the owner clicking **Mark merged** in the project's My work tab. So wire the next agent work
+straight to the agent ticket that opens the PR; never plan a "review and merge" ticket between
+them. (A project can turn this off with `require_merge`; then dependents start on completion.)
+
+Two plan shapes need the next ticket before the merge to main. Mark them with metadata (inherited
+project → epic → story → ticket; it never needs re-approval):
+- **Integration branch:** the epic's or story's tickets merge into a shared branch, and one PR
+  takes it to main. Set `integration_branch: "<branch>"` on the epic or story, and tell its
+  workers to report `branch=<it>` (merged in) or `base_branch=<it>` (a PR into it). Each ticket
+  then releases the next on completion and stays unmerged until the integration branch merges.
+  The ticket that opens the integration PR to main still gates whatever comes after it.
+- **Review of an open PR:** give the review ticket `waits_for_merge: false`. It starts once the
+  PR's ticket is done; the PR's other dependents still wait for the merge.
+
 **Put a person in the loop when the step needs**:
 
 | Reason (`human_reason`) | Examples |
 |---|---|
-| `review` | A person reviews and merges the PR (the team requires human review, or it's a protected branch) |
+| `review` | A person reviews a deliverable outside git (business or ops work): the doc, the email draft, the sheet. Not a PR merge: merges gate dependents on their own (above) |
 | `approval` | Sign-off on a prod release, a spend, a security or legal change, a customer-facing launch |
 | `access` | Access agents don't have: a prod console, a vendor dashboard, rotating a secret, a paid account |
 | `judgment` | A decision known at plan time that only a person can make: which vendor, pricing, a trade-off |
@@ -255,8 +275,12 @@ chain of work stays unbroken, and the board shows exactly who the plan is waitin
 **Not a human ticket**:
 - **A question that comes up mid-work.** A worker blocks its own ticket with the question
   (`amp_block_task`), and you answer it. Human tickets are steps you can see at plan time.
+- **Merging a PR.** A done ticket with a PR shows Merge needed, and its dependents wait on the
+  merge (above). Its owner records it, or the webhook or CI does.
 - **Approving a mockup.** That's the design ticket's artifact review.
-- **Approving the plan.** That's `amp_approve_plan`.
+- **Approving the plan.** Each person approves their own tickets in AMP's web UI (the project's
+  My work tab, "Approve"); a lead may approve on someone's behalf. It isn't a ticket, and no agent
+  can do it.
 - **Anything an agent can do with the tools it has.** Don't hand agents' work to people. If an
   agent could do it but lacks a tool or access, say so in the plan; that gap is worth knowing.
 
@@ -265,28 +289,29 @@ chain of work stays unbroken, and the board shows exactly who the plan is waitin
   who does it (their email).
   - It's your user's by default. Ask if it's not obvious whose it is: a human ticket with no
     owner is a NO-GO in `amp_check_plan`, because nobody would ever do it.
-  - A teammate's human ticket shows up in their My Work, under "To do myself".
+  - A teammate's human ticket shows up in their My work tab in the project, under "Do".
 - **One person, one action, a clear done.**
-  - Name it for the action: `Review and merge: quotes API PR`, `Approve: prod release 2.4`,
-    `Rotate: Stripe live key`.
-  - Acceptance criteria say what done means for a person: "PR merged to main", "release
-    approved in the change log".
+  - Name it for the action: `Approve: prod release 2.4`, `Rotate: Stripe live key`,
+    `Decide: Avalara or Stripe Tax`.
+  - Acceptance criteria say what done means for a person: "release approved in the change
+    log", "new key in the vault and the old one revoked".
   - The description says what they need: the PR link or branch, what to check, where to do it.
 - **Wire it both ways:**
-  - it `depends_on` the agent work it needs (the PR exists before anyone reviews it);
-  - the agent work after it `depends_on` it (deploy after the merge).
+  - it `depends_on` the agent work it needs (staging is deployed before anyone signs off);
+  - the agent work after it `depends_on` it (the prod deploy waits for the sign-off).
 
   A human ticket with nothing waiting on it is usually a step you should have wired in.
 - **Leave out `assigned_to`.** No agent runs it.
 
 ```
 Wave 1:  #30 Build quotes API              → amp-worker-backend   (ready)
-Gate:    #31 Review and merge: quotes PR   → person: sam@acme.com (review)   (blocked by #30)
-Wave 2:  #32 Deploy quotes to staging      → amp-worker-backend   (blocked by #31)
+Wave 2:  #31 Deploy quotes to staging      → amp-worker-backend   (blocked by #30; waits on its PR merge)
+Gate:    #32 Approve: quotes in prod       → person: sam@acme.com (approval)   (blocked by #31)
+Wave 3:  #33 Deploy quotes to prod         → amp-worker-backend   (blocked by #32)
 ```
 
 `amp_check_plan` lists every human ticket under `human_gates`, with how many open tickets wait on
-each. When one gate holds up most of the plan, say so when you present it. The user may want to
+each (merges aren't in it; they aren't tickets). When one gate holds up most of the plan, say so when you present it. The user may want to
 book that person's time, or move the step later.
 
 ---
@@ -498,7 +523,8 @@ If yes to any of these — add the dependency, regardless of which epic or story
 ### Check the plan before presenting it
 
 Run `amp_check_plan(project_id)` after creating the tickets and before presenting the plan or
-dispatching anything. It reports tickets connected to nothing (`isolated`), too much work that
+dispatching anything. When tickets await approval it also returns `approve_url`, the link you
+give the user (see "Stop after presenting"). It reports tickets connected to nothing (`isolated`), too much work that
 can start at once (`wide_start` — usually missing dependencies), and empty stories. Fix what it
 finds, then run it again. A warning on `amp_create_tasks` about missing
 dependencies means the same thing: decide now, not after dispatch.
@@ -555,8 +581,8 @@ Total: X tasks (Y implementation + Z wave checks + 1 code review per story)
 
 Every task shows: its ID, name, assigned agent, and either `(ready)` or `(blocked by #N, ...)`.
 Wave checks and code reviews must be clearly labeled. A human ticket shows the person and why in
-place of an agent (`→ person: sam@acme.com (review)`), and the phases name who the plan waits on:
-"Phase 2 — unblocks when Sam merges #31".
+place of an agent (`→ person: sam@acme.com (approval)`), and the phases name who the plan waits on:
+"Phase 3 — unblocks when Sam approves #32".
 If a task has no agent or no blocker status shown — fix it before presenting.
 
 **After the task tree, state the result of the file conflict check explicitly** — don't leave it
@@ -580,32 +606,53 @@ plausible-looking.
 
 ---
 
-## ⛔ Stop after presenting — do not dispatch
+## ⛔ Stop after presenting — a person approves in the web UI
 
-Wait for explicit approval. Nothing further until the user says so.
+**You never approve a plan.** Only a person can, in AMP's web UI: the project's **My work** tab,
+"Approve" (Flight plan only links there). Approval is per ticket: each person approves **their own** tickets, and a project
+lead (or owner, admin) may approve someone else's on their behalf. There is no tool for it. `amp_approve_plan` always refuses (it only reports the
+approval status and the link), and so does anything else that tries to approve over MCP, whatever
+the user says in chat. Don't call it.
 
-Approval: "approved", "go ahead", "yes", "do it", or similar.
+After presenting the plan:
 
-Changes requested → update → present again → wait again.
+1. Run `amp_check_plan(project_id)` one last time. When tickets await approval it returns
+   `awaiting_approval` (everyone's), `awaiting_approval_tickets` (`{task_id, owner_user_id,
+   yours}`), `awaiting_yours` (your user's own) and **`approve_url`**, the link to approve them.
+   That's where you stop.
+2. Hand off, in plain words, with the link, naming **their** tickets:
+   "The plan is on the board. #12, #14 and #15 are yours to approve in AMP when you're happy
+   with them: <approve_url>. I'll dispatch each once it's approved."
+   If some awaiting tickets belong to others, say so: "#16 is Sam's; it waits for Sam (or a lead
+   on Sam's behalf)." Don't ask your user to approve others' tickets unless they're a lead and
+   choose to.
+3. **Stop and wait.** Don't dispatch, claim, complete, or start anything in the meantime.
 
-When the user approves, **record it in AMP before dispatching**:
+Changes requested → update the plan → present again → hand off the link again → wait again.
 
-```
-amp_approve_plan(project_id=PROJECT_ID)
-```
+**Chat isn't approval.** "yes", "go", "looks good", "ship it", "do it", "sounds right" and the
+like don't approve anything, and you never treat ambiguous words as approval. When the user says
+something like that, check `amp_check_plan`: tickets no longer in `awaiting_approval` were
+approved in the UI and you can dispatch them; if `awaiting_yours` isn't empty, reply with the
+`approve_url` and say which of their tickets still need their click there.
 
-That's the same approval a person gives with "Approve plan" in AMP's Flight plan, and projects with
-`require_plan_approval` on refuse to dispatch tickets planned since the last approval until it's
-recorded. Never call it on your own judgment — only when the user has said yes. The user may also
-approve in the UI instead of in chat: `amp_check_plan`'s `awaiting_approval` is empty once the plan
-is approved, wherever that happened.
-
-Each new planning run (or fix tickets you add) needs approving again when the project requires it:
-if a dispatch is refused because the plan wasn't approved, present what's new and ask.
+Each new planning run (and fix tickets you add, and any ticket whose name, description or
+acceptance criteria you change) needs approving again, by its owner, when the project requires
+it. If a dispatch is refused with "ticket N isn't approved … Its owner approves it in the AMP web
+UI (Approve plan; a project lead may approve it on their behalf): <link>", present what's new,
+give the user that link (saying whose ticket it is), and stop.
 
 ---
 
 ## Dispatch — only after approval
+
+Dispatch a ticket only once it's approved in the UI (by its owner, or a lead on their behalf): it
+isn't in `amp_check_plan`'s `awaiting_approval` (or the project doesn't require approval). Never complete or move forward a ticket that
+was never dispatched and has no runs on it: AMP refuses it ("never dispatched and has no work
+recorded on it"), and the fix is a worker, not another path. Never dispatch a ticket *only* to
+complete it — a ticket that already has runs (a worker blocked with a question, and its answer
+arrived) is closed out directly with `amp_complete_task(closeout_reason=…)`; see "Closeouts"
+below.
 
 **Step 0 — re-run the file conflict check against the current batch:** before dispatching
 anything, look at everything currently in `ready_to_dispatch` (this includes fix tasks a reviewer
@@ -619,38 +666,75 @@ completes.
 
 For every task in `ready_to_dispatch`, do both steps in this order, using the task's own `assigned_to` value as the agent — not a fixed name:
 
-**Step 1 — dispatch each task** (marks it in_progress on the board):
+**Step 1 — dispatch each task** (marks it in_progress, *not started*):
 ```
 amp_dispatch_task(task_id=ID, agent_id=<task's assigned_to>)
 ```
 
-**Step 2 — spawn workers in a single message** (runs them in parallel):
+It returns `dispatch_id`, `worker_prompt`, `next` and `start_by`. The ticket is in progress but
+**not started**: nothing has picked it up yet.
+
+**Step 2 — launch each worker in the same message, with its returned `worker_prompt`,** as the prompt (so they run in parallel):
 ```
-task(prompt="Task ID: {id}. Project ID: {project_id}.", subagent_type=<task's assigned_to>)
-task(prompt="Task ID: {id}. Project ID: {project_id}.", subagent_type=<task's assigned_to>)
+task(prompt=<the worker_prompt from dispatch>, subagent_type=<task's assigned_to>)
+task(prompt=<the worker_prompt from dispatch>, subagent_type=<task's assigned_to>)
 ```
 
-Step 1 must happen before step 2. This is what shows live progress on the board.
+The `worker_prompt` already carries the ticket ID, project ID and `dispatch_id`, and tells the
+worker to call `amp_claim_task(task_id, dispatch_id)` first and complete or block the ticket
+itself. Don't retype a prompt of your own: yours would lose the `dispatch_id`, and the ticket
+would be flagged "not started" at 10 minutes and returned to ready at 30.
 
-After dispatch: monitor with `amp_list_tasks`. When workers complete, blocked tasks auto-unblock and appear in `ready_to_dispatch`. Dispatch those. **After a review task completes, always check `ready_to_dispatch` — the reviewer may have created new fix tasks.** Re-run Step 0 against that new batch before dispatching it. Repeat until `ready_to_dispatch` and `in_progress` are both empty.
+Step 1 must happen before step 2, and step 2 must happen before your turn ends. A dispatch you
+don't follow with a launched worker, in the same message, is the bug this order exists to prevent:
+everyone watching AMP sees a ticket in progress while nothing is happening. If you can't launch it
+after all, undo it at once with
+`amp_set_task_state(task_id=ID, state="backlog", reason="not started")`.
+
+**Don't move ticket state yourself.** Workers claim their own ticket and complete or block it; a
+`amp_complete_task` without a worker's `dispatch_id` is a **closeout**, and it's only for a worker
+that couldn't finish (see "Worker failure" below).
+
+After dispatch: monitor with `amp_list_tasks`. Three lists matter:
+- `not_started` — dispatched, nobody claimed it yet; launch its worker now (its `worker_prompt` is
+  in `amp_get_task`'s `dispatch_id`/`next`) or undo the dispatch at once.
+- `returned` — nobody claimed it before the deadline, or `amp_return_task` released it; it's ready
+  again, so re-dispatch it knowingly (and say so) or ask your user.
+- `quiet` — started, then silent; its worker died. See "Worker failure" below.
+
+When workers complete, blocked tasks auto-unblock and appear in `ready_to_dispatch`. Dispatch
+those. **After a review task completes, always check `ready_to_dispatch` — the reviewer may have
+created new fix tasks.** Re-run Step 0 against that new batch before dispatching it. Repeat until
+`ready_to_dispatch` and `in_progress` are both empty.
 
 **Human tickets are never dispatched.** They aren't in `ready_to_dispatch`.
-- `waiting_on_people` lists the ones a person can do now, and for each:
+- `waiting_on_people` lists what a person can do now (each item has a `kind`: `approve`,
+  `answer`, `merge`, `do` or `start`), and for each:
   - who owns it;
   - how long it has waited;
   - what it is `holding_up`;
   - whether it's `stale` (no activity for two days).
-- Tell your user plainly: "Waiting on Sam to review and merge #31; nothing else can start until
-  then." Keep dispatching everything that doesn't wait on it.
-- If it's your user's own, they can Start and Mark done in AMP. Or they tell you it's done and
-  you record it: `amp_complete_task(task_id, note, pr_url, hours_worked)`. Only on their word, and
-  ask how many hours it took if they don't say. A stale one is worth a nudge to its owner.
-- A teammate's human ticket is theirs to mark done, not yours, even when your user tells you it's
+- **A `start` item** is a ticket dispatched to them whose worker never claimed it
+  (`agent_id`, `not_started_minutes`): that's nobody working while AMP shows it in progress. It
+  clears itself when a worker claims the ticket, when you undo the dispatch, or when the watchdog
+  returns it to ready.
+- Tell your user plainly: "Waiting on Sam to approve #32; nothing else can start until then."
+  Keep dispatching everything that doesn't wait on it.
+- **A merge item** is a done ticket whose PR isn't merged yet; its dependents wait on it. Give
+  your user the PR link. It clears itself when GitHub or CI reports the merge, or when the owner
+  clicks Mark merged in My work. Don't create a ticket for it, and only record a merge
+  (`amp_report_merged`) when your user tells you it's merged.
+- **Only the person marks a human ticket done, in AMP's web UI** (Start and Mark done in the
+  project's My work tab or the ticket drawer). You can't: `amp_complete_task` on a human ticket is refused with the
+  ticket's link. When your user says theirs is done, re-read the board; if it's still open, give
+  them the link and ask them to mark it done there. A stale one is worth a nudge to its owner.
+- A teammate's human ticket is theirs to mark done in the UI, even when your user tells you it's
   finished. Re-read the board (it's usually done already). If it's still open, say it's waiting on
   them.
 
 A worker that needs a person blocks its ticket with the question and stops; the ticket appears in
-`questions`. Ask your user, record the answer with `amp_answer_question`, and re-dispatch the
+`questions`. Ask your user, record their answer with `amp_answer_question` (it shows as
+"relayed by agent" in AMP; never answer from your own judgment), and re-dispatch the
 ticket when it comes back as ready — see "When a worker asks a question" in your instructions.
 Questions don't stop the loop: keep dispatching everything else.
 
@@ -665,6 +749,23 @@ Load `amp-mcp` if you need exact tool argument shapes.
 A dispatched task can fail in ways that don't look like a normal "cannot proceed" comment: it
 returns empty output, times out, or produces no comments and no completion within a reasonable
 window. Treat this as a real signal, not noise to route around quietly.
+
+**Two different failures, two different repairs.** AMP tells them apart for you:
+
+| What you see | What happened | What to do |
+|---|---|---|
+| `not_started` in `amp_list_tasks` (dispatched, no worker claimed it) | nobody ever launched the worker, or it died before its first call | launch the worker now with its `worker_prompt`; if you won't, `amp_set_task_state(task_id, state="backlog", reason="not started")` |
+| `returned` in `amp_list_tasks` | the watchdog returned it to ready (no claim before the deadline), or `amp_return_task` released it | it's ready again: re-dispatch it knowingly, or ask your user |
+| `quiet` | it *was* claimed, then went silent: the worker died mid-run | comment what happened, record the abandoned run, set it back to `backlog`, re-dispatch |
+| `in_progress` with `phase: "started"` and a worker that returned empty output | the worker ran and produced nothing | same as `quiet`, but you already know why |
+
+`amp_return_task(task_id, reason)` is the release path when a dispatch's worker died before
+claiming — a crash, a timeout, a cancel, an AMP connection lost — and nobody is going to run it.
+It sets the ticket back to ready (or to waiting, if it still has open dependencies), clears the
+dispatch, records `returned_at`/`returned_reason` and a `returned` history entry, and AMP shows it
+in `returned`. Name the outcome in `reason`, e.g. `worker amp:amp-worker-backend timed out after
+20 min`. It **refuses a ticket a worker already claimed**: a started ticket isn't pulled out from
+under its worker — block it with a question, or close it out if the worker is gone.
 
 1. **Detect it.** If a dispatched task has been in `in_progress` with no comments and no
    completion for longer than the work plausibly takes, or the subagent's response was empty,
@@ -685,3 +786,38 @@ window. Treat this as a real signal, not noise to route around quietly.
    task still assigned to the tier that just failed, apply the same complexity test to each, and
    proactively reassign any that look like the same mismatch — rather than dispatching them one
    at a time and discovering the same failure repeatedly.
+
+---
+
+## Closeouts — when the worker didn't finish
+
+A worker completes or blocks its own ticket, passing the `dispatch_id` from its dispatch. When it
+can't (it died, timed out, or AMP lost the connection to it), **you** close the ticket out:
+
+```
+amp_complete_task(task_id=ID, closeout_reason="worker amp:amp-worker-backend timed out after 20 min;
+                 branch amp-2142 has the work", model=…, branch=…, commit=…)
+```
+
+- **No `dispatch_id`.** That's what makes it a closeout: AMP records `closeout: true`, history
+  action `closed_out` (`Closed out by <you> (not the worker): <reason>`), a run note prefixed
+  `closeout:`, and shows a Closeout tag on the ticket. Say in your report to the user that you
+  closed it, not the worker.
+- **Allowed only for a worker that couldn't finish:**
+  - a **started** ticket whose worker is gone (`in_progress`, claimed, no completion);
+  - or a ticket that is already ready/done/blocked and has **prior runs** — a worker blocked with
+    a question and the answer arrived, a design approved after the worker stopped, work done in
+    an earlier run. Close these **directly**: don't dispatch them first (that was the
+    #2473/#2494 workaround, and it's gone).
+- **Not a closeout** — don't pass `closeout_reason`, and don't tell your user it was one — when:
+  the ticket was started by the fallback (`started_by` `inferred` or `backfill`: a plugin that
+  never claimed), the ticket was dispatched but never started, or a person completes it in the
+  web UI. Those are ordinary completions.
+- **A ticket with no runs at all can't be closed out** ("never dispatched and has no work
+  recorded on it"). Dispatch it and let a worker do it, or a person completes it in the UI.
+- **Never dispatch a ticket just to complete it.** A ready ticket with runs is closed out
+  directly; a ticket with nothing on it gets a worker.
+
+A worker that died **before** claiming its ticket is the other case: `amp_return_task(task_id,
+reason)` releases it to ready, and you re-dispatch it or ask your user. Don't close out a ticket
+nobody ever started.

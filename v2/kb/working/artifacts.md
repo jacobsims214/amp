@@ -19,8 +19,9 @@ or anything else that speaks MCP.
    it. The ticket shows as a question; the artifact shows under the project's **Artifacts** tab
    and in the ticket.
 3. **You review.** Open the artifact: HTML mockups run live (switch Desktop, Tablet, Phone), and
-   older versions are a click away. **Approve**, or **Request changes** and say what. Or tell
-   your manager agent in chat, and it records your verdict with `amp_review_artifact`.
+   older versions are a click away. **Approve**, or **Request changes** and say what. Approving
+   is yours to click: agents can't approve over MCP. You can tell your manager agent in chat what
+   to change, and it records that with `amp_review_artifact(approve=false, note=…)`.
 4. **Your verdict goes on the ticket** and the ticket goes back to ready. The manager dispatches
    it again: the designer publishes a new version, or completes the ticket once you've approved.
    Completing it unblocks the build.
@@ -28,7 +29,8 @@ or anything else that speaks MCP.
    compare their result with it.
 
 Who can review: the ticket's owner or creator, a lead, or a project owner (anyone on the project
-for an artifact without a ticket). Agent accounts can't: a person approves, like plan approval.
+for an artifact without a ticket), in the web UI. No agent can approve, not even one under your
+own login: a person approves, like plan approval.
 
 ## Keeping or letting go
 

@@ -1,0 +1,13 @@
+-- The ticket as it was approved (AMP #2483, design #2494, KB
+-- decisions/human-work-ux.md §2 "Approve view").
+--
+-- ApproveTask stores the ticket's name, description, acceptance criteria
+-- and dependency ids here in the same UPDATE that sets approved_at. When
+-- the ticket is re-planned after that, the My work Approve view returns
+-- the snapshot as changed_since.previous, and the UI shows a diff of what
+-- changed since the person approved it.
+--
+-- Additive only, nullable, no backfill: tickets approved before this
+-- migration have no snapshot, and the view falls back to "edited at …".
+-- Idempotent.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS approved_snapshot JSONB;

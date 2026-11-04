@@ -104,6 +104,12 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 	case *MsgDispatchTask:
 		a.routeToStory(ctx, msg.TaskID, msg)
 
+	case *MsgClaimStart:
+		a.routeToStory(ctx, msg.TaskID, msg)
+
+	case *MsgReturnTask:
+		a.routeToStory(ctx, msg.TaskID, msg)
+
 	case *MsgCompleteTask:
 		a.routeToStory(ctx, msg.TaskID, msg)
 
@@ -120,6 +126,12 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 		a.routeToStory(ctx, msg.TaskID, msg)
 
 	case *MsgSetTaskStartAt:
+		a.routeToStory(ctx, msg.TaskID, msg)
+
+	case *MsgApproveTask:
+		a.routeToStory(ctx, msg.TaskID, msg)
+
+	case *MsgSetMergeState:
 		a.routeToStory(ctx, msg.TaskID, msg)
 
 	case *MsgAddComment:

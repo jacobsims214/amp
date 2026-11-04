@@ -80,6 +80,27 @@ global:
   # matching how odoo-operator's Application overrides `image.tag`.
   imageTag: "latest"   # override per release, e.g. sha-763788d
 
+# Client IP in the audit log (#2430, #2469). See values.yaml for what these
+# mean. The services believe the client address Envoy sends only from
+# Envoy's pods, which run in this cluster's pod CIDR; the networkPolicy
+# below keeps every other pod away from the services.
+# envoy.clientIP stays at the chart default (xffNumTrustedHops: 0): rows
+# record Envoy's TCP peer, which is whatever proxy sits in front of Envoy
+# here. Not spoofable, but not the end client either. To record the end
+# client, describe the hops in front of Envoy (envoy.clientIP) once they pass
+# it on: an operator choice, see the release notes (#2436).
+clientIP:
+  trustedProxies:
+    - 10.244.0.0/16
+
+networkPolicy:
+  enabled: true
+  # Who may reach Envoy is left open (the chart default). With
+  # envoy.clientIP.xffNumTrustedHops at 0 nothing in front of Envoy can
+  # choose its recorded address, so this isn't needed for the audit log.
+  envoyIngress:
+    enabled: false
+
 image:
   # Built + pushed by .github/workflows/build-images.yml on every push to
   # main / tag. Namespace matches env.IMAGE_NAMESPACE in that workflow.
@@ -89,9 +110,51 @@ image:
 ampApi:
   tag: ""   # empty = use global.imageTag
   replicas: 1
+  # Audit checkpoint signing key (#2439 H2). The Secret's value is never in
+  # git. Create it once, before this chart version reaches prod:
+  #   amp-api audit keygen -out signing-key   # prints the public key and key id: keep a copy off-box
+  #   kubectl -n amp create secret generic amp-audit-signing --from-file=signing-key=signing-key
+  #   rm signing-key
+  # The reference is optional: until the Secret exists amp-api starts without
+  # a key, checkpoints are unsigned and /api/audit/verify says "unproven".
+  audit:
+    signingKey:
+      existingSecret: amp-audit-signing
+  # Webhook auth headers and signing secrets are encrypted at rest with the
+  # key in this Secret (#2441). Its value is never in git. Create it once:
+  #   openssl rand -base64 32 | tr -d '\n' > encryption-key   # keep a copy off-box
+  #   kubectl -n amp create secret generic amp-secrets-encryption --from-file=encryption-key=encryption-key
+  #   rm encryption-key
+  # The reference is optional: until the Secret exists amp-api starts without
+  # a key, and webhook auth headers can't be added.
+  secretsEncryption:
+    existingSecret: amp-secrets-encryption
   resources:
     requests: { cpu: 250m, memory: 256Mi }
     limits: { cpu: "1", memory: 1Gi }
+
+# amp-relay (remote control, epic 165). Its image is built by
+# build-images.yml like the others. Turning the relay off (enabled: false) is
+# a pause, not an end: sessions stay active and resume when it is back.
+relay:
+  enabled: true
+  tag: ""   # empty = use global.imageTag
+  # ArgoCD can't keep the chart's lookup-or-random secrets stable (see
+  # secretOverrides above), so the relay's database password and cluster
+  # token come from Secrets created by hand in namespace amp (#2470). Copies
+  # are kept off the cluster. The chart refuses to render with the relay on
+  # unless both are pinned.
+  requirePinnedSecrets: true
+  database:
+    # kubernetes.io/basic-auth: username amp_relay, password (URL-safe: it
+    # goes into DATABASE_URL). Labelled cnpg.io/reload=true, so CloudNativePG
+    # sets the managed role's password from it and follows a rotation.
+    existingSecret: amp-relay-db
+  clusterToken:
+    # Opaque, key "token" (32+ random characters). Mounted in amp-relay and
+    # amp-api as RELAY_CLUSTER_TOKEN; amp-api's own cluster token stays in
+    # the database.
+    existingSecret: amp-relay-cluster-token
 
 ui:
   tag: ""
@@ -134,7 +197,9 @@ oauth2Proxy:
   # concurrent token refreshes race — one redeems the rotating refresh token,
   # the other fails with "Refresh token is invalid or has already been
   # claimed by another client", periodically killing the browser session.
-  # Same multi-replica limitation as amp-api's actor split-brain. See
+  # This limitation is oauth2-proxy's own: amp-api no longer has one (since
+  # cluster mode, any number of amp-api replicas is safe and its single
+  # replica is a choice; see architecture/clustering.md). See
   # discoveries/prod-diagnostic-2026-08-02.md.
   replicas: 1
   cookieSecure: true

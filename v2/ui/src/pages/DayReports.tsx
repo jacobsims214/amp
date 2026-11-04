@@ -8,6 +8,7 @@ import { api } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { personName } from '../lib/people'
 import type { DayReport, DayReportItem, Member, VelocityDay } from '../types'
+import { projectLink } from '../lib/projectLink'
 
 // /reports — end-of-day reports. Your own day is built live from AMP (what
 // you completed, have in progress, are blocked on, started, created, and
@@ -289,7 +290,7 @@ function Section({ title, items, tone }: { title: string; items: DayReportItem[]
           <ul className="space-y-1">
             {list.map(it => (
               <li key={it.task_id} className="text-sm text-ink flex items-baseline gap-2">
-                <Link to={`/project/${it.project_id}?ticket=${it.task_id}`} className="amp-num text-[11.5px] text-ink-2 underline underline-offset-2 hover:text-ink flex-shrink-0">{it.ref}</Link>
+                <Link to={projectLink(it.project_id, 'mission', it.task_id)} className="amp-num text-[11.5px] text-ink-2 underline underline-offset-2 hover:text-ink flex-shrink-0">{it.ref}</Link>
                 <span className="min-w-0">
                   {it.name}
                   <span className="text-xs text-ink-3"> — {it.epic_name} › {it.story_name}</span>

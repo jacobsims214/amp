@@ -24,6 +24,23 @@ dispatches the specialist subagents. It never edits project code itself.
 
 On a repo with no `.amp.json`, ask it to initialise first — it will pick up the `amp-init` skill.
 
+## Updating: dispatch and completion changed, please update
+
+**Please update the plugin when you update AMP.** AMP made dispatching and starting two separate
+steps in the server, and this release of the plugin is the first that knows it. `amp_dispatch_task`
+now marks a ticket dispatched but **not started**, the worker starts it with
+`amp_claim_task(task_id, dispatch_id)`, and a ticket nobody starts is flagged after 10 minutes and
+returned to ready after 30. This release teaches the manager and workers that flow: the manager
+launches the worker with the `worker_prompt` dispatch returns, the worker claims first, and a
+manager only "closes out" a ticket its worker couldn't finish.
+
+An older plugin keeps working against a new server — AMP has a fallback, so with no claim the
+worker's first comment, run, block or completion starts the ticket (`started_by: "inferred"`) and
+nothing is flagged or returned. What an older plugin misses is the rest: its manager never sees
+`worker_prompt` or `next`, so a ticket it dispatches and doesn't start by hand is flagged at 10
+minutes and returned to ready at 30 instead of being launched correctly. Update with
+`/plugin update amp@amp` and restart Claude Code.
+
 ## What's inside
 
 | Component | Contents |

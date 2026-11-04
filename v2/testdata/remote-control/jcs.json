@@ -1,0 +1,62 @@
+{
+  "_meta": {
+    "generator": "v2/testdata/remote-control/gen_vectors.py",
+    "protocol": "v2/docs/remote-control/protocol.md",
+    "protocol_version": 1
+  },
+  "description": "RFC 8785 canonicalization under the protocol's I-JSON profile. `canonical` is the exact UTF-8 text. `reject` inputs make an envelope malformed (receivers that cannot detect a case, e.g. JSON.parse and duplicate keys, see protocol.md 3.3).",
+  "canonical": [
+    {
+      "name": "key order is by UTF-16 code units, not code points",
+      "input": "{\"\\ufb33\":1,\"\\ud83d\\ude00\":2,\"\\u20ac\":3,\"b\":4,\"a\":5,\"B\":6}",
+      "canonical": "{\"B\":6,\"a\":5,\"b\":4,\"€\":3,\"😀\":2,\"דּ\":1}"
+    },
+    {
+      "name": "whitespace removed, nested objects sorted",
+      "input": "{ \"z\" : [ 1 , { \"y\" : true , \"x\" : null } ] , \"a\" : \"s\" }",
+      "canonical": "{\"a\":\"s\",\"z\":[1,{\"x\":null,\"y\":true}]}"
+    },
+    {
+      "name": "escapes: only \\\" \\\\ \\b \\f \\n \\r \\t and \\u00XX (lower-case hex) for other controls",
+      "input": "{\"s\":\"q\\\" b\\\\ \\b\\f\\n\\r\\t \\u0001 \\u001f \\u007f\"}",
+      "canonical": "{\"s\":\"q\\\" b\\\\ \\b\\f\\n\\r\\t \\u0001 \\u001f \"}"
+    },
+    {
+      "name": "non-ASCII is raw UTF-8, never \\u-escaped (U+2028 and U+2029 included; Go's encoding/json gets this wrong)",
+      "input": "{\"s\":\"\\u00e9 \\u2028 \\u2029 \\ud83d\\ude80 </script>\"}",
+      "canonical": "{\"s\":\"é     🚀 </script>\"}"
+    },
+    {
+      "name": "integers",
+      "input": "{\"a\":0,\"b\":-1,\"c\":9007199254740991,\"d\":-9007199254740991}",
+      "canonical": "{\"a\":0,\"b\":-1,\"c\":9007199254740991,\"d\":-9007199254740991}"
+    },
+    {
+      "name": "empty containers",
+      "input": "{\"a\":{},\"b\":[],\"c\":\"\"}",
+      "canonical": "{\"a\":{},\"b\":[],\"c\":\"\"}"
+    }
+  ],
+  "reject": [
+    {
+      "name": "non-integer number",
+      "input": "{\"a\":1.5}"
+    },
+    {
+      "name": "exponent form is a non-integer number token",
+      "input": "{\"a\":1e3}"
+    },
+    {
+      "name": "integer outside +-(2^53-1)",
+      "input": "{\"a\":9007199254740992}"
+    },
+    {
+      "name": "duplicate key",
+      "input": "{\"a\":1,\"a\":2}"
+    },
+    {
+      "name": "lone surrogate",
+      "input": "{\"a\":\"\\ud800\"}"
+    }
+  ]
+}

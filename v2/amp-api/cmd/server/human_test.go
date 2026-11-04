@@ -154,9 +154,10 @@ func TestHuman_ChainWaitsForThePerson(t *testing.T) {
 	}
 }
 
-// The owner's own agent may record a human ticket done when they say so;
+// A human ticket is the person's own gate: only they mark it done, in the
+// web UI. Their own agent (over MCP) is refused with the ticket's link, and
 // agent accounts never do human work.
-func TestHuman_DoneThroughTheirAgent(t *testing.T) {
+func TestHuman_DoneOnlyByThePersonInTheUI(t *testing.T) {
 	w := newRBACWorld(t)
 	ra := newRestAs(t, w)
 	alice, bob := w.s.as(w.alice), w.s.as(w.bob)
@@ -173,15 +174,23 @@ func TestHuman_DoneThroughTheirAgent(t *testing.T) {
 	if msg := bot.callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(review)}); !strings.Contains(msg, "agent accounts") {
 		t.Fatalf("agent account completing human work: %q", msg)
 	}
-	out := bob.call(t, "amp_complete_task", map[string]any{"task_id": float64(review), "note": "merged it", "hours_worked": 0.5})
-	if out["human_work"] != true {
-		t.Fatalf("complete = %v", out)
+	// The person's own agent, over MCP, is refused with the link to the ticket.
+	wantErr(t, bob.callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(review), "note": "merged it"}),
+		"web UI", fmt.Sprintf("/project/%d/board?task=%d", w.s.projectID, review))
+	wantErr(t, bob.callExpectError(t, "amp_set_task_state", map[string]any{"task_id": float64(review), "state": "completed"}), "web UI")
+	// So is the person's API token on REST: it isn't the web UI either.
+	if code, _ := ra.doVia(t, auth.ChannelToken, "bob", http.MethodPost, fmt.Sprintf("/api/tasks/%d/complete", review), map[string]any{"note": "x"}); code != 403 {
+		t.Fatalf("API token completing a human ticket: %d, want 403", code)
 	}
+	if st := stateOf(t, bob, review); st == "completed" {
+		t.Fatal("human ticket completed off the UI")
+	}
+	// The person, in the web UI, marks it done.
+	out := ra.want(t, 200, "bob", http.MethodPost, fmt.Sprintf("/api/tasks/%d/complete", review), map[string]any{"note": "merged it", "hours_worked": 0.5})
 	run := out["run"].(map[string]any)
-	if !strings.Contains(run["note"].(string), "Recorded by "+w.bob.Email+"'s agent") || !strings.Contains(run["note"].(string), "merged it") {
+	if !strings.Contains(run["note"].(string), "merged it") || strings.Contains(run["note"].(string), "agent") {
 		t.Fatalf("note = %v", run["note"])
 	}
-	_ = ra
 }
 
 // Who does a ticket can change before it starts, never mid-work, and every
@@ -203,8 +212,9 @@ func TestHuman_SwitchingAndRules(t *testing.T) {
 	if msg := alice.callExpectError(t, "amp_update_task", map[string]any{"task_id": float64(id), "human_reason": "vibes"}); !strings.Contains(msg, "human_reason must be one of") {
 		t.Fatalf("bad reason: %q", msg)
 	}
-	// Back to agents, then started by one: no switching mid-work.
-	alice.call(t, "amp_update_task", map[string]any{"task_id": float64(id), "performer": "agent"})
+	// Back to agents (a person, in the web UI: see TestHumanTicketsBecomeAgentWorkOnlyInTheUI),
+	// then started by one: no switching mid-work.
+	newRestAs(t, w).want(t, 200, "alice", http.MethodPatch, fmt.Sprintf("/api/tasks/%d", id), map[string]any{"performer": "agent"})
 	if tk := humanTask(t, alice, id); tk["performer"] != "agent" || tk["human_reason"] != nil {
 		t.Fatalf("back to agent: %v", tk)
 	}
@@ -241,9 +251,10 @@ func TestHuman_SwitchingAndRules(t *testing.T) {
 		t.Fatalf("ownerless human ticket not flagged: %v", plan["issues"])
 	}
 
-	// Trash keeps who does it.
+	// Trash keeps who does it. An open human ticket is deleted in the web UI
+	// (#2190: off the UI that would remove the person's gate).
 	alice.call(t, "amp_assign_task", map[string]any{"task_id": float64(call), "user": "me"})
-	w.s.as(w.lead).call(t, "amp_delete_task", map[string]any{"task_id": float64(call)})
+	newRestAs(t, w).want(t, 200, "lead", http.MethodDelete, fmt.Sprintf("/api/tasks/%d", call), nil)
 	w.s.as(w.lead).call(t, "amp_restore_tasks", map[string]any{"project_id": float64(w.s.projectID), "task_ids": []any{float64(call)}})
 	if tk := humanTask(t, alice, call); tk["performer"] != "human" || tk["human_reason"] != "external" {
 		t.Fatalf("restored: %v", tk)

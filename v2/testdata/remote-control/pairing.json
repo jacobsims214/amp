@@ -1,0 +1,188 @@
+{
+  "_meta": {
+    "generator": "v2/testdata/remote-control/gen_vectors.py",
+    "protocol": "v2/docs/remote-control/protocol.md",
+    "protocol_version": 1
+  },
+  "description": "Pairing derivations (protocol.md section 7). All byte strings are base64url without padding unless named *_hex. Reproduce pairing_id, k_mac, k_sas, mac, sas_code byte for byte; verify sig (ECDSA is randomized in browsers, so test your own signing as a round trip). `reject` cases list the harness's expected code.",
+  "inputs": {
+    "pairing_secret_b64u": "VseH9ZiQ3o4Kl0k-sujoKBA2zavW_hqKP-AJSaE8Uzg",
+    "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+    "harness_pub_b64u": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8",
+    "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+    "device_pub_b64u": "BOXV9BkDJ0hi2xzrV6sXLcp_zjyplXQ3P-w2JNb4vdok_OFQPMoA6uNSJ774mnyYxIee90qeY7dDFJWJdgFm_L4",
+    "device_id": "X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs",
+    "now_ms": 1792948800000,
+    "owner_user_id": 1001
+  },
+  "link": "https://amp.example.test/sessions/rs_YIL0d-r7J-AHLPpZ00o2bA#p=VseH9ZiQ3o4Kl0k-sujoKBA2zavW_hqKP-AJSaE8Uzg&h=KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+  "derived": {
+    "pairing_id": "8D2MNaiyK5zBsUK22WHj_A",
+    "k_mac_hex": "9f43926ecebad69ff35f71ccfe7d364f75a0d702aed410eef61e4c3fc483b21f",
+    "k_sas_hex": "193657f98ea39d159b0d39287fa88d43b46824ee42f20d430560fcfc4d186fd8",
+    "sas_code": "7324-7649"
+  },
+  "request": {
+    "type": "pair_request",
+    "v": 1,
+    "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+    "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+    "pairing_id": "8D2MNaiyK5zBsUK22WHj_A",
+    "device_id": "X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs",
+    "device_pub": "BOXV9BkDJ0hi2xzrV6sXLcp_zjyplXQ3P-w2JNb4vdok_OFQPMoA6uNSJ774mnyYxIee90qeY7dDFJWJdgFm_L4",
+    "device_name": "Safari on iPhone",
+    "ts": 1792948798000,
+    "nonce": "5yUAHQeCzzXjCvQMUo4_6g"
+  },
+  "signing_input": "amp-rc/1 pair-request\n{\"device_id\":\"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\",\"device_name\":\"Safari on iPhone\",\"device_pub\":\"BOXV9BkDJ0hi2xzrV6sXLcp_zjyplXQ3P-w2JNb4vdok_OFQPMoA6uNSJ774mnyYxIee90qeY7dDFJWJdgFm_L4\",\"harness_id\":\"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\",\"nonce\":\"5yUAHQeCzzXjCvQMUo4_6g\",\"pairing_id\":\"8D2MNaiyK5zBsUK22WHj_A\",\"session_id\":\"rs_YIL0d-r7J-AHLPpZ00o2bA\",\"ts\":1792948798000,\"type\":\"pair_request\",\"v\":1}",
+  "message": {
+    "request": {
+      "type": "pair_request",
+      "v": 1,
+      "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+      "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+      "pairing_id": "8D2MNaiyK5zBsUK22WHj_A",
+      "device_id": "X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs",
+      "device_pub": "BOXV9BkDJ0hi2xzrV6sXLcp_zjyplXQ3P-w2JNb4vdok_OFQPMoA6uNSJ774mnyYxIee90qeY7dDFJWJdgFm_L4",
+      "device_name": "Safari on iPhone",
+      "ts": 1792948798000,
+      "nonce": "5yUAHQeCzzXjCvQMUo4_6g"
+    },
+    "mac": "l2EAOHVyKtKsSHPySho5WG3lFLLP7ufJym5EpXZCcNs",
+    "sig": "QvpWZf8LtT0Tgays3Revr-KabBpitzLmcG_EYix9uYSWdEOa2VH7CsVHDRZNnAUvcXaVdsLqHdoVHWuPKXcuhA"
+  },
+  "reject": [
+    {
+      "name": "bad_mac_wrong_secret",
+      "note": "MAC made with a secret that is not the link's.",
+      "message": {
+        "request": {
+          "type": "pair_request",
+          "v": 1,
+          "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "pairing_id": "8D2MNaiyK5zBsUK22WHj_A",
+          "device_id": "X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs",
+          "device_pub": "BOXV9BkDJ0hi2xzrV6sXLcp_zjyplXQ3P-w2JNb4vdok_OFQPMoA6uNSJ774mnyYxIee90qeY7dDFJWJdgFm_L4",
+          "device_name": "Safari on iPhone",
+          "ts": 1792948798000,
+          "nonce": "5yUAHQeCzzXjCvQMUo4_6g"
+        },
+        "mac": "zCzaJzouKhXN_N4iZbydOxyp6gIVIgPgJiBHVWelYxc",
+        "sig": "QvpWZf8LtT0Tgays3Revr-KabBpitzLmcG_EYix9uYSWdEOa2VH7CsVHDRZNnAUvcXaVdsLqHdoVHWuPKXcuhA"
+      },
+      "relay_user_id": 1001,
+      "expect": "bad_mac"
+    },
+    {
+      "name": "bad_signature_key_not_held",
+      "note": "Valid MAC, but the signature is not by device_pub (no proof of possession).",
+      "message": {
+        "request": {
+          "type": "pair_request",
+          "v": 1,
+          "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "pairing_id": "8D2MNaiyK5zBsUK22WHj_A",
+          "device_id": "5bgVLzzeYlwWrwJhd0NCW2PYcAqFNxGmO3mQ1mbPYDM",
+          "device_pub": "BELn0AnhW9HwYf9-SObGslJ5rNQnczFQJD_H-g84_ManxIDVBX3mdasLhIsvzul0Fg6lXVp86Kl-zGOAN8fC9Pc",
+          "device_name": "Safari on iPhone",
+          "ts": 1792948798000,
+          "nonce": "5yUAHQeCzzXjCvQMUo4_6g"
+        },
+        "mac": "RrovYI5C9opuYfsRLmFtk4XHxR6BXUqEEIRmlH8hXxc",
+        "sig": "FbV3NoEdZTUlgvjbhc-ruUqjhtglfFBeSnHxQmRC_EPKPNqhqvWthlT_yIR0uPjw1tAXnGBDTEjhs7jOiYnuVA"
+      },
+      "relay_user_id": 1001,
+      "expect": "bad_signature"
+    },
+    {
+      "name": "device_id_mismatch",
+      "note": "device_id is not the fingerprint of device_pub.",
+      "message": {
+        "request": {
+          "type": "pair_request",
+          "v": 1,
+          "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "pairing_id": "8D2MNaiyK5zBsUK22WHj_A",
+          "device_id": "5bgVLzzeYlwWrwJhd0NCW2PYcAqFNxGmO3mQ1mbPYDM",
+          "device_pub": "BOXV9BkDJ0hi2xzrV6sXLcp_zjyplXQ3P-w2JNb4vdok_OFQPMoA6uNSJ774mnyYxIee90qeY7dDFJWJdgFm_L4",
+          "device_name": "Safari on iPhone",
+          "ts": 1792948798000,
+          "nonce": "5yUAHQeCzzXjCvQMUo4_6g"
+        },
+        "mac": "Bm79y2ut9cL7UvjeZ7-8_lGhbHkDMFKixjy41EYOMhA",
+        "sig": "bwfsACSIEpto5EdgfmGzpn3GAv0oBNx_OVOoWTlWscw3EisiVGWOo12sDPvXI7TnG57T3bcE3t3RUgW-HxOk_w"
+      },
+      "relay_user_id": 1001,
+      "expect": "device_id_mismatch"
+    },
+    {
+      "name": "unknown_pairing",
+      "note": "pairing_id of another (or a consumed) secret.",
+      "message": {
+        "request": {
+          "type": "pair_request",
+          "v": 1,
+          "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "pairing_id": "l7sLH61NSwHGIA-iX5doWg",
+          "device_id": "X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs",
+          "device_pub": "BOXV9BkDJ0hi2xzrV6sXLcp_zjyplXQ3P-w2JNb4vdok_OFQPMoA6uNSJ774mnyYxIee90qeY7dDFJWJdgFm_L4",
+          "device_name": "Safari on iPhone",
+          "ts": 1792948798000,
+          "nonce": "5yUAHQeCzzXjCvQMUo4_6g"
+        },
+        "mac": "GlOkK3FsheikBtMpJX_3ZU2DjV29BipxPif7eDIXDJo",
+        "sig": "m2Ai7lj4WEb3fUzkcBs4_DxuutaliFWmah6yMtMz6S6xAAVtiewx-7jru9M-JvtJuVV_XtO80Je4KHCsdPfEnw"
+      },
+      "relay_user_id": 1001,
+      "expect": "unknown_pairing"
+    },
+    {
+      "name": "stale_ts",
+      "note": "Request ts 61 s old.",
+      "message": {
+        "request": {
+          "type": "pair_request",
+          "v": 1,
+          "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "pairing_id": "8D2MNaiyK5zBsUK22WHj_A",
+          "device_id": "X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs",
+          "device_pub": "BOXV9BkDJ0hi2xzrV6sXLcp_zjyplXQ3P-w2JNb4vdok_OFQPMoA6uNSJ774mnyYxIee90qeY7dDFJWJdgFm_L4",
+          "device_name": "Safari on iPhone",
+          "ts": 1792948739000,
+          "nonce": "v5DuCtyS7XSpBxWmz_7_Pg"
+        },
+        "mac": "1O8Gb6CGnypRC4BXvKLEW7ti74SXHtXYOHxBnlklkA8",
+        "sig": "qkHy4hdq1FVHKt1q1-hn3Q1r-G52A5lNZlMKluOUbZHOxG7ixxPcfIdCVXytEJxox7EN4viN5wGyNPUwMOGMBg"
+      },
+      "relay_user_id": 1001,
+      "expect": "stale_ts"
+    },
+    {
+      "name": "wrong_user",
+      "note": "The relay says the requester is another AMP user.",
+      "message": {
+        "request": {
+          "type": "pair_request",
+          "v": 1,
+          "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "pairing_id": "8D2MNaiyK5zBsUK22WHj_A",
+          "device_id": "X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs",
+          "device_pub": "BOXV9BkDJ0hi2xzrV6sXLcp_zjyplXQ3P-w2JNb4vdok_OFQPMoA6uNSJ774mnyYxIee90qeY7dDFJWJdgFm_L4",
+          "device_name": "Safari on iPhone",
+          "ts": 1792948798000,
+          "nonce": "5yUAHQeCzzXjCvQMUo4_6g"
+        },
+        "mac": "l2EAOHVyKtKsSHPySho5WG3lFLLP7ufJym5EpXZCcNs",
+        "sig": "QvpWZf8LtT0Tgays3Revr-KabBpitzLmcG_EYix9uYSWdEOa2VH7CsVHDRZNnAUvcXaVdsLqHdoVHWuPKXcuhA"
+      },
+      "relay_user_id": 2002,
+      "expect": "wrong_user"
+    }
+  ]
+}

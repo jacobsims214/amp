@@ -21,13 +21,13 @@ amp_create_org amp_create_project amp_create_story amp_create_task amp_create_ta
 amp_delete_story amp_delete_task amp_design_context amp_design_system_publish amp_design_system_start
 amp_dispatch_task amp_export_project amp_find_by_metadata amp_get_artifact amp_get_epic amp_get_project
 amp_get_story amp_get_task amp_get_task_comments amp_get_task_runs amp_get_ticket_history amp_guide
-amp_handover_tasks amp_import_project amp_kb_annotate amp_kb_delete amp_kb_get amp_kb_list amp_kb_reindex
+amp_handover_tasks amp_import_project amp_kb_annotate amp_kb_delete amp_kb_get amp_kb_list amp_kb_list_deleted amp_kb_reindex amp_kb_restore
 amp_kb_resolve_annotation amp_kb_search amp_kb_sources amp_kb_status amp_kb_tags amp_kb_write amp_keep_artifact
 amp_list_artifacts amp_list_day_reports amp_list_deleted_tasks amp_list_epics amp_list_orgs
 amp_list_project_members amp_list_project_stories amp_list_projects amp_list_stories amp_list_tasks
 amp_list_unmerged amp_manage_invites amp_manage_org_members amp_manage_project_teams amp_manage_team_members
 amp_manage_teams amp_move_story amp_move_task amp_project_day_reports amp_publish_artifact amp_report_run
-amp_reset_project amp_restore_project amp_restore_tasks amp_review_artifact amp_save_day_report
+amp_report_merged amp_reset_project amp_restore_project amp_restore_tasks amp_review_artifact amp_save_day_report
 amp_set_task_dependencies amp_set_task_start_at amp_set_task_state amp_trace amp_update_epic
 amp_update_project_settings amp_update_story amp_update_task amp_velocity amp_whoami amp_get_plan`)
 
@@ -90,9 +90,9 @@ func TestCatalog_ListedToolsPerCaller(t *testing.T) {
 	hidden := []string{"amp_get_ticket_history", "amp_get_task_comments", "amp_get_task_runs", "amp_create_task",
 		"amp_list_stories", "amp_list_project_stories", "amp_get_epic", "amp_get_story",
 		"amp_archive_project", "amp_restore_project", "amp_reset_project", "amp_export_project", "amp_import_project",
-		"amp_create_org", "amp_kb_tags", "amp_kb_reindex"}
+		"amp_create_org", "amp_kb_tags"}
 	admin := []string{"amp_manage_invites", "amp_manage_org_members", "amp_manage_teams", "amp_audit_log"}
-	person := []string{"amp_approve_plan", "amp_review_artifact", "amp_keep_artifact"}
+	person := []string{"amp_review_artifact", "amp_keep_artifact"}
 
 	agentUser := *w.alice.User
 	agentUser.Kind = domain.UserKindAgent
@@ -124,7 +124,11 @@ func TestCatalog_ListedToolsPerCaller(t *testing.T) {
 				t.Errorf("%s: %s listed=%v, want %v", c.who, n, got[n], c.persons)
 			}
 		}
-		for _, n := range []string{"amp_get_task", "amp_get_plan", "amp_list_tasks", "amp_dispatch_task", "amp_create_tasks", "amp_manage_team_members"} {
+		// amp_kb_reindex is listed for everyone, agents included: it checks
+		// write access to the KB it names when called.
+		// amp_approve_plan too: it never approves, it tells any caller (old
+		// manager prompts included) where a person approves.
+		for _, n := range []string{"amp_get_task", "amp_get_plan", "amp_list_tasks", "amp_dispatch_task", "amp_create_tasks", "amp_manage_team_members", "amp_kb_reindex", "amp_approve_plan"} {
 			if !got[n] {
 				t.Errorf("%s: %s not listed", c.who, n)
 			}
@@ -258,6 +262,8 @@ func TestCatalog_SearchFindsTheRightTool(t *testing.T) {
 		{"approve plan", "amp_approve_plan"}, {"check plan", "amp_check_plan"},
 		{"amp task get list dispatch", "amp_get_task"}, {"reassign ticket", "amp_assign_task"},
 		{"design context", "amp_design_context"}, {"how do I use amp", "amp_guide"},
+		{"reindex kb", "amp_kb_reindex"}, {"rebuild search index", "amp_kb_reindex"},
+		{"kb trash", "amp_kb_list_deleted"}, {"restore kb doc", "amp_kb_restore"},
 		{"list epics", "amp_list_epics"}, {"list stories", "amp_get_plan|amp_list_epics"}, {"see the plan", "amp_get_plan"},
 	}
 	// Queries whose words are in other tools' names, which opencode scores

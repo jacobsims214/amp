@@ -85,14 +85,154 @@ type MsgDispatchTask struct {
 	// Human is set when a person starts their own human ticket (the UI's
 	// Start). Agents never start human tickets, and people don't start
 	// agent tickets this way.
-	Human   bool
-	ReplyCh chan ReplySimple
+	Human bool
+	// DispatchID is the token this dispatch hands out (AMP #2801). The
+	// worker presents it to start the ticket (MsgClaimStart) and to
+	// complete it. Empty for a person's own start of a human ticket, which
+	// is started on the spot (a person works the ticket they started).
+	DispatchID string
+	ReplyCh    chan ReplySimple
+}
+
+// MsgClaimStart is a worker starting the ticket it was dispatched for
+// (amp_claim_task with a dispatch_id), or the fallback start of a plugin
+// whose first activity counts as one (AMP #2801).
+//
+// DispatchID is the token the caller presents, or "" for the fallback.
+// Inferred marks the fallback: the ticket is started but nothing is posted
+// on it, and there is no claim to refuse. A token that isn't the current
+// one is refused ("the ticket was returned and re-dispatched"), so a worker
+// from an earlier dispatch can't silently take the new run.
+type MsgClaimStart struct {
+	TaskID     int
+	DispatchID string
+	Inferred   bool
+	// By names the agent starting it for the record ("" for inferred).
+	By     string
+	ByName string
+	// Post is the comment body to post when the caller isn't inferred ("":
+	// none), so the claim shows on the ticket as well as in the history.
+	Post    string
+	ByUser  *int
+	ReplyCh chan ReplyStart
+}
+
+// ReplyStart answers MsgClaimStart: the ticket as it is after the start,
+// whether this call started it (false: it already was, which is not an
+// error), and the dispatch it started under.
+type ReplyStart struct {
+	Task           *domain.Task
+	Started        bool
+	DispatchID     string
+	AlreadyStarted bool
+	Err            error
+}
+
+// MsgReturnTask sends a dispatched ticket back to ready because no worker
+// started it (AMP #2801), or because the run holding its dispatch gave up: the watchdog's automatic return, or a harness
+// releasing a ticket whose worker ended without closing it
+// (amp_return_task).
+type MsgReturnTask struct {
+	TaskID int
+	Reason string
+	// DispatchID, when it is the ticket's current dispatch, lets that run
+	// return its own started ticket (AMP #2909). A stale one is refused.
+	DispatchID string
+	// IfDispatch makes it a compare-and-return, for the watchdog (AMP
+	// #2949): the ticket is returned only while ExpectDispatchID ("" too) is
+	// still its dispatch and nobody has started it. A ticket returned and
+	// dispatched again since the sweep read it holds a fresh dispatch, which
+	// is refused rather than returned.
+	IfDispatch       bool
+	ExpectDispatchID string
+	// By names who returned it in the history ("system" for the watchdog).
+	By      *int
+	ByName  string
+	ReplyCh chan ReplyGetTask
 }
 
 type MsgCompleteTask struct {
-	TaskID  int
-	By      *int // acting user, for the activity log
-	ReplyCh chan ReplySimple
+	TaskID int
+	By     *int // acting user, for the activity log
+	// ByName names the caller in the activity log (an email, or "local-dev")
+	// when the ticket has no agent to name.
+	ByName string
+	// RequireStarted refuses unless the ticket is in progress (or already
+	// completed): agents complete only work that was dispatched. Checked in
+	// the actor so a state change racing the caller's check can't slip by.
+	RequireStarted bool
+	// RequireDeps refuses while any dependency is incomplete (re-read from
+	// the database), so a dependency added or reopened after dispatch still
+	// holds an agent's completion. Set off the web UI.
+	RequireDeps bool
+	// MergeRequired: the run that finished it put work on a PR or a pushed
+	// branch and its project requires merges, so it completes with
+	// merge_state "needed" and its dependents keep waiting until the merge
+	// is recorded (AMP #2475). MergeWhere names the PR or branch for the
+	// waiting detail. Old replicas ignore both (gob drops unknown fields).
+	MergeRequired bool
+	MergeWhere    string
+	// DispatchID is the dispatch token the caller presents (AMP #2801). The
+	// current one makes this the worker's own completion; anything else
+	// (none, or a token from an earlier dispatch) is a closeout, which the
+	// actor records as such. CloseoutReason is the why, for the record.
+	DispatchID     string
+	CloseoutReason string
+	// CloseoutOK lets a completion of a ticket that was never dispatched
+	// through as a closeout: it needs prior work on the ticket (the service
+	// checks), which is how a ready ticket with runs is closed out without
+	// dispatching it first (#2473/#2494).
+	CloseoutOK bool
+	// InUI is set when a person completes the ticket in the AMP web UI: that
+	// is their own act, recorded as theirs, never as a manager's closeout.
+	InUI bool
+	// MergeStepFor (AMP #3009), non-zero: this completion is a human merge
+	// step completing because the merge of ticket MergeStepFor was recorded
+	// by Source ("github", "ci" or "ui"). The step's history says that, so
+	// nobody reads it as a sign-off the person gave.
+	MergeStepFor int
+	Source       string
+	ReplyCh      chan ReplyComplete
+}
+
+// ReplyComplete answers MsgCompleteTask: the ticket after the completion and
+// whether it was recorded as a closeout (the caller wasn't its worker).
+type ReplyComplete struct {
+	Task     *domain.Task
+	Closeout bool
+	Err      error
+}
+
+// MsgSetMergeState changes a ticket's merge state in its actor (AMP #2475):
+// a merge recorded, a PR abandoned, a merge marked not needed, or a PR
+// reported after completion. When the change releases or holds the
+// ticket's dependents, the actor tells them, as completion does.
+type MsgSetMergeState struct {
+	TaskID int
+	State  string // domain.MergeNone / MergeNeeded / MergeMerged / MergeAbandoned
+	// Required sets merge_required (nil keeps it).
+	Required *bool
+	// Source and At record who reported a merge and when (State merged).
+	Source string
+	At     *time.Time
+	// Where names the PR or branch, for the waiting detail when it gates.
+	Where string
+	// From applies the change only while the ticket's merge state is one of
+	// these (empty: any). The reply says whether it changed.
+	From   []string
+	By     *int
+	ByName string
+	// Detail is the activity-log line.
+	Detail  string
+	ReplyCh chan ReplyMergeState
+}
+
+// ReplyMergeState is the ticket after MsgSetMergeState, and whether its
+// merge state changed.
+type ReplyMergeState struct {
+	Task    *domain.Task
+	Changed bool
+	Err     error
 }
 
 type MsgBlockTask struct {
@@ -113,14 +253,24 @@ type MsgAssignTask struct {
 	// RequireIdle refuses the change if the ticket is in progress (set when
 	// only the project's open-reassign setting allows it).
 	RequireIdle bool
-	By          *int
-	ByName      string
-	ReplyCh     chan ReplyGetTask
+	// ByLead is set when the person making the change is a project lead or
+	// above acting in the AMP web UI (not over MCP or an API token, AMP
+	// #2223): their reassignment keeps the ticket's plan approval. Anyone
+	// else's drops it when the ticket stops being the person it was approved
+	// for (domain.Task.DropsApprovalOn, AMP #2218).
+	ByLead  bool
+	By      *int
+	ByName  string
+	ReplyCh chan ReplyGetTask
 }
 
 type MsgUpdateTask struct {
-	Req     domain.UpdateTaskRequest
-	ReplyCh chan ReplySimple
+	Req domain.UpdateTaskRequest
+	// KeepHuman, when set, refuses (with this message) switching a person's
+	// ticket to agent work. The task actor checks it atomically with the
+	// update; a string so it survives remote encoding.
+	KeepHuman string
+	ReplyCh   chan ReplySimple
 }
 
 type MsgAddComment struct {
@@ -134,11 +284,29 @@ type MsgGetComments struct {
 }
 
 type MsgSetTaskState struct {
-	TaskID  int
-	State   domain.TaskState
-	Reason  string
-	By      *int
-	ReplyCh chan ReplySimple
+	TaskID int
+	State  domain.TaskState
+	Reason string
+	By     *int
+	// DispatchID is the dispatch token the caller presents (AMP #2801): set,
+	// the caller claims to be the ticket's worker, so its completion to
+	// completed isn't recorded as a closeout.
+	DispatchID string
+	// InUI is set when a person changes the state in the AMP web UI: their
+	// own act, never a manager's closeout.
+	InUI bool
+	// ByName names who changed it in the activity log (default "manager").
+	ByName string
+	// RequireStarted refuses unless the ticket is in progress (see
+	// MsgCompleteTask).
+	RequireStarted bool
+	// RequireDeps (set off the web UI) keeps a ticket with an incomplete
+	// dependency from being made ready or done by hand: to completed or
+	// in_progress it's refused; to backlog it's refused from backlog or
+	// blocked, and work moved back from in progress or completed lands
+	// blocked on its dependencies instead.
+	RequireDeps bool
+	ReplyCh     chan ReplySimple
 }
 
 // MsgSetTaskStartAt updates a task's start_at schedule.
@@ -147,6 +315,22 @@ type MsgSetTaskStartAt struct {
 	TaskID  int
 	StartAt *time.Time
 	ReplyCh chan ReplySimple
+}
+
+// MsgApproveTask records a person's approval of one ticket's plan (AMP
+// #2198). The task actor approves it only if, at that moment, it is still
+// open, not already approved as planned now, planned at or before AsOf
+// (when set: what the person saw), and owned by ExpectOwner (whom the
+// service checked the approver may approve for). Otherwise it replies with
+// Approved false and Why. ByName/OnBehalfOf word the history entry.
+type MsgApproveTask struct {
+	TaskID      int
+	AsOf        *time.Time
+	ExpectOwner *int
+	By          *int
+	ByName      string
+	OnBehalfOf  string
+	ReplyCh     chan ReplyApproveTask
 }
 
 // MsgScheduledUnblock is sent by the timer goroutine to the TaskActor
@@ -197,6 +381,9 @@ type MsgDeleteTask struct {
 // whenever any task completes. Each TaskActor checks its own deps.
 type MsgDepCompleted struct {
 	CompletedTaskID int
+	// MergeWait, when set, means the task is done but its merge isn't
+	// recorded: dependents keep waiting, and show this as why.
+	MergeWait string
 }
 
 // MsgTaskDispatched bubbles up: TaskActor → StoryActor → EpicActor → ProjectActor
@@ -217,6 +404,7 @@ type MsgTaskCompleted struct {
 // immediately after MsgCompleteTask returns.
 type MsgFanDepCompleted struct {
 	CompletedTaskID int
+	MergeWait       string // see MsgDepCompleted
 	ReplyCh         chan ReplySimple
 }
 
@@ -360,6 +548,15 @@ type ReplyGetTask struct {
 type ReplyListTasks struct {
 	Tasks []domain.Task
 	Err   error
+}
+
+// ReplyApproveTask answers MsgApproveTask: the ticket as it is now, whether
+// this call approved it, and why not when it didn't.
+type ReplyApproveTask struct {
+	Task     *domain.Task
+	Approved bool
+	Why      string
+	Err      error
 }
 
 type ReplySimple struct {

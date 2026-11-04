@@ -1,0 +1,11 @@
+-- planned_at defaults to the statement's wall clock (AMP #2192).
+--
+-- NOW() is the transaction's start time: a ticket inserted by a long
+-- transaction that began before a plan approval would get a planned_at
+-- before that approval and be covered by it without anyone having seen it.
+-- clock_timestamp() is when the row is actually written. The repository
+-- writes planned_at explicitly with clock_timestamp() too; this keeps the
+-- column default (any other INSERT) on the same clock.
+--
+-- Default-only change: no rows are rewritten, existing values are kept.
+ALTER TABLE tasks ALTER COLUMN planned_at SET DEFAULT clock_timestamp();

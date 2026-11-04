@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -134,6 +135,12 @@ func (s *Service) CreateTask(ctx context.Context, p authz.Principal, req domain.
 	if req.Performer, req.HumanReason, err = domain.NormalizePerformer(req.Performer, req.HumanReason); err != nil {
 		return nil, nil, authz.BadRequest("%v", err)
 	}
+	// merge_for names the ticket whose PR merge this person's step tracks
+	// (AMP #3009): checked before the ticket exists, so a bad link never
+	// creates a half-wired step.
+	if err := s.checkMergeFor(ctx, req.ProjectID, 0, req.Performer, req.Metadata); err != nil {
+		return nil, nil, err
+	}
 	if req.OwnerUserID, err = s.ResolveNewTaskOwner(ctx, p, req.ProjectID, ownerRef); err != nil {
 		return nil, nil, err
 	}
@@ -180,6 +187,9 @@ func (s *Service) SetTaskDependencies(ctx context.Context, p authz.Principal, ta
 	if deps, err = s.ValidateDependencies(ctx, t.ProjectID, taskID, deps); err != nil {
 		return nil, nil, err
 	}
+	if err := s.guardDroppedHumanGates(ctx, p, t, deps); err != nil {
+		return nil, nil, err
+	}
 	pid, err := s.Registry.Get(t.ProjectID)
 	if err != nil {
 		return nil, nil, err
@@ -196,6 +206,38 @@ func (s *Service) SetTaskDependencies(ctx context.Context, p authz.Principal, ta
 			taskID, strings.ReplaceAll(string(reply.Task.State), "_", " "), joinIDs(reply.Task.BlockedByIDs)))
 	}
 	return reply.Task, warnings, nil
+}
+
+// guardDroppedHumanGates refuses, off the web UI, a dependency change that
+// drops an open human ticket from t's dependencies: that would let the work
+// after a person's gate go ahead without the person. Adding dependencies,
+// and dropping agent or completed tickets, stays allowed.
+func (s *Service) guardDroppedHumanGates(ctx context.Context, p authz.Principal, t *domain.Task, next []int) error {
+	if p.InUI() {
+		return nil
+	}
+	current, err := s.Repo.TaskDependencies(ctx, t.ID)
+	if err != nil {
+		return err
+	}
+	keep := map[int]bool{}
+	for _, d := range next {
+		keep[d] = true
+	}
+	for _, d := range current {
+		if keep[d] {
+			continue
+		}
+		dep, err := s.Repo.GetTask(ctx, d)
+		if err != nil {
+			continue // already gone: nothing left to gate on
+		}
+		if dep.IsHuman() && dep.State != domain.TaskStateCompleted {
+			return authz.UIOnly(fmt.Sprintf("Removing ticket %d's dependency on ticket %d (a person's open ticket)", t.ID, d),
+				s.TaskURL(t.ProjectID, d))
+		}
+	}
+	return nil
 }
 
 // EditDependencies adds and removes dependencies of a ticket.
@@ -314,16 +356,25 @@ type PlanReport struct {
 	OK bool `json:"ok"`
 	// Plan approval: open tickets planned since the last approval, when
 	// that was, and whether the project requires it before dispatch.
-	AwaitingApproval    []int       `json:"awaiting_approval"`
-	ApprovedAt          *time.Time  `json:"plan_approved_at,omitempty"`
-	ApprovedBy          *int        `json:"plan_approved_by,omitempty"`
-	RequirePlanApproval bool        `json:"require_plan_approval"`
-	Tasks               int         `json:"tasks"`
-	OpenTasks           int         `json:"open_tasks"`
-	Dependencies        int         `json:"dependencies"`
-	ReadyNow            []int       `json:"ready_now"`
-	LongestChain        int         `json:"longest_chain"` // tickets on the longest dependency path
-	Issues              []PlanIssue `json:"issues"`
+	AwaitingApproval []int `json:"awaiting_approval"`
+	// AwaitingApprovalTickets are the same tickets with their owners and
+	// whether they're the caller's own to approve (AMP #2198: a person
+	// approves their own tickets; others' only on their behalf, as a lead).
+	AwaitingApprovalTickets []AwaitingTicket `json:"awaiting_approval_tickets"`
+	// AwaitingYours are the caller's own among AwaitingApproval.
+	AwaitingYours       []int      `json:"awaiting_yours"`
+	ApprovedAt          *time.Time `json:"plan_approved_at,omitempty"`
+	ApprovedBy          *int       `json:"plan_approved_by,omitempty"`
+	RequirePlanApproval bool       `json:"require_plan_approval"`
+	// ApproveURL, when tickets await approval, is the project's My work tab
+	// (Approve view) where a person approves them (agents can't).
+	ApproveURL   string      `json:"approve_url,omitempty"`
+	Tasks        int         `json:"tasks"`
+	OpenTasks    int         `json:"open_tasks"`
+	Dependencies int         `json:"dependencies"`
+	ReadyNow     []int       `json:"ready_now"`
+	LongestChain int         `json:"longest_chain"` // tickets on the longest dependency path
+	Issues       []PlanIssue `json:"issues"`
 	// HumanGates are the open tickets people do, and how much open work
 	// waits on each: where the plan puts a person in the loop.
 	HumanGates      []HumanGate `json:"human_gates"`
@@ -338,6 +389,9 @@ type HumanGate struct {
 	Reason    string `json:"reason"`
 	Owner     *int   `json:"owner_user_id"`
 	HoldingUp int    `json:"holding_up"` // open tickets downstream of it
+	// MergeFor is the ticket whose PR merge this step tracks (merge_for,
+	// AMP #3009): My work shows one card for that merge, not two.
+	MergeFor int `json:"merge_for,omitempty"`
 }
 
 // readyFanoutThreshold: more ready tickets than this, when they're also more
@@ -369,168 +423,27 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 	if err != nil {
 		return nil, err
 	}
-	r := &PlanReport{Tasks: len(tasks), ReadyNow: []int{}, Issues: []PlanIssue{}, AwaitingApproval: []int{}, HumanGates: []HumanGate{}}
+	r := &PlanReport{Tasks: len(tasks), ReadyNow: []int{}, Issues: []PlanIssue{}, AwaitingApproval: []int{},
+		AwaitingApprovalTickets: []AwaitingTicket{}, AwaitingYours: []int{}, HumanGates: []HumanGate{}}
 	proj, err := s.Repo.GetProject(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
 	r.ApprovedAt, r.ApprovedBy, r.RequirePlanApproval = proj.PlanApprovedAt, proj.PlanApprovedBy, proj.RequirePlanApproval
 	for i := range tasks {
-		if tasks[i].State != domain.TaskStateCompleted && proj.AwaitsApproval(&tasks[i]) {
-			r.AwaitingApproval = append(r.AwaitingApproval, tasks[i].ID)
-		}
-	}
-	byID := map[int]domain.Task{}
-	dependents := map[int]int{}
-	for _, t := range tasks {
-		byID[t.ID] = t
-		r.Dependencies += len(t.DependencyIDs)
-		for _, d := range t.DependencyIDs {
-			dependents[d]++
-		}
-	}
-
-	var isolated, stuck []int
-	for _, t := range tasks {
-		if t.State == domain.TaskStateCompleted {
-			continue
-		}
-		r.OpenTasks++
-		waiting := false
-		for _, d := range t.DependencyIDs {
-			if byID[d].State != domain.TaskStateCompleted {
-				waiting = true
+		if t := &tasks[i]; t.State != domain.TaskStateCompleted && proj.AwaitsApproval(t) {
+			yours := t.ApprovesAsOwn(p.UserID)
+			r.AwaitingApproval = append(r.AwaitingApproval, t.ID)
+			r.AwaitingApprovalTickets = append(r.AwaitingApprovalTickets, AwaitingTicket{TaskID: t.ID, OwnerUserID: t.OwnerUserID, Yours: yours})
+			if yours {
+				r.AwaitingYours = append(r.AwaitingYours, t.ID)
 			}
 		}
-		if t.State == domain.TaskStateBacklog && !waiting {
-			r.ReadyNow = append(r.ReadyNow, t.ID)
-		}
-		if t.State == domain.TaskStateBlocked && t.BlockReason == "" && !waiting {
-			stuck = append(stuck, t.ID)
-		}
-		if len(t.DependencyIDs) == 0 && dependents[t.ID] == 0 {
-			isolated = append(isolated, t.ID)
-		}
 	}
-
-	if len(tasks) > 1 && len(isolated) > 0 {
-		r.Issues = append(r.Issues, PlanIssue{
-			Kind: "isolated", TaskIDs: isolated,
-			Message: fmt.Sprintf("%d open ticket(s) neither depend on anything nor have anything depending on them: %s. Each can run at any time, in parallel with everything else.", len(isolated), joinIDs(isolated)),
-			Fix:     "If one needs another's output, or something needs its output, wire it with amp_set_task_dependencies. Leave it only if it truly is independent work.",
-		})
+	if len(r.AwaitingApproval) > 0 {
+		r.ApproveURL = s.PlanURL(projectID)
 	}
-	if len(r.ReadyNow) > readyFanoutThreshold && len(r.ReadyNow)*2 > r.OpenTasks {
-		r.Issues = append(r.Issues, PlanIssue{
-			Kind: "wide_start", TaskIDs: r.ReadyNow,
-			Message: fmt.Sprintf("%d of %d open tickets can be dispatched right now. That much parallel work usually means dependencies are missing.", len(r.ReadyNow), r.OpenTasks),
-			Fix:     "Check each ready ticket: does it need anything built first? Add those dependencies.",
-		})
-	}
-	storyTasks := map[int]int{}
-	for _, t := range tasks {
-		storyTasks[t.StoryID]++
-	}
-	var empty []string
-	for _, st := range stories {
-		if storyTasks[st.ID] == 0 {
-			empty = append(empty, fmt.Sprintf("%q (#%d)", st.Name, st.ID))
-		}
-	}
-	if len(empty) > 0 {
-		r.Issues = append(r.Issues, PlanIssue{
-			Kind:    "empty_stories",
-			Message: "Stories with no tickets: " + strings.Join(empty, ", "),
-			Fix:     "Add their tickets, move tickets into them (amp_move_task), or delete them (amp_delete_story).",
-		})
-	}
-
-	// People in the loop: every open human ticket needs someone to do it,
-	// and the plan should say how much agent work waits on each.
-	down := map[int][]int{}
-	for _, t := range tasks {
-		for _, d := range t.DependencyIDs {
-			down[d] = append(down[d], t.ID)
-		}
-	}
-	var ownerless []int
-	for _, t := range tasks {
-		if !t.IsHuman() || t.State == domain.TaskStateCompleted {
-			continue
-		}
-		if t.OwnerUserID == nil {
-			ownerless = append(ownerless, t.ID)
-		}
-		seen := map[int]bool{}
-		queue := append([]int(nil), down[t.ID]...)
-		n := 0
-		for len(queue) > 0 {
-			id := queue[0]
-			queue = queue[1:]
-			if seen[id] {
-				continue
-			}
-			seen[id] = true
-			if byID[id].State != domain.TaskStateCompleted {
-				n++
-			}
-			queue = append(queue, down[id]...)
-		}
-		r.HumanGates = append(r.HumanGates, HumanGate{ID: t.ID, Name: t.Name, Reason: t.HumanReason, Owner: t.OwnerUserID, HoldingUp: n})
-	}
-	if len(ownerless) > 0 {
-		r.Issues = append(r.Issues, PlanIssue{
-			Kind: "human_without_owner", TaskIDs: ownerless,
-			Message: fmt.Sprintf("%d human ticket(s) have no owner, so nobody will do them and everything after them waits: %s.", len(ownerless), joinIDs(ownerless)),
-			Fix:     "Assign each to the person who does it (amp_assign_task), or make it agent work (amp_update_task performer='agent').",
-		})
-	}
-
-	// A gate that couples different people's work: its dependencies belong to
-	// two or more people, and so do the tickets waiting on it, so each person's
-	// next work waits on everyone's. Often a review that should be split.
-	ownerOf := func(id int) string {
-		if t, ok := byID[id]; ok && t.OwnerUserID != nil {
-			return fmt.Sprint(*t.OwnerUserID)
-		}
-		return ""
-	}
-	waiters := map[int][]int{}
-	for _, t := range tasks {
-		for _, d := range t.DependencyIDs {
-			waiters[d] = append(waiters[d], t.ID)
-		}
-	}
-	var coupled []int
-	var coupledDetail []string
-	for _, t := range tasks {
-		if t.State == domain.TaskStateCompleted || len(t.DependencyIDs) < 2 || len(waiters[t.ID]) < 2 {
-			continue
-		}
-		up, down := map[string]bool{}, map[string]bool{}
-		for _, d := range t.DependencyIDs {
-			if o := ownerOf(d); o != "" {
-				up[o] = true
-			}
-		}
-		for _, w := range waiters[t.ID] {
-			if o := ownerOf(w); o != "" {
-				down[o] = true
-			}
-		}
-		if len(up) >= 2 && len(down) >= 2 {
-			coupled = append(coupled, t.ID)
-			coupledDetail = append(coupledDetail, fmt.Sprintf("#%d (waits on %d people's tickets; %d tickets of %d people wait on it)", t.ID, len(up), len(waiters[t.ID]), len(down)))
-		}
-	}
-	if len(coupled) > 0 {
-		r.Issues = append(r.Issues, PlanIssue{
-			Kind: "coupled_gate", Severity: "warn", TaskIDs: coupled,
-			Message: "These tickets join different people's work: " + strings.Join(coupledDetail, "; ") +
-				". Everyone's next tickets wait until all of it is done, so one person's delay stalls the others.",
-			Fix: "If the waiting tickets only need part of it, split the gate (e.g. one check per stack or per person) and re-point dependencies with amp_set_task_dependencies.",
-		})
-	}
+	stuck := planGraph(r, tasks, stories)
 
 	// Metadata drift: epics missing keys most of their sibling epics carry
 	// (e.g. capitalizable, jira_epic), often under a near-miss name instead.
@@ -630,6 +543,254 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 		r.Summary += fmt.Sprintf(" Repaired %d ticket(s) stuck blocked although all their dependencies are done; they are ready now: %s.", len(stuck), joinIDs(stuck))
 	}
 	return r, nil
+}
+
+// planGraph adds to r what the dependency graph of tasks (a whole project's
+// tickets) and its stories show: dependency and open counts, the tickets
+// ready now, isolated tickets, too much starting at once, empty stories,
+// human gates, human tickets without an owner and gates coupling people's
+// work. It returns the tickets stuck blocked on dependencies that are all
+// done. Pure: CheckPlan and the My work approval plan both use it.
+func planGraph(r *PlanReport, tasks []domain.Task, stories []domain.Story) (stuck []int) {
+	byID := map[int]domain.Task{}
+	dependents := map[int]int{}
+	for _, t := range tasks {
+		byID[t.ID] = t
+		r.Dependencies += len(t.DependencyIDs)
+		for _, d := range t.DependencyIDs {
+			dependents[d]++
+		}
+	}
+
+	var isolated []int
+	for _, t := range tasks {
+		if t.State == domain.TaskStateCompleted {
+			continue
+		}
+		r.OpenTasks++
+		waiting := false
+		for _, d := range t.DependencyIDs {
+			if byID[d].State != domain.TaskStateCompleted {
+				waiting = true
+			}
+		}
+		if t.State == domain.TaskStateBacklog && !waiting {
+			r.ReadyNow = append(r.ReadyNow, t.ID)
+		}
+		if t.State == domain.TaskStateBlocked && t.BlockReason == "" && !waiting {
+			stuck = append(stuck, t.ID)
+		}
+		if len(t.DependencyIDs) == 0 && dependents[t.ID] == 0 {
+			isolated = append(isolated, t.ID)
+		}
+	}
+
+	if len(tasks) > 1 && len(isolated) > 0 {
+		r.Issues = append(r.Issues, PlanIssue{
+			Kind: "isolated", TaskIDs: isolated,
+			Message: fmt.Sprintf("%d open ticket(s) neither depend on anything nor have anything depending on them: %s. Each can run at any time, in parallel with everything else.", len(isolated), joinIDs(isolated)),
+			Fix:     "If one needs another's output, or something needs its output, wire it with amp_set_task_dependencies. Leave it only if it truly is independent work.",
+		})
+	}
+	if len(r.ReadyNow) > readyFanoutThreshold && len(r.ReadyNow)*2 > r.OpenTasks {
+		r.Issues = append(r.Issues, PlanIssue{
+			Kind: "wide_start", TaskIDs: r.ReadyNow,
+			Message: fmt.Sprintf("%d of %d open tickets can be dispatched right now. That much parallel work usually means dependencies are missing.", len(r.ReadyNow), r.OpenTasks),
+			Fix:     "Check each ready ticket: does it need anything built first? Add those dependencies.",
+		})
+	}
+	storyTasks := map[int]int{}
+	for _, t := range tasks {
+		storyTasks[t.StoryID]++
+	}
+	var empty []string
+	for _, st := range stories {
+		if storyTasks[st.ID] == 0 {
+			empty = append(empty, fmt.Sprintf("%q (#%d)", st.Name, st.ID))
+		}
+	}
+	if len(empty) > 0 {
+		r.Issues = append(r.Issues, PlanIssue{
+			Kind:    "empty_stories",
+			Message: "Stories with no tickets: " + strings.Join(empty, ", "),
+			Fix:     "Add their tickets, move tickets into them (amp_move_task), or delete them (amp_delete_story).",
+		})
+	}
+
+	// People in the loop: every open human ticket needs someone to do it,
+	// and the plan should say how much agent work waits on each.
+	down := map[int][]int{}
+	for _, t := range tasks {
+		for _, d := range t.DependencyIDs {
+			down[d] = append(down[d], t.ID)
+		}
+	}
+	var ownerless []int
+	for _, t := range tasks {
+		if !t.IsHuman() || t.State == domain.TaskStateCompleted {
+			continue
+		}
+		if t.OwnerUserID == nil {
+			ownerless = append(ownerless, t.ID)
+		}
+		seen := map[int]bool{}
+		queue := append([]int(nil), down[t.ID]...)
+		n := 0
+		for len(queue) > 0 {
+			id := queue[0]
+			queue = queue[1:]
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			if byID[id].State != domain.TaskStateCompleted {
+				n++
+			}
+			queue = append(queue, down[id]...)
+		}
+		r.HumanGates = append(r.HumanGates, HumanGate{ID: t.ID, Name: t.Name, Reason: t.HumanReason, Owner: t.OwnerUserID, HoldingUp: n,
+			MergeFor: MergeFor(&t)})
+	}
+	if len(ownerless) > 0 {
+		r.Issues = append(r.Issues, PlanIssue{
+			Kind: "human_without_owner", TaskIDs: ownerless,
+			Message: fmt.Sprintf("%d human ticket(s) have no owner, so nobody will do them and everything after them waits: %s.", len(ownerless), joinIDs(ownerless)),
+			Fix:     "Assign each to the person who does it (amp_assign_task), or make it agent work (amp_update_task performer='agent').",
+		})
+	}
+	checkMergeSteps(r, tasks)
+
+	// A gate that couples different people's work: its dependencies belong to
+	// two or more people, and so do the tickets waiting on it, so each person's
+	// next work waits on everyone's. Often a review that should be split.
+	ownerOf := func(id int) string {
+		if t, ok := byID[id]; ok && t.OwnerUserID != nil {
+			return fmt.Sprint(*t.OwnerUserID)
+		}
+		return ""
+	}
+	waiters := map[int][]int{}
+	for _, t := range tasks {
+		for _, d := range t.DependencyIDs {
+			waiters[d] = append(waiters[d], t.ID)
+		}
+	}
+	var coupled []int
+	var coupledDetail []string
+	for _, t := range tasks {
+		if t.State == domain.TaskStateCompleted || len(t.DependencyIDs) < 2 || len(waiters[t.ID]) < 2 {
+			continue
+		}
+		up, down := map[string]bool{}, map[string]bool{}
+		for _, d := range t.DependencyIDs {
+			if o := ownerOf(d); o != "" {
+				up[o] = true
+			}
+		}
+		for _, w := range waiters[t.ID] {
+			if o := ownerOf(w); o != "" {
+				down[o] = true
+			}
+		}
+		if len(up) >= 2 && len(down) >= 2 {
+			coupled = append(coupled, t.ID)
+			coupledDetail = append(coupledDetail, fmt.Sprintf("#%d (waits on %d people's tickets; %d tickets of %d people wait on it)", t.ID, len(up), len(waiters[t.ID]), len(down)))
+		}
+	}
+	if len(coupled) > 0 {
+		r.Issues = append(r.Issues, PlanIssue{
+			Kind: "coupled_gate", Severity: "warn", TaskIDs: coupled,
+			Message: "These tickets join different people's work: " + strings.Join(coupledDetail, "; ") +
+				". Everyone's next tickets wait until all of it is done, so one person's delay stalls the others.",
+			Fix: "If the waiting tickets only need part of it, split the gate (e.g. one check per stack or per person) and re-point dependencies with amp_set_task_dependencies.",
+		})
+	}
+	return stuck
+}
+
+// mergeStepWords are what a person's ticket name is checked for when it reads
+// as "merge this PR". Matching is a heuristic for a warning only: it never
+// changes a ticket, and a false positive costs a sentence.
+var mergeStepWords = []string{"merge pr", "merge the pr", "merge pull request", "merge the pull request",
+	"review and merge", "review & merge", "merge #"}
+
+// checkMergeSteps warns about the duplicate merge journey (AMP #3009, from
+// discoveries/merge-actions-user-journey.md): a person's ticket that is
+// plainly a merge step — its name says merge — but carries no merge_for.
+// Those are the cards that come back as a second action for a PR My work
+// already has a Merge card for, and the ones a GitHub or CI merge can't
+// clear, so the person ends up marking done a merge that already happened.
+//
+// Two shapes are reported, both warnings, so the plan stays GO:
+//   - unlinked_merge_step: merge-looking steps with no merge_for at all;
+//   - duplicate_merge_step: two of them reaching the same ticket (the same
+//     ticket in both their dependency sets), which is two steps for one
+//     merge by any reading.
+//
+// Nothing here edits a ticket: a merge-looking step its owner keeps unlinked
+// still works exactly as before (the completion-time bridge is unchanged),
+// and a linked step is never flagged.
+func checkMergeSteps(r *PlanReport, tasks []domain.Task) {
+	var unlinked []domain.Task
+	byDep := map[int][]int{} // dependency -> unlinked merge-looking steps reaching it
+	for _, t := range tasks {
+		if !t.IsHuman() || t.State == domain.TaskStateCompleted || MergeFor(&t) != 0 || !looksLikeMergeStep(t) {
+			continue
+		}
+		unlinked = append(unlinked, t)
+		for _, d := range t.DependencyIDs {
+			byDep[d] = append(byDep[d], t.ID)
+		}
+	}
+	if len(unlinked) == 0 {
+		return
+	}
+	ids := make([]int, 0, len(unlinked))
+	names := make([]string, 0, len(unlinked))
+	for _, t := range unlinked {
+		ids = append(ids, t.ID)
+		names = append(names, fmt.Sprintf("#%d %q", t.ID, t.Name))
+	}
+	var dupIDs []int
+	var dupDetail []string
+	for d, steps := range byDep {
+		if len(steps) < 2 {
+			continue
+		}
+		slices.Sort(steps)
+		dupIDs = append(dupIDs, steps...)
+		dupDetail = append(dupDetail, fmt.Sprintf("%s each wait on #%d", joinIDs(steps), d))
+	}
+	slices.Sort(dupIDs)
+	if len(dupDetail) > 0 {
+		slices.Sort(dupDetail)
+		r.Issues = append(r.Issues, PlanIssue{
+			Kind: "duplicate_merge_step", Severity: "warn", TaskIDs: dupIDs,
+			Message: "Two or more person's steps look like the same merge: " + strings.Join(dupDetail, "; ") +
+				". One PR gets one card in My work, so a second step for it is work nobody owes.",
+			Fix: "Keep one step and delete the rest (amp_delete_task), or link each to the ticket whose PR it merges with amp_update_task metadata {\"merge_for\": <ticket id>} if they are genuinely different merges.",
+		})
+	}
+	r.Issues = append(r.Issues, PlanIssue{
+		Kind: "unlinked_merge_step", Severity: "warn", TaskIDs: ids,
+		Message: fmt.Sprintf("%d person's step(s) look like merge steps but don't say which ticket's PR they merge: %s. My work can't fold an unlinked step into the PR's Merge card, "+
+			"so a merge made on GitHub still leaves the step asking to be marked done.", len(unlinked), strings.Join(names, "; ")),
+		Fix: "Set merge_for on each to the ticket whose PR it merges (amp_update_task metadata {\"merge_for\": <ticket id>}). " +
+			"Leave it unlinked only if the merge has no agent ticket behind it to record.",
+	})
+}
+
+// looksLikeMergeStep reports whether a person's ticket reads as "merge this
+// PR": its name says merge. A step with merge_for set is never asked (the
+// caller skips those first).
+func looksLikeMergeStep(t domain.Task) bool {
+	name := strings.ToLower(t.Name)
+	for _, w := range mergeStepWords {
+		if strings.Contains(name, w) {
+			return true
+		}
+	}
+	return false
 }
 
 func longestChain(tasks []domain.Task) int {
@@ -793,6 +954,32 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 		return nil, nil, authz.BadRequest("these tasks depend on each other in a cycle: %s", strings.Join(cyc, ", "))
 	}
 
+	// merge_for may name a ref in this batch, so a merge step and the ticket
+	// whose PR it tracks can be planned in one call (AMP #3009). Two steps on
+	// one ticket is refused before anything is created, as CreateTask would
+	// refuse the second.
+	mergeRef := map[int]int{}  // spec index -> spec index it tracks
+	mergeFrom := map[int]int{} // spec index -> spec index tracking it
+	for i, sp := range specs {
+		if v, ok := sp.Metadata[domain.MetaMergeFor]; ok && v != nil {
+			ref, isRef := v.(string)
+			if !isRef {
+				continue
+			}
+			if j, ok := byRef[strings.TrimSpace(ref)]; ok && strings.TrimSpace(ref) != "" {
+				mergeRef[i], mergeFrom[j] = j, i
+			}
+		}
+	}
+	for i := range mergeRef {
+		if mergeRef[i] == i {
+			return nil, nil, authz.BadRequest("%q can't track its own merge", specs[i].Ref)
+		}
+		if specs[i].Performer != domain.PerformerHuman {
+			return nil, nil, authz.BadRequest("%q: merge_for belongs on a person's merge step (performer \"human\")", specs[i].Ref)
+		}
+	}
+
 	ids := make([]int, len(specs))
 	out := make([]CreatedTask, len(specs))
 	for _, i := range order {
@@ -801,10 +988,20 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 		for _, j := range refDeps[i] {
 			deps = append(deps, ids[j])
 		}
+		meta := sp.Metadata
+		if j, ok := mergeRef[i]; ok {
+			// Dependencies are resolved by now, so the ref is a ticket id.
+			meta = domain.Metadata{domain.MetaMergeFor: ids[j]}
+			for k, v := range sp.Metadata {
+				if k != domain.MetaMergeFor {
+					meta[k] = v
+				}
+			}
+		}
 		t, _, err := s.CreateTask(ctx, p, domain.CreateTaskRequest{
 			ProjectID: projectID, StoryID: sp.StoryID, Name: sp.Name, Description: sp.Description,
 			AcceptanceCriteria: sp.AcceptanceCriteria, Priority: sp.Priority, AssignedTo: sp.AssignedTo,
-			DependencyIDs: deps, StartAt: sp.StartAt, Metadata: sp.Metadata,
+			DependencyIDs: deps, StartAt: sp.StartAt, Metadata: meta,
 			Performer: sp.Performer, HumanReason: sp.HumanReason,
 		}, sp.Owner)
 		if err != nil {
@@ -894,6 +1091,25 @@ func (s *Service) DeleteEpic(ctx context.Context, p authz.Principal, e *domain.E
 	return err
 }
 
+// guardDeletedHumanGates refuses, off the web UI, deleting an open human
+// ticket (directly, or with its story or epic): that would remove a person's
+// gate without the person. Completed human tickets can still be deleted.
+func (s *Service) guardDeletedHumanGates(ctx context.Context, p authz.Principal, projectID int, ids []int) error {
+	if p.InUI() {
+		return nil
+	}
+	for _, id := range ids {
+		t, err := s.Repo.GetTask(ctx, id)
+		if err != nil {
+			return err
+		}
+		if t.IsHuman() && t.State != domain.TaskStateCompleted {
+			return authz.UIOnly(fmt.Sprintf("Deleting ticket %d (a person's open ticket)", id), s.TaskURL(projectID, id))
+		}
+	}
+	return nil
+}
+
 // deleterOf is who the trash records as deleting something.
 func deleterOf(p authz.Principal) *int {
 	if !p.HasUser() {
@@ -907,6 +1123,9 @@ func deleterOf(p authz.Principal) *int {
 // actors (msg is a delete message without its reply channel), and updates
 // the tickets that depended on what was deleted. It returns those tickets.
 func (s *Service) deleteTickets(ctx context.Context, p authz.Principal, projectID int, ids []int, del func() error, msg interface{}) ([]int, error) {
+	if err := s.guardDeletedHumanGates(ctx, p, projectID, ids); err != nil {
+		return nil, err
+	}
 	dependents, err := s.Repo.Dependents(ctx, ids)
 	if err != nil {
 		return nil, err
@@ -961,16 +1180,28 @@ func (s *Service) AnswerQuestion(ctx context.Context, p authz.Principal, taskID 
 	return s.answer(ctx, p, t, answer)
 }
 
+// answerAttribution is how an answer is recorded: by the person in the web
+// UI, or "relayed by agent" when it came over MCP or a token (a manager
+// passing on what its person said), so nobody mistakes it for the person's
+// own click.
+func answerAttribution(p authz.Principal) (author, detail string) {
+	if p.InUI() {
+		return p.Email, "Question answered by " + p.Label() + " in the AMP web UI"
+	}
+	return p.Label() + " (relayed by agent)", "Question answered for " + p.Label() + ", relayed by agent (" + p.Channel + ")"
+}
+
 // answer posts answer on t (already checked) and sends it back to ready.
 func (s *Service) answer(ctx context.Context, p authz.Principal, t *domain.Task, answer string) (*domain.Task, error) {
 	taskID := t.ID
 	if t.State != domain.TaskStateBlocked || t.BlockReason == "" || strings.HasPrefix(t.BlockReason, "scheduled:") {
 		return nil, authz.BadRequest("ticket %d has no open question: only a ticket blocked with a reason (amp_block_task) can be answered", taskID)
 	}
+	author, detail := answerAttribution(p)
 	if answer = strings.TrimSpace(answer); answer != "" {
 		added := make(chan actor.ReplyAddComment, 1)
 		if err := s.Registry.Send(t.ProjectID, &actor.MsgAddComment{Req: domain.AddCommentRequest{
-			TaskID: taskID, Author: p.Email, Body: answer, AuthorUserID: p.UserRef(),
+			TaskID: taskID, Author: author, Body: answer, AuthorUserID: p.UserRef(),
 		}, ReplyCh: added}); err != nil {
 			return nil, err
 		}
@@ -979,13 +1210,38 @@ func (s *Service) answer(ctx context.Context, p authz.Principal, t *domain.Task,
 		}
 	}
 	set := make(chan actor.ReplySimple, 1)
-	if err := s.Registry.Send(t.ProjectID, &actor.MsgSetTaskState{TaskID: taskID, State: domain.TaskStateBacklog, Reason: "", By: p.UserRef(), ReplyCh: set}); err != nil {
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgSetTaskState{TaskID: taskID, State: domain.TaskStateBacklog, Reason: detail, By: p.UserRef(), ByName: author, ReplyCh: set}); err != nil {
 		return nil, err
 	}
 	if r := actor.Await(ctx, set); r.Err != nil {
 		return nil, r.Err
 	}
-	// Back to waiting if a dependency is unfinished.
+	// A ticket scheduled before it got its question is held by its schedule
+	// again: the set to backlog above stopped its timer, and a future start_at
+	// must not let it be dispatched early (nor a restart re-schedule it later,
+	// so the live board and the board after a restart agree). Read start_at
+	// from the actor, not the copy loaded before the call. A start time that
+	// has passed leaves it to backlog or its dependencies, as before.
+	cur := make(chan actor.ReplyGetTask, 1)
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgGetTask{TaskID: taskID, ReplyCh: cur}); err != nil {
+		return nil, err
+	}
+	c := actor.Await(ctx, cur)
+	if c.Err != nil {
+		return nil, c.Err
+	}
+	if c.Task != nil && c.Task.StartAt != nil && c.Task.StartAt.After(time.Now()) {
+		at := *c.Task.StartAt
+		sched := make(chan actor.ReplySimple, 1)
+		if err := s.Registry.Send(t.ProjectID, &actor.MsgSetTaskStartAt{TaskID: taskID, StartAt: &at, ReplyCh: sched}); err != nil {
+			return nil, err
+		}
+		if r := actor.Await(ctx, sched); r.Err != nil {
+			return nil, r.Err
+		}
+	}
+	// Back to waiting if a dependency is unfinished. A ticket held by its
+	// schedule is left alone here; its release checks dependencies when it fires.
 	rec := make(chan actor.ReplySimple, 1)
 	if err := s.Registry.Send(t.ProjectID, &actor.MsgReconcileDeps{TaskID: taskID, ReplyCh: rec}); err != nil {
 		return nil, err
@@ -1003,23 +1259,305 @@ func (s *Service) answer(ctx context.Context, p authz.Principal, t *domain.Task,
 
 // ---- Plan approval ----
 
-// ApprovePlan records that a person approved the project's plan as it is
-// now: every ticket planned so far may be dispatched. Team leads and
-// project owners can approve; agents can't (a person approves agents' plans).
+// Plan approval is per ticket (AMP #2198, option D of #2197). A person in
+// the web UI approves specific tickets; each records approved_at and
+// approved_by, and a ticket is approved iff approved_at >= planned_at. By
+// default a person approves only their own tickets (Task.ApprovesAsOwn);
+// approving anyone else's is "on behalf" of its owner: asked for
+// explicitly (on_behalf) and allowed to project leads, owners and admins.
+// See KB architecture/plan-approval.md, "The approve-plan contract".
+
+// ApproveRequest says which tickets a person approves.
+type ApproveRequest struct {
+	// TaskIDs are the tickets to approve. nil (missing) means the default:
+	// every open ticket awaiting approval that the caller approves as their
+	// own, or everyone's when OnBehalf is set. Tickets that are completed
+	// or already approved are skipped.
+	TaskIDs []int `json:"task_ids"`
+	// AsOf, when set, is the newest planned_at the person was shown: only
+	// tickets planned at or before it are approved.
+	AsOf *time.Time `json:"as_of"`
+	// OnBehalf allows approving tickets that aren't the caller's own.
+	OnBehalf bool `json:"on_behalf"`
+}
+
+// ApprovedTicket is a ticket an approve call approved.
+type ApprovedTicket struct {
+	TaskID      int  `json:"task_id"`
+	OwnerUserID *int `json:"owner_user_id"`
+	// OnBehalf: the ticket wasn't the approver's own.
+	OnBehalf bool `json:"on_behalf"`
+}
+
+// AwaitingTicket is an open ticket still waiting for a person to approve it.
+type AwaitingTicket struct {
+	TaskID      int  `json:"task_id"`
+	OwnerUserID *int `json:"owner_user_id"`
+	// Yours: the caller would approve it as their own (Task.ApprovesAsOwn).
+	Yours bool `json:"yours"`
+}
+
+// ApproveResult is what an approve call did and what still awaits.
+type ApproveResult struct {
+	// Project is the project after the call; plan_approved_at/by are its
+	// last approval (moved only when this call approved something).
+	Project *domain.Project `json:"project"`
+	// Approved are the tickets this call approved, by id.
+	Approved        []int            `json:"approved"`
+	ApprovedTickets []ApprovedTicket `json:"approved_tickets"`
+	// AwaitingApproval are every open ticket in the project still awaiting
+	// approval afterwards, anyone's (as before #2198), and StillAwaiting
+	// the same with owners; AwaitingYours the caller's own among them.
+	AwaitingApproval []int            `json:"awaiting_approval"`
+	StillAwaiting    []AwaitingTicket `json:"still_awaiting"`
+	AwaitingYours    []int            `json:"awaiting_yours"`
+	// Skipped are requested tickets this call didn't approve, with why.
+	Skipped map[string]string `json:"skipped,omitempty"`
+	// OnBehalf: at least one approved ticket was someone else's.
+	OnBehalf bool `json:"on_behalf"`
+}
+
+// ApprovePlan approves the caller's own tickets awaiting approval: the
+// default ApproveTickets. MCP's amp_approve_plan calls it only to be
+// refused (approval is for a person in the web UI).
 func (s *Service) ApprovePlan(ctx context.Context, p authz.Principal, projectID int) (*domain.Project, error) {
-	if p.Agent {
-		return nil, authz.Forbidden("agent accounts can't approve plans; a person approves (in AMP, or by telling the orchestrator)")
-	}
-	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member); err != nil {
-		return nil, err
-	}
-	// Approval is the person saying "go" to the plan their agent drafted: any
-	// person on the project may give it (agent accounts can't, above).
-	proj, err := s.Repo.ApprovePlan(ctx, projectID, p.UserRef())
+	r, err := s.ApproveTickets(ctx, p, projectID, ApproveRequest{})
 	if err != nil {
 		return nil, err
 	}
-	s.audit(ctx, p, domain.AuditEntry{Action: "plan.approve", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
-		Summary: fmt.Sprintf("approved the plan of %s", proj.Name)})
-	return proj, nil
+	return r.Project, nil
+}
+
+// ApproveTickets records a person's approval of tickets in the project's
+// plan (see ApproveRequest). Only a person in the web UI, with at least
+// member access, approves. Approving tickets that aren't the caller's own
+// needs req.OnBehalf and lead access or above; otherwise nothing is
+// approved (403). Each approved ticket gets a history entry, and the call
+// one plan.approve audit row naming the tickets and their owners.
+func (s *Service) ApproveTickets(ctx context.Context, p authz.Principal, projectID int, req ApproveRequest) (*ApproveResult, error) {
+	lvl, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member)
+	if err != nil {
+		if authz.StatusOf(err, 0) == 403 {
+			s.AuditApproveDenied(ctx, p, projectID, req, nil, err)
+		}
+		return nil, err
+	}
+	if err := authz.RequireUI(p, "Plan approval", s.PlanURL(projectID)); err != nil {
+		s.AuditApproveDenied(ctx, p, projectID, req, nil, err)
+		return nil, err
+	}
+	tasks, err := s.Repo.ListTasks(ctx, projectID, "")
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[int]*domain.Task, len(tasks))
+	for i := range tasks {
+		byID[tasks[i].ID] = &tasks[i]
+	}
+	awaits := func(t *domain.Task) bool { return t.State != domain.TaskStateCompleted && !t.Approved() }
+
+	// Which tickets: the ones asked for, or by default the caller's own
+	// awaiting ones (everyone's with on_behalf).
+	var picked []*domain.Task
+	skipped := map[string]string{}
+	if req.TaskIDs != nil {
+		seen := map[int]bool{}
+		for _, id := range req.TaskIDs {
+			t, ok := byID[id]
+			if !ok {
+				return nil, authz.BadRequest("ticket %d is not in project %d; nothing was approved", id, projectID)
+			}
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			switch {
+			case t.State == domain.TaskStateCompleted:
+				skipped[idStr(id)] = "it is completed"
+			case t.Approved():
+				skipped[idStr(id)] = "it is already approved"
+			default:
+				picked = append(picked, t)
+			}
+		}
+	} else {
+		for i := range tasks {
+			if t := &tasks[i]; awaits(t) && (req.OnBehalf || t.ApprovesAsOwn(p.UserID)) {
+				picked = append(picked, t)
+			}
+		}
+	}
+	slices.SortFunc(picked, func(a, b *domain.Task) int { return a.ID - b.ID })
+
+	// Someone else's tickets: only on_behalf, and only for a lead or above.
+	var others []int
+	for _, t := range picked {
+		if !t.ApprovesAsOwn(p.UserID) {
+			others = append(others, t.ID)
+		}
+	}
+	if len(others) > 0 && !req.OnBehalf {
+		err := authz.Forbidden("tickets %v aren't yours (they're owned by, or were planned by, someone else); approving them is "+
+			"approving on their owner's behalf: send on_behalf: true (project leads, owners and admins only), or approve only your "+
+			"own tickets. Nothing was approved.", others)
+		s.AuditApproveDenied(ctx, p, projectID, req, others, err)
+		return nil, err
+	}
+	if len(others) > 0 && lvl < authz.Lead {
+		err := authz.Forbidden("approving other people's tickets %v on their behalf needs lead access or above on project %d; "+
+			"you can approve your own tickets, and their owners (or a lead) approve theirs. Nothing was approved.", others, projectID)
+		s.AuditApproveDenied(ctx, p, projectID, req, others, err)
+		return nil, err
+	}
+
+	// Approve each through its task actor, which re-checks it as it is now.
+	names := map[int]string{}
+	ownerLabel := func(t *domain.Task) string {
+		who := t.OwnerUserID
+		if who == nil {
+			who = t.CreatedBy
+		}
+		if who == nil {
+			return "nobody (unassigned)"
+		}
+		if n, ok := names[*who]; ok {
+			return n
+		}
+		n := fmt.Sprintf("user %d", *who)
+		if u, err := s.Repo.GetUserByID(ctx, *who); err == nil && u.Email != "" {
+			n = u.Email
+		}
+		if t.OwnerUserID == nil {
+			n += " (unassigned, planned by them)"
+		}
+		names[*who] = n
+		return n
+	}
+	res := &ApproveResult{Approved: []int{}, ApprovedTickets: []ApprovedTicket{}, AwaitingYours: []int{}}
+	owners := map[string]any{}
+	onBehalfOf := []any{}
+	// A ticket that fails (trashed since the list above, a DB error, no
+	// reply in time) is skipped with the reason, not fatal: the tickets
+	// already approved stay approved, so the call must still stamp, audit and
+	// publish them (AMP #2219). If the request itself ends, the tickets not
+	// yet sent aren't tried.
+	var stopped error
+	for _, t := range picked {
+		if stopped = ctx.Err(); stopped != nil {
+			skipped[idStr(t.ID)] = fmt.Sprintf("not tried: the request ended first (%v)", stopped)
+			continue
+		}
+		own := t.ApprovesAsOwn(p.UserID)
+		msg := &actor.MsgApproveTask{TaskID: t.ID, AsOf: req.AsOf, ExpectOwner: t.OwnerUserID, By: p.UserRef(), ByName: p.Label()}
+		if !own {
+			msg.OnBehalfOf = ownerLabel(t)
+		}
+		replyCh := make(chan actor.ReplyApproveTask, 1)
+		msg.ReplyCh = replyCh
+		if err := s.Registry.Send(projectID, msg); err != nil {
+			skipped[idStr(t.ID)] = "couldn't approve it: " + err.Error()
+			continue
+		}
+		reply := actor.Await(ctx, replyCh)
+		if reply.Err != nil {
+			skipped[idStr(t.ID)] = "couldn't approve it: " + reply.Err.Error()
+			continue
+		}
+		if !reply.Approved {
+			skipped[idStr(t.ID)] = reply.Why
+			continue
+		}
+		res.Approved = append(res.Approved, t.ID)
+		res.ApprovedTickets = append(res.ApprovedTickets, ApprovedTicket{TaskID: t.ID, OwnerUserID: t.OwnerUserID, OnBehalf: !own})
+		owners[idStr(t.ID)] = t.OwnerUserID
+		if !own {
+			res.OnBehalf = true
+			onBehalfOf = append(onBehalfOf, msg.OnBehalfOf)
+		}
+	}
+	if len(skipped) > 0 {
+		res.Skipped = skipped
+	}
+
+	if stopped == nil {
+		stopped = ctx.Err() // ended while awaiting the last reply
+	}
+
+	// From here on the approvals are done and must be recorded, even if the
+	// request has ended or a read below fails: stamp, audit and publish on a
+	// context the caller can't cancel, and report any error only after.
+	fin, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	var failed error
+	// The project's "last approved ... by" moves only when something was
+	// approved: a click that approved nothing (a stale page) takes no credit.
+	if len(res.Approved) > 0 {
+		res.Project, err = s.Repo.RecordPlanApproval(fin, projectID, p.UserRef())
+	} else {
+		res.Project, err = s.Repo.GetProject(fin, projectID)
+	}
+	if err != nil {
+		failed = err
+	}
+	awaiting, err := s.Repo.TasksAwaitingApproval(fin, projectID)
+	if err != nil && failed == nil {
+		failed = err
+	}
+	res.AwaitingApproval, res.StillAwaiting = make([]int, 0, len(awaiting)), make([]AwaitingTicket, 0, len(awaiting))
+	for _, a := range awaiting {
+		yours := (&domain.Task{OwnerUserID: a.OwnerUserID, CreatedBy: a.CreatedBy}).ApprovesAsOwn(p.UserID)
+		res.AwaitingApproval = append(res.AwaitingApproval, a.ID)
+		res.StillAwaiting = append(res.StillAwaiting, AwaitingTicket{TaskID: a.ID, OwnerUserID: a.OwnerUserID, Yours: yours})
+		if yours {
+			res.AwaitingYours = append(res.AwaitingYours, a.ID)
+		}
+	}
+
+	// Who approved, from where and with what client come from the request
+	// (fillAuditContext). The row also says which tickets the approval
+	// covered (ids and count, plus the plan's link) and which version of
+	// the plan was approved: plan_as_of is the as_of the page sent (the
+	// plan as the person saw it), or when not sent, the approval time.
+	approvedAt := time.Now().UTC()
+	details := map[string]any{
+		"channel": p.Channel, "approved": res.Approved, "owners": owners, "approved_by": p.UserRef(),
+		"on_behalf": res.OnBehalf, "on_behalf_of": onBehalfOf, "still_awaiting": res.AwaitingApproval,
+		"approved_count": len(res.Approved), "plan_url": s.PlanURL(projectID),
+		"approved_at": approvedAt.Format(time.RFC3339Nano), "plan_as_of": approvedAt.Format(time.RFC3339Nano),
+	}
+	if req.AsOf != nil {
+		details["as_of"] = req.AsOf.UTC().Format(time.RFC3339Nano)
+		details["plan_as_of"] = details["as_of"]
+	}
+	if req.TaskIDs != nil {
+		details["task_ids"] = req.TaskIDs
+	}
+	if len(skipped) > 0 {
+		details["skipped"] = skipped
+	}
+	if failed != nil {
+		details["error"] = failed.Error()
+	}
+	name := fmt.Sprintf("project %d", projectID)
+	if res.Project != nil {
+		name = res.Project.Name
+	}
+	summary := fmt.Sprintf("approved %d ticket(s) in the plan of %s", len(res.Approved), name)
+	if res.OnBehalf {
+		summary += ", some on their owners' behalf"
+	}
+	s.audit(fin, p, domain.AuditEntry{Action: "plan.approve", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
+		TargetName: name, Summary: summary, Details: details})
+	// Published here, not by the REST or MCP handler, so every way of
+	// approving refreshes open My work and Flight plan pages the same way.
+	if res.Project != nil {
+		s.Registry.Publish(domain.Event{Type: domain.EventProjectUpdated, ProjectID: projectID, Payload: res.Project, At: time.Now()})
+	}
+	switch {
+	case stopped != nil:
+		return nil, fmt.Errorf("plan approval stopped early (%w); approved %v before it did, the rest weren't approved", stopped, res.Approved)
+	case failed != nil:
+		return nil, fmt.Errorf("plan approval: approved %v, then couldn't read the result: %w", res.Approved, failed)
+	}
+	return res, nil
 }

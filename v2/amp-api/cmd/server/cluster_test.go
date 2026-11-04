@@ -123,6 +123,7 @@ func clusterProject(t *testing.T, repo *repository.Repo, rs ...*replica) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	planApprovalOff(t, repo, proj.ID)
 	epic, err := repo.CreateEpic(ctx, domain.CreateEpicRequest{ProjectID: proj.ID, Name: "e", Priority: "1"})
 	if err != nil {
 		t.Fatal(err)
@@ -200,7 +201,7 @@ func TestCluster_RequestsRunOnTheOwner(t *testing.T) {
 	if st := stateOf(t, b.mcp, next); st != "blocked" {
 		t.Fatalf("new dependent ticket via B: %s", st)
 	}
-	b.mcp.call(t, "amp_complete_task", map[string]any{"task_id": float64(dep)})
+	b.mcp.finish(t, dep)
 	if st := stateOf(t, b.mcp, next); st != "backlog" {
 		t.Fatalf("after its dependency finished via B: %s", st)
 	}

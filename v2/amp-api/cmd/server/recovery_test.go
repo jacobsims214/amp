@@ -102,6 +102,7 @@ func newCrashableStack(t *testing.T) *crashableStack {
 	if err != nil {
 		t.Fatalf("create project: %v", err)
 	}
+	planApprovalOff(t, repo, proj.ID)
 	epic, err := repo.CreateEpic(ctx, domain.CreateEpicRequest{
 		ProjectID: proj.ID, Name: "crash-epic", Priority: "1",
 	})

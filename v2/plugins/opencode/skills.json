@@ -72,7 +72,7 @@
  {
   "id": "amp-planning",
   "name": "amp-planning",
-  "description": "Full protocol for planning, creating the task hierarchy, getting approval, and dispatching workers \u2014 including the hard approval gate",
+  "description": "Full protocol for planning, creating the task hierarchy, handing the plan to a person to approve in AMP's web UI, and dispatching workers \u2014 including the hard approval gate agents can never pass themselves",
   "path": "skills/amp-planning/SKILL.md",
   "contentFile": "skills/amp-planning/SKILL.body.md"
  },

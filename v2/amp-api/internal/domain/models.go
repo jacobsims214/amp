@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // ---- Enums ----
 
@@ -58,16 +61,30 @@ type Project struct {
 	PlanApprovedAt      *time.Time `json:"plan_approved_at,omitempty"`
 	PlanApprovedBy      *int       `json:"plan_approved_by,omitempty"`
 	RequirePlanApproval bool       `json:"require_plan_approval"`
+	// RequireMerge (default on): a ticket that completes with a PR or a
+	// pushed branch holds the tickets that depend on it until its merge is
+	// recorded (Task.MergeState). Off, dependents start on completion.
+	// RequireMergeSince is when it last went on: tickets completed before
+	// then are never gated.
+	RequireMerge      bool       `json:"require_merge"`
+	RequireMergeSince *time.Time `json:"require_merge_since,omitempty"`
+	// Dispatch watchdog (AMP #2801): a dispatched ticket no worker starts is
+	// flagged after NotStartedFlagMinutes and returned to ready after
+	// NotStartedReturnMinutes. 0 turns either off; both default on (10, 30).
+	NotStartedFlagMinutes   int `json:"not_started_flag_minutes"`
+	NotStartedReturnMinutes int `json:"not_started_return_minutes"`
 	// Metadata is free-form key/value data for integrations (see Metadata).
 	Metadata  Metadata  `json:"metadata"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// AwaitsApproval reports whether a ticket was planned after the project's
-// plan was last approved (always, if it never was).
+// AwaitsApproval reports whether ticket t still waits for a person to
+// approve it. Since AMP #2198 approval is per ticket (Task.Approved): the
+// project's PlanApprovedAt is only when its last approval happened and no
+// longer decides. The project receiver is kept so callers read the same.
 func (p *Project) AwaitsApproval(t *Task) bool {
-	return p.PlanApprovedAt == nil || t.CreatedAt.After(*p.PlanApprovedAt)
+	return !t.Approved()
 }
 
 // ProjectSettings is a change to a project's settings; nil fields are kept.
@@ -78,6 +95,12 @@ type ProjectSettings struct {
 	// RequirePlanApproval: tickets planned after the last approval can't be
 	// dispatched until someone approves the plan again.
 	RequirePlanApproval *bool `json:"require_plan_approval"`
+	// RequireMerge: done tickets with an unmerged PR hold their dependents.
+	RequireMerge *bool `json:"require_merge"`
+	// NotStartedFlagMinutes / NotStartedReturnMinutes: the dispatch
+	// watchdog's timeouts (AMP #2801); 0 disables each.
+	NotStartedFlagMinutes   *int `json:"not_started_flag_minutes"`
+	NotStartedReturnMinutes *int `json:"not_started_return_minutes"`
 	// Metadata sets keys; null removes one (see MetadataPatch).
 	Metadata MetadataPatch `json:"metadata,omitempty"`
 }
@@ -163,6 +186,243 @@ type Task struct {
 	Metadata  Metadata  `json:"metadata"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// PlannedAt is when the ticket's scope was last set: its creation, its
+	// restore from the trash, or the last change to its name, description,
+	// or acceptance criteria. A plan approval covers tickets planned before
+	// it (Project.AwaitsApproval); comments and dependency changes don't
+	// move it.
+	PlannedAt time.Time `json:"planned_at"`
+	// ApprovedAt is when a person last approved the ticket's plan, and
+	// ApprovedBy who (nil: approved by a migration, or the person's account
+	// is gone). The ticket is approved iff ApprovedAt is at or after
+	// PlannedAt (Approved): re-planning it makes it wait again.
+	ApprovedAt *time.Time `json:"approved_at,omitempty"`
+	ApprovedBy *int       `json:"approved_by,omitempty"`
+	// ApprovedFor is whose ticket it was when it was approved: its owner,
+	// or for an unassigned ticket the person who planned it (nil: nobody's,
+	// a legacy row). When a Member moves the ticket to someone else, the
+	// approval is dropped; a project lead's reassignment and dispatch's
+	// automatic claim keep it (AMP #2218, Task.DropsApprovalOn).
+	ApprovedFor *int `json:"approved_for,omitempty"`
+	// Merge signal (AMP #2475). MergeRequired is set when the ticket
+	// completes with a PR or pushed branch while its project requires
+	// merges; MergeState is then "needed" until the merge is recorded, and
+	// the tickets that depend on it wait (see MergeGates). MergedAt and
+	// MergeSource are the first merge report (ui, ci or github).
+	MergeRequired bool       `json:"merge_required"`
+	MergeState    string     `json:"merge_state"`
+	MergedAt      *time.Time `json:"merged_at,omitempty"`
+	MergeSource   string     `json:"merge_source,omitempty"`
+	// WaitingDetail says why a ticket still waits when a dependency it
+	// waits on is done but not merged ("Waiting on merge of #N (PR …)").
+	// Computed by its actor, never stored.
+	WaitingDetail string `json:"waiting_detail,omitempty"`
+
+	// Dispatch integrity (AMP #2801, epic 180). A dispatched ticket isn't
+	// started until its worker claims it: the four states are unchanged and
+	// "dispatched, not started" is derived (Task.Phase) from StartedAt.
+	//
+	// DispatchID is the token amp_dispatch_task handed out for the current
+	// dispatch. A worker claims with it (amp_claim_task) and completes with
+	// it; a completion without it is a closeout. Empty when not dispatched
+	// (or after a return).
+	DispatchID string `json:"dispatch_id,omitempty"`
+	// StartedAt is when the ticket was started: a worker's claim, or the
+	// first activity of a plugin that doesn't claim (StartedBy "inferred").
+	// NULL on an in_progress ticket means no worker has started it yet.
+	StartedAt *time.Time `json:"started_at,omitempty"`
+	// StartedBy names the agent that started it ("inferred" for the
+	// fallback, "backfill" for tickets in flight when it landed).
+	StartedBy string `json:"started_by,omitempty"`
+	// ReturnedAt and ReturnedReason record a dispatched ticket the watchdog
+	// (or amp_return_task) sent back to ready; the next dispatch clears them.
+	ReturnedAt     *time.Time `json:"returned_at,omitempty"`
+	ReturnedReason string     `json:"returned_reason,omitempty"`
+	// Phase is the derived display phase: PhaseNotStarted (in_progress with
+	// no StartedAt), PhaseStarted (in_progress with one), or "" for any
+	// other state. Computed on read, never stored.
+	Phase string `json:"phase,omitempty"`
+	// NotStartedMinutes is how long a dispatched ticket has gone without a
+	// worker starting it: set only while Phase is PhaseNotStarted, so no
+	// client has to do the arithmetic (the board's "18 min", My work's
+	// "not_started_minutes"). Computed on read, never stored.
+	NotStartedMinutes int `json:"not_started_minutes,omitempty"`
+}
+
+// Display phases of an in-progress ticket (Task.Phase, AMP #2801). There is
+// no new task state: in_progress + no started_at is "not started".
+const (
+	PhaseNotStarted = "not_started"
+	PhaseStarted    = "started"
+)
+
+// PhaseOf returns the display phase for a ticket in state with the given
+// started_at.
+func PhaseOf(state TaskState, startedAt *time.Time) string {
+	if state != TaskStateInProgress {
+		return ""
+	}
+	if startedAt == nil {
+		return PhaseNotStarted
+	}
+	return PhaseStarted
+}
+
+// Started reports whether the ticket has been started (claimed, or started
+// by the fallback). A ticket in any state but in_progress is past starting.
+func (t *Task) Started() bool { return t.StartedAt != nil }
+
+// StartedBy values that mean "no worker presented a dispatch token": the
+// first-activity fallback of a plugin that doesn't claim, and the backfill
+// of tickets that were in flight when AMP #2801 landed. A run started this
+// way is closed by its own completion (see TaskActor.handleComplete).
+const (
+	StartedByInferred = "inferred"
+	StartedByBackfill = "backfill"
+	// StartedByCloseout marks a closeout of a ticket nobody had started.
+	StartedByCloseout = "closeout"
+)
+
+// InferredStart reports whether a ticket's start came from the fallback
+// rather than a claim: no worker holds its dispatch token.
+func InferredStart(startedBy string) bool {
+	return startedBy == StartedByInferred || startedBy == StartedByBackfill
+}
+
+// CompleteIsCloseout reports whether a completion that presents dispatchID
+// is a closeout: the caller isn't the ticket's worker (AMP #2801).
+//
+// Three cases aren't:
+//   - the caller presented the current token: it is the worker;
+//   - a ticket started by the fallback (or the backfill): nobody there
+//     presented a token, because its plugin doesn't claim, and this
+//     completion is the end of the run that its first activity started;
+//   - a dispatched ticket nobody has started yet: the completion is itself
+//     that fallback start (an old plugin whose only write is the completion),
+//     not somebody closing a ticket that wasn't theirs.
+//
+// Everything else is: a done ticket with no current token on it is being
+// closed by someone other than its worker, mostly from ready (the
+// #2473/#2494 pattern) or after its worker's run died.
+func (t *Task) CompleteIsCloseout(dispatchID string) bool {
+	if t.IsHuman() || t.CurrentDispatch(dispatchID) || InferredStart(t.StartedBy) {
+		return false
+	}
+	if t.State != TaskStateInProgress {
+		return true
+	}
+	return t.StartedAt != nil
+}
+
+// CompletionIsCloseout is CompleteIsCloseout for a caller that may also give
+// an explicit closeoutReason (amp_complete_task's closeout_reason). A
+// non-empty reason is the caller saying it isn't the worker, so without the
+// current token it is a closeout even where CompleteIsCloseout would read a
+// bare completion as an old plugin's own: a dispatched ticket nobody started,
+// or one whose start was inferred (AMP #2908). A bare completion with no
+// reason keeps the backward-compatible reading. The reason must be the
+// caller's explicit one, never a run note standing in for it.
+func (t *Task) CompletionIsCloseout(dispatchID, closeoutReason string) bool {
+	if t.CompleteIsCloseout(dispatchID) {
+		return true
+	}
+	return !t.IsHuman() && !t.CurrentDispatch(dispatchID) && strings.TrimSpace(closeoutReason) != ""
+}
+
+// CurrentDispatch reports whether id is the ticket's current dispatch token.
+// An empty id never matches: a caller that presents none is a closeout.
+func (t *Task) CurrentDispatch(id string) bool { return id != "" && id == t.DispatchID }
+
+// WithPhase returns a copy of t with Phase filled in, for a read.
+func (t Task) WithPhase() Task {
+	t.Phase = PhaseOf(t.State, t.StartedAt)
+	return t
+}
+
+// Merge states (Task.MergeState).
+const (
+	MergeNone      = "none"
+	MergeNeeded    = "needed"
+	MergeMerged    = "merged"
+	MergeAbandoned = "abandoned"
+)
+
+// Merge sources: who recorded a merge first.
+const (
+	MergeSourceUI     = "ui"
+	MergeSourceCI     = "ci"
+	MergeSourceGitHub = "github"
+)
+
+// MergeGates reports whether a done ticket in merge state ms still holds
+// the tickets that depend on it: its PR waits to be merged, or was closed
+// without merging and nobody has said it isn't needed.
+func MergeGates(ms string) bool {
+	return ms == MergeNeeded || ms == MergeAbandoned
+}
+
+// Approved reports whether a person approved the ticket as it's planned
+// now: approved at or after its last planning (AMP #2198).
+func (t *Task) Approved() bool {
+	return t.ApprovedAt != nil && !t.ApprovedAt.Before(t.Planned())
+}
+
+// ApprovesAsOwn reports whether userID approving t approves their own work:
+// they own it, or nobody owns it and they created it. Anything else is
+// approving on someone's behalf (AMP #2198). A ticket with neither owner
+// nor creator (legacy rows, local dev) is nobody's, so only the local-dev
+// principal (user 0, no account) approves it as its own.
+func (t *Task) ApprovesAsOwn(userID int) bool {
+	who := t.OwnerUserID
+	if who == nil {
+		who = t.CreatedBy
+	}
+	if who == nil {
+		return userID == 0
+	}
+	return *who == userID
+}
+
+// ApprovalOwner is whose approval the ticket needs: its owner, or for an
+// unassigned ticket the person who planned it (nil when neither is set).
+func (t *Task) ApprovalOwner() *int {
+	if t.OwnerUserID != nil {
+		return t.OwnerUserID
+	}
+	return t.CreatedBy
+}
+
+// DropsApprovalOn reports whether giving t to newOwner (nil: releasing it)
+// drops its plan approval, when the person making the change isn't a
+// project lead or above acting in the AMP web UI (byLead false; a lead
+// over MCP or an API token counts as not a lead here, AMP #2223). An approval is for one person
+// (ApprovedFor): it survives only while the ticket is that person's again
+// afterwards, so a Member can't approve someone's ticket by claiming it,
+// approving it as their own and handing it back, nor hand their approved
+// ticket to someone who never approved it (AMP #2218). A lead's
+// reassignment in the web UI keeps it: a lead may approve on anyone's
+// behalf there anyway.
+func (t *Task) DropsApprovalOn(newOwner *int, byLead bool) bool {
+	if t.ApprovedAt == nil || byLead {
+		return false
+	}
+	next := newOwner
+	if next == nil {
+		next = t.CreatedBy
+	}
+	if next == nil || t.ApprovedFor == nil {
+		return !(next == nil && t.ApprovedFor == nil)
+	}
+	return *next != *t.ApprovedFor
+}
+
+// Planned is when the ticket was last planned (PlannedAt, or CreatedAt for
+// a value built without it).
+func (t *Task) Planned() time.Time {
+	if t.PlannedAt.IsZero() {
+		return t.CreatedAt
+	}
+	return t.PlannedAt
 }
 
 // IsHuman reports whether a person, not an agent, does this ticket.
@@ -378,6 +638,12 @@ type ExportKBDoc struct {
 	Tags        []string       `json:"tags"`
 	Author      string         `json:"author"`
 	Annotations []KBAnnotation `json:"annotations,omitempty"`
+	// Reason, CreatedAt and UpdatedAt (unix seconds) were added with the
+	// Postgres KB store. Exports made before then lack them; an import treats
+	// a zero date as "now".
+	Reason    string `json:"reason,omitempty"`
+	CreatedAt int64  `json:"created_at,omitempty"`
+	UpdatedAt int64  `json:"updated_at,omitempty"`
 }
 
 // KBAnnotation is a note left on a KB doc (kb.Annotation).
@@ -429,7 +695,65 @@ type AuditEntry struct {
 	TargetID    string         `json:"target_id,omitempty"`
 	Summary     string         `json:"summary"`
 	Details     map[string]any `json:"details,omitempty"`
+
+	// Audit log v2 (KB decisions/audit-log-v2.md). Every field is new and
+	// omitempty, so consumers of the v1 shape see only additions. Rows
+	// written before v2 read SchemaVersion 1 with these empty.
+	SchemaVersion    int            `json:"schema_version,omitempty"`
+	ActorType        string         `json:"actor_type,omitempty"`  // AuditActor*
+	AuthMethod       string         `json:"auth_method,omitempty"` // dex_session, oauth_mcp, api_token, cluster, local_dev, none
+	TokenID          *int64         `json:"token_id,omitempty"`    // api_tokens.id, never the token
+	SessionID        string         `json:"session_id,omitempty"`
+	OnBehalfOfUserID *int           `json:"on_behalf_of_user_id,omitempty"`
+	AgentProfile     string         `json:"agent_profile,omitempty"`
+	TargetName       string         `json:"target_name,omitempty"`
+	Outcome          string         `json:"outcome,omitempty"` // AuditOutcome*
+	Reason           string         `json:"reason,omitempty"`
+	SourceIP         string         `json:"source_ip,omitempty"`
+	UserAgent        string         `json:"user_agent,omitempty"`
+	Client           string         `json:"client,omitempty"` // AuditClient*
+	RequestID        string         `json:"request_id,omitempty"`
+	TraceID          string         `json:"trace_id,omitempty"`
+	Before           map[string]any `json:"before,omitempty"`
+	After            map[string]any `json:"after,omitempty"`
+
+	// Tamper evidence (#2429): the row's place in its chain ("org:<id>" or
+	// "global") and its hash, hex. A copy kept elsewhere (a SIEM via
+	// webhooks) can later prove what the row said. Empty on an entry not
+	// yet read back from the database.
+	ChainKey string `json:"chain_key,omitempty"`
+	ChainSeq int64  `json:"chain_seq,omitempty"`
+	Hash     string `json:"hash,omitempty"`
 }
+
+// AuditSchemaVersion is what writers put in AuditEntry.SchemaVersion.
+const AuditSchemaVersion = 2
+
+// Who made an audited change (AuditEntry.ActorType).
+const (
+	AuditActorHuman     = "human"
+	AuditActorAgent     = "agent"
+	AuditActorSystem    = "system"
+	AuditActorAnonymous = "anonymous"
+)
+
+// The result of an audited action (AuditEntry.Outcome).
+const (
+	AuditOutcomeSuccess = "success"
+	AuditOutcomeDenied  = "denied"
+	AuditOutcomeFailed  = "failed"
+)
+
+// The surface an audited change came through (AuditEntry.Client).
+const (
+	AuditClientWeb     = "web"
+	AuditClientMCP     = "mcp"
+	AuditClientHarness = "harness"
+	AuditClientAPI     = "api"
+	AuditClientRelay   = "relay"
+	AuditClientCLI     = "cli"
+	AuditClientSystem  = "system"
+)
 
 // AuditFilter selects audit entries; zero fields don't filter.
 type AuditFilter struct {
@@ -439,6 +763,46 @@ type AuditFilter struct {
 	Action      string // exact action, or a prefix ending in "." (e.g. "org.")
 	BeforeID    int64  // page backwards from here
 	Limit       int
+
+	// Audit log v2 filters (#2431).
+	Actor      string     // actor email, case-insensitive substring
+	ActorType  string     // AuditActor*
+	TargetType string     // exact
+	TargetID   string     // exact
+	IP         string     // an address or a CIDR prefix (source_ip <<= IP)
+	Outcome    string     // AuditOutcome*
+	Client     string     // AuditClient*
+	From       *time.Time // at >= From
+	To         *time.Time // at < To
+}
+
+// Values is the filter as it was asked for, without the paging fields:
+// what an audit.export row records.
+func (f AuditFilter) Values() map[string]any {
+	out := map[string]any{}
+	set := func(k string, v any, zero bool) {
+		if !zero {
+			out[k] = v
+		}
+	}
+	set("org_id", f.OrgID, f.OrgID == 0)
+	set("project_id", f.ProjectID, f.ProjectID == 0)
+	set("actor_user_id", f.ActorUserID, f.ActorUserID == 0)
+	set("action", f.Action, f.Action == "")
+	set("actor", f.Actor, f.Actor == "")
+	set("actor_type", f.ActorType, f.ActorType == "")
+	set("target_type", f.TargetType, f.TargetType == "")
+	set("target_id", f.TargetID, f.TargetID == "")
+	set("ip", f.IP, f.IP == "")
+	set("outcome", f.Outcome, f.Outcome == "")
+	set("client", f.Client, f.Client == "")
+	if f.From != nil {
+		out["from"] = f.From.UTC().Format(time.RFC3339)
+	}
+	if f.To != nil {
+		out["to"] = f.To.UTC().Format(time.RFC3339)
+	}
+	return out
 }
 
 // IsAgent reports whether u is an agent account.

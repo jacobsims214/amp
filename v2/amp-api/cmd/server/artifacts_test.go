@@ -123,6 +123,64 @@ func TestArtifacts_ReviewLoop(t *testing.T) {
 	_ = build
 }
 
+// A verdict answers the ticket only when the ticket is waiting on that
+// artifact's review. Blocked on an unrelated question (or on another
+// artifact), the verdict is recorded on the artifact and noted on the ticket,
+// but the ticket stays blocked on its question.
+func TestArtifacts_VerdictAnswersOnlyItsReview(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	alice := w.as(w.alice)
+	publish := func(task int, title string) int {
+		out := alice.call(t, "amp_publish_artifact", map[string]any{"task_id": float64(task), "title": title, "kind": "html", "content": mockupHTML})
+		return intField(t, out["artifact"].(map[string]any), "id")
+	}
+	review := func(id int, approve bool, note string) map[string]any {
+		return ra.want(t, 200, "alice", http.MethodPost, fmt.Sprintf("/api/artifacts/%d/review", id),
+			map[string]any{"approve": approve, "note": note})["artifact"].(map[string]any)
+	}
+
+	// Blocked on this artifact's review (asked with its url, as designers do): the verdict answers it.
+	asked := mkIn(t, alice, w.s.storyID, "Mockup: billing page")
+	id := publish(asked, "Billing mockup")
+	alice.call(t, "amp_block_task", map[string]any{"task_id": float64(asked),
+		"reason": fmt.Sprintf("Review the Billing mockup: https://amp.test/artifacts/%d. Tabs or one long page?", id)})
+	review(id, false, "One long page.")
+	if task := getTask(t, alice, asked); task["state"] != "backlog" || task["block_reason"] != nil && task["block_reason"] != "" {
+		t.Fatalf("ticket blocked on the review should be ready again: %v %v", task["state"], task["block_reason"])
+	}
+
+	// Blocked on an unrelated question: the verdict is recorded, but the question stays open.
+	other := mkIn(t, alice, w.s.storyID, "Mockup: invoices page")
+	oid := publish(other, "Invoices mockup")
+	const question = "Avalara or Stripe Tax? Both work in the sandbox."
+	alice.call(t, "amp_block_task", map[string]any{"task_id": float64(other), "reason": question})
+	got := review(oid, true, "")
+	if got["status"] != "approved" || intField(t, got, "approved_version") != 1 {
+		t.Fatalf("verdict should still be recorded on the artifact: %v", got)
+	}
+	task := getTask(t, alice, other)
+	if task["state"] != "blocked" || task["block_reason"] != question {
+		t.Fatalf("ticket blocked on another question must stay blocked: %v %q", task["state"], task["block_reason"])
+	}
+	if c := lastComment(t, alice, other); !strings.Contains(c, fmt.Sprintf("Approved artifact #%d", oid)) {
+		t.Fatalf("verdict should be noted on the ticket: %q", c)
+	}
+
+	// Blocked on a different artifact's review: a verdict on this one doesn't answer it.
+	second := publish(other, "Invoices mockup, dark")
+	reason := fmt.Sprintf("Review artifact #%d?", second)
+	alice.call(t, "amp_block_task", map[string]any{"task_id": float64(other), "reason": reason})
+	review(oid, false, "Tighter table.")
+	if task := getTask(t, alice, other); task["state"] != "blocked" || task["block_reason"] != reason {
+		t.Fatalf("verdict on #%d answered the review of #%d: %v", oid, second, task["state"])
+	}
+	review(second, true, "")
+	if task := getTask(t, alice, other); task["state"] != "backlog" {
+		t.Fatalf("verdict on the artifact under review should answer it: %v", task["state"])
+	}
+}
+
 // Kinds are checked against content; images reach agents as images; agents
 // can't review; and a project-level artifact needs no ticket.
 func TestArtifacts_KindsAndRules(t *testing.T) {

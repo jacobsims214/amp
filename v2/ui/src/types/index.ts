@@ -18,6 +18,13 @@ export interface Project {
   plan_approved_at?: string
   plan_approved_by?: number
   require_plan_approval?: boolean
+  /** done tickets with an unmerged PR hold their dependents until the merge is recorded (default on) */
+  require_merge?: boolean
+  require_merge_since?: string
+  /** a dispatched ticket no worker starts is flagged after this many minutes; 0 = off (AMP #2801) */
+  not_started_flag_minutes?: number
+  /** a dispatched ticket no worker starts is returned to ready after this many minutes; 0 = off (AMP #2801) */
+  not_started_return_minutes?: number
 }
 
 export interface Epic {
@@ -78,11 +85,44 @@ export interface Task {
   human_reason?: HumanReason
   /** when it last became ready: ready → started is time waiting to be picked up */
   ready_at?: string
+  /** the current dispatch token (d_…); empty when it isn't dispatched (AMP #2801) */
+  dispatch_id?: string
+  /** when a worker started it (a claim, or an older plugin's first activity); null on an in_progress ticket = dispatched but not started (AMP #2801) */
+  started_at?: string | null
+  /** the agent that started it, "inferred" (an older plugin's first activity), or "backfill" (AMP #2801) */
+  started_by?: string
+  /** when the watchdog (or amp_return_task) sent it back to ready, and why; cleared by the next dispatch (AMP #2801) */
+  returned_at?: string | null
+  returned_reason?: string
+  /** server-derived, never recomputed here: "not_started" | "started" on an in_progress ticket, absent on any other state (AMP #2801) */
+  phase?: TaskPhase
+  /** server-derived: minutes a dispatched ticket has waited for a worker; only while phase is not_started (AMP #2801) */
+  not_started_minutes?: number
+  /** when its scope (name, description, acceptance criteria) was last set; newer than the plan's approval = awaiting approval */
+  planned_at?: string
+  /** when a person last approved its plan (#2198); approved iff approved_at >= planned_at */
+  approved_at?: string
+  /** who approved it (null with approved_at set: a migration kept an earlier approval) */
+  approved_by?: number | null
+  /** set when it completed with a PR or pushed branch while its project requires merges (#2475) */
+  merge_required?: boolean
+  /** none | needed | merged | abandoned; needed and abandoned hold its dependents (#2475) */
+  merge_state?: MergeState
+  /** the first merge report: when, and by what (ui, ci or github) */
+  merged_at?: string
+  merge_source?: string
+  /** why it still waits when a dependency is done but not merged: "Waiting on merge of #N (PR …)" */
+  waiting_detail?: string
   /** free-form key/value data for integrations (its own, not inherited) */
   metadata?: Metadata
   created_at: string
   updated_at: string
 }
+
+export type MergeState = 'none' | 'needed' | 'merged' | 'abandoned' | ''
+
+/** Dispatch integrity (AMP #2801): how far an in_progress ticket is. Server-supplied. */
+export type TaskPhase = 'not_started' | 'started'
 
 export type HumanReason = 'review' | 'approval' | 'access' | 'judgment' | 'external' | 'physical' | 'other'
 
@@ -108,6 +148,45 @@ export interface ActivityLog {
   created_at: string
 }
 
+// ---- Plan approval (POST /projects/:id/approve-plan, #2198) ----
+
+/** What a person approves: see api.approvePlan. */
+export interface ApproveRequest {
+  taskIds?: number[]
+  asOf?: string
+  onBehalf?: boolean
+}
+
+/** One ticket still waiting, and whether it's the caller's own. */
+export interface AwaitingTicket {
+  task_id: number
+  owner_user_id?: number | null
+  yours: boolean
+}
+
+/** The server's answer (service.ApproveResult); older servers send only project and awaiting_approval. */
+export interface ApproveResponse {
+  project: Project
+  approved?: number[]
+  approved_tickets?: Array<{ task_id: number; owner_user_id?: number | null; on_behalf: boolean }>
+  awaiting_approval?: number[]
+  still_awaiting?: AwaitingTicket[]
+  awaiting_yours?: number[]
+  /** ticket id -> why it wasn't approved ("it was planned after what was approved (as_of)") */
+  skipped?: Record<string, string>
+  on_behalf?: boolean
+}
+
+/** ApproveResponse with defaults filled in. */
+export interface ApproveResult {
+  project: Project
+  approved: number[]
+  awaitingApproval: number[]
+  awaitingYours: number[]
+  skipped: Record<string, string>
+  onBehalf: boolean
+}
+
 // ---- Plan check (GET /projects/:id/plan-check) ----
 
 export interface PlanIssue {
@@ -123,6 +202,8 @@ export interface PlanReport {
   ok: boolean
   /** open tickets planned since the plan was last approved */
   awaiting_approval?: number[]
+  /** the Flight plan page where a person approves, when tickets await approval */
+  approve_url?: string
   plan_approved_at?: string
   plan_approved_by?: number
   require_plan_approval?: boolean
@@ -298,6 +379,7 @@ export interface SSEEvent {
     | 'project.created'
     | 'project.archived'
     | 'project.restored'
+    | 'project.updated'
     | 'epic.created'
     | 'epic.state_changed'
     | 'story.created'
@@ -395,6 +477,10 @@ export interface Me {
   teams?: { id: number; name: string; org_id: number; role: string }[]
   kind?: UserKind
   via_token?: boolean
+  /** Feature flags for this caller. Absent on older APIs (treat as unavailable). */
+  capabilities?: {
+    remote_control?: { available: boolean; org_ids?: number[]; reason?: string | null }
+  }
 }
 
 export type UserKind = 'human' | 'agent'
@@ -429,6 +515,77 @@ export interface AuditEntry {
   target_id?: string
   summary: string
   details?: Record<string, unknown>
+  // Audit log v2: all optional; entries from before v2 have schema_version 1 (or none) and none of these.
+  schema_version?: number
+  actor_type?: AuditActorType
+  auth_method?: string
+  token_id?: number
+  session_id?: string
+  on_behalf_of_user_id?: number
+  agent_profile?: string
+  target_name?: string
+  outcome?: AuditOutcome
+  reason?: string
+  source_ip?: string
+  user_agent?: string
+  client?: AuditClient
+  request_id?: string
+  trace_id?: string
+  before?: Record<string, unknown>
+  after?: Record<string, unknown>
+  chain_key?: string
+  chain_seq?: number
+  hash?: string
+}
+
+export type AuditActorType = 'human' | 'agent' | 'system' | 'anonymous'
+export type AuditOutcome = 'success' | 'denied' | 'failed'
+export type AuditClient = 'web' | 'mcp' | 'harness' | 'api' | 'relay' | 'cli' | 'system'
+
+/** What the audit log is narrowed to; empty fields don't filter. Same names as GET /api/audit. */
+export interface AuditFilter {
+  action?: string
+  actor?: string
+  actor_type?: AuditActorType | ''
+  target_type?: string
+  target_id?: string
+  ip?: string
+  outcome?: AuditOutcome | ''
+  client?: AuditClient | ''
+  project_id?: number
+  /** ISO times; to is exclusive. */
+  from?: string
+  to?: string
+}
+
+/** GET /api/audit/verify */
+export type AuditVerifyStatus = 'ok' | 'unproven' | 'failed'
+
+export interface AuditVerifyReport {
+  /** True only when status is ok. */
+  ok: boolean
+  /** ok: verified and signed; unproven: no problems, but nothing signed proves it; failed: tampering or loss. Missing from older servers. */
+  status?: AuditVerifyStatus
+  checked_at: string
+  signing: { configured: boolean; key_id?: string }
+  chains: {
+    chain_key: string
+    ok: boolean
+    status?: AuditVerifyStatus
+    rows: number
+    head_seq: number
+    anchor_seq?: number
+    checkpoints_matched: number
+    signed_checkpoints: number
+    last_signed_seq?: number
+    problems: { kind: string; seq?: number; audit_id?: number; detail: string }[]
+    warnings?: string[]
+    /** Rows read by this check: with incremental, only those written since the last one (#2441). Older servers omit it. */
+    rows_read?: number
+    incremental?: boolean
+    /** When every row of the chain was last re-read in full. */
+    full_check_at?: string
+  }[]
 }
 
 export type WebhookFormat = 'json' | 'slack'
@@ -444,6 +601,13 @@ export interface Webhook {
   secret?: string
   events: string[]
   active: boolean
+  /** The extra header sent with each delivery (its value is never shown). */
+  auth_header_name?: string
+  auth_header_set?: boolean
+  /** A webhook of the whole AMP: audit entries only, all of them. */
+  instance?: boolean
+  /** Audit entries carry their request context (IP, user agent, session and token ids, before/after). Opt-in; on by default for instance webhooks. */
+  include_context?: boolean
   created_by?: number
   created_at: string
   updated_at: string
@@ -459,6 +623,9 @@ export interface WebhookChange {
   format?: WebhookFormat
   events?: string[]
   active?: boolean
+  /** "Name: value" sets it, "" removes it, absent keeps it. */
+  auth_header?: string
+  include_context?: boolean
 }
 
 export interface WebhookDelivery {
@@ -473,6 +640,40 @@ export interface WebhookDelivery {
   last_error?: string
   created_at: string
   delivered_at?: string
+}
+
+/** A project's inbound GitHub merge webhook (GET /projects/:id/github-hook). */
+export interface GitHubHook {
+  project_id: number
+  created_by?: number
+  created_at: string
+  rotated_at: string
+  rejected_count: number
+  last_rejected_at?: string
+}
+
+/** One signed delivery GitHub made to a project's hook. */
+export interface GitHubHookDelivery {
+  delivery_id: string
+  event: string
+  action?: string
+  status: number
+  result: string
+  task_ids: number[] | null
+  received_at: string
+}
+
+export interface GitHubHookInfo {
+  configured: boolean
+  /** where GitHub posts; relative when the server has no public URL configured */
+  url: string
+  hook?: GitHubHook
+  deliveries: GitHubHookDelivery[] | null
+  /** only in the answer to generating or rotating the secret: shown once */
+  secret?: string
+  /** the secret is stored encrypted (the server has an encryption key) */
+  encrypted: boolean
+  setup?: { payload_url?: string; content_type?: string; events?: string }
 }
 
 export interface AmpUser {
@@ -595,6 +796,127 @@ export interface MyWork {
   flags: WorkTask[]
   agents: MyAgent[]
   done_24h: number
+  /* The "waiting on you" summary (service.MyWorkSummary, AMP #2478). Optional:
+     older servers don't send it. KB architecture/waiting-on-you.md. */
+  counts?: WaitCounts
+  /** projects with anything waiting or coming up, most waiting first */
+  projects?: ProjectWait[]
+  projects_total?: number
+  projects_offset?: number
+  projects_limit?: number
+  projects_more?: boolean
+  rows_per_project?: number
+  /** the person's projects with nothing for them */
+  clear_projects?: ProjectRef[]
+  agents_in_progress?: number
+  owned_truncated?: boolean
+  flags_truncated?: boolean
+}
+
+// ---- Waiting on you (service.WaitingOn; KB decisions/human-work-ux.md §1) ----
+
+export type WaitKind = 'approve' | 'answer' | 'merge' | 'start' | 'do'
+
+/** Waiting is approve + answer + merge + start + do; coming_up is shown, never counted. */
+export interface WaitCounts {
+  waiting: number
+  approve: number
+  answer: number
+  merge: number
+  /** a ticket of yours dispatched to an agent that no worker has started (AMP #2801) */
+  start: number
+  do: number
+  coming_up: number
+}
+
+/** GET /my-work/counts: the badges. `projects` holds only projects with something waiting or coming up. */
+export interface MyWorkCounts {
+  counts: WaitCounts
+  projects: Record<string, WaitCounts>
+}
+
+/** One item in a person's Waiting on people row: a ticket, or for approve, an epic's tickets awaiting them. */
+export interface PersonWaitItem {
+  kind: WaitKind
+  task_ids: number[]
+  /** approve only */
+  epic_id?: number
+  epic_name?: string
+  since: string
+  /** start: the agent it was dispatched to, and how long it has waited (AMP #2801) */
+  agent_id?: string
+  not_started_minutes?: number
+}
+
+/** One person in GET /projects/:id/waiting-on-people (service.WaitingOn for them). */
+export interface PersonWaiting {
+  user_id: number
+  counts: WaitCounts
+  /** approve, answer, merge, do; oldest first within each */
+  items: PersonWaitItem[]
+  /** ticket ids of their Coming up */
+  coming_up: number[]
+}
+
+/** GET /projects/:id/waiting-on-people: Mission's Waiting on people, every person with something waiting or coming up. */
+export interface PeopleWaiting {
+  project_id: number
+  people: PersonWaiting[]
+}
+
+/** One thing waiting on you (Waiting on you): "approve:<epic id>" (one per epic) or "task:<ticket id>". */
+export interface WaitItem {
+  kind: WaitKind | 'coming_up'
+  key: string
+  project_id: number
+  project_code: string
+  project_name: string
+  /** the ticket, for every kind but approve */
+  task_id?: number
+  /** every ticket the item contains, so ?focus=<any of them> finds it */
+  task_ids: number[]
+  /** the ticket's name, or the epic's for approve */
+  name: string
+  state?: string
+  since: string
+  performer?: string
+  human_reason?: string
+  owner_user_id?: number
+  epic_id?: number
+  epic_name?: string
+  /** approve: how many tickets await */
+  count?: number
+  question?: string
+  merge_state?: string
+  pr_url?: string
+  branch?: string
+  completed_at?: string
+  /** start: the agent it was dispatched to, and how long it has waited (AMP #2801) */
+  agent_id?: string
+  not_started_minutes?: number
+  /** merge: open tickets that depend on it directly */
+  holding_up?: number[]
+  awaiting_approval?: boolean
+  start_at?: string
+}
+
+/** One project's card in the top-level My work summary. */
+export interface ProjectWait {
+  project_id: number
+  project_code: string
+  project_name: string
+  counts: WaitCounts
+  /** the first items in display order, at most rows_per_project */
+  rows: WaitItem[]
+  /** how many more items there are in the project */
+  more: number
+  agents_in_progress: number
+}
+
+export interface ProjectRef {
+  id: number
+  code: string
+  name: string
 }
 
 // ---- Project report (GET /projects/:id/report) ----
@@ -828,4 +1150,185 @@ export interface ArtifactVersion {
   created_by: number | null
   created_by_email?: string
   created_at: string
+}
+
+// ---- The project's My work tab and its Approve view (AMP #2478, #2483) ----
+
+/** A ticket outside the approval set that the set depends on, or that depends on it. */
+export interface DepSummary {
+  id: number
+  project_id: number
+  epic_id: number
+  story_id: number
+  name: string
+  state: string
+  block_reason?: string
+  performer: string
+  owner_user_id?: number | null
+  merge_state: string
+  /** the tickets after it may start (done and, while merges are required, merged) */
+  satisfied: boolean
+  waiting_detail?: string
+}
+
+export interface OutsideTicket extends DepSummary {
+  epic_name: string
+  project_code?: string
+  project_name?: string
+  relation: 'dependency' | 'dependent' | 'both'
+}
+
+/** A human ticket in the plan and how much open work waits on it (amp_check_plan). */
+export interface HumanGate {
+  id: number
+  name: string
+  reason: string
+  owner_user_id?: number | null
+  holding_up: number
+}
+
+/** A ticket as it was when last approved (stored at approval, migration 040). */
+export interface ApprovedSnapshot {
+  name: string
+  description: string
+  acceptance_criteria: string
+  dependency_ids: number[]
+}
+
+export interface ChangedSince {
+  at: string
+  by?: string
+  last_approved_at?: string
+  /** absent for tickets approved before AMP stored snapshots */
+  previous?: ApprovedSnapshot
+}
+
+export interface PlanEpic {
+  id: number
+  name: string
+  description: string
+  caller_last_approved_at?: string
+  ticket_count?: number
+  awaiting_ids?: number[]
+}
+
+export interface PlanStory {
+  id: number
+  epic_id?: number
+  name: string
+  description: string
+  acceptance_criteria: string
+  task_ids: number[]
+  awaiting_ids: number[]
+}
+
+/** One open ticket in an approval plan, in full. */
+export interface PlanTicket {
+  id: number
+  epic_id?: number
+  story_id: number
+  name: string
+  description: string
+  acceptance_criteria: string
+  priority: Priority
+  state: TaskState
+  block_reason?: string
+  performer: 'agent' | 'human' | string
+  human_reason?: string
+  assigned_to?: string
+  owner_user_id?: number | null
+  owner_name: string
+  created_by?: number | null
+  planned_at: string
+  approved_at?: string
+  approved_by?: number | null
+  approved_for?: number | null
+  merge_state: string
+  /** not approved as planned now */
+  awaiting: boolean
+  /** the caller approves it as their own */
+  yours: boolean
+  change: 'new' | 'changed' | null
+  changed_since?: ChangedSince
+  dependency_ids: number[]
+  dependent_ids: number[]
+  /** dependencies not satisfied now */
+  waits_on: number[]
+  starts_on_approval: boolean
+}
+
+/** GET /projects/:id/my-work?approve=<epic ids|all> → {plan}. */
+export interface ApprovalPlan {
+  /** the first epic of the set (older servers: the only one) */
+  epic: PlanEpic
+  /** every epic in the set; older servers send only `epic` */
+  epics?: PlanEpic[]
+  stories: PlanStory[]
+  done_stories?: PlanStory[]
+  /** the newest planned_at returned: send it back verbatim as approve-plan's as_of */
+  as_of?: string
+  caller_last_approved_at?: string
+  require_plan_approval: boolean
+  can_approve_on_behalf: boolean
+  tickets: PlanTicket[]
+  tickets_total: number
+  offset: number
+  limit: number
+  more: boolean
+  awaiting_ids: number[]
+  yours_ids: number[]
+  for_user_ids: number[]
+  new_ids: number[]
+  changed_ids: number[]
+  starts_on_approval: number[]
+  human_gates: HumanGate[]
+  issues: PlanIssue[]
+  outside: OutsideTicket[]
+}
+
+/** A ticket's merge state after Mark merged / Not needed (service.MergeRecord). */
+export interface MergeRecord {
+  task_id: number
+  merge_state: MergeState
+  merge_source?: string
+  merged_at?: string
+  /** an earlier report recorded the merge; this one changed nothing */
+  already_recorded: boolean
+  message: string
+  run?: Run
+  task?: Task
+}
+
+/** A ticket's place in a project's My work list (WaitItem with its detail). */
+export interface ProjectWaitItem extends WaitItem {
+  task?: Task
+  plan?: ApprovalPlan
+  waits_on?: DepSummary[]
+}
+
+export interface DoneItem {
+  kind: WaitKind
+  task_id?: number
+  task_ids: number[]
+  epic_id?: number
+  name: string
+  at: string
+  count: number
+  merge_source?: string
+  merge_state?: string
+}
+
+/** GET /projects/:id/my-work */
+export interface ProjectMyWork {
+  project_id: number
+  user_id: number
+  /** a lead reading someone else's list: the actions are theirs */
+  read_only: boolean
+  kinds: WaitKind[]
+  counts: WaitCounts
+  items: Record<WaitKind, ProjectWaitItem[]>
+  coming_up: ProjectWaitItem[]
+  done_today: DoneItem[]
+  agents: { project_id: number; in_progress: number; ready: number; waiting: number; done_today: number }
+  day: string
 }

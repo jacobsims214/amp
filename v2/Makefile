@@ -54,7 +54,7 @@ up: dev-stop ## Start everything (postgres + amp-api + ui) via docker compose
 	@echo ""
 	@echo "  UI         → http://localhost:5173"
 	@echo "  API        → http://localhost:3001"
-	@echo "  MCP        → http://localhost:8000/sse"
+	@echo "  MCP        → http://localhost:8000/mcp"
 	@echo "  Typesense  → http://localhost:8108"
 	@echo "  Ollama     → http://localhost:11434"
 	@echo ""
@@ -93,7 +93,7 @@ dev: db-up ## Start api + ui locally (background, tracked by PID files)
 	@echo ""
 	@echo "  UI  → http://localhost:5173"
 	@echo "  API → http://localhost:3001"
-	@echo "  MCP → http://localhost:8000/sse"
+	@echo "  MCP → http://localhost:8000/mcp"
 	@echo ""
 	@echo "  Logs: make logs-dev"
 	@echo "  Stop: make dev-stop  (or  make down)"
@@ -224,11 +224,6 @@ build: api-build ui-build ## Build both API binary and UI bundle
 clean: dev-stop ## Stop dev processes and remove built artifacts
 	rm -rf $(API_DIR)/bin $(UI_DIR)/dist $(PID_DIR)
 	@echo "Cleaned."
-
-# ---- global config sync ----
-
-sync-global: ## Merge v2 skills, prompts, and opencode.json into ~/.config/opencode (upsert)
-	./scripts/sync-global-config.sh
 
 # ---- combined checks (run before commit) ----
 
