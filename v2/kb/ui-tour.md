@@ -11,6 +11,12 @@ tags: [ui, onboarding, navigation]
   Answer, Merge, Start, Do), one card per project, plus your agents at work and what finished
   lately. It only informs: each row opens that project's My work with the item in focus. Its
   badge is your total waiting.
+  My work is one person's list, so it needs a signed-in AMP user. When sign-in is off (local
+  development, no `OIDC_ISSUER_URL`) or your sign-in has no AMP user (not invited, email domain
+  not allowed, or email not verified), My work, the project's My work tab and Mission's Waiting on
+  you strip say so and show no counts: use the project's Board, which has every ticket, or ask an
+  admin for an invite and sign in again. When My work fails to load it shows the error and **Try again**,
+  never zeros.
 - **Projects** — every project you can see. A project with something waiting on you shows the
   count.
 - **Day reports** — your saved end-of-day reports and your completed tickets.

@@ -5,14 +5,15 @@ import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { createMemoryRouter, RouterProvider, useLocation } from 'react-router-dom'
+import { AuthContext } from '../contexts/auth-context'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ProjectMyWork } from './ProjectMyWork'
 import { ProjectLanding } from './ProjectLanding'
 import { ProjectNav } from '../components/ProjectNav'
 import { fixedTab, landingPath, landingTab } from '../lib/landing'
 import { resetWaitCounts } from '../lib/waitCounts'
-import { myWork } from '../test/myWorkFixture'
-import type { MyWorkCounts, ProjectMyWork as Data } from '../types'
+import { doItem, myWork, task } from '../test/myWorkFixture'
+import type { Me, MyWorkCounts, ProjectMyWork as Data, Task } from '../types'
 
 let data: Data = myWork('busy')
 let counts: MyWorkCounts = { counts: { waiting: 5, approve: 1, answer: 1, merge: 1, start: 1, do: 1, coming_up: 1 }, projects: { 2: { waiting: 5, approve: 1, answer: 1, merge: 1, start: 1, do: 1, coming_up: 1 } } }
@@ -51,14 +52,14 @@ function Where() {
   return <span data-testid="where">{l.pathname + l.search}</span>
 }
 
-function at(url: string) {
+function at(url: string, me: Me | null = null, loading = false) {
   const router = createMemoryRouter([
     { path: '/project/:projectId', element: <><ProjectLanding /><Where /></> },
     { path: '/project/:projectId/my-work', element: <><ProjectMyWork /><Where /></> },
     { path: '/project/:projectId/mission', element: <><ProjectNav projectId={2} currentView="mission" /><p>Mission page</p><Where /></> },
     { path: '/project/:projectId/board', element: <><p>Board page</p><Where /></> },
   ], { initialEntries: [url] })
-  render(<RouterProvider router={router} />)
+  render(<AuthContext.Provider value={{ me, loading, error: null, isAdmin: false }}><RouterProvider router={router} /></AuthContext.Provider>)
   return router
 }
 const where = () => screen.getByTestId('where').textContent
@@ -143,7 +144,52 @@ describe('My work tab: states', () => {
   it('shows an error with Try again', async () => {
     server.use(http.get('*/api/projects/2/my-work', () => HttpResponse.json({ error: 'boom' }, { status: 500 })))
     at('/project/2/my-work')
-    expect(await screen.findByRole('alert')).toHaveTextContent("Couldn't load My work")
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent("Couldn't load My work: boom")
+    expect(alert).toHaveTextContent('no counts are shown')
+    expect(screen.queryByRole('status', { name: 'Loading My work' })).toBeNull()
+    expect(screen.queryByRole('group', { name: /waiting on you/i })).toBeNull()
+    server.use(http.get('*/api/projects/2/my-work', () => HttpResponse.json(data)))
+    await userEvent.click(within(alert).getByRole('button', { name: 'Try again' }))
+    expect(await screen.findByRole('region', { name: 'Waiting on you' })).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('no AMP user, sign-in off: explains local dev and points at the Board, with no Try again', async () => {
+    server.use(http.get('*/api/projects/2/my-work', () => HttpResponse.json({ error: 'My work needs a signed-in AMP user' }, { status: 400 })))
+    at('/project/2/my-work', { subject: 'local-dev', email: 'local-dev@amp.local', name: 'Local Dev', roles: [] })
+    const panel = await screen.findByRole('region', { name: 'My work is off: sign-in is turned off' })
+    expect(panel).toHaveTextContent('Sign-in is turned off on this AMP')
+    expect(panel).toHaveTextContent('OIDC_ISSUER_URL')
+    expect(panel).not.toHaveTextContent('needs a signed-in AMP user')
+    expect(within(panel).getByRole('link', { name: /Open the Board/ })).toHaveAttribute('href', '/project/2/board')
+    expect(within(panel).queryByRole('link', { name: /Sign in/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('no AMP user while the identity is loading: keeps the loader, never the raw error or a Sign in guess', async () => {
+    server.use(http.get('*/api/projects/2/my-work', () => HttpResponse.json({ error: 'My work needs a signed-in AMP user' }, { status: 400 })))
+    let hits = 0
+    server.events.on('response:mocked', ({ request }) => { if (new URL(request.url).pathname === '/api/projects/2/my-work') hits++ })
+    at('/project/2/my-work', null, true)
+    await waitFor(() => expect(hits).toBeGreaterThan(0))
+    await new Promise(r => setTimeout(r, 20))
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByRole('link', { name: /Sign in/ })).toBeNull()
+    expect(screen.queryByText(/needs a signed-in AMP user/)).toBeNull()
+    server.events.removeAllListeners()
+  })
+
+  it('no AMP user, signed out: a Sign in link that comes back here', async () => {
+    server.use(http.get('*/api/projects/2/my-work', () => HttpResponse.json({ error: 'My work needs a signed-in AMP user' }, { status: 400 })))
+    at('/project/2/my-work', { subject: 'oidc|abc', email: 'jo@example.com', name: 'Jo', roles: [] })
+    const panel = await screen.findByRole('region', { name: 'My work: not signed in' })
+    expect(panel).toHaveTextContent('you are signed in as jo@example.com')
+    expect(panel).toHaveTextContent('Ask an AMP admin to invite this email')
+    expect(within(panel).getByRole('link', { name: /Sign in/ }).getAttribute('href')).toMatch(/^\/oauth2\/start\?rd=/)
+    expect(within(panel).getByRole('link', { name: /Open the Board/ })).toHaveAttribute('href', '/project/2/board')
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull()
   })
 })
 
@@ -260,5 +306,55 @@ describe('My work tab: loading', () => {
     at('/project/2/my-work')
     await screen.findByRole('region', { name: 'Waiting on you' })
     expect(document.querySelector('.amp-skel')).toBeNull()
+  })
+})
+
+// Each card says, in one line under its title, what the item needs from you.
+describe('My work tab: what each item needs from you', () => {
+  const withDo = (over: Partial<Task>) => {
+    const d = myWork('busy')
+    d.items.do = [{ ...doItem(), human_reason: 'judgment', task: task(2481, { performer: 'human', human_reason: 'judgment', ...over }) }]
+    return d
+  }
+  const needsOf = (key: string) => document.querySelector(`[data-item-key="${key}"]`)!.querySelectorAll('[data-needs]')
+
+  it('every non-approve card has exactly one needs line; the Approve card has none', async () => {
+    at('/project/2/my-work')
+    await screen.findByRole('region', { name: 'Waiting on you' })
+    expect(needsOf('approve:172')).toHaveLength(0)
+    const lines = Object.fromEntries(['task:2473', 'task:2471', 'task:2803', 'task:2481'].map(k => {
+      const found = needsOf(k)
+      expect(found).toHaveLength(1)
+      return [k, found[0].textContent]
+    }))
+    expect(lines).toEqual({
+      'task:2473': 'Answer: Approved as is, or request changes?',
+      'task:2471': 'Merge PR #88, 2 tickets wait',
+      'task:2803': 'Launch its run, or return #2803 to ready',
+      'task:2481': 'Do with your access: d',
+    })
+  })
+
+  it('a judgment ticket says "Decide" with the first sentence of its brief, and folds the brief', async () => {
+    data = withDo({ description: 'Pick the Q1 targets. Options are in the planning doc.', acceptance_criteria: 'Three targets recorded' })
+    at('/project/2/my-work')
+    await screen.findByRole('region', { name: 'Waiting on you' })
+    const card = document.querySelector('[data-item-key="task:2481"]') as HTMLElement
+    expect(within(card).getByText('Decide: Pick the Q1 targets.')).toBeInTheDocument()
+    const brief = card.querySelector('details')!
+    expect(brief).not.toHaveAttribute('open')
+    await userEvent.click(within(card).getByText('Show brief'))
+    expect(brief).toHaveAttribute('open')
+    expect(within(brief).getByText('Pick the Q1 targets. Options are in the planning doc.')).toBeVisible()
+    expect(within(brief).getByText('Three targets recorded')).toBeVisible()
+  })
+
+  it('a ticket with no description says so, with no brief to show', async () => {
+    data = withDo({ description: '', acceptance_criteria: '' })
+    at('/project/2/my-work')
+    await screen.findByRole('region', { name: 'Waiting on you' })
+    const card = document.querySelector('[data-item-key="task:2481"]') as HTMLElement
+    expect(within(card).getByText('No instructions: open the ticket')).toBeInTheDocument()
+    expect(card.querySelector('details')).toBeNull()
   })
 })

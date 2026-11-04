@@ -5,7 +5,7 @@
  * the action lives. The counts come from the server's one "waiting on you"
  * classifier (GET /api/my-work, KB architecture/waiting-on-you.md).
  */
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { ChevronRight } from 'lucide-react'
 import { api } from '../api/client'
@@ -16,11 +16,14 @@ import { QUIET_MS, silentFor } from '../lib/ticketState'
 import type { Artifact, DayReport, MyWork as MyWorkData, ProjectRef, ProjectWait, VelocityDay, WaitCounts, WaitItem, WaitKind, WorkTask } from '../types'
 import { SkeletonReadouts, SkeletonRegion, SkeletonSection } from '../components/ui/Skeleton'
 import { useDelayedFlag } from '../hooks/useDelayedFlag'
-import { isHuman, reasonLabel } from '../lib/human'
+import { isHuman } from '../lib/human'
+import { needsLine } from '../lib/humanActions'
 import { expiresIn } from '../lib/artifacts'
 import { MySessionsPanel } from '../components/remote/MySessionsPanel'
 import { remoteAvailable, useRemote } from '../remote/remote-context'
 import { projectLink } from '../lib/projectLink'
+import { isNoUserError, noMyWorkReason } from '../lib/myWorkAccess'
+import { MyWorkLoadError, MyWorkUnavailable } from '../components/human/MyWorkUnavailable'
 
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone
 const ymd = (d: Date) => d.toLocaleDateString('en-CA', { timeZone: TZ })
@@ -64,27 +67,31 @@ function prNumber(url?: string): string | null {
   return m ? `PR #${m[1]}` : null
 }
 
-/** A row's title and the small line under it. */
+/**
+ * A row's title and the small line under it. The line leads with what the
+ * item needs from you (needsLine, the same words as the project tab), then
+ * how long it has waited.
+ */
 function describe(it: WaitItem): { title: string; sub: string } {
-  const waitOn = (n?: number) => (n ? ` · ${plural(n, 'ticket')} wait${n === 1 ? 's' : ''}` : '')
+  const needs = needsLine(it)
   switch (it.kind) {
     case 'approve':
       return { title: `Approve the plan: ${it.name || `epic ${it.epic_id}`} (${plural(it.count ?? it.task_ids.length, 'ticket')})`,
         sub: `Epic ${it.epic_id} · planned ${ago(it.since)} ago` }
     case 'answer':
-      return { title: `#${it.task_id} ${it.name}`, sub: `Question · waiting ${ago(it.since)}` }
+      return { title: `#${it.task_id} ${it.name}`, sub: `${needs} · waiting ${ago(it.since)}` }
     case 'merge': {
       const pr = prNumber(it.pr_url)
       return { title: `#${it.task_id} ${pr ? `Merge ${pr}: ` : 'Merge: '}${it.name}`,
-        sub: `${it.merge_state === 'abandoned' ? 'PR closed without merging' : `Done ${ago(it.completed_at ?? it.since)} ago`}${waitOn(it.holding_up?.length)}` }
+        sub: it.merge_state === 'abandoned' ? needs : `${needs} · done ${ago(it.completed_at ?? it.since)} ago` }
     }
     case 'start':
       // The server's own minutes (not_started_minutes): no local arithmetic.
       return { title: `#${it.task_id} ${it.name}`,
-        sub: `Dispatched${it.agent_id ? ` to ${it.agent_id}` : ''}${it.not_started_minutes != null ? ` ${it.not_started_minutes} min ago` : ''}; no worker has started it` }
+        sub: `${needs} · dispatched${it.agent_id ? ` to ${it.agent_id}` : ''}${it.not_started_minutes != null ? ` ${it.not_started_minutes} min ago` : ''}, no worker has started it` }
     default:
       return { title: `#${it.task_id} ${it.name}`,
-        sub: `${it.state === 'in_progress' ? 'Started' : 'Ready'} ${ago(it.since)} · ${reasonLabel(it.human_reason)}` }
+        sub: `${needs} · ${it.state === 'in_progress' ? `started ${ago(it.since)} ago` : `ready for ${ago(it.since)}`}` }
   }
 }
 
@@ -149,6 +156,36 @@ function ProjectCard({ p }: { p: ProjectWait }) {
   )
 }
 
+/**
+ * Plans waiting for your approval, across every project, above the project
+ * cards (AMP issue #72): a plan in a project far down the list isn't buried.
+ * The rows are the same approve rows the cards show (the server lists
+ * approvals first in each card), so a plan appears here and in its card.
+ * `total` is the server's approve count; when the cards don't carry every
+ * approval (more projects than shown, or more approvals than a card's rows)
+ * the panel says how many are elsewhere.
+ */
+function PlansToApprove({ rows, total }: { rows: WaitItem[]; total: number }) {
+  const rest = total - rows.length
+  return (
+    <section className="amp-panel border-l-[3px]" style={{ borderLeftColor: 'var(--violet)' }} aria-label="Plans waiting for your approval">
+      <div className="flex items-center gap-2.5 px-4 py-3 border-b border-line">
+        <KindMark kind="approve">Plans to approve</KindMark>
+        <span className="ml-auto amp-num text-[11px] text-ink-3">{total}</span>
+      </div>
+      <ul className="list-none m-0 p-0">
+        {rows.map(it => (
+          <LinkRow key={`${it.project_id}:${it.key}`} to={itemLink(it)} wide={false}
+            lead={<span className="amp-num text-[10.5px] text-ink-3">{it.project_code}</span>}
+            title={`${it.project_name}: ${it.name || `epic ${it.epic_id}`}`}
+            sub={`${needsLine(it)} · planned ${ago(it.since)} ago`} />
+        ))}
+      </ul>
+      {rest > 0 && <p className="m-0 px-4 py-2 border-t border-line-sub text-[12px] text-ink-3">+{plural(rest, 'more plan')} not listed here: open the project's My work</p>}
+    </section>
+  )
+}
+
 function SectionRule({ children }: { children: React.ReactNode }) {
   return <div className="flex items-center gap-3 mt-2"><span className="amp-label">{children}</span><span className="flex-1 h-px bg-line" /></div>
 }
@@ -163,7 +200,7 @@ function Velocity({ days }: { days: VelocityDay[] }) {
 }
 
 export function MyWork() {
-  const { me } = useAuth()
+  const { me, loading: authLoading } = useAuth()
   const remote = useRemote()
   const [work, setWork] = useState<MyWorkData | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -171,16 +208,27 @@ export function MyWork() {
   const [draft, setDraft] = useState<DayReport | null>(null)
   const [expiring, setExpiring] = useState<Artifact[]>([])
 
-  useEffect(() => {
+  const loadWork = useCallback(() => {
     api.myWork().then(setWork).catch(e => setError(e instanceof Error ? e.message : 'Failed to load'))
+  }, [])
+
+  useEffect(() => {
+    loadWork()
     const to = new Date(), from = new Date(Date.now() - 13 * 86_400_000)
     api.velocity({ from: ymd(from), to: ymd(to), tz: TZ }).then(setVelocity).catch(() => {})
     api.dayReportDraft(ymd(to), TZ).then(setDraft).catch(() => {})
     api.expiringArtifacts(14).then(setExpiring).catch(() => {})
-  }, [])
+  }, [loadWork])
 
+  // No AMP user to collect a list for: the server answers with an empty list
+  // (or, from older APIs, an error). Say why instead of showing zeros.
+  const noWork = authLoading ? null : noMyWorkReason(me) ?? (isNoUserError(error) ? 'no-user' : null)
+
+  // A first load: identity or the list hasn't answered, and nothing went wrong yet.
+  // Never zeros or green in the meantime: the summary waits for both.
+  const firstLoad = (authLoading || !work) && !error && !noWork
   // Tier 1: the header is up at once; the summary's shapes show only if the load runs long.
-  const showSkeleton = useDelayedFlag(!work && !error, undefined, 400)
+  const showSkeleton = useDelayedFlag(firstLoad, undefined, 400)
 
   const counts = work?.counts ?? ZERO
   const cards = work?.projects ?? []
@@ -188,6 +236,7 @@ export function MyWork() {
   const comingOnly = cards.filter(p => p.counts.waiting === 0)
   const clear = work?.clear_projects ?? []
   const totalProjects = (work?.projects_total ?? cards.length) + clear.length
+  const approveRows = waitingCards.flatMap(p => p.rows.filter(r => r.kind === 'approve'))
 
   // Your agents, per project: your agent tickets in progress (the older
   // `owned` list) plus agent accounts' tickets.
@@ -220,8 +269,9 @@ export function MyWork() {
       <PageHeader crumb="Overview" title="My work"
         meta="A summary across your projects. Each row opens the item in that project's My work." />
       <div className="p-4 sm:p-7 sm:pt-5 grid gap-4">
-        {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
-        {!work && !error && (
+        {noWork && <MyWorkUnavailable reason={noWork} email={me?.email} />}
+        {!noWork && error && <MyWorkLoadError error={error} onRetry={() => { setError(null); loadWork() }} />}
+        {firstLoad && (
           <SkeletonRegion label="Loading your work" className="grid gap-4">
             {showSkeleton && <>
               <SkeletonReadouts cells={7} />
@@ -232,7 +282,7 @@ export function MyWork() {
             </>}
           </SkeletonRegion>
         )}
-        {work && <>
+        {work && !authLoading && !error && !noWork && <>
           <div className="amp-panel amp-panel-top grid grid-cols-3 md:grid-cols-7" aria-label="Waiting on you, across your projects">
             <div className="col-span-3 md:col-span-1 px-4 py-3 grid gap-1.5 border-b md:border-b-0 border-line"
               style={counts.waiting ? { background: 'var(--st-flag)', color: '#fff' } : undefined}>
@@ -258,6 +308,7 @@ export function MyWork() {
 
           <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)]">
             <section className="grid gap-4 min-w-0" aria-label="By project">
+              {counts.approve > 0 && <PlansToApprove rows={approveRows} total={counts.approve} />}
               {waitingCards.length > 0 ? <>
                 <SectionRule>By project · most waiting first</SectionRule>
                 {waitingCards.map(p => <ProjectCard key={p.project_id} p={p} />)}
