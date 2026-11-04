@@ -1244,9 +1244,16 @@ func (a RepoGitHubFactCredentials) Secret(ctx context.Context, projectID int, ho
 
 // GitHubClientReaderFactory returns the production reader factory: a
 // githubfacts.Client bound to the credential the coordinator resolved.
+//
+// The factory is called from every background refresh, up to
+// DefaultGitHubFactsMaxRefresh at once, so each call copies opts before touching
+// it. Writing opts.Token into the struct the closure captures would be an
+// unsynchronized write on state shared by all calls (#3217): a data race, and
+// one that could hand a project's read another project's credential.
 func GitHubClientReaderFactory(opts githubfacts.Options) GitHubFactReaderFactory {
 	return func(token githubfacts.TokenSource) GitHubFactReader {
-		opts.Token = token
-		return githubfacts.New(opts)
+		call := opts // per-call copy; the captured Options is never mutated
+		call.Token = token
+		return githubfacts.New(call)
 	}
 }
