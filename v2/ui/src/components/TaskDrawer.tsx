@@ -785,7 +785,7 @@ function DetailsTab({ task, onClose, onRefresh, canWork, canPlan, onUpdated }: {
         <div>
           <div className="amp-label mb-2">Description</div>
           <div className="bg-surface-2 p-4 border border-line">
-            <Markdown size="compact">{task.description}</Markdown>
+            <Markdown size="compact" projectId={task.project_id}>{task.description}</Markdown>
           </div>
         </div>
       )}
@@ -793,7 +793,7 @@ function DetailsTab({ task, onClose, onRefresh, canWork, canPlan, onUpdated }: {
         <div>
           <div className="amp-label mb-2">Acceptance criteria</div>
           <div className="bg-surface-2 p-4 border border-line">
-            <Markdown size="compact">{task.acceptance_criteria}</Markdown>
+            <Markdown size="compact" projectId={task.project_id}>{task.acceptance_criteria}</Markdown>
           </div>
         </div>
       )}
