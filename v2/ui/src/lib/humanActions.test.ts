@@ -46,6 +46,8 @@ describe('needsLine', () => {
   it('do: no description says so', () => {
     expect(needsLine(item({ human_reason: 'judgment', task: { description: '' } }))).toBe('No instructions: open the ticket')
     expect(needsLine(item({ human_reason: 'judgment', task: { description: '  \n ' } }))).toBe('No instructions: open the ticket')
+    expect(needsLine(item({ human_reason: 'judgment', task: { description: '', acceptance_criteria: 'Three targets recorded' } })))
+      .toBe('Decide: see the acceptance criteria in the brief')
   })
 
   it('do without the ticket (summary rows) points at the ticket for the brief', () => {

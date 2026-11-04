@@ -74,11 +74,12 @@ const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? o
  * - merge: "Merge PR #88, 2 tickets wait"; a closed PR asks to reopen or release it
  * - start: "Launch its run, or return #2803 to ready"
  * - do: the reason's verb and the brief's first sentence ("Decide: Pick the
- *   Q1 targets."), or "No instructions: open the ticket" when the ticket has
- *   no description. Summary rows carry no ticket (the server sends it only
+ *   Q1 targets."), "<verb>: see the acceptance criteria in the brief" when
+ *   only the criteria are written, or "No instructions: open the ticket" when
+ *   the ticket has neither. Summary rows carry no ticket (the server sends it only
  *   to the project tab), so there it points at the ticket for the brief.
  */
-export function needsLine(it: WaitItem & { task?: Pick<Task, 'description' | 'block_reason' | 'human_reason'> }): string {
+export function needsLine(it: WaitItem & { task?: Pick<Task, 'description' | 'acceptance_criteria' | 'block_reason' | 'human_reason'> }): string {
   switch (it.kind) {
     case 'approve':
       return `Review and approve ${plural(it.count ?? it.task_ids.length, 'ticket')}`
@@ -101,7 +102,9 @@ export function needsLine(it: WaitItem & { task?: Pick<Task, 'description' | 'bl
       const verb = reasonVerb(it.human_reason || it.task?.human_reason)
       if (!it.task) return `${verb}: open the ticket for the brief`
       const brief = firstSentence(it.task.description)
-      return brief ? `${verb}: ${brief}` : 'No instructions: open the ticket'
+      if (brief) return `${verb}: ${brief}`
+      // No description but acceptance criteria: the brief has something to read.
+      return it.task.acceptance_criteria?.trim() ? `${verb}: see the acceptance criteria in the brief` : 'No instructions: open the ticket'
     }
     default:
       return ''
