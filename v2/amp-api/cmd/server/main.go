@@ -323,6 +323,11 @@ func main() {
 	mcpTools := mcp.NewServer(registry, repo, sseHub, kbSvc)
 	mcpTools.SetAppURL(appPublicURL())
 	mcpTools.SetArtifactRetention(artifactRetention())
+	// Repository facts for the merge-alert policy (AMP #3158). One coordinator
+	// serves every project; it reads the cache on the My work path and refreshes
+	// in the background, so a slow or unreachable GitHub can never slow a page.
+	mergeFacts := githubFactsCoordinator(repo)
+	mcpTools.SetMergeFacts(mergeFacts)
 	mcpSrv := newMCPServer(mcpTools)
 
 	// Token audience (RFC 8707 / MCP 2026-07-28 "token audience binding").
@@ -372,6 +377,7 @@ func main() {
 	restHandler := api.NewRestHandler(registry, repo, sseHub, kbSvc)
 	restHandler.SetAppURL(appPublicURL())
 	restHandler.SetArtifactRetention(artifactRetention())
+	restHandler.SetMergeFacts(mergeFacts)
 	// ---- 6a. Remote control (epic 165) ----
 	// The relay itself is its own service, amp-relay (cmd/relay): amp-api
 	// serves none of its routes (/relay/, /api/sessions). It keeps the org

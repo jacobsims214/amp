@@ -128,9 +128,33 @@ type WaitItem struct {
 	// (state 9 of the mockup).
 	BaseBranch string `json:"base_branch,omitempty"`
 	// TargetSource says where BaseBranch came from: "run" when a run reported
-	// it, "unknown" when nothing did. It is what lets a card say why it can't
+	// it, "detected" when GitHub's own pull read confirmed the PR's target,
+	// "unknown" when nothing did. It is what lets a card say why it can't
 	// tell you where this goes instead of implying it knows.
 	TargetSource string `json:"target_source,omitempty"`
+	// Alert is the merge-alert classifier's arm for this item (AMP #3158,
+	// #3133's policy): "default_branch", "rule", "unknown" — the three that
+	// ask a person — or "internal", agent organization, and empty when no
+	// classification was made (a caller that does not fill it, e.g. a unit
+	// test building an item by hand). An "internal" item is never listed: it
+	// stays a gated ticket and its dependents keep waiting, but nobody is told
+	// about the merge.
+	Alert string `json:"alert,omitempty"`
+	// AlertReason is one line saying why, in the terms the card or chip shows
+	// (artifact #27 states 3 and 9). Always set when Alert is.
+	AlertReason string `json:"alert_reason,omitempty"`
+	// Rule is the rule-box detail for a rule alert: which ruleset demands what
+	// of this person. Empty for every other arm, which has no rule to name.
+	Rule string `json:"rule,omitempty"`
+	// ReviewURL is where the person acts on a rule alert: the PR on GitHub,
+	// where the review happens. Empty when the item has no PR URL. A rule card
+	// offers this and never Mark merged — the approval happens on GitHub, and
+	// the merge is recorded by the webhook or Mark merged afterwards.
+	ReviewURL string `json:"review_url,omitempty"`
+	// DefaultBranch is the repository's detected default branch this item was
+	// classified against, for the card's repo chip. "" when it could not be
+	// read: never a guess.
+	DefaultBranch string `json:"default_branch,omitempty"`
 	// HoldingUp: the open tickets that wait for this merge and actually need
 	// it, so the count on the card is what the action unblocks. A dependent
 	// with waits_for_merge: false is in NotWaiting: it started when the work
@@ -314,6 +338,12 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 		if err := s.fillMergeItems(ctx, w.Items, merges); err != nil {
 			return nil, err
 		}
+		// Only actionable merges reach a person (AMP #3158, the alert policy of
+		// #3133): an internal one is agent organization and an already-merged
+		// one asks nobody anything. Dropped BEFORE the fold, so a plan's human
+		// merge step stays an ordinary Do item instead of disappearing with the
+		// card it was folded into.
+		w.Items = dropNonAlertMerges(w.Items)
 		// One card per PR: a plan's merge step folded into a card above is not
 		// also a Do item of its own.
 		w.Items, w.ComingUp = dedupFoldedSteps(w.Items, w.ComingUp)
@@ -510,6 +540,28 @@ func (s *Service) fillMergeItems(ctx context.Context, items []WaitItem, merges [
 		if ref.BaseBranch != "" {
 			it.TargetSource = MergeTargetRun
 		}
+		// The policy, from cached facts only (AMP #3158). It never makes an
+		// HTTP call: a miss is the unknown arm, which keeps the card the person
+		// sees today rather than hiding a real merge behind a slow GitHub.
+		//
+		// merged is false here because a Merge item exists only while the merge
+		// is NOT recorded (domain.MergeGates); GitHub's own answer for a PR it
+		// already sees merged arrives through the pull read and decides the
+		// "none" arm instead, which is the case that matters — AMP is simply
+		// behind the repository.
+		cls := s.classifyMerge(ctx, it.ProjectID, ref, it.OwnerUserID)
+		it.Alert, it.AlertReason = cls.Alert.Kind, cls.Alert.Reason
+		it.Rule, it.DefaultBranch = cls.Alert.Rule, cls.Alert.DefaultBranch
+		if cls.Target != "" {
+			// GitHub's own answer for the PR's target replaces the run's report,
+			// and says so: a card can then call it detected rather than inferred.
+			it.BaseBranch, it.TargetSource = cls.Target, MergeTargetDetected
+		}
+		if it.Alert == MergeAlertRule {
+			// The approval happens on GitHub; this is where it happens, and the
+			// only action a rule card offers (artifact #27 state 3).
+			it.ReviewURL = it.PRURL
+		}
 		it.HoldingUp = waiters[it.TaskID]
 		step, hasStep := steps[it.TaskID]
 		if hasStep {
@@ -541,9 +593,12 @@ func (s *Service) fillMergeItems(ctx context.Context, items []WaitItem, merges [
 const (
 	// MergeTargetRun: a run reported the branch the work goes into.
 	MergeTargetRun = "run"
-	// MergeTargetUnknown: nothing reported it. AMP reads no repository
-	// metadata (no default branch, no branch protection), so a card can't
-	// infer the target — and must say so rather than assume "main".
+	// MergeTargetDetected: the PR's own target, as GitHub's pull read reported
+	// it (AMP #3158). It outranks MergeTargetRun, because what a person typed
+	// or a harness guessed is not what the repository says.
+	MergeTargetDetected = "detected"
+	// MergeTargetUnknown: nothing reported it. A card then says it can't
+	// verify the target instead of assuming "main".
 	MergeTargetUnknown = "unknown"
 )
 

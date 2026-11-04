@@ -58,6 +58,16 @@ type PersonWait struct {
 	// means AMP could not verify the target — never "main".
 	BaseBranch   string `json:"base_branch,omitempty"`
 	TargetSource string `json:"target_source,omitempty"`
+	// merge (AMP #3158): the alert policy's arm and why, so a manager can tell
+	// a default-branch merge from a rule-required approval from the honest
+	// unknown. Only the arms that ask a person appear here: an internal merge
+	// (agent organization) and an already-merged one are absent from the list
+	// entirely, exactly as they are absent from My work.
+	Alert         string `json:"alert,omitempty"`
+	AlertReason   string `json:"alert_reason,omitempty"`
+	Rule          string `json:"rule,omitempty"`
+	ReviewURL     string `json:"review_url,omitempty"`
+	DefaultBranch string `json:"default_branch,omitempty"`
 	// TrackedBy: the plan's human merge step folded into this Merge card
 	// (merge_for), with the readiness the backend's bridges enforce, so the
 	// card never offers Mark merged for a step it would refuse to close.
@@ -279,6 +289,8 @@ func (s *Server) personWait(it service.WaitItem, owner *int, ownerEmail string, 
 		p.State = "completed"
 		p.MergeState, p.PRURL, p.Branch = it.MergeState, it.PRURL, it.Branch
 		p.BaseBranch, p.TargetSource = it.BaseBranch, it.TargetSource
+		p.Alert, p.AlertReason, p.Rule = it.Alert, it.AlertReason, it.Rule
+		p.ReviewURL, p.DefaultBranch = it.ReviewURL, it.DefaultBranch
 		p.TrackedBy, p.NotWaiting = it.TrackedBy, it.NotWaiting
 	case service.WaitStart:
 		p.State = domain.PhaseNotStarted

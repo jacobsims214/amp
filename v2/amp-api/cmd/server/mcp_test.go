@@ -32,6 +32,7 @@ import (
 // mcpStack holds a fully wired MCP server backed by real postgres + actors.
 type mcpStack struct {
 	srv       *mcpserver.MCPServer
+	mcpSrv    *mcp.Server
 	repo      *repository.Repo
 	reg       *actor.Registry
 	hub       *hub.Hub
@@ -139,7 +140,7 @@ func setupMCP(t *testing.T) *mcpStack {
 	srv := mcpserver.NewMCPServer("amp-api-test", "2.0.0", append([]mcpserver.ServerOption{mcpserver.WithToolCapabilities(false)}, mcpHandler.ServerOptions()...)...)
 	mcpHandler.Register(srv)
 
-	return &mcpStack{srv: srv, repo: repo, reg: reg, hub: sseHub, kb: kbSvc, projectID: proj.ID, epicID: epic.ID, storyID: story.ID}
+	return &mcpStack{srv: srv, mcpSrv: mcpHandler, repo: repo, reg: reg, hub: sseHub, kb: kbSvc, projectID: proj.ID, epicID: epic.ID, storyID: story.ID}
 }
 
 // testKB connects to the Typesense at TEST_TYPESENSE_URL (keyword search
