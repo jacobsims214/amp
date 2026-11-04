@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { api } from '../api/client'
 import { useSSE } from './useSSE'
+import { withTimeout } from '../lib/timeout'
 import type { Epic, Story, Task, SSEEvent } from '../types'
 
 export interface BoardData {
@@ -34,22 +35,32 @@ export function useBoardData(projectId: number): BoardData {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
+  // Each load gets a number; only the newest may set state, so a slow load
+  // that answers after a timeout and Retry can't overwrite the fresh one.
+  const loadSeq = useRef(0)
+
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current
     setLoading(true)
     setError(null)
     try {
-      const [epicList, taskList] = await Promise.all([
-        api.listEpics(projectId),
-        api.listTasks(projectId),
-      ])
+      const { epicList, storyList, taskList } = await withTimeout((async () => {
+        const [epicList, taskList] = await Promise.all([
+          api.listEpics(projectId),
+          api.listTasks(projectId),
+        ])
+        const storyLists = await Promise.all(epicList.map(e => api.listStories(e.id)))
+        return { epicList, storyList: storyLists.flat(), taskList }
+      })(), 'Loading the board')
+      if (seq !== loadSeq.current) return
       setEpics(epicList)
-      const storyLists = await Promise.all(epicList.map(e => api.listStories(e.id)))
-      setStories(storyLists.flat())
+      setStories(storyList)
       setTasks(taskList)
     } catch (e) {
+      if (seq !== loadSeq.current) return
       setError(e instanceof Error ? e.message : 'Failed to load board')
     } finally {
-      setLoading(false)
+      if (seq === loadSeq.current) setLoading(false)
     }
   }, [projectId])
 
