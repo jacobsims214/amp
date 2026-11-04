@@ -1,34 +1,39 @@
 /**
  * The launch: AMP's Go / No-Go poll, played over the app as it starts.
  *
- * The flight director polls four stations on a CRT; each GO lights one of
- * AMP's bands, and "ALL STATIONS GO" brings up the wordmark. The last
- * station waits for /api/me, so the launch ends when the app is ready
+ * The flight director runs a status check on a CRT while AMP's bands light
+ * up, then the wordmark comes in. The status lines are real: they come from
+ * the /api/me call (lib/launch.ts), and a check that wasn't run gets no line.
+ * The API line waits for /api/me, so the launch ends when the app is ready
  * (never more than a few seconds later).
  *
- * - Full (6.6 s): arriving from the sign-in redirect, or the first visit in
- *   12 hours. Everything else that loads the app (a refresh, a new tab) gets
- *   the short version (2 s). Moving between pages never replays it.
+ * - It plays at most once per browser session, and only when the app is
+ *   opened at "/" (see shouldLaunch in lib/launch.ts). Refreshes, deep links
+ *   and moving between pages never replay it.
+ * - Full (5 s): arriving from the sign-in redirect, or the first visit in
+ *   12 hours. Otherwise the short version (2 s).
  * - Any click or key skips it. With reduced motion, the logo just fades in.
  * - `?launch=full` or `?launch=short` forces a version (for demos).
  */
 import { useEffect, useRef, useState } from 'react'
 import { useAuth } from '../../hooks/useAuth'
+import { forcedLaunch, markLaunched, stations, summary, type Station, type Tone } from '../../lib/launch'
 
 const BANDS = ['#D9482B', '#EB8A2E', '#EBC34B', '#2C66B8']
 const INK = '#E8ECF2', INK2 = '#9AA4B2', INK3 = '#5E6876', CRT = '#060A0C'
-const STATIONS = ['PLAN CHECK', 'AGENTS', 'KNOWLEDGE BASE', 'TELEMETRY']
+const TONE: Record<Tone, string> = { go: BANDS[3], nogo: BANDS[0], info: INK, pending: INK3 }
 
-const DUR = { full: 6600, short: 2000, reduced: 700 } as const
-// Full version: each station is typed, then answers GO a beat later.
+const DUR = { full: 5000, short: 2000, reduced: 700 } as const
+// Full version: each line is typed, then answers a beat later (once its check is in).
 const stationAt = (i: number) => 1800 + i * 800
 const goAt = (i: number) => stationAt(i) + 600
-const ALL_GO = goAt(3) + 500 // "ALL STATIONS GO"
+const bandAt = (i: number) => goAt(0) + i * 350 // the four bands light in turn
+const ALL_GO = goAt(1) + 500 // the summary line
 const WORDMARK = ALL_GO + 200 // wordmark letters, over 600 ms
 // Short version
 const SHORT_GO = (i: number) => 200 + i * 250
 const SHORT_ALL = SHORT_GO(3) + 200
-const HOLD = goAt(3) // the last station waits for the app
+const HOLD = goAt(0) // the API line waits for /api/me
 const HOLD_CAP = 4000
 const LAST_KEY = 'amp.launch.last'
 const FULL_EVERY = 12 * 3600 * 1000
@@ -37,8 +42,8 @@ type Mode = keyof typeof DUR
 
 function pickMode(): Mode {
   if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return 'reduced'
-  const forced = new URLSearchParams(window.location.search).get('launch')
-  if (forced === 'full' || forced === 'short') return forced
+  const forced = forcedLaunch(window.location.search)
+  if (forced) return forced
   let last = 0
   try { last = Number(localStorage.getItem(LAST_KEY)) || 0 } catch { /* storage blocked: treat as first visit */ }
   const fromSignIn = /\/(oauth2|dex|auth|login|sso|saml|oidc)\b/i.test(document.referrer)
@@ -88,7 +93,7 @@ function logo(ctx: CanvasRenderingContext2D, cx: number, cy: number, s: number, 
   })
 }
 
-function draw(ctx: CanvasRenderingContext2D, w: number, h: number, t: number, mode: Mode, now: number) {
+function draw(ctx: CanvasRenderingContext2D, w: number, h: number, t: number, mode: Mode, now: number, lines: Station[]) {
   ctx.fillStyle = CRT
   ctx.fillRect(0, 0, w, h)
   const narrow = w < 720
@@ -111,20 +116,25 @@ function draw(ctx: CanvasRenderingContext2D, w: number, h: number, t: number, mo
   y += lh
   mono(ctx, type('LAUNCH STATUS CHECK', 900, 35), left, y, px * 0.85, INK3)
   y += lh * 1.35
-  const bands = [0, 0, 0, 0]
-  STATIONS.forEach((st, i) => {
+  const bands = [0, 1, 2, 3].map(i => {
+    const at = full ? bandAt(i) : SHORT_GO(i)
+    return eOut(seg(t, at, at + 260))
+  })
+  lines.forEach((st, i) => {
     const at = full ? stationAt(i) : 0
     const go = full ? goAt(i) : SHORT_GO(i)
-    const label = (st + ' ').padEnd(17, '.')
+    const label = (st.label + ' ').padEnd(17, '.')
     mono(ctx, type(label, at, 22), left, y, px * 0.9, INK2)
     const g = seg(t, go, go + 120)
-    if (g > 0) mono(ctx, 'GO', left + ctx.measureText(label).width + px * 0.6, y, px * 0.9, rgba(BANDS[i], g), 600)
-    bands[i] = eOut(seg(t, go, go + 260))
+    // A check still in flight shows a blinking ellipsis, never a GO it hasn't earned.
+    const value = st.tone === 'pending' ? (Math.floor(now / 300) % 2 ? '...' : '') : st.value
+    if (g > 0 && value) mono(ctx, value, left + ctx.measureText(label).width + px * 0.6, y, px * 0.9, rgba(TONE[st.tone], g), 600)
     y += lh
   })
   const allAt = full ? ALL_GO : SHORT_ALL
   const all = seg(t, allAt, allAt + 150)
-  if (all > 0) mono(ctx, 'ALL STATIONS GO', left, y + lh * 0.4, px * 0.9, rgba(INK, all), 600)
+  const end = summary(lines)
+  if (all > 0) mono(ctx, end.text, left, y + lh * 0.4, px * 0.9, rgba(end.tone === 'nogo' ? TONE.nogo : INK, all), 600)
   if (Math.floor(now / 420) % 2 === 0) {
     ctx.fillStyle = rgba(INK, 0.8)
     ctx.fillRect(left, y + lh * 1.05, px * 0.55, px * 0.12)
@@ -142,14 +152,21 @@ function draw(ctx: CanvasRenderingContext2D, w: number, h: number, t: number, mo
 }
 
 export function LaunchSequence() {
-  const { loading } = useAuth()
+  const { me, loading, error } = useAuth()
   const [mode] = useState(pickMode)
   const [phase, setPhase] = useState<'run' | 'out' | 'done'>('run')
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const ready = useRef(!loading)
   const skip = useRef(false)
+  const lines = useRef(stations({ me, loading, error }))
 
-  useEffect(() => { ready.current = !loading }, [loading])
+  useEffect(() => {
+    ready.current = !loading
+    lines.current = stations({ me, loading, error })
+  }, [me, loading, error])
+
+  // Once per session: a refresh or a new page load later in this tab skips it.
+  useEffect(() => { markLaunched() }, [])
 
   // While the launch is up, the app's own animations wait (see .amp-launching).
   useEffect(() => {
@@ -187,7 +204,7 @@ export function LaunchSequence() {
       if (skip.current) t = dur
       else if (mode === 'full' && t >= HOLD && !ready.current && held < HOLD_CAP) held += dt
       else t = Math.min(dur, t + dt)
-      draw(ctx, w, h, t, mode, now)
+      draw(ctx, w, h, t, mode, now, lines.current)
       if (t >= dur) {
         setPhase('out')
         out = window.setTimeout(() => setPhase('done'), 300)
