@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { api } from '../api/client'
 import type { Run, Usage } from '../types'
 import { tokens, usd } from '../lib/usage'
+import { Markdown } from './ui/Markdown'
 
 const OUTCOME: Record<Run['outcome'], string> = {
   completed: 'var(--st-done)', blocked: 'var(--st-flag)', progress: 'var(--st-prog)', abandoned: 'var(--ink-3)',
@@ -51,7 +52,8 @@ export function RunsPanel({ taskId, refreshKey }: { taskId: number; refreshKey?:
                 {r.merged && <span className="text-success-ink">merged</span>}
                 {r.pr_url && <a href={r.pr_url} target="_blank" rel="noreferrer" className="underline underline-offset-2 hover:text-ink">PR</a>}
               </span>
-              {r.note && <><span /><span className="col-span-2 text-[12px] text-ink-2">{r.note}</span></>}
+              {/* The run's note is the agent's own summary, written as markdown. */}
+              {r.note && <><span /><div className="col-span-2 min-w-0" data-testid="run-note"><Markdown size="compact">{r.note}</Markdown></div></>}
             </div>
           ))}
         </div>

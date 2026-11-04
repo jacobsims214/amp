@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useParams } from 'react-router-dom'
 import { Projects } from './pages/Projects'
 import { MyWork } from './pages/MyWork'
@@ -25,6 +26,7 @@ import { RemoteProvider } from './remote/RemoteProvider'
 import { AuthProvider } from './contexts/AuthContext'
 import { AppShell } from './components/shell/AppShell'
 import { LaunchSequence } from './components/brand/LaunchSequence'
+import { shouldLaunch } from './lib/launch'
 
 /** An unknown view under a project opens the project (My work or Mission, by the landing rule). */
 function ProjectFallback() {
@@ -43,11 +45,14 @@ function NotFound() {
 }
 
 export default function App() {
+  // Decided once, from the URL the app was opened at: only a cold start at "/"
+  // plays the launch, once per session. Deep links (including the remote
+  // session page, where on a phone you want the chat now) go straight in.
+  const [launch] = useState(() => !window.location.pathname.startsWith('/sessions/') && shouldLaunch())
   return (
     <AuthProvider>
       <RemoteProvider>
-      {/* The remote session page skips the launch animation: on a phone you want the chat now. */}
-      {!window.location.pathname.startsWith('/sessions/') && <LaunchSequence />}
+      {launch && <LaunchSequence />}
       <BrowserRouter>
         <Routes>
           {/* Standalone (no sidebar) so it works on a phone; served with a strict CSP. */}

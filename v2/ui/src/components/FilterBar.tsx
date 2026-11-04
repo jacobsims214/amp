@@ -54,6 +54,7 @@ export function FilterBar({ filter, onChange, epicOptions, memberOptions, counts
             <button
               key={opt.value}
               onClick={() => onChange({ ...filter, state: opt.value as FilterState['state'] })}
+              aria-pressed={isActive}
               className={`flex items-center gap-1.5 px-3 py-1  text-xs font-medium transition-all cursor-pointer ${
                 isActive
                   ? 'bg-ink text-on-ink'
