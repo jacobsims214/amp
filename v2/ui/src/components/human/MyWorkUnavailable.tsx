@@ -19,7 +19,7 @@ function signInHref(): string {
   return `/oauth2/start?rd=${encodeURIComponent(here)}`
 }
 
-export function MyWorkUnavailable({ reason, projectId }: { reason: NoMyWork; projectId?: number }) {
+export function MyWorkUnavailable({ reason, projectId, email }: { reason: NoMyWork; projectId?: number; email?: string }) {
   const local = reason === 'local-dev'
   // Where every ticket is, with its actions: this project's Board, or the project list.
   const board = projectId ? { to: projectLink(projectId, 'board'), label: 'Open the Board' } : { to: '/projects', label: 'Open a project' }
@@ -35,10 +35,10 @@ export function MyWorkUnavailable({ reason, projectId }: { reason: NoMyWork; pro
       <p className="m-0 text-[13.5px] text-ink-2 leading-normal max-w-[64ch]">
         {local
           ? 'This AMP runs without sign-in (local development). Everyone is the shared Local Dev identity, which is not an AMP user, so no plan, question or merge can be waiting on you. Nothing has been counted, so no counts are shown.'
-          : 'My work is one person\'s list, and this session is not signed in as an AMP user: you may have signed out, or your session expired. Nothing has been counted, so no counts are shown.'}
+          : `My work is one person's list, and this session has no AMP user${email ? ` (you are signed in as ${email})` : ''}: the account may not be invited to this AMP, its email domain may not be allowed, or its email isn't verified. Nothing has been counted, so no counts are shown.`}
       </p>
       <ul className="m-0 pl-5 grid gap-1 text-[13px] text-ink-2 leading-normal list-disc">
-        {!local && <li>Sign in, and this page reloads with your list.</li>}
+        {!local && <li>Ask an AMP admin to invite this email, or sign in with the account you use for AMP; this page then shows your list.</li>}
         <li>To see what is waiting right now, open the Board: every ticket is there, and its panel has the actions.</li>
         {local && <li>To get a My work of your own, run AMP with sign-in on (set <code className="amp-num text-[12px]">OIDC_ISSUER_URL</code>) and sign in.</li>}
       </ul>

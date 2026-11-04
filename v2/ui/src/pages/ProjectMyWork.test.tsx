@@ -52,14 +52,14 @@ function Where() {
   return <span data-testid="where">{l.pathname + l.search}</span>
 }
 
-function at(url: string, me: Me | null = null) {
+function at(url: string, me: Me | null = null, loading = false) {
   const router = createMemoryRouter([
     { path: '/project/:projectId', element: <><ProjectLanding /><Where /></> },
     { path: '/project/:projectId/my-work', element: <><ProjectMyWork /><Where /></> },
     { path: '/project/:projectId/mission', element: <><ProjectNav projectId={2} currentView="mission" /><p>Mission page</p><Where /></> },
     { path: '/project/:projectId/board', element: <><p>Board page</p><Where /></> },
   ], { initialEntries: [url] })
-  render(<AuthContext.Provider value={{ me, loading: false, error: null, isAdmin: false }}><RouterProvider router={router} /></AuthContext.Provider>)
+  render(<AuthContext.Provider value={{ me, loading, error: null, isAdmin: false }}><RouterProvider router={router} /></AuthContext.Provider>)
   return router
 }
 const where = () => screen.getByTestId('where').textContent
@@ -167,10 +167,25 @@ describe('My work tab: states', () => {
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
+  it('no AMP user while the identity is loading: keeps the loader, never the raw error or a Sign in guess', async () => {
+    server.use(http.get('*/api/projects/2/my-work', () => HttpResponse.json({ error: 'My work needs a signed-in AMP user' }, { status: 400 })))
+    let hits = 0
+    server.events.on('response:mocked', ({ request }) => { if (new URL(request.url).pathname === '/api/projects/2/my-work') hits++ })
+    at('/project/2/my-work', null, true)
+    await waitFor(() => expect(hits).toBeGreaterThan(0))
+    await new Promise(r => setTimeout(r, 20))
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByRole('link', { name: /Sign in/ })).toBeNull()
+    expect(screen.queryByText(/needs a signed-in AMP user/)).toBeNull()
+    server.events.removeAllListeners()
+  })
+
   it('no AMP user, signed out: a Sign in link that comes back here', async () => {
     server.use(http.get('*/api/projects/2/my-work', () => HttpResponse.json({ error: 'My work needs a signed-in AMP user' }, { status: 400 })))
     at('/project/2/my-work', { subject: 'oidc|abc', email: 'jo@example.com', name: 'Jo', roles: [] })
     const panel = await screen.findByRole('region', { name: 'My work: not signed in' })
+    expect(panel).toHaveTextContent('you are signed in as jo@example.com')
+    expect(panel).toHaveTextContent('Ask an AMP admin to invite this email')
     expect(within(panel).getByRole('link', { name: /Sign in/ }).getAttribute('href')).toMatch(/^\/oauth2\/start\?rd=/)
     expect(within(panel).getByRole('link', { name: /Open the Board/ })).toHaveAttribute('href', '/project/2/board')
     expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull()

@@ -262,7 +262,7 @@ export function MyWork() {
       <PageHeader crumb="Overview" title="My work"
         meta="A summary across your projects. Each row opens the item in that project's My work." />
       <div className="p-4 sm:p-7 sm:pt-5 grid gap-4">
-        {noWork && <MyWorkUnavailable reason={noWork} />}
+        {noWork && <MyWorkUnavailable reason={noWork} email={me?.email} />}
         {!noWork && error && <MyWorkLoadError error={error} onRetry={() => { setError(null); loadWork() }} />}
         {(authLoading || !work) && !error && !noWork && <div className="flex justify-center py-16"><BandLoader label="Loading your work" /></div>}
         {work && !authLoading && !error && !noWork && <>

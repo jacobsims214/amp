@@ -195,12 +195,13 @@ export function Mission() {
   const pid = Number(projectId)
   const { epics, stories, tasks, loading, error, refresh, applyTask } = useBoardData(pid)
   const { members, myAccess, openReassign, people } = useProjectPeople(pid)
-  const { me } = useAuth()
+  const { me, loading: authLoading } = useAuth()
   const waitCounts = useWaitCounts()
   // No AMP user (sign-in off, or signed out): the server's counts are all
   // zeros because nothing can be anyone's, so show none of them.
-  const noWork = noMyWorkReason(me)
-  const yours = noWork ? null : projectCounts(waitCounts, pid)
+  // Until the identity is known, show no strip: the counts may be local dev's zeros.
+  const noWork = authLoading ? null : noMyWorkReason(me)
+  const yours = noWork || authLoading ? null : projectCounts(waitCounts, pid)
   // Waiting on people: every person's items, from the server's one definition
   // (GET /projects/:id/waiting-on-people), refetched shortly after tickets change.
   // Kept with its project id so another project's people never show here.

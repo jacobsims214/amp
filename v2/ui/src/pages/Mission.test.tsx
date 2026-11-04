@@ -73,13 +73,13 @@ afterEach(async () => {
 })
 afterAll(() => { server.close(); vi.unstubAllGlobals() })
 
-async function open(me: Me = { user_id: ME, email: 'jacob@x.io' } as never) {
+async function open(me: Me | null = { user_id: ME, email: 'jacob@x.io' } as never, loading = false) {
   // The strip reads the shared counts store, which AppShell fills; do it here.
   const { refreshWaitCounts } = await import('../lib/waitCounts')
   await refreshWaitCounts()
   const router = createMemoryRouter([{ path: '/project/:projectId/mission', element: <Mission /> }], { initialEntries: ['/project/2/mission'] })
   render(
-    <AuthContext.Provider value={{ me, loading: false, error: null, isAdmin: false }}>
+    <AuthContext.Provider value={{ me, loading, error: null, isAdmin: false }}>
       <RouterProvider router={router} />
     </AuthContext.Provider>,
   )
@@ -112,6 +112,14 @@ describe('Mission (informational)', () => {
     // The readouts keep the project's numbers but never claim "0 for you".
     expect(screen.getByText('Questions').parentElement).not.toHaveTextContent('for you')
     expect(screen.getByText('Merge needed').parentElement).not.toHaveTextContent('yours')
+  })
+
+  it('identity still loading: no strip yet, so local dev never flashes green', async () => {
+    counts = { counts: { waiting: 0, approve: 0, answer: 0, merge: 0, start: 0, do: 0, coming_up: 0 }, projects: {} }
+    await open(null, true)
+    expect(screen.queryByText('Nothing waits on you here')).toBeNull()
+    expect(screen.queryByText('Waiting on you: not counted')).toBeNull()
+    expect(screen.getByText('Questions').parentElement).not.toHaveTextContent('for you')
   })
 
   it('signed out: says so, not "Nothing waits on you here"', async () => {
