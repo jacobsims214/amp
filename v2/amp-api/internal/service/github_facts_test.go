@@ -198,6 +198,19 @@ func (s *memGitHubFactStore) UpsertGitHubPullFacts(_ context.Context, k reposito
 	return &out, nil
 }
 
+// InvalidateGitHubPullFacts mirrors 044's scoped delete: one pull request's row,
+// matched case-insensitively on the slug and never across projects.
+func (s *memGitHubFactStore) InvalidateGitHubPullFacts(_ context.Context, k repository.GitHubFactsKey, n int) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := pullKey(k, n)
+	if _, ok := s.pulls[key]; !ok {
+		return false, nil
+	}
+	delete(s.pulls, key)
+	return true, nil
+}
+
 // seedRepo puts facts in the cache as if a refresh had stored them, so a test can
 // set up a hot read without going through one.
 func (s *memGitHubFactStore) seedRepo(projectID int, slug string, w repository.GitHubRepoFactsWrite) {
@@ -1360,3 +1373,202 @@ func TestGitHubFactsPullStateIsOnlyMergedOrUnknown(t *testing.T) {
 
 func boolPtr(b bool) *bool { return &b }
 func intPtr(i int) *int    { return &i }
+
+// ---- webhook invalidation (AMP #3160) ----
+
+// TestGitHubFactsInvalidatePullDropsOnlyThatPull is the guard on the invalidation's
+// SCOPE: a pull-request delivery drops that pull request's facts and nothing else.
+//
+// Dropping the repository or branch rows here would be the plausible bug: they are
+// in the same cache and it is one statement to delete them. It is wrong because a
+// pull-request event says nothing about the default branch or a branch's rules —
+// so the "fix" would throw away good evidence on every delivery and make the 15m
+// TTL mean nothing. Mutation: make InvalidatePull call InvalidateGitHubRepoFacts
+// and this test fails on the surviving repository and branch rows.
+func TestGitHubFactsInvalidatePullDropsOnlyThatPull(t *testing.T) {
+	clk := newClock()
+	store := newMemGitHubFactStore()
+	slug := "acme/rocket"
+	readAt := clk.now()
+	store.seedRepo(7, slug, repository.GitHubRepoFactsWrite{
+		DefaultBranch: "main", DefaultBranchSource: repository.GitHubBranchSourceREST,
+		Completeness: repository.GitHubCompletenessComplete, VerifiedAt: &readAt,
+	})
+	store.seedBranch(7, slug, "feat/x", repository.GitHubBranchFactsWrite{
+		Rules: []byte(`[]`), Completeness: repository.GitHubCompletenessComplete, VerifiedAt: &readAt,
+	})
+	store.seedPull(7, slug, 12, repository.GitHubPullFactsWrite{
+		BaseBranch: "feat/x", State: "unknown", Completeness: repository.GitHubCompletenessComplete, VerifiedAt: &readAt,
+	})
+	// Sibling PR and a same-named repository in another project: both must survive.
+	store.seedPull(7, slug, 13, repository.GitHubPullFactsWrite{
+		BaseBranch: "main", State: "unknown", Completeness: repository.GitHubCompletenessComplete, VerifiedAt: &readAt,
+	})
+	store.seedRepo(8, slug, repository.GitHubRepoFactsWrite{
+		DefaultBranch: "trunk", DefaultBranchSource: repository.GitHubBranchSourceREST,
+		Completeness: repository.GitHubCompletenessComplete, VerifiedAt: &readAt,
+	})
+	store.seedPull(8, slug, 12, repository.GitHubPullFactsWrite{
+		BaseBranch: "trunk", State: "merged", Completeness: repository.GitHubCompletenessComplete, VerifiedAt: &readAt,
+	})
+	c := coordinator(t, store, &memGitHubFactCredentials{}, &scriptedReader{}, clk.now)
+
+	ctx := context.Background()
+	if _, err := c.Lookup(ctx, GitHubFactsRequest{ProjectID: 7, Slug: slug, PR: 12, Target: "feat/x"}); err != nil {
+		t.Fatalf("lookup before invalidation: %v", err)
+	}
+
+	had, err := c.InvalidatePull(ctx, GitHubFactsRequest{ProjectID: 7, Slug: slug, PR: 12})
+	if err != nil || !had {
+		t.Fatalf("InvalidatePull = (%v, %v), want (true, nil)", had, err)
+	}
+
+	// The pull request's own facts are gone: the next read sees them as unread.
+	if _, err := store.GetGitHubPullFacts(ctx, repository.GitHubFactsKey{ProjectID: 7, Slug: slug}, 12); !errors.Is(err, repository.ErrNoGitHubPullFacts) {
+		t.Errorf("the invalidated pull request's facts survive: %v", err)
+	}
+	// ... and everything else is untouched.
+	if b, err := store.GetGitHubPullFacts(ctx, repository.GitHubFactsKey{ProjectID: 7, Slug: slug}, 13); err != nil || b.BaseBranch != "main" {
+		t.Errorf("a sibling pull request's facts were dropped: %+v %v", b, err)
+	}
+	if f, err := store.GetGitHubRepoFacts(ctx, repository.GitHubFactsKey{ProjectID: 7, Slug: slug}); err != nil || f.DefaultBranch != "main" {
+		t.Errorf("the repository's default branch was dropped: %+v %v", f, err)
+	}
+	if b, err := store.GetGitHubBranchFacts(ctx, repository.GitHubFactsKey{ProjectID: 7, Slug: slug}, "feat/x"); err != nil || len(b.Rules) == 0 {
+		t.Errorf("the branch's rules were dropped: %+v %v", b, err)
+	}
+	// Cross-project: same slug, same PR number, another project — never reached.
+	if p, err := store.GetGitHubPullFacts(ctx, repository.GitHubFactsKey{ProjectID: 8, Slug: slug}, 12); err != nil || p.State != "merged" {
+		t.Errorf("another project's pull request was dropped: %+v %v", p, err)
+	}
+
+	// A second invalidation of the same facts is a miss, not an error: a delivery
+	// for a repository AMP never cached is the ordinary case, not a failure.
+	if had, err := c.InvalidatePull(ctx, GitHubFactsRequest{ProjectID: 7, Slug: slug, PR: 12}); err != nil || had {
+		t.Errorf("second InvalidatePull = (%v, %v), want (false, nil)", had, err)
+	}
+	// A request that cannot name a row is refused before it reaches the cache.
+	if _, err := c.InvalidatePull(ctx, GitHubFactsRequest{ProjectID: 7, Slug: slug}); err == nil {
+		t.Error("InvalidatePull with no pull request number was accepted")
+	}
+	if _, err := c.InvalidatePull(ctx, GitHubFactsRequest{ProjectID: 0, Slug: slug, PR: 12}); err == nil {
+		t.Error("InvalidatePull with no project was accepted")
+	}
+}
+
+// TestGitHubFactsInvalidatePullClearsTheNegativeWindow: a delivery is new evidence,
+// so it must also clear the failure that was keeping the scope quiet. Otherwise the
+// row is dropped and the next read still refuses to refill it for up to NegativeTTL
+// — the invalidation would do nothing for exactly as long as the error it was meant
+// to clear. Mutation: drop the forgetPull call and the "after invalidation" read
+// below starts no refresh.
+func TestGitHubFactsInvalidatePullClearsTheNegativeWindow(t *testing.T) {
+	clk := newClock()
+	fail := true
+	seed := make(chan struct{})
+	reader := &scriptedReader{answer: func(ctx context.Context, req githubfacts.Request) (*githubfacts.Facts, error) {
+		<-seed
+		if fail {
+			return failingFacts(githubfacts.KindNotFound), nil
+		}
+		return okFacts(req), nil
+	}}
+	close(seed)
+	store := newMemGitHubFactStore()
+	c := coordinator(t, store, &memGitHubFactCredentials{}, reader, clk.now)
+	req := testRequest()
+
+	// A first read whose refresh fails, which negative-caches the scope.
+	if _, err := c.Lookup(context.Background(), req); err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	waitIdle(t, c)
+	if n := reader.callCount(); n != 1 {
+		t.Fatalf("the first refresh made %d reads, want 1", n)
+	}
+	// Inside the window, nothing retries — that is the negative cache working.
+	if v, err := c.Lookup(context.Background(), req); err != nil || v.Refresh.Started || v.Refresh.Joined {
+		t.Fatalf("a negative-cached scope started a refresh: %+v %v", v.Refresh, err)
+	}
+
+	// A delivery arrives. It drops the (empty) row and must forget the failure.
+	clk.advance(2 * time.Second) // still inside the 60s window
+	fail = false                 // the next refresh succeeds
+	if _, err := c.InvalidatePull(context.Background(), GitHubFactsRequest{ProjectID: req.ProjectID, Slug: req.Slug, PR: req.PR}); err != nil {
+		t.Fatalf("InvalidatePull: %v", err)
+	}
+
+	after, err := c.Lookup(context.Background(), req)
+	if err != nil {
+		t.Fatalf("lookup after invalidation: %v", err)
+	}
+	if !after.Refresh.Started && !after.Refresh.Joined {
+		t.Errorf("a delivery did not clear the negative window: %+v", after.Refresh)
+	}
+	if after.Refresh.Failure != "" {
+		t.Errorf("Refresh.Failure = %q after a delivery, want none", after.Refresh.Failure)
+	}
+	waitIdle(t, c)
+	if n := reader.callCount(); n != 2 {
+		t.Errorf("reads after the delivery = %d, want 2", n)
+	}
+}
+
+// TestGitHubFactsInvalidatedPullIsUnknownNotAbsent: after an invalidation the pulled
+// facts are unknown and say so, and the read wants to refill them. A card must
+// never read "dropped" as "GitHub says no reviewer is required".
+func TestGitHubFactsInvalidatedPullIsUnknownNotAbsent(t *testing.T) {
+	clk := newClock()
+	readAt := clk.now()
+	store := newMemGitHubFactStore()
+	store.seedRepo(7, "acme/rocket", repository.GitHubRepoFactsWrite{
+		DefaultBranch: "main", DefaultBranchSource: repository.GitHubBranchSourceREST,
+		Completeness: repository.GitHubCompletenessComplete, VerifiedAt: &readAt,
+	})
+	store.seedBranch(7, "acme/rocket", "feat/x", repository.GitHubBranchFactsWrite{
+		Rules: []byte(`[]`), Completeness: repository.GitHubCompletenessComplete, VerifiedAt: &readAt,
+	})
+	store.seedPull(7, "acme/rocket", 12, repository.GitHubPullFactsWrite{
+		BaseBranch: "feat/x", RequestedReviewers: []string{"octocat"},
+		Completeness: repository.GitHubCompletenessComplete, VerifiedAt: &readAt,
+	})
+	// The refill blocks, so the assertion is about the VIEW, not a race.
+	gate := make(chan struct{})
+	reader := &scriptedReader{answer: func(ctx context.Context, req githubfacts.Request) (*githubfacts.Facts, error) {
+		<-gate
+		return okFacts(req), nil
+	}}
+	c := coordinator(t, store, &memGitHubFactCredentials{}, reader, clk.now)
+	req := testRequest()
+
+	before, err := c.Lookup(context.Background(), req)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	waitIdle(t, c)
+	if !before.Pull.Trusted || len(before.Pull.RequestedReviewers) != 1 {
+		t.Fatalf("setup: the pull facts are not trusted: %+v", before.Pull)
+	}
+	if _, err := c.InvalidatePull(context.Background(), GitHubFactsRequest{ProjectID: req.ProjectID, Slug: req.Slug, PR: req.PR}); err != nil {
+		t.Fatalf("InvalidatePull: %v", err)
+	}
+
+	after, err := c.Lookup(context.Background(), req)
+	if err != nil {
+		t.Fatalf("lookup after invalidation: %v", err)
+	}
+	if after.Pull.Trusted {
+		t.Error("an invalidated pull request's facts are still trusted")
+	}
+	if after.Pull.Unknown == "" {
+		t.Error("an invalidated pull request's facts have no Unknown reason: dropped must not read as absent")
+	}
+	if len(after.Pull.RequestedReviewers) != 0 {
+		t.Errorf("the dropped reviewers are still present: %v", after.Pull.RequestedReviewers)
+	}
+	if !after.Refresh.Started && !after.Refresh.Joined {
+		t.Errorf("nothing wanted to refill the invalidated facts: %+v", after.Refresh)
+	}
+	close(gate)
+	waitIdle(t, c)
+}

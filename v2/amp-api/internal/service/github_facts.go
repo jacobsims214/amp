@@ -104,6 +104,10 @@ type GitHubFactStore interface {
 	UpsertGitHubBranchFacts(ctx context.Context, key repository.GitHubFactsKey, branch string, w repository.GitHubBranchFactsWrite) (*repository.GitHubBranchFacts, error)
 	GetGitHubPullFacts(ctx context.Context, key repository.GitHubFactsKey, number int) (*repository.GitHubPullFacts, error)
 	UpsertGitHubPullFacts(ctx context.Context, key repository.GitHubFactsKey, number int, w repository.GitHubPullFactsWrite) (*repository.GitHubPullFacts, error)
+	// InvalidateGitHubPullFacts drops one pull request's cached facts. It is the
+	// webhook's write (AMP #3160): a delivery is new evidence, and the row it
+	// contradicts must go rather than wait out the TTL.
+	InvalidateGitHubPullFacts(ctx context.Context, key repository.GitHubFactsKey, number int) (bool, error)
 }
 
 // GitHubFactCredentials supplies the project's GitHub credential. Secret's
@@ -520,6 +524,38 @@ func (c *GitHubFactsCoordinator) Refresh(ctx context.Context, req GitHubFactsReq
 	return f.facts, false, f.err
 }
 
+// InvalidatePull drops the cached facts for one pull request, so the next read
+// re-reads them from GitHub instead of trusting a row a webhook delivery has just
+// contradicted. It reports whether there was a row; a miss is not an error, and
+// neither is a project that has never cached this repository.
+//
+// This is the webhook's entry point (AMP #3160), and it is deliberately narrow.
+// It does NOT drop the repository or branch rows: a pull-request event says
+// nothing about the default branch or a branch's rules, and dropping them would
+// throw away good evidence and make the 15m TTL meaningless. A default-branch
+// rename is a `repository` event, which this hook is not subscribed to, so that
+// stays the TTL's job — the correctness backstop when no delivery arrives.
+//
+// The scope's negative-cache entry is forgotten too. Without that, a delivery
+// arriving inside a 60s negative window would drop the row and then have the next
+// read refuse to refill it: the invalidation would be invisible for exactly as
+// long as the failure it was meant to clear.
+func (c *GitHubFactsCoordinator) InvalidatePull(ctx context.Context, req GitHubFactsRequest) (bool, error) {
+	key, err := req.factsKey()
+	if err != nil {
+		return false, err
+	}
+	if req.PR <= 0 {
+		return false, fmt.Errorf("github facts: a pull request number is required to invalidate its facts")
+	}
+	had, err := c.store.InvalidateGitHubPullFacts(ctx, key, req.PR)
+	if err != nil {
+		return false, err
+	}
+	c.negative.forgetPull(key, req.PR)
+	return had, nil
+}
+
 // recordOutcome feeds one attempt to the negative cache: a failed attempt silences
 // its scope for NegativeTTL, a successful one forgets the previous failure.
 func (c *GitHubFactsCoordinator) recordOutcome(key factsFlightKey, facts *githubfacts.Facts, err error) {
@@ -933,6 +969,21 @@ func (n *githubFactsNegativeCache) fail(key factsFlightKey, class string, now ti
 	}
 	n.until[key] = now.Add(ttl)
 	n.failure[key] = class
+}
+
+// forgetPull drops every negative-cache entry for one pull request, whatever
+// target it was recorded under. A webhook delivery is new evidence about that
+// pull request, so a failure recorded before it must not keep the scope quiet:
+// the delivery exists precisely because something changed.
+func (n *githubFactsNegativeCache) forgetPull(key repository.GitHubFactsKey, pr int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for k := range n.until {
+		if k.ProjectID == key.ProjectID && k.Host == key.Host && strings.EqualFold(k.Slug, key.Slug) && k.PR == pr {
+			delete(n.until, k)
+			delete(n.failure, k)
+		}
+	}
 }
 
 // succeed clears a scope's negative window: the next failure is a new fact.
