@@ -56,8 +56,15 @@ otherwise. Every project page takes `?focus=<ticket id>` to open on one ticket.
 - **Library** — the project's knowledge base, plus links to the team and org KBs and this guide.
 - **Settings** — general (including which org the project is in), plan approval, merges (whether
   dependents wait for merges), metadata, team access, knowledge bases, trash (restore deleted
-  tickets), and for owners the GitHub merge webhook (`working/merging-and-ci.md`), webhooks, the
-  audit log and the danger zone (archive, reset).
+  tickets), and for owners the GitHub token, the GitHub merge webhook
+  (`working/merging-and-ci.md`), webhooks, the audit log and the danger zone (archive, reset).
+  - **GitHub token** — for project owners only: the read credential AMP uses for this project's
+    repository, and what lets a merge alert know which branch a pull request targets and which
+    repository rules are holding it. It is **write-only** — pasting it seals it at rest, and the
+    panel shows only the host, a label and when it was attached or replaced; no page, API answer,
+    error or audit entry ever carries the value. **Save token** / **Replace token** attaches it or
+    swaps it in place; **Remove token** deletes the credential *and every repository fact it
+    produced*. No token is a real state: a public repository is read without one.
 
 Each ticket opens a side panel with its description, acceptance criteria, comments, runs
 (model, tokens, cost, git details) and history. When the ticket waits on you, the panel has the
