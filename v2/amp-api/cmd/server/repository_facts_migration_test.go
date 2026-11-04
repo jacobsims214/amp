@@ -414,8 +414,11 @@ func TestMigration_044CompletenessAndFailureClass(t *testing.T) {
 //     sealed blob.
 //
 // The credential itself lives in the sealed storage the project credential
-// service adds (AMP #3154); facts reference it by id, which is an INTEGER and
-// carries no secret.
+// service adds (AMP #3154): project_github_credentials.sealed_secret, which is
+// this guard's one allowed exception — and it stays allowed only because
+// migration 045 CHECKs that it holds a sealed value ("enc:v1:…") or nothing
+// at all, so it can't hold a token in the clear. That is asserted below rather
+// than taken on trust.
 func TestMigration_044HasNoSecretColumn(t *testing.T) {
 	d := newRepoFactsDB(t)
 	const tables = `('project_github_credentials', 'github_repo_facts',
@@ -445,6 +448,12 @@ func TestMigration_044HasNoSecretColumn(t *testing.T) {
 		// credential_id is the allowed exception: it is a reference to the
 		// credential row (an id, not a value) and it is an INTEGER.
 		if col == "github_repo_facts.credential_id (integer)" {
+			continue
+		}
+		// sealed_secret is the other one, and it is the column #3154 exists
+		// for: a sealed value only, enforced by 045's CHECK (asserted
+		// below). Nothing else on these tables may be named like a secret.
+		if col == "project_github_credentials.sealed_secret (text)" {
 			continue
 		}
 		named = append(named, col)
@@ -488,4 +497,13 @@ func TestMigration_044HasNoSecretColumn(t *testing.T) {
 	err = d.exec(`INSERT INTO github_repo_facts (project_id, repo_slug, last_error_class, last_error_at)
 		VALUES ($1, 'owner/x', 'error: 401 Bad credentials (token ghp_abcdef)', NOW())`, d.p1)
 	wantSQLState(t, "a token written as a failure reason", err, "23514")
+
+	// The one column that is allowed to hold a secret can hold only a SEALED
+	// one: a plaintext token is refused by the database, not merely avoided by
+	// the code that writes it.
+	wantSQLState(t, "a plaintext token in the credential column",
+		d.exec(`UPDATE project_github_credentials SET sealed_secret = 'ghp_abcdef0123456789' WHERE id = $1`, d.c1),
+		"23514")
+	// A sealed value is what the storage layer writes, and it is accepted.
+	d.mustExec(`UPDATE project_github_credentials SET sealed_secret = 'enc:v1:deadbeef:c2VhbGVk' WHERE id = $1`, d.c1)
 }
