@@ -56,8 +56,9 @@ otherwise. Every project page takes `?focus=<ticket id>` to open on one ticket.
 - **Library** — the project's knowledge base, plus links to the team and org KBs and this guide.
 - **Settings** — general (including which org the project is in), plan approval, merges (whether
   dependents wait for merges), metadata, team access, knowledge bases, trash (restore deleted
-  tickets), and for owners the GitHub token, the GitHub merge webhook
-  (`working/merging-and-ci.md`), webhooks, the audit log and the danger zone (archive, reset).
+  tickets), and for owners the GitHub token and the GitHub merge webhook, then webhooks, the audit
+  log and the danger zone (archive, reset). `working/merging-and-ci.md` covers both GitHub
+  settings in full.
   - **GitHub token** — for project owners only: the read credential AMP uses for this project's
     repository, and what lets a merge alert know which branch a pull request targets and which
     repository rules are holding it. It is **write-only** — pasting it seals it at rest, and the
