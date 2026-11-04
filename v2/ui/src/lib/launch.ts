@@ -2,8 +2,9 @@
  * When the launch animation plays, and what its status lines are allowed to say.
  *
  * - It plays at most once per browser session (a sessionStorage flag), and only
- *   when the app is opened at "/". A refresh, a second tab later in the session,
- *   or a pasted deep link (/project/3/board?focus=7) goes straight to the page.
+ *   when the app is opened at "/". sessionStorage is per tab, so "session" means
+ *   this tab: a refresh, or a pasted deep link (/project/3/board?focus=7), goes
+ *   straight to the page. A brand-new tab opened at "/" plays it again.
  * - `?launch=full` or `?launch=short` forces it (for demos).
  * - Its status lines only report what the app actually checked. Today that's the
  *   /api/me call: whether amp-api answered, and who you are signed in as.
@@ -49,7 +50,10 @@ export interface Station {
 /** The status lines, from what /api/me told us. */
 export function stations(auth: Pick<AuthState, 'me' | 'loading' | 'error'>): Station[] {
   if (auth.loading) return [{ label: 'AMP API', value: '', tone: 'pending' }]
-  if (auth.error || !auth.me) return [{ label: 'AMP API', value: 'NO ANSWER', tone: 'nogo' }]
+  if (auth.error) return [{ label: 'AMP API', value: 'NO ANSWER', tone: 'nogo' }]
+  // No error and no identity: amp-api answered "signed out" and the app is
+  // redirecting to sign-in. That isn't a failure, so don't say NO ANSWER.
+  if (!auth.me) return [{ label: 'AMP API', value: '', tone: 'pending' }]
   const who = (auth.me.name || auth.me.email || auth.me.subject || '').trim()
   const out: Station[] = [{ label: 'AMP API', value: 'GO', tone: 'go' }]
   if (who) out.push({ label: 'SIGNED IN AS', value: who.toUpperCase().slice(0, 28), tone: 'info' })

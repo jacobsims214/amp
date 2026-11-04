@@ -166,7 +166,10 @@ export function LaunchSequence() {
   }, [me, loading, error])
 
   // Once per session: a refresh or a new page load later in this tab skips it.
-  useEffect(() => { markLaunched() }, [])
+  // Only marked once /api/me has answered (signed in, or a real failure): a
+  // signed-out visit at "/" is about to be sent to sign-in, and the launch
+  // should still play when sign-in brings this tab back to "/".
+  useEffect(() => { if (me || error) markLaunched() }, [me, error])
 
   // While the launch is up, the app's own animations wait (see .amp-launching).
   useEffect(() => {

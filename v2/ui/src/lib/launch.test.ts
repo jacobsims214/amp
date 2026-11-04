@@ -50,6 +50,7 @@ describe('stations', () => {
       { me: null, loading: true, error: null },
       { me, loading: false, error: null },
       { me: null, loading: false, error: 'Failed to load identity (502)' },
+      { me: null, loading: false, error: null },
     ]) {
       for (const line of stations(s)) expect(line.label).not.toMatch(unchecked)
     }
@@ -68,6 +69,12 @@ describe('stations', () => {
       { label: 'SIGNED IN AS', value: 'LOCAL DEV', tone: 'info' },
     ])
     expect(summary(lines)).toEqual({ text: 'ALL STATIONS GO', tone: 'go' })
+  })
+
+  it('does not call a signed-out redirect a failure', () => {
+    const lines = stations({ me: null, loading: false, error: null })
+    expect(lines).toEqual([{ label: 'AMP API', value: '', tone: 'pending' }])
+    expect(summary(lines).text).toBe('STANDING BY')
   })
 
   it('reports a failed /api/me as NO ANSWER, not GO', () => {
