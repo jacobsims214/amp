@@ -53,8 +53,10 @@ Two further outcomes ask nobody, and so never appear as a Merge item at all:
 
 - **Internal** — the PR targets a branch that isn't the default, and complete, fresh evidence
   proves no rule requires anyone. Landing on an integration branch is agent organization: there
-  is no acknowledgement, no chore, and no card. (A rule that *does* demand an approval isn't quiet:
-  with AMP unable to attribute the rule to a person today, such a PR lands on **unknown**.)
+  is no acknowledgement, no chore, and no card. Two things can keep a merge out of this arm: a
+  rule that *does* demand an approval (with AMP unable to attribute it to a person, such a PR lands
+  on **unknown**), and an *unprotected* target branch — see "What stays unknown" for why that is
+  the common case.
 - **None** — GitHub's own pull read says the PR is already merged, even though AMP hadn't been
   told. The item asks nobody and leaves My work; its ticket still reads Merge needed until the
   merge is recorded, because suppressing an alert is not a merge (see "Alerts are not the gate").
@@ -192,17 +194,24 @@ chip, never at silence:
   "internal" either. This is why the rule arm can't be reached today. A requested reviewer on its
   own is never treated as proof that a rule requires them: GitHub auto-requests code owners
   whether or not anything is protected.
-- **A partial rules read.** When the evaluated rules answered but classic branch protection could
-  not be read with this token, AMP cannot prove the *absence* of a rule, so it falls back to the
-  PR's own signals: a review GitHub says is required, plus this person among the requested
-  reviewers. The PR's review decision and mergeable state aren't read today, so that fallback
-  never fires and a partial read stays **unknown**.
-- **Classic branch protection's own settings.** AMP reads that endpoint to decide whether the rules
-  read is complete, but the review requirements configured there are not turned into rule
-  evidence: AMP's rule evidence is the evaluated rulesets. So a non-default branch protected *only*
-  by classic branch protection has no rule for AMP to name, and with both reads answered the
-  evidence looks complete — a PR into that branch classifies as internal. (A PR into the default
-  branch still asks its owner: clause (a) needs only the default branch.)
+- **An unprotected target branch.** Being unprotected is not an error, but GitHub answers the
+  classic-protection endpoint with `404 Branch not protected` — the same 404 a token without
+  permission gets. AMP cannot tell those apart, so the protection read counts as unanswered and
+  the rules are **partial** for any branch without classic protection. Proving "no rule applies"
+  needs a *complete* read, so a non-default target without classic branch protection lands on
+  **unknown** rather than internal. (Verified live against this repository on 2026-11-04: the
+  evaluated rules for `fix/actionable-merge-workflow` return `[]`, and its protection endpoint
+  answers `404 Branch not protected`. The reader's own tests pin the same rule — "a 404 is not
+  proof the branch is unprotected".) That is the safe direction — the item is shown — but it does
+  mean the quiet internal arm needs a target whose protection endpoint actually answers.
+- **A partial rules read's fallback never fires.** When the rules are only partially known, AMP
+  would fall back to the PR's own signals: a review GitHub says is required, plus this person
+  among the requested reviewers. The stored PR facts never include GitHub's review decision or
+  mergeable state, so that fallback cannot fire and a partial read stays **unknown**.
+- **Classic branch protection's own settings.** AMP reads that endpoint only to decide whether the
+  rules read is complete; the review requirements configured there are not turned into rule
+  evidence, because AMP's rule evidence is the evaluated rulesets. So a non-default branch
+  protected *only* by classic branch protection has no rule for AMP to name.
 - **A manual default-branch setting.** The policy has a slot for a person's declaration (one that
   doesn't age out on the TTL), but no settings surface writes it yet, so a repository whose default
   branch can't be read stays unknown even if everyone knows the answer.
