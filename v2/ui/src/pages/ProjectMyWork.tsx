@@ -33,11 +33,11 @@ import { useSSE } from '../hooks/useSSE'
 import { personName } from '../lib/people'
 import { ago } from '../lib/approval'
 import { reasonLabel } from '../lib/human'
-import { KIND_LABEL } from '../lib/humanActions'
+import { KIND_LABEL, needsLine } from '../lib/humanActions'
 import { startItemText } from '../lib/dispatchState'
 import { projectLink } from '../lib/projectLink'
 import { refreshWaitCounts } from '../lib/waitCounts'
-import type { DepSummary, DoneItem, Project, ProjectMyWork as Data, ProjectWaitItem, WaitKind } from '../types'
+import type { DepSummary, DoneItem, Project, ProjectMyWork as Data, ProjectWaitItem, Task, WaitKind } from '../types'
 import './projectMyWork.css'
 
 const KINDS: WaitKind[] = ['approve', 'answer', 'merge', 'start', 'do']
@@ -349,7 +349,9 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
           {kind === 'do' && <span className="amp-label border border-line px-1.5 py-1 leading-none">{it.state === 'in_progress' ? 'In progress' : 'Ready'}</span>}
           {kind === 'start' && <span className="amp-label border px-1.5 py-1 leading-none" style={{ borderColor: 'var(--warning)', color: 'var(--warning-ink)' }}>Not started</span>}
         </div>
+        <p className="m-0 mt-1 text-[13.5px] leading-snug text-ink" data-needs="">{needsLine(it)}</p>
         <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[12.5px] text-ink-2">{meta.map(m => <span key={m}>{m}</span>)}</div>
+        {kind === 'do' && t && <Brief task={t} />}
         <div className="mt-3">
           {t ? <HumanActions task={t} kind={kind} canAct={!readOnly} prUrl={it.pr_url} branch={it.branch}
             minutes={it.not_started_minutes} onChanged={() => onChanged()} />
@@ -358,6 +360,25 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
       </article>
       {note}
     </>
+  )
+}
+
+/** A Do ticket's brief, folded: the description and acceptance criteria as written. */
+function Brief({ task }: { task: Pick<Task, 'description' | 'acceptance_criteria'> }) {
+  const description = task.description?.trim()
+  const criteria = task.acceptance_criteria?.trim()
+  if (!description && !criteria) return null
+  return (
+    <details className="mt-2">
+      <summary className="amp-label cursor-pointer select-none text-ink-2 hover:text-ink">Show brief</summary>
+      <div className="mt-2 grid gap-2 border-l-2 border-line pl-3 text-[13px] leading-relaxed text-ink-2">
+        {description && <p className="m-0 whitespace-pre-line">{description}</p>}
+        {criteria && <div>
+          <span className="amp-label">Acceptance criteria</span>
+          <p className="m-0 mt-1 whitespace-pre-line">{criteria}</p>
+        </div>}
+      </div>
+    </details>
   )
 }
 

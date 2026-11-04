@@ -11,8 +11,8 @@ import { ProjectLanding } from './ProjectLanding'
 import { ProjectNav } from '../components/ProjectNav'
 import { fixedTab, landingPath, landingTab } from '../lib/landing'
 import { resetWaitCounts } from '../lib/waitCounts'
-import { myWork } from '../test/myWorkFixture'
-import type { MyWorkCounts, ProjectMyWork as Data } from '../types'
+import { doItem, myWork, task } from '../test/myWorkFixture'
+import type { MyWorkCounts, ProjectMyWork as Data, Task } from '../types'
 
 let data: Data = myWork('busy')
 let counts: MyWorkCounts = { counts: { waiting: 5, approve: 1, answer: 1, merge: 1, start: 1, do: 1, coming_up: 1 }, projects: { 2: { waiting: 5, approve: 1, answer: 1, merge: 1, start: 1, do: 1, coming_up: 1 } } }
@@ -236,5 +236,55 @@ describe('badges', () => {
     expect(tab).toHaveAttribute('href', '/project/2/my-work')
     expect(tab.querySelector('span')).toHaveClass('bg-accent')
     expect(screen.getByRole('link', { name: 'Mission' })).toHaveAttribute('href', '/project/2/mission')
+  })
+})
+
+// Each card says, in one line under its title, what the item needs from you.
+describe('My work tab: what each item needs from you', () => {
+  const withDo = (over: Partial<Task>) => {
+    const d = myWork('busy')
+    d.items.do = [{ ...doItem(), human_reason: 'judgment', task: task(2481, { performer: 'human', human_reason: 'judgment', ...over }) }]
+    return d
+  }
+  const needsOf = (key: string) => document.querySelector(`[data-item-key="${key}"]`)!.querySelectorAll('[data-needs]')
+
+  it('every non-approve card has exactly one needs line; the Approve card has none', async () => {
+    at('/project/2/my-work')
+    await screen.findByRole('region', { name: 'Waiting on you' })
+    expect(needsOf('approve:172')).toHaveLength(0)
+    const lines = Object.fromEntries(['task:2473', 'task:2471', 'task:2803', 'task:2481'].map(k => {
+      const found = needsOf(k)
+      expect(found).toHaveLength(1)
+      return [k, found[0].textContent]
+    }))
+    expect(lines).toEqual({
+      'task:2473': 'Answer: Approved as is, or request changes?',
+      'task:2471': 'Merge PR #88, 2 tickets wait',
+      'task:2803': 'Launch its run, or return #2803 to ready',
+      'task:2481': 'Do with your access: d',
+    })
+  })
+
+  it('a judgment ticket says "Decide" with the first sentence of its brief, and folds the brief', async () => {
+    data = withDo({ description: 'Pick the Q1 targets. Options are in the planning doc.', acceptance_criteria: 'Three targets recorded' })
+    at('/project/2/my-work')
+    await screen.findByRole('region', { name: 'Waiting on you' })
+    const card = document.querySelector('[data-item-key="task:2481"]') as HTMLElement
+    expect(within(card).getByText('Decide: Pick the Q1 targets.')).toBeInTheDocument()
+    const brief = card.querySelector('details')!
+    expect(brief).not.toHaveAttribute('open')
+    await userEvent.click(within(card).getByText('Show brief'))
+    expect(brief).toHaveAttribute('open')
+    expect(within(brief).getByText('Pick the Q1 targets. Options are in the planning doc.')).toBeVisible()
+    expect(within(brief).getByText('Three targets recorded')).toBeVisible()
+  })
+
+  it('a ticket with no description says so, with no brief to show', async () => {
+    data = withDo({ description: '', acceptance_criteria: '' })
+    at('/project/2/my-work')
+    await screen.findByRole('region', { name: 'Waiting on you' })
+    const card = document.querySelector('[data-item-key="task:2481"]') as HTMLElement
+    expect(within(card).getByText('No instructions: open the ticket')).toBeInTheDocument()
+    expect(card.querySelector('details')).toBeNull()
   })
 })
