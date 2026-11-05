@@ -25,4 +25,11 @@ describe('stripMarkdown', () => {
   it('returns empty for empty input', () => {
     expect(stripMarkdown('')).toBe('')
   })
+  it('keeps literal asterisks that are not emphasis', () => {
+    expect(stripMarkdown('match *.go and *.ts files')).toBe('match *.go and *.ts files')
+    expect(stripMarkdown('2*3*4 and 2 * 3 * 4')).toBe('2*3*4 and 2 * 3 * 4')
+  })
+  it('still strips single-asterisk emphasis', () => {
+    expect(stripMarkdown('see *this* now, (*that*).')).toBe('see this now, (that).')
+  })
 })

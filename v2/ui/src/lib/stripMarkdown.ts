@@ -11,7 +11,9 @@ export function stripMarkdown(src: string): string {
     .replace(/^\s*>\s?/gm, '')
     .replace(/`([^`]*)`/g, '$1')
     .replace(/(\*\*|__)(.+?)\1/g, '$2')
-    .replace(/\*(?!\s)([^*]+?)\*/g, '$1')
+    // Emphasis only: not inside a word (2*3*4), and the closing * must follow
+    // a non-space, so globs like "*.go and *.ts" keep their asterisks.
+    .replace(/(^|[^\w*])\*(?![\s*])([^*]*?[^\s*])\*(?![\w*])/g, '$1$2')
     .replace(/(^|[^\w])_(?!\s)([^_]+?)_(?=$|[^\w])/g, '$1$2')
     .replace(/~~(.+?)~~/g, '$1')
     .replace(/\s+/g, ' ')
