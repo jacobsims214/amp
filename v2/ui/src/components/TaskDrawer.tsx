@@ -29,6 +29,7 @@ import { MetadataEditor } from './MetadataEditor'
 import { metadataPatch } from '../lib/metadata'
 import { Markdown } from './ui/Markdown'
 import { RunsPanel } from './RunsPanel'
+import { StoryContext } from './StoryContext'
 
 interface Props {
   task: Task | null
@@ -764,6 +765,9 @@ function TaskPlacement({ task, plan, canEdit, onUpdated }: {
             {epics.find(e => e.id === task.epic_id)?.name ?? 'Epic'} › {story?.name ?? `Story #${task.story_id}`}
           </div>
         )}
+        <div className="mt-2">
+          <StoryContext story={story} epic={epics.find(e => e.id === task.epic_id)} projectId={task.project_id} />
+        </div>
       </div>
       <div>
         <div className="flex items-center gap-2 mb-2">

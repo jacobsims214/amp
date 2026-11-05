@@ -2,6 +2,7 @@
 // Details tab agree, an unapproved ticket says so where its state is shown,
 // and the creator is named (or, in local dev, why nobody is).
 import { cleanup, render, screen, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { createMemoryRouter, RouterProvider } from 'react-router-dom'
@@ -16,10 +17,12 @@ export const trustTask = (over: Partial<Task> = {}): Task => ({
 })
 const members: ProjectMember[] = [{ user_id: 9, email: 'jo@example.com', display_name: 'Jo Owner', access: 'member' as ProjectAccess }]
 
+let storyDesc = ''
+let epicDesc = ''
 const server = setupServer(
   http.get('*/api/projects/2/tasks', () => HttpResponse.json({ tasks: [] })),
-  http.get('*/api/projects/2/epics', () => HttpResponse.json({ epics: [{ id: 1, project_id: 2, name: 'Leads' }] })),
-  http.get('*/api/epics/1/stories', () => HttpResponse.json({ stories: [{ id: 3, epic_id: 1, name: 'Import' }] })),
+  http.get('*/api/projects/2/epics', () => HttpResponse.json({ epics: [{ id: 1, project_id: 2, name: 'Leads', description: epicDesc }] })),
+  http.get('*/api/epics/1/stories', () => HttpResponse.json({ stories: [{ id: 3, epic_id: 1, name: 'Import', description: storyDesc, acceptance_criteria: '' }] })),
   http.get('*/api/tasks/:id/history', () => HttpResponse.json({ history: [], count: 0 })),
   http.get('*/api/tasks/:id/comments', () => HttpResponse.json({ comments: [] })),
   http.get('*/api/tasks/:id/runs', () => HttpResponse.json({ runs: [], usage: { runs: 0 } })),
@@ -27,7 +30,7 @@ const server = setupServer(
 )
 class FakeEventSource { onmessage = null; onerror = null; addEventListener() {} removeEventListener() {} close() {} }
 beforeAll(() => { vi.stubGlobal('EventSource', FakeEventSource); server.listen() })
-afterEach(() => { cleanup(); server.resetHandlers() })
+afterEach(() => { cleanup(); server.resetHandlers(); storyDesc = ''; epicDesc = '' })
 afterAll(() => { server.close(); vi.unstubAllGlobals() })
 
 function open(t: Task, meId: number | 'local' = 9, opts: { requireApproval?: boolean; members?: ProjectMember[] } = {}) {
@@ -88,5 +91,25 @@ describe('TaskDrawer shows an agent question\'s options (#130)', () => {
       question: { options: [{ label: 'Daily', consequence: 'Cheaper' }, { label: 'Hourly', consequence: '' }], recommended: 0 } }))
     const group = await screen.findByRole('radiogroup', { name: 'Choose an answer' })
     expect(within(group).getByRole('radio', { name: /Daily/ }).closest('label')).toHaveTextContent('Recommended')
+  })
+})
+
+describe('TaskDrawer story context (#133)', () => {
+  it("shows the story's description as markdown after expanding Story context", async () => {
+    storyDesc = '**Goal**: import every lead'
+    epicDesc = 'Leads reach sales the same day.'
+    open(trustTask())
+    const toggle = await screen.findByRole('button', { name: 'Story context' })
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    await userEvent.click(toggle)
+    const ctx = screen.getByTestId('story-context')
+    expect(within(ctx).getByText('Goal', { selector: 'strong' })).toBeInTheDocument()
+    expect(within(ctx).getByText('Leads reach sales the same day.')).toBeInTheDocument()
+  })
+
+  it('has no Story context toggle when the story and epic have no description', async () => {
+    open(trustTask())
+    await screen.findByText('Import')
+    expect(screen.queryByRole('button', { name: 'Story context' })).toBeNull()
   })
 })
