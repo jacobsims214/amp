@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sort"
 	"strings"
@@ -398,6 +399,51 @@ type HumanGate struct {
 // than half the open work, usually means dependencies are missing.
 const readyFanoutThreshold = 4
 
+// countNoun is "1 ticket" or "3 tickets".
+func countNoun(n int, one, many string) string {
+	return fmt.Sprintf("%d %s", n, pick(n, one, many))
+}
+
+// pick is one for n == 1, many otherwise.
+func pick[T any](n int, one, many T) T {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// kbContextIssue is the plan check's "Context in the KB" finding, or nil when
+// the project KB holds docs: an empty KB is a blocking no_context issue, and
+// a KB AMP can't read (none configured, or an error reading it) is a warning,
+// since nothing shows the plan's context is written down (#129).
+func (s *Service) kbContextIssue(ctx context.Context, projectID int) *PlanIssue {
+	if s.KB == nil {
+		return &PlanIssue{
+			Kind: "no_context", Severity: "warn",
+			Message: "This AMP has no knowledge base configured, so nothing shows the decisions behind this plan are written down anywhere but the session that made it.",
+			Fix:     "Configure the KB (Typesense) for this AMP, then write architecture/project-overview.md and the decisions/ docs with amp_kb_write.",
+		}
+	}
+	n, err := s.KB.CountDocs(ctx, kb.Project(projectID))
+	if err != nil {
+		// The cause (hosts, paths) stays in the server log, not the report.
+		slog.Error("plan check: read project KB", "project_id", projectID, "err", err)
+		return &PlanIssue{
+			Kind: "no_context", Severity: "warn",
+			Message: "AMP couldn't read the project knowledge base, so it can't tell whether the context behind this plan is written down.",
+			Fix:     "Check that the KB (Typesense) is reachable, then run the check again.",
+		}
+	}
+	if n > 0 {
+		return nil
+	}
+	return &PlanIssue{
+		Kind:    "no_context",
+		Message: "The project knowledge base is empty. The decisions behind this plan exist only in the session that made it.",
+		Fix:     "Write architecture/project-overview.md (what this is, the stack, how it's laid out) and a doc per decision the user made under decisions/ (what, why, when) with amp_kb_write.",
+	}
+}
+
 // CheckPlan reviews a project's tickets and dependencies: isolated tickets,
 // too much that can start at once, empty stories, and tickets stuck blocked
 // on dependencies that are all done (which it repairs).
@@ -498,14 +544,28 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 
 	// A plan with an empty project KB: the decisions behind it live only in
 	// the planner's session, and the next session or engineer starts blind.
-	if r.OpenTasks > 0 && s.KB != nil {
-		if n, err := s.KB.CountDocs(ctx, kb.Project(projectID)); err == nil && n == 0 {
-			r.Issues = append(r.Issues, PlanIssue{
-				Kind:    "no_context",
-				Message: "The project knowledge base is empty. The decisions behind this plan exist only in the session that made it.",
-				Fix:     "Write architecture/project-overview.md (what this is, the stack, how it's laid out) and a doc per decision the user made under decisions/ (what, why, when) with amp_kb_write.",
-			})
+	// A KB AMP can't read is no evidence of context: it's a warning, never a
+	// GO (#129).
+	if r.OpenTasks > 0 {
+		if iss := s.kbContextIssue(ctx, projectID); iss != nil {
+			r.Issues = append(r.Issues, *iss)
 		}
+	}
+
+	// Tickets nobody has approved yet: the plan can't be called done while a
+	// person still has to approve it. A warning, not NO-GO: the planner can't
+	// approve (only a person in the web UI can), and a fresh plan always
+	// waits for that (#129). Only when the project requires approval: there
+	// nothing waits on it.
+	if n := len(r.AwaitingApproval); n > 0 && r.RequirePlanApproval {
+		msg := fmt.Sprintf("%s %s for a person to approve the plan: %s. %s",
+			countNoun(n, "ticket", "tickets"), pick(n, "waits", "wait"), joinIDs(r.AwaitingApproval),
+			pick(n, "It can't be dispatched until then.", "They can't be dispatched until then."))
+		r.Issues = append(r.Issues, PlanIssue{
+			Kind: "awaiting_approval", Severity: "warn", TaskIDs: r.AwaitingApproval,
+			Message: msg,
+			Fix:     "Its owner approves it in AMP's My work (" + r.ApproveURL + "); a project lead can approve on their behalf. Agents can't approve.",
+		})
 	}
 
 	// Blocked by dependencies that are all done: left stuck by older versions
@@ -522,8 +582,8 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 			r.OK = false
 		}
 	}
-	r.Summary = fmt.Sprintf("%d tickets (%d open), %d dependencies, %d ready to dispatch now, longest chain %d.",
-		r.Tasks, r.OpenTasks, r.Dependencies, len(r.ReadyNow), r.LongestChain)
+	r.Summary = fmt.Sprintf("%s (%d open), %s, %d ready to dispatch now, longest chain %d.",
+		countNoun(r.Tasks, "ticket", "tickets"), r.OpenTasks, countNoun(r.Dependencies, "dependency", "dependencies"), len(r.ReadyNow), r.LongestChain)
 	warns := 0
 	for _, iss := range r.Issues {
 		if iss.Severity == "warn" {
@@ -534,13 +594,15 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 	case r.OK && warns == 0:
 		r.Summary += " No problems found."
 	case r.OK:
-		r.Summary += fmt.Sprintf(" No blocking problems; %d warning(s) worth a look.", warns)
+		r.Summary += fmt.Sprintf(" No blocking problems; %s worth a look.", countNoun(warns, "warning", "warnings"))
 	}
 	if n := len(r.HumanGates); n > 0 {
-		r.Summary += fmt.Sprintf(" %d step(s) are done by people (human_gates); the work after them waits for them.", n)
+		r.Summary += fmt.Sprintf(" %s done by people (human_gates); the work after %s waits for %s.",
+			pick(n, "1 step is", fmt.Sprintf("%d steps are", n)), pick(n, "it", "them"), pick(n, "it", "them"))
 	}
-	if len(stuck) > 0 {
-		r.Summary += fmt.Sprintf(" Repaired %d ticket(s) stuck blocked although all their dependencies are done; they are ready now: %s.", len(stuck), joinIDs(stuck))
+	if n := len(stuck); n > 0 {
+		r.Summary += fmt.Sprintf(" Repaired %s stuck blocked although all %s dependencies are done; %s ready now: %s.",
+			countNoun(n, "ticket", "tickets"), pick(n, "its", "their"), pick(n, "it is", "they are"), joinIDs(stuck))
 	}
 	return r, nil
 }
