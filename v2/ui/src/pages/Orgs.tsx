@@ -12,6 +12,7 @@ import { OrgRemoteControlSetting } from '../components/remote/OrgRemoteControlSe
 import { personName } from '../lib/people'
 import type { AddMemberResult, Invite, Member, Org, OrgRole, Team, TeamRole } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
+import { errMsg } from '../lib/adminStyles'
 
 // Orgs → Teams → Users administration. Controls are hidden or disabled based
 // on the caller's org role (my_role) and global admin status, but the API
@@ -21,11 +22,11 @@ const fieldCls =
   'px-3 py-2 rounded-lg text-sm bg-surface border border-line text-ink placeholder-ink-3 outline-none focus:border-primary'
 const smallSelectCls =
   'bg-bg border border-line rounded-lg px-2 py-1 text-xs text-ink focus:outline-none focus:border-primary cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed'
-const primaryBtnCls =
-  'flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-semibold text-white disabled:opacity-50 cursor-pointer'
+// The shared primary button: it has a background (white text on none made
+// Create and Invite invisible, #124).
+const primaryBtnCls = 'amp-btn amp-btn-primary shrink-0 disabled:opacity-50'
 const iconBtnCls = 'text-ink-2 hover:text-danger-ink disabled:opacity-50 cursor-pointer transition-colors'
 
-const errMsg = (e: unknown, fallback: string) => e instanceof Error ? e.message : fallback
 
 function addedMessage(email: string, r: AddMemberResult) {
   return r.invited
@@ -364,17 +365,18 @@ function OrgMembers({ org, canManage, canGrantOwner, meId }: { org: Org; canMana
   return (
     <div>
       {canManage && (
-        <form onSubmit={handleAdd} className="flex flex-wrap items-start gap-2 mb-4">
-          <input type="email" required placeholder="email@example.com" value={email} onChange={e => setEmail(e.target.value)} className={`${fieldCls} flex-1 min-w-[220px]`} />
-          <select value={role} onChange={e => setRole(e.target.value as OrgRole)} className={fieldCls}>
+        <form onSubmit={handleAdd} className="flex flex-wrap items-start gap-2 mb-4" aria-label={`Invite to ${org.name}`}>
+          <input type="email" required placeholder="email@example.com" aria-label="Email to invite" value={email} onChange={e => setEmail(e.target.value)} className={`${fieldCls} flex-1 min-w-[220px]`} />
+          <select value={role} onChange={e => setRole(e.target.value as OrgRole)} className={fieldCls} aria-label="Role">
             <option value="member">Member</option>
             <option value="admin">Admin</option>
             {canGrantOwner && <option value="owner">Owner</option>}
           </select>
           <button type="submit" disabled={adding} className={primaryBtnCls}>
             {adding ? <Loader2 size={14} className="animate-spin" /> : <UserPlus size={14} />}
-            Add
+            Invite
           </button>
+          <p className="basis-full m-0 text-[12px] text-ink-3">Someone already on AMP is added now; anyone else gets an invite, accepted when they first sign in.</p>
         </form>
       )}
       <Notice error={error} info={info} />

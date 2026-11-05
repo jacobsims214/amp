@@ -18,6 +18,7 @@ import { MetadataEditor } from '../components/MetadataEditor'
 import { DependencyPicker } from '../components/DependencyPicker'
 import { PlanCheckModal } from '../components/PlanCheckModal'
 import { metadataPatch } from '../lib/metadata'
+import { errMsg } from '../lib/adminStyles'
 import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal'
 import { ProjectNav } from '../components/ProjectNav'
 import { OwnerStack } from '../components/OwnerAvatar'
@@ -227,7 +228,6 @@ export function Board() {
   const toggleStory = (id: number) =>
     setCollapsedStories(prev => { const s = new Set(prev); if (s.has(id)) s.delete(id); else s.add(id); return s })
 
-  const errMsg = (e: unknown, fallback: string) => e instanceof Error ? e.message : fallback
 
   // Metadata being edited in the epic / story dialog: what it started as,
   // the edited value, and what the item inherits (shown read-only).
