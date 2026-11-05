@@ -183,6 +183,11 @@ func FromContext(ctx context.Context) (Principal, error) {
 		return p, nil
 	}
 	if ident.User == nil {
+		if msg := ident.ProvisionRefusal.Message(); msg != "" {
+			// Sign-in worked but JIT provisioning refused it: say why and
+			// who can fix it (#69).
+			return Principal{}, &Error{Status: 403, Msg: msg}
+		}
 		return Principal{}, Forbidden("this token has no AMP user (missing email claim); sign in again")
 	}
 	return Principal{
