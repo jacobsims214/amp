@@ -1,6 +1,6 @@
 import { PageHeader } from '../components/ui/PageHeader'
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { Loader2, Clock, Layers, Archive, RotateCcw, ChevronDown, ChevronUp, Download, Upload, Plus } from 'lucide-react'
 import { api } from '../api/client'
 import { useSSE } from '../hooks/useSSE'
@@ -47,6 +47,9 @@ export function Projects() {
 
   // Orgs the caller can place projects in (global admins see all).
   const [orgs, setOrgs] = useState<Org[]>([])
+  // /projects?new=1 (the Get started checklist's link) opens New project once the orgs are in.
+  const [params, setParams] = useSearchParams()
+  const [orgsLoaded, setOrgsLoaded] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
   const [createForm, setCreateForm] = useState({ name: '', code: '', description: '' })
   const [createHome, setCreateHome] = useState<ProjectHome>(NO_HOME)
@@ -57,8 +60,18 @@ export function Projects() {
   const importHomeRef = useRef<ProjectHome>(NO_HOME)
 
   useEffect(() => {
-    api.listOrgs().then(setOrgs).catch(() => setOrgs([]))
+    api.listOrgs().then(setOrgs).catch(() => setOrgs([])).finally(() => setOrgsLoaded(true))
   }, [])
+
+  // ?new opens the dialog as the New project button does, with the same default home.
+  const wantsNew = orgsLoaded && params.has('new')
+  useEffect(() => {
+    if (!wantsNew) return
+    openCreate()
+    setParams(p => { const n = new URLSearchParams(p); n.delete('new'); return n }, { replace: true })
+    // openCreate reads orgs, which have loaded once wantsNew is true
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wantsNew])
 
   const defaultHome = (): ProjectHome => ({ orgId: orgs.length > 1 ? orgs[0].id : null, teamId: null })
 

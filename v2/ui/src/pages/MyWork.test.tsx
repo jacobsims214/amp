@@ -10,7 +10,7 @@ import { AuthContext } from '../contexts/auth-context'
 import { RemoteProvider } from '../remote/RemoteProvider'
 import { httpTransport } from '../remote/transport'
 import { unpairedCrypto } from '../remote/crypto'
-import type { Me, MyWork as MyWorkData, WaitCounts, WaitItem, WorkTask } from '../types'
+import type { GettingStarted, Me, MyWork as MyWorkData, WaitCounts, WaitItem, WorkTask } from '../types'
 import userEvent from '@testing-library/user-event'
 
 const hourAgo = new Date(Date.now() - 3_600_000).toISOString()
@@ -55,8 +55,12 @@ const busy: MyWorkData = {
 }
 
 let payload: MyWorkData = busy
+const DONE = { done: true, at: hourAgo }
+const allDone: GettingStarted = { agent: DONE, project: { ...DONE, project_id: 2 }, plan: { ...DONE, project_id: 2 } }
+let started: GettingStarted = allDone
 const server = setupServer(
   http.get('*/api/my-work', () => HttpResponse.json(payload)),
+  http.get('*/api/my-work/getting-started', () => HttpResponse.json(started)),
   http.get('*/api/velocity', () => HttpResponse.json({ days: [] })),
   http.get('*/api/day-reports/*', () => HttpResponse.json({ error: 'none' }, { status: 404 })),
   http.get('*/api/artifacts/expiring', () => HttpResponse.json({ artifacts: [
@@ -64,7 +68,7 @@ const server = setupServer(
   ] })),
 )
 beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }))
-afterEach(() => { payload = busy })
+afterEach(() => { payload = busy; started = allDone; localStorage.clear() })
 afterAll(() => server.close())
 
 function renderMyWork(me: Me = { subject: 's', email: 'jo@example.com', name: 'Jo', roles: [], user_id: 7 }) {
@@ -275,5 +279,74 @@ describe('top-level My work: no zeros when there is nothing to count', () => {
     await userEvent.click(within(alert).getByRole('button', { name: 'Try again' }))
     expect(await screen.findByLabelText('Waiting on you, across your projects')).toBeInTheDocument()
     expect(screen.queryByRole('alert')).toBeNull()
+  })
+})
+
+// The Get started checklist (#128) sits where the queue will be, on an empty
+// My work, until every step that can be done here is done.
+describe('top-level My work: Get started', () => {
+  const fresh: GettingStarted = { agent: { done: false }, project: { done: false }, plan: { done: false } }
+  const empty: MyWorkData = { owned: [], flags: [], agents: [], done_24h: 0, counts: counts({}), projects: [], projects_total: 0, clear_projects: [], agents_in_progress: 0 }
+
+  it('shows the four steps on a fresh instance, with the MCP address and how to connect', async () => {
+    payload = empty
+    started = fresh
+    renderMyWork()
+    const list = await screen.findByRole('region', { name: 'Set up AMP in three steps' })
+    expect(within(list).getByText('0 of 3 done')).toBeInTheDocument()
+    expect(within(list).getByLabelText('MCP address')).toHaveTextContent(`${window.location.origin}/mcp`)
+    expect(within(list).getByRole('button', { name: 'Copy address' })).toBeInTheDocument()
+    expect(within(list).getByRole('link', { name: /How to connect your agent/ })).toHaveAttribute('href', '/guide?doc=setup/connect-your-agent.md')
+    expect(within(list).getByRole('link', { name: 'Create a project' })).toHaveAttribute('href', '/projects?new=1')
+    expect(within(list).getAllByRole('link', { name: 'manager agent' })[0]).toHaveAttribute('href', '/guide?doc=setup/connect-your-agent.md')
+    expect(within(list).queryByText(/receipt/i)).toBeNull()
+  })
+
+  it('checks steps from the server and links the plan step to the project', async () => {
+    payload = empty
+    started = { ...fresh, agent: { done: true, at: hourAgo, client: 'harness' }, project: { done: true, at: hourAgo, project_id: 9 }, plan: { done: false, project_id: 9 } }
+    renderMyWork()
+    const list = await screen.findByRole('region', { name: 'Set up AMP in three steps' })
+    expect(within(list).getByText('2 of 3 done')).toBeInTheDocument()
+    expect(within(list).getByLabelText('Step 1: Connect an agent, done')).toHaveTextContent('Connected 1 hour ago through the AMP Harness.')
+    expect(within(list).getByLabelText('Step 3: Review and approve the agent\'s plan, to do')).toBeInTheDocument()
+    expect(within(list).queryByLabelText('MCP address')).toBeNull()
+    expect(within(list).getByRole('link', { name: /Open the project's My work/ })).toHaveAttribute('href', '/project/9/my-work')
+  })
+
+  it('is gone once every step is done', async () => {
+    payload = empty
+    renderMyWork()
+    await screen.findByText('No project needs you right now.')
+    expect(screen.queryByRole('region', { name: 'Set up AMP in three steps' })).toBeNull()
+  })
+
+  it('Hide keeps it hidden for this person', async () => {
+    payload = empty
+    started = fresh
+    const { unmount } = renderMyWork()
+    const list = await screen.findByRole('region', { name: 'Set up AMP in three steps' })
+    await userEvent.click(within(list).getByRole('button', { name: 'Hide' }))
+    expect(screen.queryByRole('region', { name: 'Set up AMP in three steps' })).toBeNull()
+    unmount()
+    renderMyWork()
+    await screen.findByText('No project needs you right now.')
+    expect(screen.queryByRole('region', { name: 'Set up AMP in three steps' })).toBeNull()
+  })
+
+  it('shows with sign-in off too, above the explanation', async () => {
+    payload = EMPTY
+    started = fresh
+    renderMyWork({ subject: 'local-dev', email: 'local-dev@amp.local', name: 'Local Dev', roles: [] })
+    const list = await screen.findByRole('region', { name: 'Set up AMP in three steps' })
+    const off = screen.getByRole('region', { name: 'My work is off: sign-in is turned off' })
+    expect(list.compareDocumentPosition(off) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('stays out of a busy My work', async () => {
+    started = fresh
+    renderMyWork()
+    await screen.findByRole('heading', { name: 'AMP v2' })
+    expect(screen.queryByRole('region', { name: 'Set up AMP in three steps' })).toBeNull()
   })
 })

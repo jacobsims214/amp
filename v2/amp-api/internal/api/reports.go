@@ -87,6 +87,7 @@ func (h *RestHandler) velocity(w http.ResponseWriter, r *http.Request) {
 // my agents, and (AMP #2478) what waits on me grouped by project.
 // GET /api/my-work?rows=&projects_offset=&projects_limit=&tz=
 // GET /api/my-work/counts: the sidebar badge, in total and per project.
+// GET /api/my-work/getting-started: the first-run checklist's steps.
 func (h *RestHandler) myWork(w http.ResponseWriter, r *http.Request) {
 	pr, ok := h.principal(w, r)
 	if !ok {
@@ -105,6 +106,15 @@ func (h *RestHandler) myWork(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jsonOK(w, counts)
+		return
+	case "getting-started":
+		// The Get started checklist on an empty My work (#128).
+		gs, err := h.svc.GettingStarted(r.Context(), pr)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, gs)
 		return
 	default:
 		http.NotFound(w, r)

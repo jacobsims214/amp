@@ -50,7 +50,7 @@ describe('My Work → My sessions', () => {
   it('is hidden when the capability flag says unavailable, or the API has no flag', async () => {
     for (const who of [me(false), me()]) {
       const { unmount } = renderMyWork(who)
-      await screen.findByText(/Nothing on this page is a button/)
+      await screen.findByText(/Nothing here acts on a ticket/)
       expect(screen.queryByText('My sessions')).toBeNull()
       unmount()
     }
