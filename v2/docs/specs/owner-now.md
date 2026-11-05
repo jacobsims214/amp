@@ -88,7 +88,7 @@ Ticket numbers are illustrative.
 GET /api/my-work … /projects/:id/my-work ─ items (approve/answer/verify*/merge/start/do) ─▶ Needs you
 GET /api/projects/:id/waiting-on-people ─ everyone else's items ───────────────────────▶ Blocked
 board tasks (useBoardData, SSE) ─ in_progress, blocked-with-question, unowned, done ───▶ Running / Blocked / Done
-GET /api/projects/:id/activity?since=3d ─ latest `comment` detail per task ───────────▶ Running (last step)
+GET /api/projects/:id/activity?since=<3 days ago> ─ latest `comment` detail per task ───────────▶ Running (last step)
 GET /api/projects/:id/receipts/summary* ─ status, held, has_media per task ────────────▶ Done split
                                                                      * = from PR #149 (#126)
 Phase 2: WaitItem.ask + .unblocks, PersonWaitItem.ask, unowned items, latest comments (server)
@@ -209,9 +209,11 @@ The status comes from #126's `GET /api/projects/:id/receipts/summary`, read with
   `self_checked` counts as unverified (Q6).
 - In #126 v1 nothing writes `independently_verified`, so until its verifier follow-up exists, Done
   & verified holds only Accepted tickets.
-- PR #149 has no separate `failed` status. A Reject or a failed verifier check derives
-  `unverified`, and the receipt says why. If #149 adds `failed` before it merges, those tickets
-  are Done but unverified, shown in `--danger-ink`.
+- PR #149 has no separate `failed` status. A failed verifier check derives `unverified`
+  (`DeriveStatus` rule 3). A Reject only removes an earlier Accept, so the status falls back to
+  the worker's checks (often `self_checked`) and the receipt shows "Rejected by `<name>`: `<note>`"
+  (`domain.Rejection`). Either way the ticket is Done but unverified. If #149 adds `failed` before
+  it merges, those tickets are shown in `--danger-ink`.
 - Badges reuse #149's `VerificationBadge` and `STATUS_LABEL` / `STATUS_TONE`. A row with
   `has_media` shows the media icon in Phase 1. Thumbnails come in Phase 3.
 
@@ -302,7 +304,7 @@ because the page never removes a row on its own. An undo toast is a follow-up.
 | D4 | Human tickets have no receipts | #126 D15 | human |
 | D5 | Comment-derived self-checks stay "unverified", labelled "from comment" | #126 D28 | human |
 | D6 | No `tasks.ask` column. A judgment ticket's question comes from its decision doc | #125 D14 | human |
-| D7 | Unblock counts are transitive for do and answer and direct waiters for merges, matching My work and `waiting_on_people` | #125 D24, #152 | human |
+| D7 | Unblock counts are transitive for do and answer and direct waiters for merges, matching My work and `waiting_on_people` | #125 D24 | human |
 | D8 | Related changes ship in one PR per phase | Owner process constraint | human |
 | D9 | Lane membership is exclusive and checked in a fixed order (Needs you, Blocked, Running, Done) | A ticket shown twice reads as two things | agent |
 | D10 | Blocked lists root blockers (wait items of others, and unowned questions and merges), and counts their waiting dependents | Short lane, and every row names who clears it | agent |
