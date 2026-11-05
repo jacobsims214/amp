@@ -497,6 +497,13 @@ pub struct WorkerInfo {
     pub cwd: PathBuf,
     pub worktree: Option<PathBuf>,
     pub branch: Option<String>,
+    /// The commit `HEAD` was on when the harness handed the worktree over (AMP #3003): the
+    /// run-start state a later report compares against to tell an unchanged worktree from one the
+    /// run produced work in. `None` without a worktree, or when git could not resolve `HEAD` (a
+    /// repository with no commit), which leaves that comparison unavailable rather than failing.
+    /// It never goes into `worker_context`/`worker_prompt`: a worker is not told a base it may not
+    /// have branched from.
+    pub worktree_start: Option<String>,
     /// Where it works (#2364): its own worktree, its own folder `amp-work/<ticket>/`, or the
     /// manager's folder (`shared`, also for read-only roles).
     pub workspace: Placement,
@@ -2014,6 +2021,7 @@ impl Supervisor {
             cwd: self.manager.cwd.clone(),
             worktree: None,
             branch: None,
+            worktree_start: None,
             workspace: at.place.unwrap_or(Placement::Shared),
             git: at.repo.is_git(),
             edits: at.edits,
@@ -2032,6 +2040,7 @@ impl Supervisor {
                     info.cwd = wt.path.clone();
                     info.worktree = Some(wt.path);
                     info.branch = wt.branch;
+                    info.worktree_start = wt.start_commit;
                 }
                 Err(e) => {
                     return self
@@ -2377,67 +2386,94 @@ impl Supervisor {
     /// the call names a base: [`workspace::placement`] decided that).
     async fn worktree(&self, req: &RunRequest, repo: &Repo) -> Result<Worktree, String> {
         let _lock = self.git_lock.lock().await;
-        let top = match repo {
-            Repo::Usable { top } | Repo::NoCommit { top } => top.clone(),
-            other => {
-                return Err(other
-                    .why_not(&self.manager.cwd)
-                    .unwrap_or_else(|| "no git repository".to_owned()));
-            }
-        };
-        let path = top.join(".worktrees").join(req.task_id.to_string());
-        exclude_worktrees_dir(&top).await;
-
-        if path.exists() {
-            let inner = git(&path, &["rev-parse", "--show-toplevel"])
-                .await
-                .map_err(|e| format!("{} exists but is not a git worktree: {e}", path.display()))?;
-            if !same_path(Path::new(&inner), &path) {
-                return Err(format!(
-                    "{} exists but is not a git worktree (it belongs to {inner})",
-                    path.display()
-                ));
-            }
-            let branch = git(&path, &["branch", "--show-current"])
-                .await
-                .ok()
-                .filter(|b| !b.is_empty());
-            return Ok(Worktree {
-                path,
-                branch,
-                reused: true,
-            });
-        }
-
-        let branch = req
-            .branch
-            .clone()
-            .filter(|b| !b.trim().is_empty())
-            .unwrap_or_else(|| format!("amp-{}", req.task_id));
-        let path_str = path.to_string_lossy().into_owned();
-        let exists = git(
-            &top,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ],
-        )
-        .await
-        .is_ok();
-        if exists {
-            git(&top, &["worktree", "add", &path_str, &branch]).await?;
-        } else {
-            let base = req.base.clone().unwrap_or_else(|| "HEAD".to_owned());
-            git(&top, &["worktree", "add", "-b", &branch, &path_str, &base]).await?;
-        }
-        Ok(Worktree {
-            path,
-            branch: Some(branch),
-            reused: false,
-        })
+        prepare_worktree(req, repo, &self.manager.cwd).await
     }
+}
+
+/// Creates or reuses `<top>/.worktrees/<task_id>`, and records the commit the worker starts from
+/// (AMP #3003). `manager_cwd` only words the refusal when the folder is in no usable repository.
+async fn prepare_worktree(
+    req: &RunRequest,
+    repo: &Repo,
+    manager_cwd: &Path,
+) -> Result<Worktree, String> {
+    let top = match repo {
+        Repo::Usable { top } | Repo::NoCommit { top } => top.clone(),
+        other => {
+            return Err(other
+                .why_not(manager_cwd)
+                .unwrap_or_else(|| "no git repository".to_owned()));
+        }
+    };
+    let path = top.join(".worktrees").join(req.task_id.to_string());
+    exclude_worktrees_dir(&top).await;
+
+    if path.exists() {
+        let inner = git(&path, &["rev-parse", "--show-toplevel"])
+            .await
+            .map_err(|e| format!("{} exists but is not a git worktree: {e}", path.display()))?;
+        if !same_path(Path::new(&inner), &path) {
+            return Err(format!(
+                "{} exists but is not a git worktree (it belongs to {inner})",
+                path.display()
+            ));
+        }
+        let branch = git(&path, &["branch", "--show-current"])
+            .await
+            .ok()
+            .filter(|b| !b.is_empty());
+        let start_commit = worktree_start(&path).await;
+        return Ok(Worktree {
+            path,
+            branch,
+            reused: true,
+            start_commit,
+        });
+    }
+
+    let branch = req
+        .branch
+        .clone()
+        .filter(|b| !b.trim().is_empty())
+        .unwrap_or_else(|| format!("amp-{}", req.task_id));
+    let path_str = path.to_string_lossy().into_owned();
+    let exists = git(
+        &top,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .await
+    .is_ok();
+    if exists {
+        git(&top, &["worktree", "add", &path_str, &branch]).await?;
+    } else {
+        let base = req.base.clone().unwrap_or_else(|| "HEAD".to_owned());
+        git(&top, &["worktree", "add", "-b", &branch, &path_str, &base]).await?;
+    }
+    let start_commit = worktree_start(&path).await;
+    Ok(Worktree {
+        path,
+        branch: Some(branch),
+        reused: false,
+        start_commit,
+    })
+}
+
+/// `HEAD` of a worktree the harness just handed over (AMP #3003). One `rev-parse` covers all three
+/// handovers — a new branch sits on its branch point, an existing branch on its tip, and a reused
+/// worktree on whatever the previous run left — so a run compares against its own start.
+///
+/// `None` when git cannot resolve `HEAD` (a repository with no commit): detection is then simply
+/// unavailable, which must never fail the handover.
+async fn worktree_start(path: &Path) -> Option<String> {
+    git(path, &["rev-parse", "HEAD"])
+        .await
+        .ok()
+        .filter(|sha| !sha.is_empty())
 }
 
 /// Where run_ticket decided the worker works (#2364).
@@ -2525,10 +2561,15 @@ fn ticket_folder(cwd: &Path, task_id: i64) -> Result<(PathBuf, bool), String> {
     Ok((path, false))
 }
 
+#[derive(Debug)]
 struct Worktree {
     path: PathBuf,
     branch: Option<String>,
     reused: bool,
+    /// `HEAD` when the worker was given the worktree (AMP #3003); `None` if git could not resolve
+    /// it. The whole point of the capture: refs alone cannot tell "this run never committed" from
+    /// "the branch was merged elsewhere" afterwards.
+    start_commit: Option<String>,
 }
 
 enum Stop<R> {
@@ -3515,5 +3556,265 @@ mod tests {
         assert_eq!(human_duration(Duration::from_secs(3600)), "60 min");
         assert_eq!(human_duration(Duration::from_secs(90)), "90 s");
         assert_eq!(human_duration(Duration::from_millis(300)), "300 ms");
+    }
+
+    // ---- AMP #3003: the run-start commit a worktree handover records ----
+
+    /// A throwaway repository under the workspace's target dir (D13: never `/tmp`).
+    fn repo_dir(name: &str) -> PathBuf {
+        let base = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("CARGO_MANIFEST_DIR")
+                    .map(|d| PathBuf::from(d).join("../../target").join("tmp"))
+            })
+            .unwrap_or_else(|| PathBuf::from("target/tmp"));
+        let dir = base.join("amp-core-supervisor-worktree").join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    /// Runs git synchronously (the tests below are the only place that needs it; the production
+    /// helper is the async [`git`]).
+    fn run_git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// A repository with one commit on `main`; returns it and the commit's SHA.
+    fn repo_with_a_commit(name: &str) -> (PathBuf, String) {
+        let repo = repo_dir(name);
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "test repo\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        let head = run_git(&repo, &["rev-parse", "HEAD"]);
+        (repo, head)
+    }
+
+    fn commit_empty(dir: &Path, message: &str) -> String {
+        run_git(dir, &["commit", "-q", "--allow-empty", "-m", message]);
+        run_git(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// Another commit on top of `branch`'s tip, without checking it out (so no worktree is made
+    /// yet): a branch that already has a run's commits on it.
+    fn commit_on_branch(dir: &Path, branch: &str, message: &str) -> String {
+        let tip = run_git(dir, &["rev-parse", branch]);
+        let tree = run_git(dir, &["rev-parse", &format!("{branch}^{{tree}}")]);
+        let new = run_git(dir, &["commit-tree", &tree, "-p", &tip, "-m", message]);
+        run_git(dir, &["update-ref", &format!("refs/heads/{branch}"), &new]);
+        new
+    }
+
+    /// A new branch starts on its branch point, and that commit is what the handover records:
+    /// the default base (`HEAD` of the manager's repo) and a named one alike.
+    #[tokio::test]
+    async fn a_new_worktree_records_the_base_it_started_from() {
+        let (repo, first) = repo_with_a_commit("new");
+        let tip = commit_empty(&repo, "later work on main");
+        let repo_kind = Repo::probe(&repo);
+        assert!(matches!(repo_kind, Repo::Usable { .. }), "{repo_kind:?}");
+
+        // Default base: HEAD of the manager's repo when the worktree is made.
+        let wt = prepare_worktree(
+            &RunRequest {
+                task_id: 11,
+                ..RunRequest::default()
+            },
+            &repo_kind,
+            &repo,
+        )
+        .await
+        .unwrap();
+        assert_eq!(wt.branch.as_deref(), Some("amp-11"));
+        assert!(!wt.reused);
+        assert_eq!(wt.start_commit.as_deref(), Some(tip.as_str()));
+        assert_eq!(run_git(&wt.path, &["rev-parse", "HEAD"]), tip);
+
+        // A named base: the branch point the manager asked for, not anything later.
+        let wt = prepare_worktree(
+            &RunRequest {
+                task_id: 12,
+                branch: Some("from-older".into()),
+                base: Some(first.clone()),
+                ..RunRequest::default()
+            },
+            &repo_kind,
+            &repo,
+        )
+        .await
+        .unwrap();
+        assert_eq!(wt.branch.as_deref(), Some("from-older"));
+        assert_eq!(wt.start_commit.as_deref(), Some(first.as_str()));
+        assert_eq!(run_git(&wt.path, &["rev-parse", "HEAD"]), first);
+    }
+
+    /// An existing branch already has commits of its own: the handover records its tip, so the
+    /// run's own commits are all that `start..HEAD` can show.
+    #[tokio::test]
+    async fn an_existing_branch_records_its_tip() {
+        let (repo, first) = repo_with_a_commit("existing");
+        run_git(&repo, &["branch", "ticket-13", &first]);
+        let branch_tip = commit_on_branch(&repo, "ticket-13", "work from an earlier run");
+        let repo_kind = Repo::probe(&repo);
+
+        let wt = prepare_worktree(
+            &RunRequest {
+                task_id: 13,
+                branch: Some("ticket-13".into()),
+                ..RunRequest::default()
+            },
+            &repo_kind,
+            &repo,
+        )
+        .await
+        .unwrap();
+        assert_eq!(wt.branch.as_deref(), Some("ticket-13"));
+        assert!(
+            !wt.reused,
+            "a branch that exists but has no worktree is added"
+        );
+        assert_eq!(wt.start_commit.as_deref(), Some(branch_tip.as_str()));
+        assert_eq!(run_git(&wt.path, &["rev-parse", "HEAD"]), branch_tip);
+    }
+
+    /// The reused worktree (#2347) records `HEAD` at reuse, so a second run over work the first
+    /// one committed still compares against its own start.
+    #[tokio::test]
+    async fn a_reused_worktree_records_head_at_reuse() {
+        let (repo, _) = repo_with_a_commit("reused");
+        let repo_kind = Repo::probe(&repo);
+        let req = RunRequest {
+            task_id: 14,
+            ..RunRequest::default()
+        };
+
+        let first = prepare_worktree(&req, &repo_kind, &repo).await.unwrap();
+        let base = first.start_commit.clone().expect("a start commit");
+        // The first run commits its work in the worktree.
+        let produced = commit_empty(&first.path, "the first run's work");
+        assert_ne!(produced, base);
+
+        let second = prepare_worktree(&req, &repo_kind, &repo).await.unwrap();
+        assert!(second.reused);
+        assert_eq!(second.path, first.path);
+        assert_eq!(second.start_commit.as_deref(), Some(produced.as_str()));
+        // What a run's report will ask: nothing new since the handover, one commit for the first
+        // run's start as the second run's start.
+        assert_eq!(
+            run_git(
+                &second.path,
+                &["rev-list", "--count", &format!("{produced}..HEAD")]
+            ),
+            "0"
+        );
+        assert_eq!(
+            run_git(
+                &second.path,
+                &["rev-list", "--count", &format!("{base}..HEAD")]
+            ),
+            "1"
+        );
+    }
+
+    /// A repository with no commit on its current branch records nothing (the handover must not
+    /// fail for it), and a named base that does resolve is recorded like any other.
+    #[tokio::test]
+    async fn a_no_commit_repository_records_no_start_rather_than_failing() {
+        let repo = repo_dir("no-commit");
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        // An unborn HEAD: the checkout has no commit, but `main` exists further down.
+        assert_eq!(worktree_start(&repo).await, None, "no HEAD to record");
+        let repo_kind = Repo::probe(&repo);
+        assert!(matches!(repo_kind, Repo::NoCommit { .. }), "{repo_kind:?}");
+
+        // With nothing to branch from, the handover refuses (as it always has) — with an error,
+        // not a panic and not a start commit.
+        let e = prepare_worktree(
+            &RunRequest {
+                task_id: 21,
+                ..RunRequest::default()
+            },
+            &repo_kind,
+            &repo,
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("worktree"), "{e}");
+        assert!(!repo.join(".worktrees/21").exists());
+
+        // Give `main` a commit behind the still-unborn HEAD, and a named base then makes a
+        // worktree whose start is that commit (the case `workspace::placement` can pick: #2364's
+        // `isolation = "worktree"` in a repository with no commit on its current branch).
+        std::fs::write(repo.join("README.md"), "test repo\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        let tree = run_git(&repo, &["write-tree"]);
+        let base = run_git(&repo, &["commit-tree", &tree, "-m", "first commit"]);
+        run_git(&repo, &["update-ref", "refs/heads/main", &base]);
+        let wt = prepare_worktree(
+            &RunRequest {
+                task_id: 22,
+                base: Some("main".into()),
+                ..RunRequest::default()
+            },
+            &repo_kind,
+            &repo,
+        )
+        .await
+        .unwrap();
+        assert_eq!(wt.start_commit.as_deref(), Some(base.as_str()));
+    }
+
+    /// The start commit is the harness's own bookkeeping: it never reaches the worker's context or
+    /// prompt, so no worker is told a base it may not have branched from (AMP #3003).
+    #[test]
+    fn the_start_commit_never_reaches_the_worker() {
+        let info = WorkerInfo {
+            task_id: 31,
+            agent_id: "amp:amp-worker-backend".into(),
+            role: "amp-worker-backend".into(),
+            dispatch_id: "d_x".into(),
+            model: "wf/wf-1".into(),
+            cwd: PathBuf::from("/repo/.worktrees/31"),
+            worktree: Some(PathBuf::from("/repo/.worktrees/31")),
+            branch: Some("amp-31".into()),
+            worktree_start: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            workspace: Placement::Worktree,
+            git: true,
+            edits: true,
+            manager_cwd: PathBuf::from("/repo"),
+            totals: Arc::default(),
+        };
+        for text in [
+            worker_context(&info, "amp-manager"),
+            worker_prompt(&info, &RunRequest::default(), None),
+        ] {
+            assert!(!text.contains("0123456789abcdef"), "{text}");
+            assert!(!text.contains("worktree_start"), "{text}");
+        }
+        // The worktree and branch are still told, as before.
+        let context = worker_context(&info, "amp-manager");
+        assert!(
+            context.contains("worktree: /repo/.worktrees/31"),
+            "{context}"
+        );
+        assert!(context.contains("branch: amp-31"), "{context}");
+        assert!(context.contains("dispatch_id: d_x"), "{context}");
     }
 }

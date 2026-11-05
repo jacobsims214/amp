@@ -91,20 +91,39 @@ func TestKBStatusStoredAndIndexedCounts(t *testing.T) {
 
 // With Typesense unreachable, a backfilled KB's status still answers from
 // Postgres: indexed_docs is absent and index_error says why.
+//
+// The scope id contains "404" on purpose: the collection is then named
+// kb_team_9714046, and the connection-refused error from
+// http://127.0.0.1:1 embeds that name. Before #3131 isNotFound matched the
+// substring "404" in any error text, so this dead index read as a missing
+// collection: indexed_docs came back as 0 and index_error stayed empty.
+// Keeping the id this way means the misread can never come back silently.
 func TestKBStatusWithIndexDown(t *testing.T) {
-	_, repo, sc := backfilledKB(t)
+	s, repo, _ := storedService(t)
+	sc := Team(1_000_404)
+	t.Cleanup(func() { s.Drop(context.Background(), sc) }) //nolint:errcheck
 	ctx := context.Background()
+	if err := repo.CompleteKBBackfill(ctx, storeScope(sc), 0); err != nil {
+		t.Fatal(err)
+	}
+	if col := collectionName(sc); !strings.Contains(col, "404") || sc.String() != "team 1000404" {
+		t.Fatalf("scope %v is meant to name a collection containing 404; got %q", sc, col)
+	}
 	down := New("http://127.0.0.1:1", "x", "", "")
 	down.SetStore(repo)
-	for _, p := range []string{"a.md", "b.md"} {
-		if _, err := down.WriteDoc(ctx, sc, p, p, "body", "me", nil, "", nil); err != nil {
-			t.Fatal(err)
-		}
+	if _, err := down.WriteDoc(ctx, sc, "a.md", "a.md", "body", "me", nil, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := down.WriteDoc(ctx, sc, "b.md", "b.md", "body", "me", nil, "", nil); err != nil {
+		t.Fatal(err)
 	}
 	st := mustStatus(t, down, sc)
 	if st.TotalDocs != 2 || intOf(st.StoredDocs) != "2" || st.IndexedDocs != nil || st.IndexError == "" ||
 		st.Backfill == nil || st.Backfill.Status != BackfillComplete {
 		t.Fatalf("status = %+v, stored %s, indexed %s", st, intOf(st.StoredDocs), intOf(st.IndexedDocs))
+	}
+	if !strings.Contains(st.IndexError, "connection refused") {
+		t.Errorf("index_error = %q, want the connection error (a dead index, not a missing collection)", st.IndexError)
 	}
 }
 

@@ -18,7 +18,7 @@ const HumanStaleAfter = 48 * time.Hour
 
 // PersonWait is one item in amp_list_tasks' waiting_on_people ("Waiting on
 // you", KB decisions/human-work-ux.md §1 and §5): something a person has to
-// do next, of one of four kinds (approve, answer, merge, do), or, in
+// do next, of one of five kinds (approve, answer, merge, start, do), or, in
 // coming_up, a human ticket of theirs that isn't actionable yet.
 //
 // The fields before Kind are the original shape (when the list only held
@@ -35,7 +35,7 @@ type PersonWait struct {
 	HoldingUp    []int  `json:"holding_up,omitempty"` // open tickets that can't start until it's done (transitively)
 	Stale        bool   `json:"stale,omitempty"`      // do: no activity for HumanStaleAfter
 
-	Kind        string    `json:"kind"`     // approve | answer | merge | do | coming_up
+	Kind        string    `json:"kind"`     // approve | answer | merge | start | do | coming_up
 	TaskIDs     []int     `json:"task_ids"` // every ticket in the item (approve: all awaiting in the epic)
 	OwnerUserID *int      `json:"owner_user_id,omitempty"`
 	Since       time.Time `json:"since"`
@@ -53,6 +53,28 @@ type PersonWait struct {
 	MergeState string `json:"merge_state,omitempty"`
 	PRURL      string `json:"pr_url,omitempty"`
 	Branch     string `json:"branch,omitempty"`
+	// merge (AMP #3011): where the merge would land as the run reported it,
+	// and where that came from. base_branch empty + target_source "unknown"
+	// means AMP could not verify the target — never "main".
+	BaseBranch   string `json:"base_branch,omitempty"`
+	TargetSource string `json:"target_source,omitempty"`
+	// merge (AMP #3158): the alert policy's arm and why, so a manager can tell
+	// a default-branch merge from a rule-required approval from the honest
+	// unknown. Only the arms that ask a person appear here: an internal merge
+	// (agent organization) and an already-merged one are absent from the list
+	// entirely, exactly as they are absent from My work.
+	Alert         string `json:"alert,omitempty"`
+	AlertReason   string `json:"alert_reason,omitempty"`
+	Rule          string `json:"rule,omitempty"`
+	ReviewURL     string `json:"review_url,omitempty"`
+	DefaultBranch string `json:"default_branch,omitempty"`
+	// TrackedBy: the plan's human merge step folded into this Merge card
+	// (merge_for), with the readiness the backend's bridges enforce, so the
+	// card never offers Mark merged for a step it would refuse to close.
+	TrackedBy *service.MergeStepFold `json:"tracked_by,omitempty"`
+	// NotWaiting: open dependents that opted out with waits_for_merge: false —
+	// they are not counted in holding_up because this merge doesn't hold them.
+	NotWaiting []int `json:"not_waiting,omitempty"`
 	// coming_up: what it still waits on
 	WaitsOn          []int      `json:"waits_on,omitempty"`
 	AwaitingApproval bool       `json:"awaiting_approval,omitempty"`
@@ -266,6 +288,10 @@ func (s *Server) personWait(it service.WaitItem, owner *int, ownerEmail string, 
 	case service.WaitMerge:
 		p.State = "completed"
 		p.MergeState, p.PRURL, p.Branch = it.MergeState, it.PRURL, it.Branch
+		p.BaseBranch, p.TargetSource = it.BaseBranch, it.TargetSource
+		p.Alert, p.AlertReason, p.Rule = it.Alert, it.AlertReason, it.Rule
+		p.ReviewURL, p.DefaultBranch = it.ReviewURL, it.DefaultBranch
+		p.TrackedBy, p.NotWaiting = it.TrackedBy, it.NotWaiting
 	case service.WaitStart:
 		p.State = domain.PhaseNotStarted
 		p.AgentID, p.NotStartedMinutes = it.AgentID, it.NotStartedMinutes
@@ -283,6 +309,15 @@ func (s *Server) personWait(it service.WaitItem, owner *int, ownerEmail string, 
 	}
 	if it.Kind != service.WaitApprove {
 		p.HoldingUp = holding(p.ID)
+	}
+	// A Merge item counts only dependents that actually wait for the merge
+	// (AMP #3011): the transitive set above includes ones that started already
+	// with waits_for_merge: false, and a card that says "3 tickets wait" when
+	// two of them didn't is the overstatement
+	// discoveries/merge-actions-user-journey.md names. service fills this from
+	// repository.TrueWaiters, so the count is what the action unblocks.
+	if it.Kind == service.WaitMerge {
+		p.HoldingUp = it.HoldingUp
 	}
 	return p
 }

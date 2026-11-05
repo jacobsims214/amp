@@ -12,6 +12,7 @@ import { inputCls, labelCls } from '../components/CrudModal'
 import { canManageProject } from '../lib/people'
 import { WebhooksPanel } from '../components/WebhooksPanel'
 import { GitHubHookPanel } from '../components/GitHubHookPanel'
+import { GitHubCredentialPanel } from '../components/GitHubCredentialPanel'
 import { AuditLogPanel } from '../components/AuditLogPanel'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
 import type { KBSource, Metadata, Org, Project, ProjectAccess } from '../types'
@@ -111,7 +112,7 @@ export function ProjectSettings() {
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-[200px_minmax(0,1fr)] gap-6 px-7 py-6 items-start">
         <nav className="hidden lg:grid gap-0.5 sticky top-6" aria-label="Settings sections">
           <span className="amp-label px-2.5 pb-2">Settings</span>
-          {['General', 'Plan approval', 'Merges', 'Dispatch watchdog', 'Metadata', 'Team access', 'Knowledge bases', 'Trash', ...(canManage ? ['GitHub merge webhook', 'Webhooks', 'Audit log', 'Danger zone'] : [])].map(t => (
+          {['General', 'Plan approval', 'Merges', 'Dispatch watchdog', 'Metadata', 'Team access', 'Knowledge bases', 'Trash', ...(canManage ? ['GitHub token', 'GitHub merge webhook', 'Webhooks', 'Audit log', 'Danger zone'] : [])].map(t => (
             <a key={t} href={`#${slug(t)}`} className="px-2.5 py-1.5 text-[13px] text-ink-2 hover:text-ink hover:bg-surface-3">{t}</a>
           ))}
         </nav>
@@ -264,6 +265,13 @@ export function ProjectSettings() {
                 description="Tickets deleted in the last 30 days. Restoring brings back their text, owner, state, comments, history, and dependency links.">
                 <TrashPanel projectId={pid} />
               </Section>
+
+              {canManage && (
+                <Section title="GitHub token"
+                  description="What AMP reads this project's repository with. It is how a merge alert knows which branch a pull request targets and which repository rules are holding it.">
+                  <GitHubCredentialPanel projectId={pid} />
+                </Section>
+              )}
 
               {canManage && (
                 <Section title="GitHub merge webhook"

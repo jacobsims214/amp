@@ -115,12 +115,56 @@ type WaitItem struct {
 	// start: the agent it was dispatched to, and how long it has waited
 	AgentID           string `json:"agent_id,omitempty"`
 	NotStartedMinutes int    `json:"not_started_minutes,omitempty"`
-	// merge
+	// merge: where the work is, who really waits on it, and the plan's step
+	// for it (AMP #3011 — the data contract of the approved mockup
+	// design/merge-journey-mockup.md).
 	MergeState  string     `json:"merge_state,omitempty"`
 	PRURL       string     `json:"pr_url,omitempty"`
 	Branch      string     `json:"branch,omitempty"`
 	CompletedAt *time.Time `json:"completed_at,omitempty"`
-	HoldingUp   []int      `json:"holding_up,omitempty"` // open tickets that depend on it directly
+	// BaseBranch is the branch the merge would land on, as the run reported
+	// it. Empty is *unknown*, never "main": AMP has no repository metadata
+	// to read a default branch from, and guessing one would hide a real merge
+	// (state 9 of the mockup).
+	BaseBranch string `json:"base_branch,omitempty"`
+	// TargetSource says where BaseBranch came from: "run" when a run reported
+	// it, "detected" when GitHub's own pull read confirmed the PR's target,
+	// "unknown" when nothing did. It is what lets a card say why it can't
+	// tell you where this goes instead of implying it knows.
+	TargetSource string `json:"target_source,omitempty"`
+	// Alert is the merge-alert classifier's arm for this item (AMP #3158,
+	// #3133's policy): "default_branch", "rule", "unknown" — the three that
+	// ask a person — or "internal", agent organization, and empty when no
+	// classification was made (a caller that does not fill it, e.g. a unit
+	// test building an item by hand). An "internal" item is never listed: it
+	// stays a gated ticket and its dependents keep waiting, but nobody is told
+	// about the merge.
+	Alert string `json:"alert,omitempty"`
+	// AlertReason is one line saying why, in the terms the card or chip shows
+	// (artifact #27 states 3 and 9). Always set when Alert is.
+	AlertReason string `json:"alert_reason,omitempty"`
+	// Rule is the rule-box detail for a rule alert: which ruleset demands what
+	// of this person. Empty for every other arm, which has no rule to name.
+	Rule string `json:"rule,omitempty"`
+	// ReviewURL is where the person acts on a rule alert: the PR on GitHub,
+	// where the review happens. Empty when the item has no PR URL. A rule card
+	// offers this and never Mark merged — the approval happens on GitHub, and
+	// the merge is recorded by the webhook or Mark merged afterwards.
+	ReviewURL string `json:"review_url,omitempty"`
+	// DefaultBranch is the repository's detected default branch this item was
+	// classified against, for the card's repo chip. "" when it could not be
+	// read: never a guess.
+	DefaultBranch string `json:"default_branch,omitempty"`
+	// HoldingUp: the open tickets that wait for this merge and actually need
+	// it, so the count on the card is what the action unblocks. A dependent
+	// with waits_for_merge: false is in NotWaiting: it started when the work
+	// completed, so it is named but never counted.
+	HoldingUp  []int `json:"holding_up,omitempty"`
+	NotWaiting []int `json:"not_waiting,omitempty"`
+	// TrackedBy: the plan's human merge step for this PR (its merge_for names
+	// this ticket), folded into this card instead of a second Do card, with
+	// the readiness the backend's own bridges enforce (AMP #3009/#3011).
+	TrackedBy *MergeStepFold `json:"tracked_by,omitempty"`
 	// coming_up: what it still waits on.
 	WaitsOn          []repository.DepSummary `json:"waits_on,omitempty"`
 	AwaitingApproval bool                    `json:"awaiting_approval,omitempty"`
@@ -291,22 +335,18 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 
 	// Merge items: where the work is, and what waits on it.
 	if len(merges) > 0 {
-		refs, err := s.Repo.LatestMergeRefs(ctx, merges)
-		if err != nil {
+		if err := s.fillMergeItems(ctx, w.Items, merges); err != nil {
 			return nil, err
 		}
-		deps, err := s.Repo.OpenDependents(ctx, merges)
-		if err != nil {
-			return nil, err
-		}
-		for i := range w.Items {
-			it := &w.Items[i]
-			if it.Kind != WaitMerge {
-				continue
-			}
-			it.PRURL, it.Branch = refs[it.TaskID].PRURL, refs[it.TaskID].Branch
-			it.HoldingUp = deps[it.TaskID]
-		}
+		// Only actionable merges reach a person (AMP #3158, the alert policy of
+		// #3133): an internal one is agent organization and an already-merged
+		// one asks nobody anything. Dropped BEFORE the fold, so a plan's human
+		// merge step stays an ordinary Do item instead of disappearing with the
+		// card it was folded into.
+		w.Items = dropNonAlertMerges(w.Items)
+		// One card per PR: a plan's merge step folded into a card above is not
+		// also a Do item of its own.
+		w.Items, w.ComingUp = dedupFoldedSteps(w.Items, w.ComingUp)
 	}
 
 	// Coming up: which dependencies still hold each one.
@@ -359,6 +399,208 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 	}
 	return w, nil
 }
+
+// MergeStepFold is a plan's human merge step folded into the Merge card of
+// the PR it tracks (AMP #3009's merge_for, rendered as the approved mockup's
+// states 4-5: one card per PR, the prerequisites on its face, "tracked by
+// #N" instead of a second Do card).
+type MergeStepFold struct {
+	// TaskID, Name: the step itself (a person's ticket).
+	TaskID int    `json:"task_id"`
+	Name   string `json:"name"`
+	State  string `json:"state"`
+	// Ready: Mark merged is offered on the card. Computed by the same rule the
+	// two bridges enforce — recordLinkedMergeStep refuses a step its owner
+	// started, one blocked on a question, or one still waiting on an
+	// unfinished prerequisite — so the card never offers an action the
+	// backend would answer with "it stays open".
+	Ready bool `json:"ready"`
+	// WaitingOn: the prerequisites that still hold it (the step's dependencies
+	// that aren't satisfied yet), so the card can list them.
+	WaitingOn []int `json:"waiting_on,omitempty"`
+	// Reason: one sentence for why it isn't ready, empty when it is.
+	Reason string `json:"reason,omitempty"`
+}
+
+// mergeStepFold builds the folded step for one Merge card. done is the
+// dependency states the step's own prerequisites are read from.
+func (s *Service) mergeStepFold(st repository.MergeStep, done map[int]bool) *MergeStepFold {
+	f := &MergeStepFold{TaskID: st.TaskID, Name: st.Name, State: st.State, WaitingOn: []int{}}
+	if st.State == string(domain.TaskStateCompleted) {
+		f.Reason = "its merge step is done"
+		return f
+	}
+	if st.State == string(domain.TaskStateInProgress) {
+		f.Reason = "its merge step is in progress: its owner finishes it"
+		return f
+	}
+	if st.State == string(domain.TaskStateBlocked) && st.BlockReason != "" && !strings.HasPrefix(st.BlockReason, "scheduled:") {
+		f.Reason = "its merge step is waiting on a question"
+		return f
+	}
+	// The step's OTHER dependencies, by the rule recordLinkedMergeStep's
+	// openPrerequisites uses. The one it tracks is skipped on purpose, and not
+	// just for tidiness: openPrerequisites reads DepStates, so the tracked
+	// ticket counts as unsatisfied while its merge is `needed` — which is
+	// exactly now, before the merge this card offers. Including it would make
+	// every linked step wait on itself and no card could ever be ready. The
+	// dependency rule itself makes the same exception for merge steps
+	// (repository.DepStatesFor), which is why the step can run at all; here the
+	// PR existing is what makes it due.
+	for _, d := range st.DependencyIDs {
+		if d != st.Tracks && !done[d] {
+			f.WaitingOn = append(f.WaitingOn, d)
+		}
+	}
+	if len(f.WaitingOn) > 0 {
+		f.Reason = fmt.Sprintf("its merge step still waits on %s", joinIDs(f.WaitingOn))
+		return f
+	}
+	f.Ready = true
+	return f
+}
+
+// dedupFoldedSteps drops from the list the plan's merge steps that a Merge
+// card in the same list has folded in (one card per PR, never two: approved
+// mockup states 4-5, and the duplicate discoveries/merge-actions-user-journey.md
+// names).
+//
+// Only a step this person's list shows is dropped, and only when its PR's card
+// is in that same list: when the PR belongs to one person and the plan's step
+// to another, they are two people's lists and each keeps what is theirs. The
+// step is not lost either way — recording the merge through the card completes
+// it (Service.recordMergeReport → recordLinkedMergeStep), so nobody owes a
+// click on it.
+func dedupFoldedSteps(items []WaitItem, comingUp []WaitItem) ([]WaitItem, []WaitItem) {
+	folded := map[int]bool{}
+	for _, it := range items {
+		if it.Kind == WaitMerge && it.TrackedBy != nil {
+			folded[it.TrackedBy.TaskID] = true
+		}
+	}
+	if len(folded) == 0 {
+		return items, comingUp
+	}
+	keptItems := make([]WaitItem, 0, len(items))
+	for _, it := range items {
+		// Only Do: a merge step is a person's ticket, so it can never be a
+		// start item (that kind requires agent work).
+		if it.Kind == WaitDo && folded[it.TaskID] {
+			continue
+		}
+		keptItems = append(keptItems, it)
+	}
+	keptComing := make([]WaitItem, 0, len(comingUp))
+	for _, it := range comingUp {
+		if folded[it.TaskID] {
+			continue
+		}
+		keptComing = append(keptComing, it)
+	}
+	return keptItems, keptComing
+}
+
+// fillMergeItems fills the Merge items' half of the contract: where the work
+// is (PR, head, target and where the target came from), who really waits on
+// the merge, and the plan's step folded into the card.
+func (s *Service) fillMergeItems(ctx context.Context, items []WaitItem, merges []int) error {
+	refs, err := s.Repo.LatestMergeRefs(ctx, merges)
+	if err != nil {
+		return err
+	}
+	waiters, err := s.Repo.TrueWaiters(ctx, merges)
+	if err != nil {
+		return err
+	}
+	all, err := s.Repo.OpenDependents(ctx, merges)
+	if err != nil {
+		return err
+	}
+	steps, err := s.Repo.MergeStepsFor(ctx, merges)
+	if err != nil {
+		return err
+	}
+	// The fold's readiness needs the steps' dependencies' states, all at once.
+	var depIDs []int
+	for _, st := range steps {
+		depIDs = append(depIDs, st.DependencyIDs...)
+	}
+	done, _, err := s.Repo.DepStates(ctx, depIDs)
+	if err != nil {
+		return err
+	}
+	for i := range items {
+		it := &items[i]
+		if it.Kind != WaitMerge {
+			continue
+		}
+		ref := refs[it.TaskID]
+		it.PRURL, it.Branch, it.BaseBranch = ref.PRURL, ref.Branch, ref.BaseBranch
+		it.TargetSource = MergeTargetUnknown
+		if ref.BaseBranch != "" {
+			it.TargetSource = MergeTargetRun
+		}
+		// The policy, from cached facts only (AMP #3158). It never makes an
+		// HTTP call: a miss is the unknown arm, which keeps the card the person
+		// sees today rather than hiding a real merge behind a slow GitHub.
+		//
+		// merged is false here because a Merge item exists only while the merge
+		// is NOT recorded (domain.MergeGates); GitHub's own answer for a PR it
+		// already sees merged arrives through the pull read and decides the
+		// "none" arm instead, which is the case that matters — AMP is simply
+		// behind the repository.
+		cls := s.classifyMerge(ctx, it.ProjectID, ref, it.OwnerUserID)
+		it.Alert, it.AlertReason = cls.Alert.Kind, cls.Alert.Reason
+		it.Rule, it.DefaultBranch = cls.Alert.Rule, cls.Alert.DefaultBranch
+		if cls.Target != "" {
+			// GitHub's own answer for the PR's target replaces the run's report,
+			// and says so: a card can then call it detected rather than inferred.
+			it.BaseBranch, it.TargetSource = cls.Target, MergeTargetDetected
+		}
+		if it.Alert == MergeAlertRule {
+			// The approval happens on GitHub; this is where it happens, and the
+			// only action a rule card offers (artifact #27 state 3).
+			it.ReviewURL = it.PRURL
+		}
+		it.HoldingUp = waiters[it.TaskID]
+		step, hasStep := steps[it.TaskID]
+		if hasStep {
+			it.TrackedBy = s.mergeStepFold(step, done)
+		}
+		// Dependents that are open but do not wait for this merge: named,
+		// never counted, so "nothing waits on this merge" is truthful.
+		//
+		// NotWaiting is the opt-outs (waits_for_merge: false) — it is the list
+		// a card names as "reads the open PR and does not wait for it". The
+		// merge step is not one of those: it performs the merge, and it is
+		// already on the card as TrackedBy, so listing it here would read as a
+		// second, unexplained exclusion.
+		waiting := map[int]bool{}
+		for _, d := range waiters[it.TaskID] {
+			waiting[d] = true
+		}
+		for _, d := range all[it.TaskID] {
+			if waiting[d] || (hasStep && d == step.TaskID) {
+				continue
+			}
+			it.NotWaiting = append(it.NotWaiting, d)
+		}
+	}
+	return nil
+}
+
+// Where a Merge card's target came from (WaitItem.TargetSource).
+const (
+	// MergeTargetRun: a run reported the branch the work goes into.
+	MergeTargetRun = "run"
+	// MergeTargetDetected: the PR's own target, as GitHub's pull read reported
+	// it (AMP #3158). It outranks MergeTargetRun, because what a person typed
+	// or a harness guessed is not what the repository says.
+	MergeTargetDetected = "detected"
+	// MergeTargetUnknown: nothing reported it. A card then says it can't
+	// verify the target instead of assuming "main".
+	MergeTargetUnknown = "unknown"
+)
 
 // ---- The plan in place (approve items) ----
 

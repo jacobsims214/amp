@@ -412,8 +412,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"feature. Give each ticket a short `ref` (e.g. 'schema', 'api', 'ui'); `depends_on` lists refs of other tickets in "+
 			"this batch, or IDs of existing tickets. Everything is checked first (unknown refs, other projects, cycles); then "+
 			"tickets are created in dependency order. Returns the ID created for each ref. Tickets not connected to "+
-			"anything are reported, since they can all start at once. A step only a person can do (review and merge a PR, "+
-			"a sign-off, prod access, a decision, someone outside the team) is a ticket too: performer 'human' with its "+
+			"anything are reported, since they can all start at once. A step only a person can do (a sign-off, prod "+
+			"access, a decision, someone outside the team) is a ticket too: performer 'human' with its "+
 			"owner as the person, wired into depends_on, so the agent tickets after it wait for them. "+
 			"Merges: a ticket finished with a PR or pushed branch holds the tickets after it until the merge is recorded. "+
 			"Two metadata keys change that (inherited project -> epic -> story -> ticket; no re-approval): set "+
@@ -1398,7 +1398,7 @@ func (s *Server) createTasks(rctx context.Context, args map[string]interface{}) 
 		if !ok {
 			return nil, fmt.Errorf("tasks[%d] must be an object", i)
 		}
-		meta, err := optNewMetadata(m)
+		meta, err := optNewMetadataAllowMergeForRef(m)
 		if err != nil {
 			return nil, fmt.Errorf("tasks[%d]: %w", i, err)
 		}
@@ -2495,6 +2495,30 @@ func optNewMetadata(args map[string]interface{}) (domain.Metadata, error) {
 	p, err := optMetadataPatch(args)
 	if err != nil || p == nil {
 		return nil, err
+	}
+	return domain.Metadata(p).Clean()
+}
+
+// optNewMetadataAllowMergeForRef is optNewMetadata for amp_create_tasks, where
+// merge_for may name a ref in the same batch (AMP #3009): a string is left as
+// it is, for CreateTasks to resolve into a ticket id; a number is a ticket id
+// and passes through as one. Everywhere else a ref would be meaningless, so
+// it is refused there (optNewMetadata). The message names both accepted
+// spellings, and the check accepts both — a message offering an option the
+// check refuses is what AMP #3218 fixed here.
+func optNewMetadataAllowMergeForRef(args map[string]interface{}) (domain.Metadata, error) {
+	p, err := optMetadataPatch(args)
+	if err != nil || p == nil {
+		return nil, err
+	}
+	if v, ok := p[domain.MetaMergeFor]; ok && v != nil {
+		// A number must be a real ticket id; a string is either its digits
+		// or a ref this batch resolves. Anything else (a bool, a fraction) is
+		// refused here, where the caller can still fix the argument.
+		_, isStr := v.(string)
+		if _, err := domain.ParseMergeFor(v); err != nil && !isStr {
+			return nil, fmt.Errorf("merge_for must be a ref in this batch (a string) or a ticket id (a number, or its digits as a string)")
+		}
 	}
 	return domain.Metadata(p).Clean()
 }

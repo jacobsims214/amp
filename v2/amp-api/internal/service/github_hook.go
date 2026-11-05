@@ -147,6 +147,10 @@ type GitHubResult struct {
 	Result   string `json:"result"`
 	Replayed bool   `json:"replayed,omitempty"`
 	TaskIDs  []int  `json:"task_ids,omitempty"`
+	// Invalidated says this delivery dropped the cached repository facts it
+	// contradicted (AMP #3160), so the next My work read re-reads them instead
+	// of waiting out the TTL.
+	Invalidated bool `json:"invalidated,omitempty"`
 }
 
 // verifyGitHubSignature checks X-Hub-Signature-256 ("sha256=<hex>") against
@@ -175,13 +179,42 @@ func SignGitHubPayload(secret string, body []byte) string {
 // ghPullRequestEvent is the part of GitHub's pull_request payload AMP reads.
 type ghPullRequestEvent struct {
 	Action      string `json:"action"`
+	Number      int    `json:"number"`
 	PullRequest struct {
+		Number         int    `json:"number"`
 		HTMLURL        string `json:"html_url"`
 		Merged         bool   `json:"merged"`
 		MergeCommitSHA string `json:"merge_commit_sha"`
 		Head           ghRef  `json:"head"`
 		Base           ghRef  `json:"base"`
 	} `json:"pull_request"`
+	// Repository is the repository the hook is installed on: the base side of
+	// the pull request, and the identity the facts cache is keyed by.
+	Repository struct {
+		FullName string `json:"full_name"`
+	} `json:"repository"`
+}
+
+// pullNumber is the pull request's number, from whichever of the two places
+// GitHub put it. Both are present on a real delivery; a payload with neither is
+// not about a pull request AMP can name, and 0 means "don't invalidate".
+func (e ghPullRequestEvent) pullNumber() int {
+	if e.PullRequest.Number > 0 {
+		return e.PullRequest.Number
+	}
+	return e.Number
+}
+
+// repoSlug is the repository this delivery is about, as the facts cache names
+// it. The top-level `repository` is the repo the hook belongs to (the base side
+// of a fork PR); base.repo is the same repository and is the fallback for a
+// payload that omits it. A fork's head repo is deliberately never used: its
+// rules are not the ones the merge is judged by.
+func (e ghPullRequestEvent) repoSlug() string {
+	if slug := strings.ToLower(strings.TrimSpace(e.Repository.FullName)); slug != "" {
+		return slug
+	}
+	return e.PullRequest.Base.repo()
 }
 
 type ghRef struct {
@@ -243,11 +276,65 @@ func (s *Service) HandleGitHubDelivery(ctx context.Context, d GitHubDelivery) Gi
 			Result: "already handled this delivery: " + nameOrDash(prev.Result)}
 		return res
 	}
+	// The delivery is new evidence about this pull request, so the cached facts it
+	// contradicts go now rather than at the end of their TTL (AMP #3160). This runs
+	// after the claim (a replay changes nothing) and before the event is acted on,
+	// because the delivery is a real change on GitHub whether or not AMP can act
+	// on it: a merge recording that fails is redelivered as a replay, which is a
+	// no-op, so invalidating afterwards would leave the cache wrong until the TTL.
+	invalidated := s.invalidateFactsForDelivery(ctx, d.ProjectID, d.Event, ev)
 	res := s.handleGitHubEvent(ctx, d.ProjectID, d.Event, ev)
+	if invalidated {
+		res.Invalidated = true
+		// Said in the result as well as the field: a 204 has no body to read, and
+		// the delivery log is where an operator asks whether a delivery reached
+		// the cached facts.
+		res.Result += "; dropped the cached repository facts it contradicts"
+	}
 	if err := s.Repo.FinishGitHubDelivery(ctx, d.ProjectID, d.DeliveryID, res.Status, res.Result, res.TaskIDs); err != nil {
 		slog.Warn("github webhook: record delivery", "project_id", d.ProjectID, "err", err)
 	}
 	return res
+}
+
+// invalidateFactsForDelivery drops the cached repository facts a delivery has
+// just contradicted, and reports whether it dropped any. It is the webhook's
+// whole write to the facts cache (AMP #3160), and it is deliberately narrow:
+//
+//   - Only a `pull_request` delivery invalidates anything. The hook is subscribed
+//     to pull requests alone (githubHookInfo's setup), and an unsupported event
+//     stays harmless: it changes no cache and no ticket.
+//   - Only THAT pull request's facts are dropped. A pull-request event says
+//     nothing about the default branch or a branch's rules, so the repository and
+//     branch rows are left alone — dropping them would discard good evidence and
+//     make the 15m TTL meaningless. A default-branch rename is a `repository`
+//     event, which this hook does not receive, so that stays the TTL's job: the
+//     correctness backstop when no delivery arrives.
+//   - Only the project in the URL is touched, and only for the repository the
+//     payload names. The key carries the project, so a delivery to one project's
+//     hook cannot reach another project's rows even when both cache the same
+//     repository; the other project's copy stays stale until its own TTL, which
+//     is the safe direction (stale, never wrong).
+//
+// A failure here is logged and swallowed: the delivery's own work (recording a
+// merge) must not fail because a cache row could not be dropped, and the TTL
+// still bounds how long the stale row can be believed.
+func (s *Service) invalidateFactsForDelivery(ctx context.Context, projectID int, event string, ev ghPullRequestEvent) bool {
+	if s.Facts == nil || event != "pull_request" {
+		return false
+	}
+	slug, pr := ev.repoSlug(), ev.pullNumber()
+	if slug == "" || pr <= 0 {
+		// Nothing to name: a payload without a repository or a number cannot
+		// identify a cached row, and guessing one would drop another PR's facts.
+		return false
+	}
+	had, err := s.Facts.InvalidatePull(ctx, GitHubFactsRequest{ProjectID: projectID, Slug: slug, PR: pr})
+	if err != nil {
+		slog.Warn("github webhook: invalidate cached repository facts", "project_id", projectID, "slug", slug, "pr", pr, "err", err)
+		return false
+	}
+	return had
 }
 
 func (s *Service) handleGitHubEvent(ctx context.Context, projectID int, event string, ev ghPullRequestEvent) GitHubResult {

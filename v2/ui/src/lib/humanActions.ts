@@ -3,6 +3,9 @@
  * ticket asks of a person, the kinds' labels and colours, and a done ticket's
  * merge status line (KB decisions/human-work-ux.md §2, §4, §5), and the one
  * line that says what a My work item needs from the person (needsLine).
+ *
+ * The Merge card's copy (why it's shown, where the target came from) lives in
+ * lib/merge.ts with the rest of the merge concern.
  */
 import type { Task, WaitItem, WaitKind } from '../types'
 

@@ -676,6 +676,54 @@ export interface GitHubHookInfo {
   setup?: { payload_url?: string; content_type?: string; events?: string }
 }
 
+/**
+ * A project's GitHub API credential as the API can report it (AMP #3154/#3155).
+ * There is deliberately no token field: the token is write-only, so nothing
+ * here could carry one even if the server started sending it. `rotated_at`
+ * is null on a first attach and set when the token was replaced.
+ */
+export interface GitHubCredential {
+  id: number
+  project_id: number
+  host: string
+  label: string
+  created_by?: number
+  created_at: string
+  rotated_at?: string
+}
+
+/**
+ * Why a project's GitHub credential is unusable or unconfigurable right now,
+ * as a class from a closed list rather than a message — the token never
+ * appears in one. Unknown values are rendered as a generic notice, never
+ * echoed as a server message.
+ *
+ * `no_encryption_key`: this server has no AMP_SECRETS_KEY, so a token can't
+ * be attached and one already stored can't be opened.
+ */
+export type GitHubCredentialError = 'no_encryption_key'
+
+/**
+ * What an attach (PUT) or rotate (POST) sends. The token is the only secret
+ * field; it lives in this request body for one call and is never kept.
+ */
+export interface GitHubCredentialChange {
+  token: string
+  label?: string
+  host?: string
+}
+
+/** GET /projects/:id/github-credential (project owners). */
+export interface GitHubCredentialInfo {
+  configured: boolean
+  host: string
+  credential?: GitHubCredential
+  /** this server has a key to seal a token with */
+  encrypted: boolean
+  /** absent or '' when nothing is wrong; see GitHubCredentialError */
+  last_error?: string
+}
+
 export interface AmpUser {
   id: number
   subject: string
@@ -865,7 +913,7 @@ export interface PeopleWaiting {
 }
 
 /** One thing waiting on you (Waiting on you): "approve:<epic id>" (one per epic) or "task:<ticket id>". */
-export interface WaitItem {
+export interface WaitItem extends MergeClassifier {
   kind: WaitKind | 'coming_up'
   key: string
   project_id: number
@@ -896,8 +944,71 @@ export interface WaitItem {
   not_started_minutes?: number
   /** merge: open tickets that depend on it directly */
   holding_up?: number[]
+  /**
+   * merge (AMP #3011): the branch the merge would land on, as a run reported it.
+   * Absent is *unknown*, never "main" — read target_source, not this, to decide.
+   */
+  base_branch?: string
+  /** merge: where base_branch came from — "run" when a run reported it, "unknown" when nothing did */
+  target_source?: MergeTargetSource
+  /** merge: open dependents that opted out with waits_for_merge: false — named, never counted */
+  not_waiting?: number[]
+  /** merge: the plan's human merge step folded into this card (its merge_for names this ticket) */
+  tracked_by?: MergeStepFold
   awaiting_approval?: boolean
   start_at?: string
+}
+
+/**
+ * Where a Merge card's target branch came from (service.MergeTargetRun /
+ * MergeTargetDetected / MergeTargetUnknown). "detected" is GitHub's own pull
+ * read: it outranks a run's report, because what someone typed or the harness
+ * guessed is not what the repository says (AMP #3158).
+ */
+export type MergeTargetSource = 'run' | 'detected' | 'unknown'
+
+/**
+ * The merge-alert classifier's arms (service.MergeAlert*, AMP #3133/#3158):
+ * default_branch and rule ask the person for a real reason; unknown is the
+ * honest watch (evidence missing, stale, partial or ambiguous); internal is
+ * agent organization and asks nobody; none is work already merged.
+ */
+export type MergeAlertKind = 'default_branch' | 'rule' | 'internal' | 'unknown' | 'none'
+
+/**
+ * The merge-alert classifier's fields on a merge item (REST `WaitItem` and MCP
+ * `PersonWait` both carry them). Absent on a pre-#3158 server
+ * (`classification_made: false` there): then the card keeps its older,
+ * explicitly unverified behaviour instead of guessing an arm.
+ */
+export interface MergeClassifier {
+  /** which arm decided this item reaches the person; absent when nothing was classified */
+  alert?: MergeAlertKind
+  /** one line saying why, in the terms the card shows (artifact #27 v2 states 3 and 9) */
+  alert_reason?: string
+  /** the rule-box detail for a rule alert: which ruleset demands what, and why it is this person */
+  rule?: string
+  /** where the person acts on a rule alert: the PR on GitHub, where the review happens */
+  review_url?: string
+  /** the repository's detected default branch this was classified against; "" when it could not be read */
+  default_branch?: string
+}
+
+/**
+ * The plan's human merge step folded into a Merge card (AMP #3009's `merge_for`,
+ * service.MergeStepFold). `ready` is computed by the backend's own bridge guards,
+ * so the card never offers Mark merged for a step it would refuse to close.
+ */
+export interface MergeStepFold {
+  task_id: number
+  name: string
+  state: string
+  /** Mark merged may be offered: every prerequisite is met and no guard refuses it */
+  ready: boolean
+  /** the prerequisites still holding it (its dependencies that aren't satisfied yet) */
+  waiting_on?: number[]
+  /** why it isn't ready, in one sentence; empty when it is */
+  reason?: string
 }
 
 /** One project's card in the top-level My work summary. */
@@ -1297,6 +1408,21 @@ export interface MergeRecord {
   message: string
   run?: Run
   task?: Task
+  /** the plan's human merge step tracking this merge: what the report did to it (AMP #3009) */
+  linked_step?: MergeStepRecord
+}
+
+/**
+ * What a merge report did to the plan's human step whose `merge_for` names the
+ * ticket: completed it (one act, not two), found it already done, or left it
+ * open because its owner started it or a prerequisite is unfinished.
+ */
+export interface MergeStepRecord {
+  task_id: number
+  state: string
+  completed: boolean
+  already_done: boolean
+  message: string
 }
 
 /** A ticket's place in a project's My work list (WaitItem with its detail). */

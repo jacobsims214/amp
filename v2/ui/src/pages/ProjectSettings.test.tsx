@@ -1,12 +1,19 @@
-// Project settings: the require_merge toggle and who sees the GitHub merge webhook (AMP #2485).
-import { render, screen } from '@testing-library/react'
+// Project settings: the require_merge toggle, who sees the GitHub merge webhook
+// (AMP #2485), and who sees the GitHub token form (AMP #3161).
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Project, ProjectAccess } from '../types'
 
 const project: Project = { id: 3, name: 'P', code: 'P', description: '', state: 'active', created_at: '', updated_at: '', require_merge: true }
-const state = vi.hoisted(() => ({ access: 'owner' as string, update: vi.fn<(id: number, s: Partial<Project>) => Promise<Project>>() }))
+const state = vi.hoisted(() => ({
+  access: 'owner' as string,
+  update: vi.fn<(id: number, s: Partial<Project>) => Promise<Project>>(),
+  // Every GitHub-token call the page makes, so a test can prove a non-owner's
+  // page never even asks (the server would refuse it anyway).
+  credential: vi.fn<(id: number) => Promise<unknown>>(),
+}))
 
 vi.mock('../api/client', () => ({
   api: new Proxy({}, {
@@ -15,6 +22,7 @@ vi.mock('../api/client', () => ({
       if (name === 'listProjectMembers') return Promise.resolve({ members: [], my_access: state.access })
       if (name === 'kbSources') return Promise.resolve([])
       if (name === 'getGitHubHook') return Promise.resolve({ configured: false, url: '/api/hooks/github/3', deliveries: [], encrypted: true })
+      if (name === 'getGitHubCredential') return state.credential(args[0] as number)
       if (name === 'updateProjectSettings') return state.update(args[0] as number, args[1] as Partial<Project>)
       return Promise.reject(new Error(`not mocked: ${String(name)}`))
     },
@@ -32,7 +40,11 @@ function renderAs(access: ProjectAccess) {
   )
 }
 
-beforeEach(() => { state.update.mockReset() })
+beforeEach(() => {
+  state.update.mockReset()
+  state.credential.mockReset()
+  state.credential.mockResolvedValue({ configured: false, host: 'github.com', encrypted: true })
+})
 
 describe('ProjectSettings require_merge', () => {
   it('turns require_merge off and back on for a project owner', async () => {
@@ -76,6 +88,49 @@ describe('ProjectSettings require_merge', () => {
     renderAs('owner')
     expect(await screen.findByRole('heading', { name: 'GitHub merge webhook' })).toBeInTheDocument()
     expect(await screen.findByRole('button', { name: /generate secret/i })).toBeInTheDocument()
+  })
+})
+
+// The GitHub API token (AMP #3161): a project-owner setting, like the merge
+// webhook beside it, and never rendered for someone the server would refuse.
+describe('ProjectSettings GitHub token', () => {
+  it('shows the token form to a project owner, empty and ready to paste into', async () => {
+    renderAs('owner')
+    expect(await screen.findByRole('heading', { name: 'GitHub token' })).toBeInTheDocument()
+    const input = await screen.findByLabelText(/^token$/i)
+    expect(input).toHaveValue('')
+    expect(input).toHaveAttribute('type', 'password')
+    expect(await screen.findByRole('button', { name: /save token/i })).toBeInTheDocument()
+    expect(state.credential).toHaveBeenCalledWith(3)
+  })
+
+  it('shows the configured state instead of the empty form when a token is attached', async () => {
+    state.credential.mockResolvedValue({
+      configured: true, host: 'github.com', encrypted: true,
+      credential: { id: 1, project_id: 3, host: 'github.com', label: '', created_at: '2026-11-01T10:00:00Z' },
+    })
+    renderAs('owner')
+    expect(await screen.findByRole('button', { name: /replace token/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /remove token/i })).toBeInTheDocument()
+    expect(await screen.findByLabelText(/^token$/i)).toHaveValue('')
+  })
+
+  it('is absent for a lead, who never asks the API for it', async () => {
+    renderAs('lead')
+    expect(await screen.findByRole('heading', { name: 'Merges' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'GitHub token' })).not.toBeInTheDocument()
+    expect(screen.queryByLabelText(/^token$/i)).not.toBeInTheDocument()
+    // Not merely hidden: the page doesn't call a route it has no business on.
+    await waitFor(() => expect(state.credential).not.toHaveBeenCalled())
+  })
+
+  it('lists the section in the settings nav for an owner only', async () => {
+    const { unmount } = renderAs('owner')
+    expect(await screen.findByRole('link', { name: 'GitHub token' })).toHaveAttribute('href', '#github-token')
+    unmount()
+    renderAs('lead')
+    await screen.findByRole('navigation', { name: 'Settings sections' })
+    expect(screen.queryByRole('link', { name: 'GitHub token' })).not.toBeInTheDocument()
   })
 })
 

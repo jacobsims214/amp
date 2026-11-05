@@ -48,6 +48,13 @@ import (
 //	POST /api/tasks/:id/start_at
 //	GET  /api/events              ← SSE stream (only events for projects you can see)
 //
+// Project GitHub credentials (write-only; see github_credentials.go):
+//
+//	GET    /api/projects/:id/github-credential          owner: configured status, metadata, last problem
+//	PUT    /api/projects/:id/github-credential          owner: attach or replace the token (body)
+//	POST   /api/projects/:id/github-credential/rotate   owner: replace an attached token
+//	DELETE /api/projects/:id/github-credential          owner: remove it
+//
 // Multi-user (see orgs.go for org/team administration):
 //
 //	GET  /api/projects/:id/members        users with access, and their level
@@ -861,6 +868,17 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			sub = parts[2]
 		}
 		h.projectGitHubHook(w, r, pr, projectID, sub)
+		return
+
+	case "github-credential":
+		// GET status · PUT attach/rotate (token in the body) ·
+		// POST rotate · DELETE. Owner-only, and the token never comes
+		// back out (internal/api/github_credentials.go, AMP #3155).
+		sub := ""
+		if len(parts) > 2 {
+			sub = parts[2]
+		}
+		h.projectGitHubCredential(w, r, pr, projectID, sub)
 		return
 
 	case "reset":

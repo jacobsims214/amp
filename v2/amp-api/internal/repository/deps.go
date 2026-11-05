@@ -121,10 +121,28 @@ func (r *Repo) NoMergeWait(ctx context.Context, ids []int) (map[int]bool, error)
 // DepStatesFor is DepStates as dependent sees its dependencies ids: when
 // dependent doesn't wait for merges (waits_for_merge: false), a completed
 // dependency is satisfied even while its merge is pending.
+//
+// A merge step (a person's ticket with merge_for, AMP #3009) is the exception
+// the other way: for the one ticket whose merge it tracks, completion alone
+// satisfies it. The step's job IS that merge, so waiting for that merge to be
+// recorded before the step that records it can run would be waiting for
+// itself. Its other dependencies keep the ordinary rule, so a review or a
+// release it waits on still gates it.
 func (r *Repo) DepStatesFor(ctx context.Context, dependent int, ids []int) (map[int]bool, map[int]string, error) {
 	done, waits, err := r.DepStates(ctx, ids)
-	if err != nil || len(waits) == 0 || dependent == 0 {
+	if err != nil || dependent == 0 || len(ids) == 0 {
 		return done, waits, err
+	}
+	tracked, err := r.TaskTrackingItself(ctx, dependent)
+	if err != nil {
+		return nil, nil, err
+	}
+	if tracked != 0 && waits[tracked] != "" {
+		done[tracked] = true
+		delete(waits, tracked)
+	}
+	if len(waits) == 0 {
+		return done, waits, nil
 	}
 	nowait, err := r.NoMergeWait(ctx, []int{dependent})
 	if err != nil {
@@ -178,6 +196,131 @@ func MergeWaitDetail(id int, mergeState, where string) string {
 		s += " (" + where + ")"
 	}
 	return s
+}
+
+// TaskTrackingItself is the ticket taskID's merge_for names, i.e. the ticket
+// whose PR merge it tracks, or 0 when it is not a merge step (AMP #3009).
+func (r *Repo) TaskTrackingItself(ctx context.Context, taskID int) (int, error) {
+	var tracks *int
+	err := r.db.QueryRow(ctx, `SELECT `+mergeForSQL+` FROM tasks WHERE id = $1`, taskID).Scan(&tracks)
+	if err != nil {
+		return 0, err
+	}
+	if tracks == nil {
+		return 0, nil
+	}
+	return *tracks, nil
+}
+
+// TaskTrackingMerge is the human merge step whose own merge_for metadata
+// names ticketID: the step the plan puts before that ticket's PR merge
+// (AMP #3009). It returns 0 when nothing tracks it. A ticket's own metadata
+// only: an inherited merge_for (on a story or an epic) would point every
+// ticket under it at one PR, so it is deliberately not read here. An open
+// step wins over a done one, which is the order My work wants: the step that
+// still has something to do is the one a Merge card folds in.
+func (r *Repo) TaskTrackingMerge(ctx context.Context, ticketID int) (int, error) {
+	steps, err := r.TasksTrackingMerge(ctx, []int{ticketID})
+	if err != nil {
+		return 0, err
+	}
+	return steps[ticketID], nil
+}
+
+// TasksTrackingMerge is TaskTrackingMerge for several tickets at once:
+// ticket id → the id of the human step tracking its merge (absent when none
+// does). One query, for a page of Merge cards.
+func (r *Repo) TasksTrackingMerge(ctx context.Context, ticketIDs []int) (map[int]int, error) {
+	out := map[int]int{}
+	if len(ticketIDs) == 0 {
+		return out, nil
+	}
+	rows, err := r.db.Query(ctx, `SELECT id, `+mergeForSQL+` FROM tasks
+		WHERE performer = '`+domain.PerformerHuman+`' AND `+mergeForSQL+` = ANY($1)
+		ORDER BY (state = 'completed'), id`, ticketIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var step, tracks int
+		if err := rows.Scan(&step, &tracks); err != nil {
+			return nil, err
+		}
+		if _, seen := out[tracks]; !seen {
+			out[tracks] = step // the open step first (ORDER BY), so it wins
+		}
+	}
+	return out, rows.Err()
+}
+
+// mergeForSQLOf is a ticket's own merge_for as a ticket id, read from the
+// tasks table aliased as alias ("" for the bare table): a number or a
+// string, with an optional "#" and surrounding spaces, and NULL when it is
+// absent or not a ticket id at all. It is the SQL reading of
+// domain.Metadata.MergeFor, used to join a step to the ticket whose merge it
+// tracks.
+func mergeForSQLOf(alias string) string {
+	col := "metadata"
+	if alias != "" {
+		col = alias + ".metadata"
+	}
+	expr := "btrim(COALESCE(" + col + " ->> '" + domain.MetaMergeFor + "', ''), '# ')"
+	// The numeric bound matters as much as the pattern: '^[0-9]{1,10}$' accepts
+	// 9999999999, which doesn't fit int4, so a cast on the pattern alone would
+	// make one junk value break every read (and every row insert, in an index
+	// expression). It is also the same bound domain.ParseMergeFor enforces, so
+	// the Go and SQL readings of a link agree.
+	return `CASE WHEN ` + expr + ` ~ '^[0-9]{1,10}$' AND ` + expr + `::numeric <= 2147483647
+		THEN ` + expr + `::int ELSE NULL END`
+}
+
+// mergeForSQL is mergeForSQLOf on an unqualified tasks table.
+var mergeForSQL = mergeForSQLOf("")
+
+// MergeStepWait is a human merge step that is still open although the merge
+// it tracks is already recorded: the step its prerequisites were holding, so
+// the one a later completion or merge report has to finish.
+type MergeStepWait struct {
+	StepID int
+	Tracks int
+}
+
+// OpenMergeStepsWaitingOn finds the merge steps to re-check after depIDs
+// changed: human merge steps still open, depending on one of depIDs, whose
+// tracked ticket's merge is already recorded (AMP #3009).
+//
+// It is how a step held by a prerequisite stops owing a click. A merge report
+// that arrives before a prerequisite finishes leaves the step open, because
+// the plan's sequencing still holds; when the prerequisite is satisfied later
+// — it completes, or its own merge is recorded — nothing about the merge
+// report fires again, so without this the person would be asked to
+// acknowledge a merge that already happened. The recorded merge is the fact;
+// this revisits it from the other side.
+func (r *Repo) OpenMergeStepsWaitingOn(ctx context.Context, depIDs []int) ([]MergeStepWait, error) {
+	if len(depIDs) == 0 {
+		return nil, nil
+	}
+	steps := mergeForSQLOf("s")
+	rows, err := r.db.Query(ctx, `SELECT DISTINCT s.id, `+steps+`
+		FROM tasks s JOIN task_dependencies d ON d.task_id = s.id
+		WHERE d.depends_on = ANY($1) AND s.performer = '`+domain.PerformerHuman+`'
+		  AND s.state <> 'completed' AND `+steps+` IS NOT NULL
+		  AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = `+steps+` AND t.merge_state = 'merged')
+		ORDER BY s.id`, depIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MergeStepWait
+	for rows.Next() {
+		var w MergeStepWait
+		if err := rows.Scan(&w.StepID, &w.Tracks); err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
 }
 
 // MergeGatedTasks lists a project's completed tickets whose merge state

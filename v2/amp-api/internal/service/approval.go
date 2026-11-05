@@ -263,6 +263,15 @@ func (s *Service) SetTaskStateAs(ctx context.Context, p authz.Principal, taskID 
 			s.ReconcileDependents(ctx, t.ProjectID, deps[taskID], nil)
 		}
 	}
+	if t.State != domain.TaskStateCompleted && state == domain.TaskStateCompleted {
+		// Done by this state change, not by a completion: it may have freed a
+		// linked merge step held by exactly this ticket (AMP #3009), the same
+		// way CompleteTaskWithRun does. A ticket that still waits on its own
+		// merge holds its dependents, so this fires only when it holds nothing.
+		if cur, err := s.Repo.GetTask(ctx, taskID); err == nil && !domain.MergeGates(cur.MergeState) {
+			s.retriggerMergeStepsAfter(ctx, p, taskID)
+		}
+	}
 	// The actor may have kept it blocked on its dependencies.
 	if cur, err := s.Repo.GetTask(ctx, taskID); err == nil {
 		return cur, nil
@@ -375,6 +384,11 @@ func (s *Service) checkRunOutcome(p authz.Principal, t *domain.Task, outcome str
 // the ticket unchanged. Other actor errors come back as 400.
 func (s *Service) UpdateTask(ctx context.Context, p authz.Principal, t *domain.Task, req domain.UpdateTaskRequest) error {
 	req.TaskID = t.ID
+	// A merge_for link set here is checked against the ticket as the edit
+	// leaves it (performer included), before anything is written (AMP #3009).
+	if err := s.checkTaskMergeFor(ctx, t, req); err != nil {
+		return err
+	}
 	keepHuman := ""
 	if !p.InUI() {
 		refusal := authz.UIOnly(fmt.Sprintf("Switching ticket %d (a person's ticket) to agent work", t.ID), s.TaskURL(t.ProjectID, t.ID))

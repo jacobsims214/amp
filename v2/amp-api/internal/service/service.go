@@ -46,6 +46,18 @@ type Service struct {
 	// from there, so no in-process audit sink (OnAudit) sees them (#2399,
 	// re-review #2394 N3).
 	RelayAudit bool
+	// Facts is the repository-facts cache coordinator (AMP #3158). It answers
+	// a My work read from cached facts and may start a bounded background
+	// refresh; it never makes — or waits for — an HTTP call on this path. nil
+	// (an unwired server, and every unit test that is not about the merge
+	// policy) means no facts are known, so every merge item classifies as the
+	// honest unknown arm.
+	Facts *GitHubFactsCoordinator
+	// MergeAlertPerson answers who the ticket's owner is to the merge policy
+	// (their GitHub login, CODEOWNERS ownership). nil means AMP cannot say, so
+	// a rule that names someone stays the honest unknown arm; see
+	// MergeAlertPersonSource.
+	MergeAlertPerson MergeAlertPersonSource
 }
 
 func New(repo *repository.Repo, registry *actor.Registry, kbSvc *kb.Service) *Service {

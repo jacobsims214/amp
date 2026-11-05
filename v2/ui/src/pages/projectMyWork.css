@@ -33,6 +33,35 @@
 .pmw-item.k-start::before { background: var(--k-start); }
 .pmw-item.k-do::before { background: var(--k-do); }
 .pmw-item.focus { border-color: var(--ink); box-shadow: 0 0 0 3px color-mix(in srgb, var(--link) 18%, transparent); }
+.pmw-item.inert { background: var(--surface-2); }
+.pmw-item.inert::before { background: var(--line-str); }
+
+/* a Merge card: the PR's route, why you're asked, then the plan step's
+   prerequisites (approved artifact #27 v2, states 1-5) */
+.pmw-route { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-top: 4px; font-family: var(--font-data); font-size: 12.5px; color: var(--ink-2); }
+.pmw-route .pr { color: var(--ink); font-weight: 500; }
+.pmw-route .arrow { color: var(--ink-3); font-family: var(--font-body); }
+.pmw-route .target { color: var(--ink); }
+.pmw-route .target.unknown { color: var(--ink-3); font-style: normal; }
+.pmw-route .it-id { font-size: 12px; color: var(--ink-3); }
+.pmw-why { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin: 8px 0 0; font-size: 13px; line-height: 1.5; color: var(--ink-2); }
+.pmw-why > .amp-label { flex-shrink: 0; color: var(--teal); }
+.pmw-chip { display: inline-flex; align-items: center; font-family: var(--font-data); font-size: 11px; line-height: 1.5; color: var(--ink-2); background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 2px 7px; }
+.pmw-chip.warn { color: var(--warning-ink); border-color: var(--warning); background: color-mix(in srgb, var(--warning) 8%, var(--surface)); }
+.pmw-waiters { margin: 8px 0 0; font-size: 13px; line-height: 1.5; color: var(--ink-2); }
+.pmw-waiters b { color: var(--ink); font-weight: 600; }
+/* A rule alert's rule box (approved artifact #27 v2 state 3): sunken, labelled,
+   and readable — the exact requirement the repository imposes, in its terms. */
+.pmw-rule-box { display: grid; gap: 3px; margin: 10px 0 2px; padding: 9px 12px; background: var(--surface-3); border: 1px solid var(--line); border-radius: var(--radius); }
+.pmw-rule-box > .amp-label { color: var(--ink-2); }
+.pmw-rule-box p { margin: 0; font-size: 13px; line-height: 1.5; color: var(--ink-2); }
+.pmw-step-wait { display: grid; gap: 6px; margin-top: 10px; padding: 9px 12px; background: var(--surface-3); border: 1px solid var(--line); border-radius: var(--radius); }
+.pmw-step-ready { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin: 10px 0 0; font-size: 13px; line-height: 1.45; color: var(--ink-2); }
+.pmw-step-ready > .amp-label { flex-shrink: 0; color: var(--teal); }
+.pmw-prereqs { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.pmw-prereqs li { display: flex; align-items: baseline; gap: 7px; font-size: 12.5px; line-height: 1.4; color: var(--ink-2); }
+.pmw-prereqs .box { width: 10px; height: 10px; border: 1.5px solid var(--st-wait); border-radius: 1px; flex-shrink: 0; position: relative; top: 1px; }
+.pmw-prereqs .rid { font-family: var(--font-data); font-size: 12px; color: var(--ink-3); }
 .pmw-focus-chip { position: absolute; right: 12px; top: -10px; display: inline-flex; align-items: center; gap: 4px; background: var(--link); color: #fff; font-family: var(--font-label); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; font-weight: 600; padding: 3px 4px 3px 6px; border-radius: 1px; }
 .pmw-focus-chip button { background: none; border: 0; color: inherit; padding: 0 2px; cursor: pointer; line-height: 1; display: inline-flex; }
 .pmw-item .it-title { font-size: 15px; font-weight: 600; line-height: 1.3; color: var(--ink); }
@@ -63,4 +92,7 @@ a.pmw-row:hover { background: var(--surface-2); }
   .pmw-ro .v { font-size: 22px; }
   .pmw-item { padding: 14px 14px 14px 17px; }
   .pmw-clear { padding: 24px 18px; }
+  /* the why-line stacks under its label on a phone, and its chip may wrap */
+  .pmw-why { display: grid; gap: 4px; }
+  .pmw-chip { white-space: normal; }
 }

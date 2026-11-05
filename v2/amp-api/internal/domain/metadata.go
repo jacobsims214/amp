@@ -1,8 +1,11 @@
 package domain
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -90,6 +93,13 @@ const (
 	// dependencies to complete, not for their merges (a review of an open
 	// PR). Any other value, or none, keeps the merge gate.
 	MetaWaitsForMerge = "waits_for_merge"
+	// MetaMergeFor, on a human merge step (performer "human"), is the
+	// numeric id of the ticket whose PR merge the step tracks: "this person's
+	// step is the gate for ticket N's merge". It makes the plan's step and
+	// My work's Merge card for that PR one action instead of two (AMP #3009).
+	// Read a ticket's OWN metadata for it, never inherited metadata: a story
+	// or epic must not point every ticket under it at one PR.
+	MetaMergeFor = "merge_for"
 )
 
 // IntegrationBranch is m's integration branch, or "".
@@ -116,4 +126,56 @@ func (p MetadataPatch) TouchesMergeGate() bool {
 	_, ib := p[MetaIntegrationBranch]
 	_, wm := p[MetaWaitsForMerge]
 	return ib || wm
+}
+
+// MergeFor is m's merge_for link: the id of the ticket whose PR merge a
+// human merge step tracks, and whether one is set. It reports false for a
+// value that isn't a positive ticket id, so a malformed link reads as no
+// link (ParseMergeFor is the strict reading, for the write paths).
+func (m Metadata) MergeFor() (int, bool) {
+	id, err := ParseMergeFor(m[MetaMergeFor])
+	return id, err == nil && id > 0
+}
+
+// ParseMergeFor reads a merge_for value strictly: a positive ticket id as a
+// number, a string of digits, or "#123". A nil value is no link (an id of 0
+// and no error); anything else is an error, so a write path can refuse it
+// instead of storing a link nothing reads.
+func ParseMergeFor(v any) (int, error) {
+	switch n := v.(type) {
+	case nil:
+		return 0, nil
+	case bool:
+		return 0, fmt.Errorf("merge_for must be a ticket id, not %v", n)
+	case float64:
+		return mergeForID(int64(n), math.Trunc(n) == n, strconv.FormatFloat(n, 'f', -1, 64))
+	case float32:
+		f := float64(n)
+		return mergeForID(int64(n), math.Trunc(f) == f, strconv.FormatFloat(f, 'f', -1, 64))
+	case int:
+		return mergeForID(int64(n), true, strconv.Itoa(n))
+	case int32:
+		return mergeForID(int64(n), true, strconv.FormatInt(int64(n), 10))
+	case int64:
+		return mergeForID(n, true, strconv.FormatInt(n, 10))
+	case json.Number:
+		i, err := n.Int64()
+		return mergeForID(i, err == nil, n.String())
+	case string:
+		s := strings.TrimSpace(n)
+		if s == "" {
+			return 0, nil
+		}
+		i, err := strconv.ParseInt(strings.TrimPrefix(s, "#"), 10, 64)
+		return mergeForID(i, err == nil, n)
+	}
+	return 0, fmt.Errorf("merge_for must be a ticket id (a number), not %T", v)
+}
+
+// mergeForID is ParseMergeFor's numeric half: whole, positive, in range.
+func mergeForID(n int64, whole bool, shown string) (int, error) {
+	if !whole || n <= 0 || n > math.MaxInt32 {
+		return 0, fmt.Errorf("merge_for must be a ticket id (a positive whole number), got %s", shown)
+	}
+	return int(n), nil
 }

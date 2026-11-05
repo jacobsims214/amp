@@ -35,6 +35,29 @@ type MergeRecord struct {
 	Message         string       `json:"message"`
 	Run             *domain.Run  `json:"run,omitempty"`
 	Task            *domain.Task `json:"task,omitempty"`
+	// LinkedStep is the human merge step that tracks this merge (its
+	// merge_for is this ticket): its id, state, and whether this report
+	// completed it or found it already done (AMP #3009).
+	LinkedStep *MergeStepRecord `json:"linked_step,omitempty"`
+}
+
+// MergeStepRecord is what a merge report did to the human step linked to
+// the merge it recorded.
+//
+// The link is one-way by design: the step names the ticket whose PR it
+// gates (merge_for), and a merge recorded from outside (GitHub's webhook,
+// CI's amp_report_merged) completes the step as the same act, so the person
+// owes nothing after merging on GitHub. It is not a sign-off invented for
+// them: the step's acceptance was the merge, the report says the merge
+// happened, and the ticket's own history names who recorded it.
+type MergeStepRecord struct {
+	TaskID int    `json:"task_id"`
+	State  string `json:"state"`
+	// Completed: this report completed the step. AlreadyDone: the step was
+	// already done, and its merge record is the one on the PR's ticket.
+	Completed   bool   `json:"completed"`
+	AlreadyDone bool   `json:"already_done"`
+	Message     string `json:"message"`
 }
 
 // mergeSourceOf is who a merge report comes from when the caller doesn't
@@ -44,6 +67,266 @@ func mergeSourceOf(p authz.Principal) string {
 		return domain.MergeSourceUI
 	}
 	return domain.MergeSourceCI
+}
+
+// ---- Planned merge steps (AMP #3009) ----
+//
+// A plan can put the merge itself in the graph as a person's step: a human
+// ticket whose own metadata says which ticket's PR it tracks (merge_for).
+// Before this, that step was a second card for the same real-world merge —
+// My work's Merge item for the agent ticket, and the human ticket's own Do
+// card (discoveries/merge-actions-user-journey.md) — with no code joining
+// them. The link makes them one journey in both directions:
+//
+//   - the step's prerequisites are still its dependencies, so the merge
+//     stays sequenced: the card's action is offered only once the step is
+//     ready, and the step is the thing that releases whatever waits on it;
+//   - a merge recorded from anywhere (Mark merged on the PR's card, GitHub's
+//     webhook, CI's amp_report_merged) completes the step, because the
+//     step's acceptance criteria were that merge. Nothing is left owing a
+//     click for a merge that already happened.
+//
+// The auto-completion deliberately does not claim the person acted: the
+// step's history names who recorded the merge, no run is recorded for them,
+// and a step its owner has already started (in progress) is left to them.
+// And it never overrides the plan's sequencing: while the step still waits
+// on an unfinished prerequisite it stays open, and the merge report says so
+// instead of quietly starting the work after it.
+//
+// A ticket without the key behaves exactly as before, so legacy merge
+// tickets are unchanged; CheckPlan warns about a merge-like step that has no
+// link, because that is the duplicate this key exists to remove.
+
+// MergeFor is the ticket whose PR merge t tracks, from t's own metadata
+// (never inherited: a story's link would silently point every ticket under
+// it at one PR), or 0.
+func MergeFor(t *domain.Task) int {
+	id, ok := t.Metadata.MergeFor()
+	if !ok {
+		return 0
+	}
+	return id
+}
+
+// checkMergeFor validates a merge_for link before it is stored: a person's
+// step only, naming agent work in the same project that no other step tracks
+// (one step per merge is the duplicate this key removes). taskID is 0 for a
+// ticket being created; a ticket with no merge_for passes untouched.
+func (s *Service) checkMergeFor(ctx context.Context, projectID, taskID int, performer string, meta domain.Metadata) error {
+	v, set := meta[domain.MetaMergeFor]
+	if !set || v == nil {
+		return nil // no link: nothing to check, and removing one is always allowed
+	}
+	forID, err := domain.ParseMergeFor(v)
+	if err != nil {
+		return authz.BadRequest("%v", err)
+	}
+	if forID == 0 {
+		return authz.BadRequest("merge_for must name a ticket id; leave the key out to have no link")
+	}
+	who := "the new ticket"
+	if taskID != 0 {
+		who = fmt.Sprintf("ticket %d", taskID)
+	}
+	if performer != domain.PerformerHuman {
+		return authz.BadRequest("%s: merge_for belongs on a person's merge step (performer \"human\"); "+
+			"a merge of agent work is recorded on the ticket that opened the PR", who)
+	}
+	if taskID != 0 && forID == taskID {
+		return authz.BadRequest("%s can't track its own merge", who)
+	}
+	target, err := s.Repo.GetTask(ctx, forID)
+	if err != nil {
+		return authz.BadRequest("%s: merge_for names ticket %d, which doesn't exist", who, forID)
+	}
+	if target.ProjectID != projectID {
+		return authz.BadRequest("%s: merge_for must name a ticket in the same project (ticket %d is in project %d)",
+			who, forID, target.ProjectID)
+	}
+	if target.IsHuman() {
+		return authz.BadRequest("%s: merge_for must name the ticket whose work is merged (agent work); ticket %d is a person's ticket",
+			who, forID)
+	}
+	other, err := s.Repo.TaskTrackingMerge(ctx, forID)
+	if err != nil {
+		return err
+	}
+	if other == taskID {
+		return nil // already linked: nothing new to check, so other edits don't re-refuse it
+	}
+	if other != 0 {
+		// A done step isn't tracking anything any more: its merge is recorded,
+		// which the check below reports more usefully than a duplicate would.
+		if done, err := s.Repo.GetTask(ctx, other); err == nil && done.State != domain.TaskStateCompleted {
+			return authz.BadRequest("%s: ticket %d's merge is already tracked by ticket %d; one step per merge",
+				who, forID, other)
+		}
+	}
+	if target.MergeState == domain.MergeMerged {
+		return authz.BadRequest("%s: ticket %d's merge is already recorded (by %s), so a step tracking it would have nothing to do; "+
+			"drop the step, or point it at the ticket whose work still has to merge", who, forID, nameOrDash(target.MergeSource))
+	}
+	return nil
+}
+
+// checkTaskMergeFor validates a merge_for the edit req sets on t: against the
+// ticket as the edit leaves it, since the same request may switch it between
+// a person's step and agent work. A removal (null) passes: relinking is how a
+// wrong link is fixed.
+func (s *Service) checkTaskMergeFor(ctx context.Context, t *domain.Task, req domain.UpdateTaskRequest) error {
+	v, set := req.Metadata[domain.MetaMergeFor]
+	if !set || v == nil {
+		return nil
+	}
+	performer := t.Performer
+	if req.Performer != "" || req.HumanReason != "" {
+		perf := req.Performer
+		if perf == "" {
+			perf = t.Performer
+		}
+		p, _, err := domain.NormalizePerformer(perf, req.HumanReason)
+		if err != nil {
+			return authz.BadRequest("%v", err)
+		}
+		performer = p
+	}
+	return s.checkMergeFor(ctx, t.ProjectID, t.ID, performer, domain.Metadata{domain.MetaMergeFor: v})
+}
+
+// MergeStepFor is the human step tracking ticketID's merge, or nil when the
+// plan has none: the link that makes My work's Merge card and the plan's
+// step one action instead of two.
+func (s *Service) MergeStepFor(ctx context.Context, ticketID int) (*domain.Task, error) {
+	stepID, err := s.Repo.TaskTrackingMerge(ctx, ticketID)
+	if err != nil || stepID == 0 {
+		return nil, err
+	}
+	return s.Repo.GetTask(ctx, stepID)
+}
+
+// recordLinkedMergeStep completes the human step tracking ticketID's merge as
+// the same act as recording that merge, and says what it did (nil: no step is
+// linked). A step already done reports itself done; one its owner started is
+// left to them; one still waiting on an unfinished prerequisite stays open,
+// and the record says what it waits on.
+func (s *Service) recordLinkedMergeStep(ctx context.Context, p authz.Principal, ticketID int, source string) *MergeStepRecord {
+	step, err := s.MergeStepFor(ctx, ticketID)
+	if err != nil {
+		slog.Warn("linked merge step", "task_id", ticketID, "err", err)
+		return nil
+	}
+	if step == nil {
+		return nil
+	}
+	switch step.State {
+	case domain.TaskStateCompleted:
+		return &MergeStepRecord{TaskID: step.ID, State: string(step.State), AlreadyDone: true,
+			Message: fmt.Sprintf("its merge step #%d was already done", step.ID)}
+	case domain.TaskStateInProgress:
+		return &MergeStepRecord{TaskID: step.ID, State: string(step.State),
+			Message: fmt.Sprintf("its merge step #%d is in progress: its owner finishes it", step.ID)}
+	}
+	if step.State == domain.TaskStateBlocked && step.BlockReason != "" && !strings.HasPrefix(step.BlockReason, "scheduled:") {
+		// The step is blocked on a question for its owner: a merge report
+		// must not answer it or close the step under it.
+		return &MergeStepRecord{TaskID: step.ID, State: string(step.State),
+			Message: fmt.Sprintf("its merge step #%d is waiting on a question, so it stays open", step.ID)}
+	}
+	if open, err := s.openPrerequisites(ctx, step); err != nil {
+		slog.Warn("linked merge step prerequisites", "task_id", step.ID, "err", err)
+	} else if len(open) > 0 {
+		return &MergeStepRecord{TaskID: step.ID, State: string(step.State),
+			Message: fmt.Sprintf("its merge step #%d still waits on %s, so it stays open", step.ID, joinIDs(open))}
+	}
+	pid, err := s.Registry.Get(step.ProjectID)
+	if err != nil {
+		return &MergeStepRecord{TaskID: step.ID, State: string(step.State), Message: "its merge step couldn't be completed: " + err.Error()}
+	}
+	replyCh := make(chan actor.ReplyComplete, 1)
+	s.Registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: step.ID, ByName: source,
+		MergeStepFor: ticketID, Source: source, ReplyCh: replyCh})
+	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
+		slog.Warn("complete linked merge step", "task_id", step.ID, "err", reply.Err)
+		return &MergeStepRecord{TaskID: step.ID, State: string(step.State),
+			Message: "its merge step couldn't be completed: " + reply.Err.Error()}
+	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "task.merge.step_completed", ProjectID: intRef(step.ProjectID),
+		TargetType: "task", TargetID: idStr(step.ID), TargetName: step.Name,
+		Summary: fmt.Sprintf("%s recorded #%d's merge, which completes the merge step tracking it (#%d)", source, ticketID, step.ID),
+		Details: map[string]any{"merge_for": ticketID, "source": source}})
+	return &MergeStepRecord{TaskID: step.ID, State: string(domain.TaskStateCompleted), Completed: true,
+		Message: fmt.Sprintf("its merge step #%d is complete", step.ID)}
+}
+
+// openPrerequisites is the merge step's dependencies that still hold it: not
+// done, or done but waiting on their own merge (the same rule work starts by).
+func (s *Service) openPrerequisites(ctx context.Context, step *domain.Task) ([]int, error) {
+	if len(step.DependencyIDs) == 0 {
+		return nil, nil
+	}
+	done, _, err := s.Repo.DepStates(ctx, step.DependencyIDs)
+	if err != nil {
+		return nil, err
+	}
+	var open []int
+	for _, d := range step.DependencyIDs {
+		if !done[d] {
+			open = append(open, d)
+		}
+	}
+	return open, nil
+}
+
+// retriggerMergeSteps finishes the merge steps that depIDs were holding.
+//
+// A merge recorded while a step still waits on a prerequisite leaves the step
+// open on purpose: the plan says the merge comes after that prerequisite, and
+// a merge report doesn't get to overturn the plan (recordLinkedMergeStep).
+// But the merge is still a fact about the code, so the step must not go on
+// asking its owner to acknowledge it once the prerequisite is satisfied. This
+// is the other half: it runs wherever prerequisites become satisfied, finds
+// the linked steps that are still open with their tracked merge already
+// recorded, and finishes them the ordinary way.
+//
+// Called after depIDs change state (a completion, a recorded merge, a
+// reopened ticket). It is bounded and best-effort: a failure here leaves the
+// step open, which is where it already was, and the next report or completion
+// retries it.
+func (s *Service) retriggerMergeSteps(ctx context.Context, p authz.Principal, depIDs []int) {
+	steps, err := s.Repo.OpenMergeStepsWaitingOn(ctx, depIDs)
+	if err != nil {
+		slog.Warn("merge steps waiting on dependencies", "deps", depIDs, "err", err)
+		return
+	}
+	for _, w := range steps {
+		// The name reported in the step's history is whoever recorded the
+		// merge in the first place, not this reconciliation: the fact being
+		// acted on is their report, and saying "github" (or "ci", or "ui")
+		// keeps the step's record of why it is done truthful.
+		source := ""
+		if t, err := s.Repo.GetTask(ctx, w.Tracks); err == nil {
+			source = t.MergeSource
+		}
+		if rec := s.recordLinkedMergeStep(ctx, p, w.Tracks, source); rec != nil && rec.Completed {
+			slog.Info("merge step reconciled after its prerequisite finished", "step", w.StepID, "tracks", w.Tracks, "source", source)
+		}
+	}
+}
+
+// retriggerMergeStepsAfter is retriggerMergeSteps for the one ticket whose
+// state just changed (it completed, or its merge was recorded): the merge
+// steps waiting on it may now be free.
+func (s *Service) retriggerMergeStepsAfter(ctx context.Context, p authz.Principal, taskID int) {
+	s.retriggerMergeSteps(ctx, p, []int{taskID})
+}
+
+// mergedNow reports whether ticketID's merge is recorded: what the reverse
+// bridge asks before recording one from a person's step. A read that fails
+// answers false, so a completion never records a merge it couldn't confirm was
+// still owed.
+func (s *Service) mergedNow(ctx context.Context, ticketID int) bool {
+	t, err := s.Repo.GetTask(ctx, ticketID)
+	return err == nil && t.MergeState == domain.MergeMerged
 }
 
 // mergeWhere names a run's PR (or pushed branch) for waiting details.
@@ -159,6 +442,15 @@ func (s *Service) CompleteTaskWithRun(ctx context.Context, p authz.Principal, ta
 	if err != nil {
 		return nil, Closeout{}, err
 	}
+	// This completion may have satisfied the last prerequisite of a linked
+	// merge step (AMP #3009): a merge recorded earlier left it open on
+	// purpose, and it must not keep asking its owner to acknowledge a merge
+	// that already happened. Only when the ticket holds nothing now: gated,
+	// it completes waiting on its own merge, so its dependents keep waiting
+	// and nothing was freed.
+	if !gate {
+		s.retriggerMergeStepsAfter(ctx, p, taskID)
+	}
 	task, err := s.Repo.GetTask(ctx, taskID)
 	return task, Closeout{Closeout: reply.Closeout, Reason: reason}, err
 }
@@ -189,9 +481,21 @@ func (s *Service) setMergeState(ctx context.Context, p authz.Principal, t *domai
 }
 
 // afterRun keeps t's merge state in step with a run just recorded on it:
-// a run that reports the work merged records the merge (if nothing had),
-// and a PR or pushed branch reported after t completed, while merges are
-// required, makes it wait on that merge.
+// a run that reports the work merged records the merge (if nothing had); a
+// done ticket's gate then follows the latest run that put work up — a PR or
+// pushed branch reported elsewhere makes it wait on that merge, and one that
+// landed the work on the ticket's integration branch releases the wait
+// (still unmerged: only the integration branch's own merge to main is
+// "merged"). Merged-first-wins: once a merge is recorded, no later run
+// changes it.
+//
+// The release is the same decision ReconcileMergeMetadata makes on a
+// metadata edit (Repo.IntegrationMerged), and both go through the same
+// domain rule (Run.LandsOn), so a #2966-shaped correction works whether it
+// arrives as a run or as metadata (#3002). It is also what keeps the two
+// consistent across several runs: only the LATEST run that put work up
+// decides, so a later PR to main reported after an integration landing
+// gates again, and a correction after that releases again.
 func (s *Service) afterRun(ctx context.Context, p authz.Principal, t *domain.Task, run domain.Run) {
 	switch {
 	case run.Merged != nil && *run.Merged:
@@ -203,6 +507,8 @@ func (s *Service) afterRun(ctx context.Context, p authz.Principal, t *domain.Tas
 			Detail: fmt.Sprintf("Merge recorded by %s (%s)", mergeSourceOf(p), p.Label())}); err != nil {
 			slog.Warn("record merge state", "task_id", t.ID, "err", err)
 		}
+	case t.State == domain.TaskStateCompleted && t.MergeState == domain.MergeMerged:
+		// First report wins: a later run never undoes a recorded merge.
 	case t.State == domain.TaskStateCompleted && t.MergeState == domain.MergeNone && !t.MergeRequired &&
 		s.mergeGateFor(ctx, t, &run, t.CompletedAt):
 		yes := true
@@ -211,7 +517,58 @@ func (s *Service) afterRun(ctx context.Context, p authz.Principal, t *domain.Tas
 			Detail: "Its work was reported on " + nameOrDash(mergeWhere(run)) + " after it was done: the tickets that depend on it wait for the merge"}); err != nil {
 			slog.Warn("record merge needed", "task_id", t.ID, "err", err)
 		}
+	case t.State == domain.TaskStateCompleted && t.MergeState == domain.MergeNeeded:
+		// A later run may correct where the work went: if the ticket's
+		// latest run that put work up landed on its integration branch,
+		// the wait is for a merge that will never happen.
+		s.releaseIntegrationLanding(ctx, p, t)
 	}
+}
+
+// releaseIntegrationLanding clears t's merge gate when the latest of t's
+// runs that put work up landed on t's integration branch: the same rule the
+// project-wide sweep applies (Repo.IntegrationMerged), on the same run
+// (Run.LandsOn — base_branch is it, or, with no PR, branch is it). No
+// integration branch, or work elsewhere, changes nothing. It never records
+// the ticket merged: the work is on the integration branch, not on the main
+// line, so it stays unmerged until that branch is merged (AMP #3002).
+// Only "needed" is released: an abandoned gate (a PR closed without
+// merging) is a person's decision to reopen or wave through, exactly as
+// IntegrationMerged leaves it.
+func (s *Service) releaseIntegrationLanding(ctx context.Context, p authz.Principal, t *domain.Task) {
+	ib := s.integrationBranch(ctx, t)
+	if ib == "" {
+		return
+	}
+	runs, err := s.Repo.TaskRuns(ctx, t.ID)
+	if err != nil {
+		slog.Warn("integration landing", "task_id", t.ID, "err", err)
+		return
+	}
+	if !latestOpeningRun(runs).LandsOn(ib) {
+		return
+	}
+	no := false
+	if _, err := s.setMergeState(ctx, p, t, actor.MsgSetMergeState{State: domain.MergeNone, Required: &no,
+		From: []string{domain.MergeNeeded},
+		Detail: "Its work is on its integration branch (" + ib + "): the tickets that depend on it no longer wait; " +
+			"it stays unmerged until that branch is merged"}); err != nil {
+		slog.Warn("release integration merge", "task_id", t.ID, "err", err)
+	}
+}
+
+// latestOpeningRun is the last of runs (oldest first) that put work up: it
+// reports a PR or a branch. Zero when none does, which LandsOn nothing. It
+// is the run the merge gate follows — the same one Repo.IntegrationMerged
+// picks (ORDER BY created_at DESC LIMIT 1), so a correction reported as a
+// run and one applied as metadata reach the same answer.
+func latestOpeningRun(runs []domain.Run) domain.Run {
+	for i := len(runs) - 1; i >= 0; i-- {
+		if runs[i].PRURL != "" || runs[i].Branch != "" {
+			return runs[i]
+		}
+	}
+	return domain.Run{}
 }
 
 func nameOrDash(s string) string {
@@ -229,7 +586,15 @@ func (s *Service) recordMergeReport(ctx context.Context, p authz.Principal, t *d
 		source = mergeSourceOf(p)
 	}
 	if t.MergeState == domain.MergeMerged {
-		return s.alreadyMerged(ctx, t)
+		// Already recorded: nothing to change on the ticket, but a step linked
+		// to it may still be open (it was linked after the merge, or its
+		// prerequisites finished since). Reconcile it, so a repeat report is
+		// how a step that was held by a prerequisite gets closed.
+		rec, err := s.alreadyMerged(ctx, t)
+		if err == nil {
+			rec.LinkedStep = s.recordLinkedMergeStep(ctx, p, t.ID, source)
+		}
+		return rec, err
 	}
 	now := time.Now()
 	reply, err := s.setMergeState(ctx, p, t, actor.MsgSetMergeState{State: domain.MergeMerged, Source: source, At: &now,
@@ -258,6 +623,14 @@ func (s *Service) recordMergeReport(ctx context.Context, p authz.Principal, t *d
 	if cur != nil {
 		rec.MergedAt = cur.MergedAt
 	}
+	// A planned merge step tracking this merge is the same act, not a second
+	// card for it (AMP #3009): it completes here, whichever of the three
+	// sources recorded the merge.
+	rec.LinkedStep = s.recordLinkedMergeStep(ctx, p, t.ID, source)
+	// Recording a merge satisfies the merge waits of whoever depended on this
+	// ticket, and a merge step of theirs may have been held by exactly that
+	// wait. Re-check the ones this ticket was holding.
+	s.retriggerMergeStepsAfter(ctx, p, t.ID)
 	return rec, nil
 }
 

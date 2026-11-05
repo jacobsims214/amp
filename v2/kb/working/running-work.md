@@ -68,7 +68,16 @@ Rules that keep this healthy:
 5. Commits with the ticket ref in the message and pushes its branch.
 6. Completes (`amp_complete_task` with its `dispatch_id`) or stops with a question
    (`amp_block_task`), recording its **run**: agent, model, input/output/cache tokens, cost,
-   branch, commit, PR, pushed.
+   branch, commit, PR, pushed — and `base_branch` when the PR targets something other than the
+   place a reader would assume (an integration branch).
+
+What it reports is what makes the merge gate correct, so the fields have to be true rather than
+complete. A **run that changed nothing** reports no `branch`, `commit` or `pushed`: the harness
+sees that the worktree is still at the commit the run started from, and there is nothing to
+merge. A worker that pushed by hand, or reused a worktree that already had commits, reports that
+itself. Reaching an **integration branch** is not a merge to main — only a recorded merge releases
+the tickets after a ticket, and `pushed` never means "merged". A ticket completed with no git
+fields at all simply holds nothing and asks no one to merge.
 
 Tokens are never estimated: they come from the harness (`amp_session_usage` in opencode, the
 subagent result in Claude Code) or are left out.

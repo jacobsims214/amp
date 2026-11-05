@@ -10,7 +10,8 @@
 //!     and `pushed` into the worker's `amp_complete_task` / `amp_block_task` **on its own
 //!     ticket**, but only the fields the model left out (absent, `null` or `""`). Usage is the
 //!     worker's live [`Totals`], which already include the message that made the call; git comes
-//!     from the worker's worktree ([`git_state`]).
+//!     from the worker's worktree ([`git_state`]) and only when the run made commits there — an
+//!     unchanged worktree sends no `branch`, `commit` or `pushed` at all (AMP #3005).
 //!   - its `on_finish` reports every worker that ended without closing its ticket (error,
 //!     timeout, cancel, turn budget, or it just stopped) with `amp_report_run` (outcome
 //!     `abandoned`, `run_note` "abandoned: <reason>"), the same usage and git fields, so the
@@ -77,13 +78,61 @@ pub struct GitState {
     pub commit: String,
     /// HEAD is on its upstream (or, without an upstream, on any remote-tracking branch, as when a
     /// ticket branch is merged into the milestone branch and that is pushed). Remote-tracking refs
-    /// are as of the last fetch or push; nothing is fetched here.
+    /// are as of the last fetch or push; nothing is fetched here. Only computed for a worktree
+    /// with commits this run made: `pushed` is a fact about a *commit*, and an untouched branch
+    /// sitting on an already-public base is where the false "merge needed" came from (AMP #2966).
     pub pushed: bool,
 }
 
-/// The git fields for `dir`, or `None` when it is not a git checkout (or has no commit).
-pub async fn git_state(dir: &Path) -> Option<GitState> {
+/// The git fields for `dir`, or `None` when it is not a git checkout, has no commit, **or the run
+/// made no commits** (`start` given and `start..HEAD` is empty).
+///
+/// `start` is the commit the harness handed the worktree over at ([`WorkerInfo::worktree_start`],
+/// captured by `supervisor::prepare_worktree`, AMP #3003/#3005). With it, an unchanged worktree
+/// and one a run reset *back* to or before its start are both
+/// "this run produced nothing", so both report no git fields at all: no `branch`, no `commit` and
+/// no `pushed` — the shape a worker without a worktree already sends (#2364). That matters beyond
+/// tidiness: `UnmergedWork` (which backs `amp_list_unmerged`) selects any run with a non-empty
+/// `branch` and does not look at `pushed`, so a no-change run that named its branch would sit in
+/// Merge needed forever waiting for a merge that does not exist.
+///
+/// `None` (no start commit: no worktree, a reused folder, or a repository git could not resolve
+/// `HEAD` in) degrades to the old behaviour, inferring `pushed` from refs. That is safe: a repo
+/// with no commit has no `HEAD` for a remote ref to contain.
+///
+/// Both pushed-inference paths sit *after* the unchanged check, so neither can resurrect the
+/// false positive:
+///
+/// - the upstream path (`merge-base --is-ancestor HEAD @{u}`), whose false positive is an
+///   untouched branch whose upstream has advanced past it;
+/// - the no-upstream `--contains` fallback (the #2966 shape: a branch at an ancestor of
+///   `origin/main`).
+///
+/// Inside the *changed* case both keep their meaning: with commits beyond `start`, "HEAD is on
+/// its upstream / contained in a remote-tracking ref" really does mean this run's work is where
+/// teammates can get it, or was merged into a pushed branch (the milestone case in [`GitState`]).
+///
+/// Known residual: a **pull-only** run (a fast-forward `git pull`, no commits made here) counts
+/// the *pulled* commits as `start..HEAD`, so it still looks changed and its upstream still makes
+/// it `pushed`. Telling commits created from commits merely fetched would need committer time
+/// against run start — fragile, and not worth it: workers commit far more often than they pull.
+/// Reaching the integration branch is likewise not a merge to main; only a recorded merge is.
+pub async fn git_state(dir: &Path, start: Option<&str>) -> Option<GitState> {
     let commit = git(dir, &["rev-parse", "HEAD"]).await.ok()?;
+    if let Some(start) = start {
+        // `rev-list --count` rather than comparing the two SHAs: a run that committed and then
+        // reset back to (or before) its start made nothing this run either.
+        let range = format!("{start}..HEAD");
+        // `Ok` and no commits is the unchanged case; a failure (an unknown start, a start this
+        // checkout no longer has) leaves detection unavailable, so fall through as if there were
+        // no start rather than suppressing a real report.
+        if git(dir, &["rev-list", "--count", &range])
+            .await
+            .is_ok_and(|count| count == "0")
+        {
+            return None;
+        }
+    }
     let branch = git(dir, &["branch", "--show-current"])
         .await
         .ok()
@@ -402,7 +451,7 @@ impl RunReporter {
     /// `amp_report_run` for a worker that ended without closing its ticket.
     async fn report_abandoned(&self, worker: &WorkerInfo, report: &WorkerReport) -> String {
         let git = match &worker.worktree {
-            Some(wt) => git_state(wt).await,
+            Some(wt) => git_state(wt, worker.worktree_start.as_deref()).await,
             None => None,
         };
         let model = if report.model.is_empty() {
@@ -573,6 +622,9 @@ impl WorkerHooks for RunReporter {
         let task_id = worker.task_id;
         let model = worker.model.clone();
         let worktree = worker.worktree.clone();
+        // AMP #3005: the commit the run started from, so an unchanged worktree reports no git
+        // fields at all (cloned beside the worktree, which is all this closure has of the worker).
+        let worktree_start = worker.worktree_start.clone();
         // #2364: no git of its own: no repository at all, or its own folder (`amp-work/<id>`).
         let no_git = worktree.is_none()
             && (!worker.git || worker.workspace == crate::workspace::Placement::Folder);
@@ -592,12 +644,13 @@ impl WorkerHooks for RunReporter {
                 let args = ctx.args.clone();
                 let model = model.clone();
                 let worktree = worktree.clone();
+                let worktree_start = worktree_start.clone();
                 let dispatch_id = dispatch_id.clone();
                 // Read now: the totals already include the message that made this call.
                 let totals = totals.lock().unwrap().clone();
                 Box::pin(async move {
                     let git = match &worktree {
-                        Some(wt) => git_state(wt).await,
+                        Some(wt) => git_state(wt, worktree_start.as_deref()).await,
                         None => None,
                     };
                     let mut fields = run_fields(&model, &totals, git.as_ref());
@@ -936,5 +989,309 @@ mod tests {
             (json!(10), json!(0.25))
         );
         assert!(v["note"].as_str().unwrap().contains("amp_complete_task"));
+    }
+
+    // ---- AMP #3005: an unchanged worktree reports no git fields ----
+    //
+    // These are the only tests here that need a repository. The semantics pinned are those of
+    // `discoveries/unchanged-worktree-detection.md` § Regression boundaries.
+
+    /// A throwaway directory under the workspace's target dir (D13: never `/tmp`).
+    fn fixture_dir(name: &str) -> PathBuf {
+        let base = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("CARGO_MANIFEST_DIR")
+                    .map(|d| PathBuf::from(d).join("../../target").join("tmp"))
+            })
+            .unwrap_or_else(|| PathBuf::from("target/tmp"));
+        let dir = base.join("amp-core-run-report").join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    /// Runs git synchronously (the production helper is the async [`git`]).
+    fn sh_git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// A commit of `name` in `dir`; returns its SHA.
+    fn commit_file(dir: &Path, name: &str, contents: &str, message: &str) -> String {
+        std::fs::write(dir.join(name), contents).unwrap();
+        sh_git(dir, &["add", name]);
+        sh_git(dir, &["commit", "-q", "-m", message]);
+        sh_git(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// A repository with a bare `origin` and `main` pushed to it, so `refs/remotes/origin/main`
+    /// exists; the checkout is on `main` at that commit. Returns (repo, bare remote, HEAD).
+    ///
+    /// Both inits name the branch explicitly. The bare one must, or its `HEAD` points at whatever
+    /// `init.defaultBranch` happens to be — `master` on a CI runner — and a clone of it checks out
+    /// that instead of `main`, so the clone has no local `main` to push. Naming the branch is what
+    /// makes this fixture independent of the machine's git configuration (AMP #3146).
+    fn repo_with_a_remote(name: &str) -> (PathBuf, PathBuf, String) {
+        let dir = fixture_dir(name);
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        sh_git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "test repo\n").unwrap();
+        sh_git(&repo, &["add", "."]);
+        sh_git(&repo, &["commit", "-q", "-m", "init"]);
+        let bare = dir.join("remote.git");
+        sh_git(
+            &dir,
+            &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
+        let bare = std::fs::canonicalize(&bare).unwrap();
+        sh_git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        sh_git(&repo, &["push", "-q", "-u", "origin", "main"]);
+        let head = sh_git(&repo, &["rev-parse", "HEAD"]);
+        (repo, bare, head)
+    }
+
+    /// 1. The #2966 shape: the run never committed and its branch sits on an already-public base.
+    /// Today that reports `pushed=true` from the `--contains` fallback, which is how a no-change
+    /// run reached Merge needed. With the start commit it reports nothing at all — and with
+    /// `start: None` (no worktree, a reused folder) the old inference is still there, which is
+    /// what this closes.
+    #[tokio::test]
+    async fn an_unchanged_worktree_at_a_public_base_reports_no_git_fields() {
+        let (repo, _bare, base) = repo_with_a_remote("unchanged-contains");
+        sh_git(&repo, &["checkout", "-q", "-b", "amp-2966", &base]);
+
+        assert_eq!(git_state(&repo, Some(&base)).await, None);
+        let fields = run_fields("wf/wf-1", &totals(10, 5, 0.0), None);
+        assert!(
+            !fields.contains_key("branch")
+                && !fields.contains_key("commit")
+                && !fields.contains_key("pushed"),
+            "no git fields at all: {fields:?}"
+        );
+
+        // Without a start commit: the false positive this exists for.
+        let old = git_state(&repo, None).await.expect("a git checkout");
+        assert_eq!(old.branch.as_deref(), Some("amp-2966"));
+        assert!(old.pushed, "today's `--contains` inference, unchanged");
+    }
+
+    /// 2. The upstream path's false positive: the branch tracks a branch that has moved on, so
+    /// `merge-base --is-ancestor HEAD @{u}` succeeds although this run pushed nothing. Pins that
+    /// fixing only the `--contains` fallback would leave it broken.
+    #[tokio::test]
+    async fn an_unchanged_worktree_with_an_advanced_upstream_reports_no_git_fields() {
+        let (repo, _bare, base) = repo_with_a_remote("unchanged-upstream");
+        sh_git(&repo, &["checkout", "-q", "-b", "amp-8", &base]);
+        sh_git(&repo, &["push", "-q", "-u", "origin", "amp-8"]);
+        // Later work lands on the pushed branch: local HEAD is now an ancestor of @{u}.
+        let tree = sh_git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let later = sh_git(&repo, &["commit-tree", &tree, "-p", "HEAD", "-m", "later"]);
+        let spec = format!("{later}:refs/heads/amp-8");
+        sh_git(&repo, &["push", "-q", "origin", &spec]);
+        sh_git(&repo, &["fetch", "-q", "origin"]);
+        assert_eq!(
+            sh_git(&repo, &["rev-parse", "amp-8"]),
+            base,
+            "local is where it was"
+        );
+        // `--is-ancestor` exits 0 here, which is what made the upstream path say pushed.
+        sh_git(&repo, &["merge-base", "--is-ancestor", "HEAD", "@{u}"]);
+
+        assert_eq!(git_state(&repo, Some(&base)).await, None);
+        assert!(
+            git_state(&repo, None).await.expect("a checkout").pushed,
+            "start: None still infers it: the test is about the start commit"
+        );
+    }
+
+    /// 3. A run that made a commit and pushed nothing: changed, so the git fields are reported
+    /// with `pushed=false` (the branch is a ticket branch; nothing of the run's is public).
+    #[tokio::test]
+    async fn a_committed_but_unpushed_run_reports_branch_commit_and_not_pushed() {
+        let (repo, _bare, base) = repo_with_a_remote("committed-unpushed");
+        sh_git(&repo, &["checkout", "-q", "-b", "amp-9", &base]);
+        let head = commit_file(&repo, "work.txt", "done\n", "work (#9)");
+
+        let g = git_state(&repo, Some(&base))
+            .await
+            .expect("a worktree with commits this run");
+        assert_eq!(g.branch.as_deref(), Some("amp-9"));
+        assert_eq!(g.commit, head);
+        assert!(!g.pushed, "the commit is only local");
+    }
+
+    /// 4. A run that committed onto its own pushed branch: `pushed=true`, from the upstream path.
+    #[tokio::test]
+    async fn a_committed_and_pushed_run_still_reports_pushed() {
+        let (repo, _bare, base) = repo_with_a_remote("committed-pushed");
+        sh_git(&repo, &["checkout", "-q", "-b", "amp-10", &base]);
+        let head = commit_file(&repo, "work.txt", "done\n", "work (#10)");
+        sh_git(&repo, &["push", "-q", "-u", "origin", "amp-10"]);
+
+        let g = git_state(&repo, Some(&base))
+            .await
+            .expect("a changed worktree");
+        assert_eq!(g.branch.as_deref(), Some("amp-10"));
+        assert_eq!(g.commit, head);
+        assert!(g.pushed, "HEAD is on its upstream");
+    }
+
+    /// 5. The milestone-merge case in [`GitState`]'s comment: the worktree has unique commits and
+    /// no upstream, and those commits are contained in a pushed branch. `pushed=true` must keep
+    /// being inferred — the work is where teammates can get it and it awaits a merge.
+    #[tokio::test]
+    async fn a_run_merged_into_a_pushed_milestone_branch_still_reports_pushed() {
+        let (repo, _bare, base) = repo_with_a_remote("milestone");
+        sh_git(&repo, &["checkout", "-q", "-b", "amp-11", &base]);
+        let head = commit_file(&repo, "work.txt", "done\n", "work (#11)");
+        // Pushed as the milestone branch, not as amp-11: amp-11 itself has no upstream.
+        let spec = format!("{head}:refs/heads/milestone");
+        sh_git(&repo, &["push", "-q", "origin", &spec]);
+        sh_git(&repo, &["fetch", "-q", "origin"]);
+
+        let g = git_state(&repo, Some(&base))
+            .await
+            .expect("a changed worktree");
+        assert_eq!(g.branch.as_deref(), Some("amp-11"));
+        assert_eq!(g.commit, head);
+        assert!(g.pushed, "contained in refs/remotes/origin/milestone");
+    }
+
+    /// 6. A run that committed and then reset back to — or behind — its start made nothing this
+    /// run either, so it reports nothing. `rev-list --count` rather than comparing the two SHAs.
+    #[tokio::test]
+    async fn a_run_that_reset_back_to_or_before_its_start_reports_no_git_fields() {
+        let (repo, _bare, base) = repo_with_a_remote("backward-reset");
+        sh_git(&repo, &["checkout", "-q", "-b", "amp-12", &base]);
+        let discarded = commit_file(&repo, "work.txt", "done\n", "work (#12)");
+        sh_git(&repo, &["reset", "-q", "--hard", &base]);
+        assert_eq!(
+            git_state(&repo, Some(&base)).await,
+            None,
+            "back to the start"
+        );
+
+        // A start the checkout is now behind: `start..HEAD` holds nothing.
+        assert_eq!(
+            git_state(&repo, Some(&discarded)).await,
+            None,
+            "behind the start"
+        );
+    }
+
+    /// 7. The fill contract does not change: the harness stops *inferring*, never strips what the
+    /// model reported. An unchanged worktree whose run passed its own destination keeps every
+    /// field (the escape hatch for a refspec push, or one pushing a reused worktree's commits).
+    #[tokio::test]
+    async fn an_unchanged_run_keeps_the_destination_the_model_reported() {
+        let (repo, _bare, base) = repo_with_a_remote("fill-contract");
+        sh_git(&repo, &["checkout", "-q", "-b", "amp-13", &base]);
+        let git = git_state(&repo, Some(&base)).await;
+        assert!(git.is_none(), "nothing to infer");
+        let fields = run_fields("wf/wf-1", &totals(10, 5, 0.0), git.as_ref());
+        assert!(
+            !["branch", "commit", "pushed"]
+                .iter()
+                .any(|k| fields.contains_key(*k)),
+            "{fields:?}"
+        );
+
+        let args = json!({"task_id": 13, "branch": "feat/elsewhere", "commit": "3dea037",
+                          "pushed": true, "base_branch": "feat/integration"});
+        let filled = fill_missing(&args, &fields).expect("the usage fields are filled");
+        assert_eq!(filled["branch"], "feat/elsewhere");
+        assert_eq!(filled["commit"], "3dea037");
+        assert_eq!(filled["pushed"], true);
+        assert_eq!(filled["base_branch"], "feat/integration");
+        assert_eq!(
+            fill_missing(
+                &json!({"task_id": 13, "model": "m", "input_tokens": 1,
+                                 "output_tokens": 1, "cache_read_tokens": 1,
+                                 "cache_write_tokens": 1, "branch": "feat/elsewhere",
+                                 "commit": "3dea037", "pushed": true}),
+                &fields
+            ),
+            None,
+            "the run's own fields are authoritative"
+        );
+    }
+
+    /// 8. Detection unavailable is not suppression: a start this checkout cannot resolve, and a
+    /// checkout with no commit at all, leave `git_state` as it was (the #3003 trait: `None` there
+    /// is "no start commit", and a repository with no commit has no `HEAD` for a remote ref to
+    /// contain, so the #2966 false positive cannot arise).
+    #[tokio::test]
+    async fn a_missing_or_unresolvable_start_degrades_to_the_old_behaviour() {
+        let (repo, _bare, base) = repo_with_a_remote("missing-start");
+        sh_git(&repo, &["checkout", "-q", "-b", "amp-14", &base]);
+        let head = commit_file(&repo, "work.txt", "done\n", "work (#14)");
+
+        let unknown = "0".repeat(40);
+        let g = git_state(&repo, Some(&unknown))
+            .await
+            .expect("an unresolvable start must not suppress a real report");
+        assert_eq!(g.commit, head);
+        assert_eq!(g.branch.as_deref(), Some("amp-14"));
+        assert!(!g.pushed);
+
+        let empty = fixture_dir("no-commit").join("repo");
+        std::fs::create_dir_all(&empty).unwrap();
+        sh_git(&empty, &["init", "-q", "-b", "main"]);
+        assert_eq!(
+            git_state(&empty, Some(&base)).await,
+            None,
+            "no commit to report about"
+        );
+    }
+
+    /// The documented residual, pinned so nobody re-litigates it: a pull-only run (a fast-forward
+    /// `git pull`, no commits made here) counts the *pulled* commits as `start..HEAD`, so it looks
+    /// changed and its upstream still makes it `pushed`. Reaching that branch is also not a merge
+    /// to main — only a recorded merge is.
+    #[tokio::test]
+    async fn a_pull_only_run_still_looks_changed_the_known_residual() {
+        let (repo, bare, base) = repo_with_a_remote("pull-only");
+        let other = fixture_dir("pull-only-other").join("clone");
+        sh_git(
+            repo.parent().unwrap(),
+            &[
+                "clone",
+                "-q",
+                bare.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        commit_file(&other, "later.txt", "later\n", "later work");
+        sh_git(&other, &["push", "-q", "origin", "main"]);
+        sh_git(&repo, &["pull", "-q", "--ff-only"]);
+        assert_ne!(
+            sh_git(&repo, &["rev-parse", "HEAD"]),
+            base,
+            "fast-forwarded"
+        );
+
+        let g = git_state(&repo, Some(&base))
+            .await
+            .expect("the pulled commits count as a change");
+        assert!(
+            g.pushed,
+            "the upstream path, on commits this run only pulled"
+        );
     }
 }

@@ -135,6 +135,12 @@ func (s *Service) CreateTask(ctx context.Context, p authz.Principal, req domain.
 	if req.Performer, req.HumanReason, err = domain.NormalizePerformer(req.Performer, req.HumanReason); err != nil {
 		return nil, nil, authz.BadRequest("%v", err)
 	}
+	// merge_for names the ticket whose PR merge this person's step tracks
+	// (AMP #3009): checked before the ticket exists, so a bad link never
+	// creates a half-wired step.
+	if err := s.checkMergeFor(ctx, req.ProjectID, 0, req.Performer, req.Metadata); err != nil {
+		return nil, nil, err
+	}
 	if req.OwnerUserID, err = s.ResolveNewTaskOwner(ctx, p, req.ProjectID, ownerRef); err != nil {
 		return nil, nil, err
 	}
@@ -383,6 +389,9 @@ type HumanGate struct {
 	Reason    string `json:"reason"`
 	Owner     *int   `json:"owner_user_id"`
 	HoldingUp int    `json:"holding_up"` // open tickets downstream of it
+	// MergeFor is the ticket whose PR merge this step tracks (merge_for,
+	// AMP #3009): My work shows one card for that merge, not two.
+	MergeFor int `json:"merge_for,omitempty"`
 }
 
 // readyFanoutThreshold: more ready tickets than this, when they're also more
@@ -639,7 +648,8 @@ func planGraph(r *PlanReport, tasks []domain.Task, stories []domain.Story) (stuc
 			}
 			queue = append(queue, down[id]...)
 		}
-		r.HumanGates = append(r.HumanGates, HumanGate{ID: t.ID, Name: t.Name, Reason: t.HumanReason, Owner: t.OwnerUserID, HoldingUp: n})
+		r.HumanGates = append(r.HumanGates, HumanGate{ID: t.ID, Name: t.Name, Reason: t.HumanReason, Owner: t.OwnerUserID, HoldingUp: n,
+			MergeFor: MergeFor(&t)})
 	}
 	if len(ownerless) > 0 {
 		r.Issues = append(r.Issues, PlanIssue{
@@ -648,6 +658,7 @@ func planGraph(r *PlanReport, tasks []domain.Task, stories []domain.Story) (stuc
 			Fix:     "Assign each to the person who does it (amp_assign_task), or make it agent work (amp_update_task performer='agent').",
 		})
 	}
+	checkMergeSteps(r, tasks)
 
 	// A gate that couples different people's work: its dependencies belong to
 	// two or more people, and so do the tickets waiting on it, so each person's
@@ -697,6 +708,91 @@ func planGraph(r *PlanReport, tasks []domain.Task, stories []domain.Story) (stuc
 	return stuck
 }
 
+// mergeStepWords are what a person's ticket name is checked for when it reads
+// as "merge this PR". Matching is a heuristic for a warning only: it never
+// changes a ticket, and a false positive costs a sentence.
+var mergeStepWords = []string{"merge pr", "merge the pr", "merge pull request", "merge the pull request",
+	"review and merge", "review & merge", "merge #"}
+
+// checkMergeSteps warns about the duplicate merge journey (AMP #3009, from
+// discoveries/merge-actions-user-journey.md): a person's ticket that is
+// plainly a merge step — its name says merge — but carries no merge_for.
+// Those are the cards that come back as a second action for a PR My work
+// already has a Merge card for, and the ones a GitHub or CI merge can't
+// clear, so the person ends up marking done a merge that already happened.
+//
+// Two shapes are reported, both warnings, so the plan stays GO:
+//   - unlinked_merge_step: merge-looking steps with no merge_for at all;
+//   - duplicate_merge_step: two of them reaching the same ticket (the same
+//     ticket in both their dependency sets), which is two steps for one
+//     merge by any reading.
+//
+// Nothing here edits a ticket: a merge-looking step its owner keeps unlinked
+// still works exactly as before (the completion-time bridge is unchanged),
+// and a linked step is never flagged.
+func checkMergeSteps(r *PlanReport, tasks []domain.Task) {
+	var unlinked []domain.Task
+	byDep := map[int][]int{} // dependency -> unlinked merge-looking steps reaching it
+	for _, t := range tasks {
+		if !t.IsHuman() || t.State == domain.TaskStateCompleted || MergeFor(&t) != 0 || !looksLikeMergeStep(t) {
+			continue
+		}
+		unlinked = append(unlinked, t)
+		for _, d := range t.DependencyIDs {
+			byDep[d] = append(byDep[d], t.ID)
+		}
+	}
+	if len(unlinked) == 0 {
+		return
+	}
+	ids := make([]int, 0, len(unlinked))
+	names := make([]string, 0, len(unlinked))
+	for _, t := range unlinked {
+		ids = append(ids, t.ID)
+		names = append(names, fmt.Sprintf("#%d %q", t.ID, t.Name))
+	}
+	var dupIDs []int
+	var dupDetail []string
+	for d, steps := range byDep {
+		if len(steps) < 2 {
+			continue
+		}
+		slices.Sort(steps)
+		dupIDs = append(dupIDs, steps...)
+		dupDetail = append(dupDetail, fmt.Sprintf("%s each wait on #%d", joinIDs(steps), d))
+	}
+	slices.Sort(dupIDs)
+	if len(dupDetail) > 0 {
+		slices.Sort(dupDetail)
+		r.Issues = append(r.Issues, PlanIssue{
+			Kind: "duplicate_merge_step", Severity: "warn", TaskIDs: dupIDs,
+			Message: "Two or more person's steps look like the same merge: " + strings.Join(dupDetail, "; ") +
+				". One PR gets one card in My work, so a second step for it is work nobody owes.",
+			Fix: "Keep one step and delete the rest (amp_delete_task), or link each to the ticket whose PR it merges with amp_update_task metadata {\"merge_for\": <ticket id>} if they are genuinely different merges.",
+		})
+	}
+	r.Issues = append(r.Issues, PlanIssue{
+		Kind: "unlinked_merge_step", Severity: "warn", TaskIDs: ids,
+		Message: fmt.Sprintf("%d person's step(s) look like merge steps but don't say which ticket's PR they merge: %s. My work can't fold an unlinked step into the PR's Merge card, "+
+			"so a merge made on GitHub still leaves the step asking to be marked done.", len(unlinked), strings.Join(names, "; ")),
+		Fix: "Set merge_for on each to the ticket whose PR it merges (amp_update_task metadata {\"merge_for\": <ticket id>}). " +
+			"Leave it unlinked only if the merge has no agent ticket behind it to record.",
+	})
+}
+
+// looksLikeMergeStep reports whether a person's ticket reads as "merge this
+// PR": its name says merge. A step with merge_for set is never asked (the
+// caller skips those first).
+func looksLikeMergeStep(t domain.Task) bool {
+	name := strings.ToLower(t.Name)
+	for _, w := range mergeStepWords {
+		if strings.Contains(name, w) {
+			return true
+		}
+	}
+	return false
+}
+
 func longestChain(tasks []domain.Task) int {
 	deps := map[int][]int{}
 	for _, t := range tasks {
@@ -732,6 +828,42 @@ func longestChain(tasks []domain.Task) int {
 }
 
 // ---- Batch creation ----
+
+// mergeTarget resolves one batch spec's merge_for before anything is created,
+// and returns the link it means:
+//   - target: what it names, for error messages — "ref build", "ticket 42",
+//     or "" for no link;
+//   - j: the spec index it names when it is a ref in this batch, else -1;
+//   - id: the ticket id it names as a ticket (0 when it is a batch ref, whose
+//     ticket doesn't exist yet).
+//
+// A value that is neither a ref in the batch nor a ticket id is an error
+// naming what the caller wrote, so a broken link never reaches CreateTask as
+// an id of 0 the caller never wrote (AMP #3218).
+func mergeTarget(v any, byRef map[string]int) (target string, j, id int, err error) {
+	if v == nil {
+		return "", -1, 0, nil
+	}
+	if ref, isStr := v.(string); isStr {
+		if ref = strings.TrimSpace(ref); ref != "" {
+			if i, inBatch := byRef[ref]; inBatch {
+				return "ref " + ref, i, 0, nil
+			}
+			// Not a ref, so it has to be a ticket id, written "42" or "#42".
+			id, err := domain.ParseMergeFor(ref)
+			if err != nil || id == 0 {
+				return "", -1, 0, fmt.Errorf("merge_for names %q, which is neither a ref in this batch nor a ticket id", ref)
+			}
+			return fmt.Sprintf("ticket %d", id), -1, id, nil
+		}
+		return "", -1, 0, nil // empty: no link
+	}
+	id, err = domain.ParseMergeFor(v)
+	if err != nil {
+		return "", -1, 0, err
+	}
+	return fmt.Sprintf("ticket %d", id), -1, id, nil
+}
 
 // TaskSpec is one ticket in a batch: Ref names it within the batch, and
 // DependsOn lists the refs (or "#id" / id of existing tickets) it waits on.
@@ -858,6 +990,55 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 		return nil, nil, authz.BadRequest("these tasks depend on each other in a cycle: %s", strings.Join(cyc, ", "))
 	}
 
+	// merge_for may name a ref in this batch, so a merge step and the ticket
+	// whose PR it tracks can be planned in one call (AMP #3009). Every way a
+	// link can be wrong is refused HERE, before the creation loop below: a
+	// refusal from inside that loop leaves behind the tickets it already
+	// created — a plan half made that the caller has to clean up by hand —
+	// and a ref link the loop can't resolve reaches it as ids[j] == 0, which
+	// CreateTask then reports as "got 0" (AMP #3218).
+	mergeRef := map[int]int{}        // spec index -> spec index of the ticket whose merge it tracks
+	mergeID := map[int]int{}         // spec index -> id of the ticket whose merge it tracks, when one exists already
+	mergeFrom := map[string]string{} // merge target -> ref of the step already tracking it
+	// pos is where each spec sits in the creation order, so a ref link can be
+	// checked against the ids that exist when its step is created.
+	pos := make([]int, len(specs))
+	for p, i := range order {
+		pos[i] = p
+	}
+	for i, sp := range specs {
+		target, j, id, err := mergeTarget(sp.Metadata[domain.MetaMergeFor], byRef)
+		if err != nil {
+			return nil, nil, authz.BadRequest("%q: %v", sp.Ref, err)
+		}
+		if target == "" {
+			continue // no link at all
+		}
+		if prev, dup := mergeFrom[target]; dup {
+			return nil, nil, authz.BadRequest("two steps in this batch track the same merge (%q and %q, both merge_for %s); "+
+				"one step per merge", prev, sp.Ref, strings.TrimPrefix(target, "ref "))
+		}
+		mergeFrom[target] = sp.Ref
+		if sp.Performer != domain.PerformerHuman {
+			return nil, nil, authz.BadRequest("%q: merge_for belongs on a person's merge step (performer \"human\")", sp.Ref)
+		}
+		if j < 0 {
+			// A ticket id: CreateTask checks it against the project, and a step
+			// that doesn't exist yet can't name itself by id.
+			mergeID[i] = id
+			continue
+		}
+		if j == i {
+			return nil, nil, authz.BadRequest("%q can't track its own merge", sp.Ref)
+		}
+		if pos[j] > pos[i] {
+			return nil, nil, authz.BadRequest("%q: merge_for is the ref %q, whose ticket is created after the step, so there is no ticket "+
+				"to link yet; list %q before %q, or make %q depend on %q (a merge step comes after the work it merges)",
+				sp.Ref, specs[j].Ref, specs[j].Ref, sp.Ref, sp.Ref, specs[j].Ref)
+		}
+		mergeRef[i] = j
+	}
+
 	ids := make([]int, len(specs))
 	out := make([]CreatedTask, len(specs))
 	for _, i := range order {
@@ -866,10 +1047,26 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 		for _, j := range refDeps[i] {
 			deps = append(deps, ids[j])
 		}
+		meta := sp.Metadata
+		// Store the link as the ticket id, whatever the caller wrote: a batch
+		// ref resolved to the ticket just created, or the id it named. The
+		// pre-creation pass refused every link whose target isn't created
+		// before its step, so ids[mergeRef[i]] exists here.
+		if forID, linked := mergeRef[i]; linked {
+			mergeID[i] = ids[forID]
+		}
+		if forID, linked := mergeID[i]; linked {
+			meta = domain.Metadata{domain.MetaMergeFor: forID}
+			for k, v := range sp.Metadata {
+				if k != domain.MetaMergeFor {
+					meta[k] = v
+				}
+			}
+		}
 		t, _, err := s.CreateTask(ctx, p, domain.CreateTaskRequest{
 			ProjectID: projectID, StoryID: sp.StoryID, Name: sp.Name, Description: sp.Description,
 			AcceptanceCriteria: sp.AcceptanceCriteria, Priority: sp.Priority, AssignedTo: sp.AssignedTo,
-			DependencyIDs: deps, StartAt: sp.StartAt, Metadata: sp.Metadata,
+			DependencyIDs: deps, StartAt: sp.StartAt, Metadata: meta,
 			Performer: sp.Performer, HumanReason: sp.HumanReason,
 		}, sp.Owner)
 		if err != nil {

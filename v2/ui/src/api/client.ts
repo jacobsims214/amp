@@ -4,7 +4,7 @@ import type {
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
-  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
+  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, GitHubCredentialInfo, GitHubCredentialChange, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
   ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork, MyWorkCounts, PeopleWaiting,
 } from '../types'
 import { auditQuery, auditVerifyUrl, type AuditScope } from '../lib/audit'
@@ -61,7 +61,7 @@ async function put<T>(path: string, body?: unknown): Promise<T> {
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(err.error || `PUT ${path}: ${res.status}`)
+    throw Object.assign(new Error(err.error || `PUT ${path}: ${res.status}`), { status: res.status })
   }
   return res.json()
 }
@@ -72,10 +72,13 @@ async function del<T = void>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { method: 'DELETE' })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(err.error || `DELETE ${path}: ${res.status}`)
+    throw Object.assign(new Error(err.error || `DELETE ${path}: ${res.status}`), { status: res.status })
   }
   return res.json().catch(() => undefined) as Promise<T>
 }
+
+// The credential host travels in the query string; the token never does.
+const credentialHostQuery = (host?: string) => host ? `?host=${encodeURIComponent(host)}` : ''
 
 // Org, project, or (neither) instance webhooks.
 const webhookBase = (scope: { orgId?: number; projectId?: number }) =>
@@ -429,6 +432,19 @@ export const api = {
   getGitHubHook: (projectId: number) => get<GitHubHookInfo>(`/projects/${projectId}/github-hook`),
   rotateGitHubHookSecret: (projectId: number) => post<GitHubHookInfo>(`/projects/${projectId}/github-hook/secret`),
   deleteGitHubHook: (projectId: number) => del<{ deleted: boolean }>(`/projects/${projectId}/github-hook`),
+
+  // The project's GitHub API token: write-only (AMP #3155). The answers to
+  // every call here are GitHubCredentialInfo, which has no token field, and
+  // the token only ever travels in a PUT/POST body — never a URL, which is
+  // written to every proxy and access log on the way in.
+  getGitHubCredential: (projectId: number, host?: string) =>
+    get<GitHubCredentialInfo>(`/projects/${projectId}/github-credential${credentialHostQuery(host)}`),
+  attachGitHubCredential: (projectId: number, body: GitHubCredentialChange) =>
+    put<GitHubCredentialInfo>(`/projects/${projectId}/github-credential`, body),
+  rotateGitHubCredential: (projectId: number, body: GitHubCredentialChange) =>
+    post<GitHubCredentialInfo>(`/projects/${projectId}/github-credential/rotate`, body),
+  deleteGitHubCredential: (projectId: number, host?: string) =>
+    del<{ deleted: boolean; host: string }>(`/projects/${projectId}/github-credential${credentialHostQuery(host)}`),
 
   // Orgs
   listOrgs: () => get<{ orgs: Org[] | null }>('/orgs').then(r => r.orgs ?? []),
