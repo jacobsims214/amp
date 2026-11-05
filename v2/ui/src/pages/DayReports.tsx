@@ -112,6 +112,9 @@ function Velocity({ person }: { person: Member }) {
         <span className="ml-auto amp-num text-[11px] text-ink-3">{total} total · {weekly} this week · {(total / 30).toFixed(1)}/day</span>
       </div>
       <div className="px-4 pt-4 pb-3">
+      {days.length === 0 ? (
+        <p className="m-0 h-24 flex items-center text-[12.5px] text-ink-3">No completed tickets to chart yet.</p>
+      ) : (<>
       <div className="flex items-end gap-1 h-24">
         {days.map(d => (
           <div key={d.day} className="flex-1 flex flex-col justify-end h-full group relative"
@@ -124,6 +127,7 @@ function Velocity({ person }: { person: Member }) {
       <div className="flex justify-between amp-num text-[10.5px] text-ink-3 mt-1.5">
         <span>{prettyDay(days[0].day)}</span><span>Today</span>
       </div>
+      </>)}
       </div>
     </section>
   )

@@ -90,3 +90,17 @@ describe('DayReports Your day panel', () => {
     expect(screen.getByRole('table')).toBeInTheDocument()
   })
 })
+
+describe('DayReports Velocity panel', () => {
+  it('shows a quiet empty state instead of crashing when velocity has no days or fails', async () => {
+    vi.spyOn(api, 'reportPeople').mockResolvedValue([{ user_id: 6, display_name: 'Ada' } as Member])
+    vi.spyOn(api, 'velocity').mockRejectedValue(new Error('boom'))
+    vi.spyOn(api, 'dayReports').mockResolvedValue([])
+    render(<MemoryRouter><DayReports /></MemoryRouter>)
+    await act(async () => {})
+    await act(async () => { fireEvent.click(screen.getByText('Ada')) })
+    await act(async () => {})
+    expect(screen.getByText('No completed tickets to chart yet.')).toBeInTheDocument()
+    expect(screen.getByText('No saved reports in the last 30 days.')).toBeInTheDocument()
+  })
+})
