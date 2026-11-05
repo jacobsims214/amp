@@ -111,6 +111,13 @@ Each attempt at a ticket is a run, kept even if the ticket is later deleted. Out
 with `amp_report_run(outcome="abandoned", run_note=…)`). `amp_get_task(task_id, include=["runs"])` lists them; the
 ticket panel shows them. Abandoned runs show rework and don't count as missing usage.
 
+Every run has a link, `/r/<run id>`, that opens its ticket with the run highlighted
+(`GET /api/runs/<id>` returns the run with its `task_id`, `project_id`, `ref` and the ticket's
+`url`). A harness that runs inside an AMP remote session can pass `session_id` with the run
+(`amp_complete_task`, `amp_block_task`, `amp_report_run`): the run then links to that session.
+`amp_get_task` and `amp_claim_task` return the ticket's own link as `url` (`/t/<CODE>-<id>`);
+quote it when you send a person to the ticket.
+
 ## Tickets that aren't moving
 
 Three different problems, three different repairs:

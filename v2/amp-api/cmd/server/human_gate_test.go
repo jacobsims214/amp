@@ -17,7 +17,7 @@ func TestHuman_GateCantBeRemovedOffTheUI(t *testing.T) {
 	ra := newRestAs(t, w)
 	alice := w.s.as(w.alice)
 	_, review, deploy := humanChain(t, w)
-	link := fmt.Sprintf("/project/%d/board?task=%d", w.s.projectID, review)
+	link := fmt.Sprintf("/t/%d", review)
 
 	// Dropping the dependency on the open human ticket: refused over MCP
 	// (full list and remove), and from an API token on REST.

@@ -19,7 +19,6 @@ import { Markdown } from '../components/ui/Markdown'
 import { RunsPanel } from '../components/RunsPanel'
 import { displayState } from '../lib/ticketState'
 import type { ActivityLog, Comment, TraceHit } from '../types'
-import { projectLink } from '../lib/projectLink'
 
 /** A pasted value as a trace query: a URL is a PR, 7–40 hex chars a commit, anything else a branch. */
 function asQuery(v: string): { commit?: string; branch?: string; pr?: string } {
@@ -66,16 +65,16 @@ function Story({ hit, q, open, onToggle }: { hit: TraceHit; q: string; open: boo
     return () => { live = false }
   }, [needed, id])
   const events = [
-    ...(history ?? []).map(h => ({ at: h.created_at, who: h.actor, what: h.action.replace('_', ' '), body: h.detail })),
-    ...comments.map(c => ({ at: c.created_at, who: c.author, what: 'comment', body: c.body })),
+    ...(history ?? []).map(h => ({ key: `event-${h.id}`, at: h.created_at, who: h.actor, what: h.action.replace('_', ' '), body: h.detail })),
+    ...comments.map(c => ({ key: `comment-${c.id}`, at: c.created_at, who: c.author, what: 'comment', body: c.body })),
   ].sort((a, b) => a.at.localeCompare(b.at))
   return (
-    <Panel id={`trace-${hit.task.id}`} label={hit.ref} title={hit.task.name} right={<span>{hit.project}</span>} top>
+    <Panel id={`trace-${hit.task.id}`} label={<Link to={`/t/${hit.ref}`} className="hover:underline underline-offset-2" title="This ticket's link">{hit.ref}</Link>} title={hit.task.name} right={<span>{hit.project}</span>} top>
       <div className="px-4 py-3 grid gap-3">
         <div className="flex items-center gap-3 flex-wrap text-[12.5px]">
           <StateTag state={displayState(hit.task)} />
           <span className="amp-num text-ink-2">{hit.runs.length} matching run{hit.runs.length === 1 ? '' : 's'}</span>
-          <Link to={projectLink(hit.task.project_id, 'board', hit.task.id)} className="amp-btn amp-btn-sm">Open ticket</Link>
+          <Link to={`/t/${hit.ref}`} className="amp-btn amp-btn-sm">Open ticket</Link>
           <button type="button" className="amp-btn amp-btn-sm amp-btn-ghost" onClick={onToggle} aria-expanded={open}>{open ? 'Hide' : 'Show'} how it got here</button>
           <CopyLink url={traceLink(q, hit.task.id)} />
         </div>
@@ -87,8 +86,8 @@ function Story({ hit, q, open, onToggle }: { hit: TraceHit; q: string; open: boo
               <span className="amp-label">Timeline</span>
               {!history ? <Loader2 size={14} className="animate-spin text-ink-3 mt-2" /> : (
                 <ol className="m-0 mt-2 p-0 list-none border-l border-line">
-                  {events.map((e, i) => (
-                    <li key={i} className="pl-4 pb-3 relative">
+                  {events.map(e => (
+                    <li key={e.key} id={`trace-${hit.task.id}-${e.key}`} className="pl-4 pb-3 relative">
                       <i className="absolute -left-[4px] top-1.5 w-[7px] h-[7px] bg-ink" aria-hidden="true" />
                       <div className="text-[12px]"><b className="font-semibold">{e.who}</b> <span className="text-ink-2">{e.what}</span> <span className="amp-num text-[11px] text-ink-3">{new Date(e.at).toLocaleString()}</span></div>
                       {e.body && <div className="text-[12.5px] text-ink-2 mt-1 whitespace-pre-wrap break-words">{e.body.length > 1200 ? e.body.slice(0, 1200) + '…' : e.body}</div>}

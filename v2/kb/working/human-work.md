@@ -103,7 +103,8 @@ otherwise. A link to a specific tab always opens that tab.
 
 **Links to one item.** Every project page takes `?focus=<ticket id>`: My work scrolls to the item
 holding that ticket and outlines it; the Board and Flight plan open the ticket. Agents and AMP's
-own messages link this way, so a link always opens the thing it's about.
+own messages link to a ticket with its short link, `/t/<CODE>-<id>` (`/t/BA-34`), which opens it
+on its project's Board wherever it lives, so a link always opens the thing it's about.
 
 The same actions appear in the ticket panel when you open a ticket anywhere (the Board, Flight
 plan): Answer, Mark merged, Return to ready, Start and Mark done. Approval is the exception; the
@@ -206,8 +207,12 @@ recorded by github") and no run is recorded for its owner.
   - Every change is on the ticket's history. Comments there, an agent's question, and a run's
     note are shown as markdown (lists, code, links).
   - The open tab is in the link (`&tab=details` or `&tab=history`), and **Copy link** in the
-    panel's header copies a link to the ticket on that tab. A ticket that isn't started, and an
-    open human ticket, open on Details; other tickets open on History.
+    panel's header copies the ticket's short link, `/t/<CODE>-<id>`, naming the tab when it isn't
+    the one the ticket opens on. A ticket that isn't started, and an open human ticket, open on
+    Details; other tickets open on History.
+  - Each run under **Runs** has its own **Copy link** (`/r/<run id>`): it opens the ticket with
+    that run scrolled into view and highlighted. A run's commit links to the repository when the
+    run has a PR, and a run recorded from a remote session has **Open session**.
 - **New ticket:** choose **Done by: A person**, then the reason and the owner.
 - **Reports → People in the loop:**
   - agents vs people: tickets, how long each **waited to start** (ready → started) and **took

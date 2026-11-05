@@ -176,7 +176,7 @@ func TestHuman_DoneOnlyByThePersonInTheUI(t *testing.T) {
 	}
 	// The person's own agent, over MCP, is refused with the link to the ticket.
 	wantErr(t, bob.callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(review), "note": "merged it"}),
-		"web UI", fmt.Sprintf("/project/%d/board?task=%d", w.s.projectID, review))
+		"web UI", fmt.Sprintf("/t/%d", review))
 	wantErr(t, bob.callExpectError(t, "amp_set_task_state", map[string]any{"task_id": float64(review), "state": "completed"}), "web UI")
 	// So is the person's API token on REST: it isn't the web UI either.
 	if code, _ := ra.doVia(t, auth.ChannelToken, "bob", http.MethodPost, fmt.Sprintf("/api/tasks/%d/complete", review), map[string]any{"note": "x"}); code != 403 {

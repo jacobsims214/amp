@@ -37,6 +37,9 @@ type Run struct {
 	// BaseBranch is the branch the work went into: the PR's target, or the
 	// branch it was merged or pushed into (AMP #2596).
 	BaseBranch string `json:"base_branch,omitempty"`
+	// SessionID is the remote-control session the run happened in, when its
+	// harness knows it: the run links to /sessions/<id> (#131).
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // LandsOn reports whether the run put its work on integration branch ib:
@@ -58,7 +61,7 @@ func (r Run) LandsOn(ib string) bool {
 // callers only record runs that tell us something.
 func (r Run) HasDetail() bool {
 	return r.Model != "" || r.InputTokens != nil || r.OutputTokens != nil || r.CostUSD != nil ||
-		r.Branch != "" || r.BaseBranch != "" || r.Commit != "" || r.PRURL != "" || r.Pushed != nil || r.Merged != nil || r.Note != "" || r.HoursWorked != nil
+		r.Branch != "" || r.BaseBranch != "" || r.Commit != "" || r.PRURL != "" || r.Pushed != nil || r.Merged != nil || r.Note != "" || r.HoursWorked != nil || r.SessionID != ""
 }
 
 // OpensMerge reports whether the run put work somewhere it waits to be

@@ -104,7 +104,7 @@ describe('GitHubHookPanel deliveries', () => {
     })
     renderPanel()
     expect(await screen.findByText('merged PR #42', { exact: false })).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: '#17' })).toHaveAttribute('href', '/project/3/board?focus=17')
+    expect(screen.getByRole('link', { name: '#17' })).toHaveAttribute('href', '/t/17')
     expect(screen.getByText('pong')).toBeInTheDocument()
     expect(screen.getByText(/2 requests were refused/)).toBeInTheDocument()
   })

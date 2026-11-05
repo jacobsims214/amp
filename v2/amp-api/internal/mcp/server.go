@@ -501,7 +501,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.guard(authz.Member, s.listTasks)))
 
 	mcp.AddTool(tool("amp_get_task", "Read a ticket (task) by ID, with its effective_metadata (its project's, epic's, and story's metadata with its own on top). "+
-		"Add include for its comments (plan, progress, questions, answers), history (state changes, dispatches, who did what) and runs (model, tokens, branch, commit, PR).",
+		"Add include for its comments (plan, progress, questions, answers), history (state changes, dispatches, who did what) and runs (model, tokens, branch, commit, PR). "+
+		"url is the ticket's web UI link (/t/<CODE>-<id>): quote it when you send a person to the ticket.",
 		props{
 			"task_id": num("REQUIRED. Task ID."),
 			"include": strArr("Optional. Any of 'comments', 'history', 'runs'."),
@@ -1038,7 +1039,7 @@ func (s *Server) claimTask(rctx context.Context, args map[string]interface{}) (*
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]interface{}{"task": t, "phase": t.Phase, "next": claimNext(t)}
+	out := map[string]interface{}{"task": t, "phase": t.Phase, "next": claimNext(t), "url": s.ticketURL(rctx, t.ProjectID, t.ID)}
 	if t.StartedAt != nil {
 		out["started_at"] = t.StartedAt
 		out["started_by"] = t.StartedBy
@@ -1701,7 +1702,7 @@ func (s *Server) getTask(ctx context.Context, args map[string]interface{}) (*mcp
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]interface{}{"task": reply.Task, "effective_metadata": eff}
+	out := map[string]interface{}{"task": reply.Task, "effective_metadata": eff, "url": s.ticketURL(ctx, task.ProjectID, taskID)}
 	limit := optInt(args, "limit", 30)
 	for _, inc := range optStrSlice(args, "include") {
 		switch inc {
@@ -1732,6 +1733,16 @@ func (s *Server) getTask(ctx context.Context, args map[string]interface{}) (*mcp
 		}
 	}
 	return jsonResult(out)
+}
+
+// ticketURL is the ticket's web UI link for a person (/t/<CODE>-<id>), with
+// the project's code when it loads and /t/<id> when it doesn't.
+func (s *Server) ticketURL(ctx context.Context, projectID, taskID int) string {
+	code := ""
+	if p, err := s.repo.GetProject(ctx, projectID); err == nil && p != nil {
+		code = p.Code
+	}
+	return s.svc.TicketURL(code, taskID)
 }
 
 // lastN keeps the most recent n of a chronological list (all when n <= 0).

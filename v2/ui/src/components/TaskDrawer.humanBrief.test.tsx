@@ -40,6 +40,7 @@ const server = setupServer(
   http.get('*/api/tasks/:id/comments', () => historyHangs ? hold({ comments: [] }) : HttpResponse.json({ comments: [] })),
   http.get('*/api/tasks/:id/runs', () => HttpResponse.json({ runs: [], usage: { runs: 0 } })),
   http.get('*/api/projects/2/artifacts', () => HttpResponse.json({ artifacts: [] })),
+  http.get('*/api/projects/2', () => HttpResponse.json({ project: { id: 2, name: 'Scorecard', code: 'ab' } })),
   http.get('*/api/*', () => HttpResponse.json({})),
 )
 class FakeEventSource { onmessage = null; onerror = null; addEventListener() {} removeEventListener() {} close() {} }
@@ -187,9 +188,61 @@ describe('drawer tab', () => {
     const user = userEvent.setup()
     Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
     open(human())
+    // The canonical /t/<CODE>-<id> link, once the project's code is known.
+    expect(await screen.findByRole('link', { name: 'AB-34' })).toHaveAttribute('href', '/t/AB-34')
     await user.click(screen.getByRole('button', { name: 'Copy link' }))
-    expect(writeText).toHaveBeenCalledWith(`${window.location.origin}/project/2/board?focus=34&tab=details`)
+    // Details is where this ticket opens anyway, so the link doesn't name it.
+    expect(writeText).toHaveBeenCalledWith(`${window.location.origin}/t/AB-34`)
     expect(await screen.findByRole('status')).toHaveTextContent('Copied')
+    // Another tab is named.
+    await user.click(screen.getByRole('button', { name: 'history' }))
+    await user.click(screen.getByRole('button', { name: 'Copy link' }))
+    expect(writeText).toHaveBeenLastCalledWith(`${window.location.origin}/t/AB-34?tab=history`)
+  })
+
+  it('says so when the /t/ link named another project\'s code (?ref=)', async () => {
+    open(task({ state: 'completed' }), '/project/2/board?focus=34&ref=XY-34')
+    expect(await screen.findByRole('note')).toHaveTextContent('The link said XY-34; ticket 34 is AB-34, in another project.')
+  })
+
+  it('ignores a ?ref= that is not a ref for this ticket', async () => {
+    open(task({ state: 'completed' }), '/project/2/board?focus=34&ref=' + encodeURIComponent('Your account is locked-34'))
+    expect(await screen.findByRole('link', { name: 'AB-34' })).toBeInTheDocument()
+    expect(screen.queryByRole('note')).toBeNull()
+    cleanup()
+    open(task({ state: 'completed' }), '/project/2/board?focus=34&ref=XY-35')
+    expect(await screen.findByRole('link', { name: 'AB-34' })).toBeInTheDocument()
+    expect(screen.queryByRole('note')).toBeNull()
+  })
+
+  it('scrolls to ?event= once, not again when the history is reread', async () => {
+    historyRows = [{ id: 501, task_id: 34, project_id: 2, actor: 'jo', action: 'comment', detail: 'hi', created_at: '2026-10-29T08:00:00Z' } as ActivityLog]
+    const scrolled = vi.fn()
+    Element.prototype.scrollIntoView = scrolled
+    const router = open(task({ state: 'completed' }), '/project/2/board?focus=34&event=501')
+    await waitFor(() => expect(document.getElementById('event-501')).toHaveAttribute('aria-current', 'true'))
+    await waitFor(() => expect(scrolled).toHaveBeenCalledTimes(1))
+    await act(async () => { await router.navigate('/project/2/board?focus=34&event=501&x=1') })
+    expect(scrolled).toHaveBeenCalledTimes(1)
+  })
+
+  it('opens Details with the linked run highlighted for ?run=', async () => {
+    server.use(http.get('*/api/tasks/:id/runs', () => HttpResponse.json({
+      runs: [
+        { id: 11, task_id: 34, project_id: 2, outcome: 'abandoned', created_at: '2026-10-29T08:00:00Z' },
+        { id: 12, task_id: 34, project_id: 2, outcome: 'completed', commit: 'abc1234def', pr_url: 'https://github.com/o/r/pull/7', session_id: 'rs_1', created_at: '2026-10-29T09:00:00Z' },
+      ], usage: { runs: 2 },
+    })))
+    const scrolled = vi.fn()
+    Element.prototype.scrollIntoView = scrolled
+    open(task({ state: 'completed' }), '/project/2/board?focus=34&run=12')
+    const row = await waitFor(() => { const el = document.getElementById('run-12'); if (!el) throw new Error('no run row'); return el })
+    expect(row).toHaveAttribute('aria-current', 'true')
+    expect(document.getElementById('run-11')).not.toHaveAttribute('aria-current')
+    await waitFor(() => expect(scrolled).toHaveBeenCalled())
+    expect(within(row).getByRole('link', { name: 'abc1234de' })).toHaveAttribute('href', 'https://github.com/o/r/commit/abc1234def')
+    expect(within(row).getByRole('link', { name: 'Open session' })).toHaveAttribute('href', '/sessions/rs_1')
+    expect(screen.getByRole('button', { name: 'details' })).toHaveAttribute('aria-pressed', 'true')
   })
 
   it('links each ticket it waits on', () => {

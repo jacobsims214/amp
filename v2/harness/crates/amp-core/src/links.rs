@@ -7,8 +7,9 @@
 //! server's: `http://localhost:18000/project/68/plan`, which is not the web UI (`:5173`).
 //!
 //! [`web_links`] rewrites, in a tool result's text:
-//! - a relative page link (`/project/<n>…`, `/artifacts/<n>…`) at the start of a token (after
-//!   whitespace, a quote or an opening bracket) to `<web_base>/project/<n>…`;
+//! - a relative page link (`/project/<n>…`, `/artifacts/<n>…`, a ticket's `/t/<n>` or
+//!   `/t/<CODE>-<n>`, a run's `/r/<n>`) at the start of a token (after whitespace, a quote or an
+//!   opening bracket) to `<web_base>/project/<n>…`;
 //! - the same page on the MCP origin (`http://localhost:18000/project/<n>…`) to the web base, when
 //!   the web UI is somewhere else.
 //!
@@ -21,7 +22,7 @@ use std::borrow::Cow;
 use serde_json::Value;
 
 /// The web UI pages AMP links to.
-const PAGES: &[&str] = &["/project/", "/artifacts/"];
+const PAGES: &[&str] = &["/project/", "/artifacts/", "/t/", "/r/"];
 
 /// `text` with every relative or MCP-origin AMP page link pointed at `web_base`. Borrowed when
 /// nothing changed.
@@ -41,7 +42,7 @@ pub fn web_links<'a>(text: &'a str, web_base: &str, mcp_origin: &str) -> Cow<'a,
     while i < text.len() {
         let Some(page) = PAGES
             .iter()
-            .find(|p| text[i..].starts_with(*p) && starts_with_digit(&text[i + p.len()..]))
+            .find(|p| text[i..].starts_with(*p) && page_id(p, &text[i + p.len()..]))
         else {
             i += text[i..].chars().next().map_or(1, char::len_utf8);
             continue;
@@ -89,6 +90,24 @@ fn starts_with_digit(s: &str) -> bool {
     s.bytes().next().is_some_and(|b| b.is_ascii_digit())
 }
 
+/// What follows a page prefix names a page: a number, or for a ticket (`/t/`) also its ref,
+/// `<CODE>-<n>` (`/t/BA-34`).
+fn page_id(page: &str, rest: &str) -> bool {
+    if starts_with_digit(rest) {
+        return true;
+    }
+    if page != "/t/" {
+        return false;
+    }
+    let code = rest
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        .count();
+    let r = &rest[..code];
+    r.rfind('-')
+        .is_some_and(|dash| dash > 0 && starts_with_digit(&r[dash + 1..]))
+}
+
 /// A link starts a token at `at`: the start of the text, or after whitespace, a quote, an opening
 /// bracket or `=` (`"approve_url":"/project/…"`, `over MCP: /project/…`, `(/project/…)`).
 fn token_start(text: &str, at: usize) -> bool {
@@ -132,6 +151,20 @@ mod tests {
             fix("see (/project/7/board?task=12) and [/artifacts/3]"),
             "see (http://localhost:5173/project/7/board?task=12) and [http://localhost:5173/artifacts/3]"
         );
+    }
+
+    #[test]
+    fn ticket_and_run_links_become_web_ui_links() {
+        assert_eq!(
+            fix("done by a person in the AMP web UI: /t/34. Stop"),
+            "done by a person in the AMP web UI: http://localhost:5173/t/34. Stop"
+        );
+        assert_eq!(
+            fix(r#"{"url":"/t/BA-34","run":"/r/12"}"#),
+            r#"{"url":"http://localhost:5173/t/BA-34","run":"http://localhost:5173/r/12"}"#
+        );
+        // Not a ticket: no ref after /t/.
+        assert_eq!(fix("see /t/tmp and /r/x"), "see /t/tmp and /r/x");
     }
 
     #[test]

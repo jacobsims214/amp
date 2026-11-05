@@ -39,12 +39,38 @@ group of keys that change together, such as the Board filter, write a parse
 and serialize pair (`lib/boardFilter.ts`) and apply it with
 `usePatchSearchParams`.
 
+## Canonical links
+
+Two short links don't name a project or a view, so they can be pasted from
+anywhere (Trace, Day reports, an agent's message, a commit):
+
+- **`/t/<ref>`**, a ticket. `<ref>` is the ticket's human ref, `CODE-<id>`
+  (`/t/BA-34`), or just the id (`/t/34`, `/t/ba-34` works too). Ticket ids are
+  global, so the trailing number decides; the code is only for people reading
+  the link. A code that doesn't match still opens the ticket, and the drawer
+  says so in one line (`?ref=`). It opens the ticket's
+  project Board with the drawer open (replace, so Back skips the hop) and
+  keeps every other param: `/t/BA-34?tab=details`, `/t/BA-34?run=12`. A ticket
+  that doesn't exist or that you can't see says so.
+- **`/r/<run id>`**, a run. It opens the run's ticket with `?run=<id>`
+  (`GET /api/runs/:id` says which ticket).
+
+The server links people to tickets this way (`TaskURL` in amp-api, and the
+`url` field of `amp_get_task` and `amp_claim_task`). Old
+`/project/:id/board?task=<id>` links keep working (`task` is an alias of
+`focus`). The drawer's **Copy link**, the ref in its header, the Trace ref and
+"Open ticket", Day reports refs and GitHub delivery refs all use `/t/`.
+
 ## Params in use
 
 | Param | Where | Values | Default (left out) | History |
 |---|---|---|---|---|
 | `focus` | every project view that shows tickets | ticket id; opens its drawer (My work outlines the item) | none | push to open, replace to close |
 | `ticket`, `task` | old links | aliases of `focus`, rewritten to it on arrival | none | replace |
+| `tab` | ticket drawer | `details`, `history` (`runs` reads as `details`) | the ticket's own: Details for a ticket not started and an open human ticket, History otherwise | replace |
+| `run` | ticket drawer | run id: opens Details, scrolls to that run and highlights it | none | link only |
+| `ref` | ticket drawer | the ref a `/t/` link was typed with, when its code isn't the ticket's project's: shown as a one-line notice | none | link only (set by `/t/`) |
+| `event` | ticket drawer | activity id: opens History, scrolls to that entry and highlights it | none | link only |
 | `approve` | My work | `<epic id>[,<epic id>…]` or `all` | none | push |
 | `user` | project My work | user id, whose My work to show | the viewer | link only |
 | `status` | Board | `ready`, `in_progress`, `done`, `waiting` | all states | push |
@@ -68,7 +94,9 @@ are only compared within a view, never across views.
 ## Copy link
 
 A "Copy link" button copies the absolute URL that reproduces what's on screen,
-built from the same params (Trace: `/trace?q=<q>&open=<task id>`). Copy links
+built from the same params (Trace: `/trace?q=<q>&open=<task id>`; a ticket:
+`/t/<CODE>-<id>`, with `?tab=` only when it isn't the ticket's default; a run:
+`/r/<run id>`). Copy links
 don't yet resolve viewer-relative values: a Board link with the default
 `owner=mine` shows the *recipient's* tickets. Sharing a specific person's view
 means choosing that person (or Everyone) in the owner filter first.
@@ -78,7 +106,4 @@ means choosing that person (or Everyone) in the owner filter first.
 - Board collapsed epics and stories, and Graph expanded stories: arrangement,
   not selection. They stay per-view state for now.
 - Graph search box, zoom and pan, and the "What changed" panel.
-- The ticket drawer's tab, a canonical `/t/<ref>` ticket URL and `/r/<run id>`
-  run links. These are planned separately. When they land, add them to the
-  table above.
 - Modals (plan check, epic and story edit, team access) are not addressable.
