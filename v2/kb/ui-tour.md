@@ -53,7 +53,12 @@ copy the address bar to share exactly what you see.
   in place (`working/human-work.md`). Its badge is the number waiting on you here. Approving opens
   the Approve view (`working/planning-and-approval.md`).
 - **Board** — tickets by state. Filter by person (**Mine** is the tickets you own; **Unowned**
-  finds the rest), epic or text. A done ticket whose PR isn't merged shows **Merge needed**.
+  finds the rest), epic or text. Status filters split the two kinds of wait: **Needs a person**
+  (an agent's question, red, `status=question`) and **Waiting on other tickets** (dependencies or
+  a merge, grey, `status=waiting`); the Waiting column's header counts each. A ticket nobody has
+  approved yet shows **Needs approval** on its card and in its drawer, and the drawer's State
+  uses the same words as its badge (Ready, Waiting, Question …). A done ticket whose PR isn't
+  merged shows **Merge needed**.
   **Hand over …** moves the filtered tickets to someone else with a reason.
 - **Flight plan** — the plan as epics, stories and tickets in order, and the plan check verdict
   (GO / WARN / NO-GO). It's for reading: when tickets await your approval it says so and links
