@@ -144,6 +144,9 @@ func TestDispatchIntegrity_ClaimStartsTheTicket(t *testing.T) {
 	if out["phase"] != domain.PhaseStarted || out["dispatch_id"] != dispatchID {
 		t.Fatalf("claim result = %v, want started under %q", out, dispatchID)
 	}
+	if u, _ := out["url"].(string); !strings.HasPrefix(u, "/t/MCT-") || !strings.HasSuffix(u, fmt.Sprintf("-%d", id)) {
+		t.Fatalf("claim url = %q, want the ticket's /t/<CODE>-<id> link", u)
+	}
 	if next, _ := out["next"].(string); !strings.Contains(next, "Finish this ticket yourself") {
 		t.Fatalf("claim next doesn't send the worker to finish it: %q", next)
 	}

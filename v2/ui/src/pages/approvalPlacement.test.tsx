@@ -28,7 +28,7 @@ vi.mock('../hooks/useBoardData', () => ({
 vi.mock('../hooks/usePlanApproval', () => ({
   usePlanApproval: () => ({ project, approving: false, error: null, notice: null, approve }),
 }))
-vi.mock('../hooks/useSSE', () => ({ useSSE: () => 'connected' }))
+vi.mock('../hooks/useSSE', () => ({ useSSE: () => 'connected', subscribeSSE: () => () => {} }))
 vi.mock('../api/client', () => ({
   // Every call the pages make on load: members and the project resolve; anything else rejects (and is caught).
   api: new Proxy({}, {

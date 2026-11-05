@@ -749,6 +749,16 @@ impl ApprovalNotice {
         };
         let url = meta.and_then(|m| {
             let inst = m.instance.as_ref()?;
+            // An AMP with canonical ticket links (#131) says which ticket; its link finds the
+            // ticket's own project, which may not be the session's.
+            if let (RefusalKind::PersonInUi, Some(t)) = (refusal.kind, refusal.ticket_id)
+                && refusal
+                    .link
+                    .as_deref()
+                    .is_some_and(amp_core::approval::is_ticket_link)
+            {
+                return Some((inst.canonical_ticket_url(t), "/open <id>"));
+            }
             let pid = refusal.project_id.or(m.project_id)?;
             Some(match (refusal.kind, refusal.ticket_id) {
                 (RefusalKind::PlanApproval, _) => (

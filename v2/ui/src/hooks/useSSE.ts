@@ -41,6 +41,8 @@ function open(url: string, shared: Omit<Shared, 'source'>): EventSource {
  * stream opens with the first subscriber and closes with the last.
  */
 export function subscribeSSE(url: string, listener: Listener): () => void {
+  // No EventSource (a test environment without one): nothing to listen to.
+  if (typeof EventSource === 'undefined') return () => {}
   let shared = registry.get(url)
   if (!shared) {
     const listeners = new Set<Listener>()

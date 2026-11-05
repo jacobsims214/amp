@@ -104,3 +104,27 @@ describe('DayReports Velocity panel', () => {
     expect(screen.getByText('No saved reports in the last 30 days.')).toBeInTheDocument()
   })
 })
+
+// Who, which day and which saved report are in the URL (#131), so "Tuesday's
+// report for Ada" can be shared.
+describe('DayReports in the URL', () => {
+  const rep = (day: string) => ({
+    user_id: 6, user_email: 'ada@x', user_name: 'Ada', day, tz: 'UTC', summary: `Summary for ${day}`, saved: true, markdown: '',
+    data: {
+      completed: [], started: [], created: [], in_progress: [], blocked: [], touched: [],
+      stats: { completed: 1, started: 0, created: 0, in_progress: 0, blocked: 0, projects: 0 }, generated_at: '',
+    },
+  })
+
+  it('/reports?user=6&open=2026-11-03 shows Ada with the Nov 3 report expanded', async () => {
+    vi.spyOn(api, 'reportPeople').mockResolvedValue([{ user_id: 5, display_name: 'Me' } as Member, { user_id: 6, display_name: 'Ada' } as Member])
+    vi.spyOn(api, 'velocity').mockImplementation(never)
+    vi.spyOn(api, 'dayReports').mockResolvedValue([rep('2026-11-04'), rep('2026-11-03')])
+    render(<MemoryRouter initialEntries={['/reports?user=6&open=2026-11-03']}><DayReports /></MemoryRouter>)
+    await act(async () => {})
+    expect(screen.getByRole('heading', { name: "Ada's reports" })).toBeInTheDocument()
+    const expanded = screen.getAllByRole('button', { expanded: true })
+    expect(expanded).toHaveLength(1)
+    expect(expanded[0]).toHaveTextContent('Nov 3')
+  })
+})

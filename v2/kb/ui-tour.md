@@ -36,8 +36,12 @@ Opening a project lands on **My work** when something there waits on you, and on
 otherwise. Every project page that shows tickets takes `?focus=<ticket id>` to open on one
 ticket, and switching views keeps it. A focus link to a ticket in another project goes there;
 one to a ticket you can't see says so. Board filters (`status`, `q`, `epic`, `owner`, `done`),
-the Graph's selected node (`sel`, `chain`) and Trace queries (`q`, `open`) are in the URL too, so
-copy the address bar to share exactly what you see.
+the Graph's selected node (`sel`, `chain`), Trace queries (`q`, `open`), the Portfolio range and
+Day reports' person, day and open report (`user`, `day`, `open`) are in the URL too, so copy the
+address bar to share exactly what you see. Every ticket also has a short link that
+works from anywhere, `/t/<CODE>-<id>` (for example `/t/BA-34`, or just `/t/34`): it opens the
+ticket on its project's Board. A run has one too, `/r/<run id>`, which opens its ticket with that
+run highlighted.
 
 - **Mission** — the project at a glance, for everyone. It informs and has no action buttons:
   - a **Waiting on you** strip with your counts by kind and a link to My work (or "Nothing waits

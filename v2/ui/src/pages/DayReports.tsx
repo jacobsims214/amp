@@ -7,10 +7,10 @@ import { api } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { personName } from '../lib/people'
 import type { DayReport, DayReportItem, Member, VelocityDay } from '../types'
-import { projectLink } from '../lib/projectLink'
 import { withTimeout } from '../lib/timeout'
 import { LoadError } from '../components/ui/LoadError'
 import { Markdown } from '../components/ui/Markdown'
+import { dayParam, idParam, textParam, useSearchParamState } from '../hooks/useSearchParamState'
 
 // /reports — end-of-day reports. Your own day is built live from AMP (what
 // you completed, have in progress, are blocked on, started, created, and
@@ -35,8 +35,11 @@ export function DayReports() {
   const { me } = useAuth()
   const meId = me?.user_id
   const [people, setPeople] = useState<Member[]>([])
-  // Whose reports are shown: whoever was picked, else you.
-  const [picked, setWho] = useState<number | null>(null)
+  // Whose reports are shown: ?user= (pushed), else you. ?day= is your day's
+  // date (default today) and ?open= the saved report that's expanded
+  // (default the newest; none when collapsed). See v2/docs/url-state.md.
+  const [picked, setPicked] = useSearchParamState('user', idParam)
+  const setWho = (id: number) => setPicked(id === meId ? null : id, { push: true })
   const who = picked ?? meId ?? null
   const [error, setError] = useState<string | null>(null)
   const [attempt, setAttempt] = useState(0)
@@ -135,7 +138,7 @@ function Velocity({ person }: { person: Member }) {
 
 /* ── Your day: live draft, summary, save ──────────────────────────────────── */
 function MyDay() {
-  const [day, setDay] = useState(localDay())
+  const [day, setDay] = useSearchParamState('day', dayParam(localDay()))
   const [report, setReport] = useState<DayReport | null>(null)
   const [summary, setSummary] = useState('')
   const [loading, setLoading] = useState(true)
@@ -221,14 +224,17 @@ function MyDay() {
 function History({ person, isMe }: { person: Member; isMe: boolean }) {
   const [reports, setReports] = useState<DayReport[] | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [open, setOpen] = useState<string | null>(null)
+  // ?open=<day>, or `none`; without it the newest report is open.
+  const [openParam, setOpenParam] = useSearchParamState('open', textParam)
+  const open = openParam === 'none' ? null : openParam || reports?.[0]?.day || null
+  const setOpen = (d: string | null) => setOpenParam(d == null ? 'none' : d === reports?.[0]?.day ? '' : d)
   const [attempt, setAttempt] = useState(0)
 
   useEffect(() => {
     let live = true
     const to = localDay()
     withTimeout(api.dayReports({ user: String(person.user_id), from: addDays(to, -30), to, tz: TZ }), 'Loading saved reports')
-      .then(r => { if (live) { setReports(r); setOpen(r[0]?.day ?? null) } })
+      .then(r => { if (live) setReports(r) })
       .catch(e => { if (live) setError(e instanceof Error ? e.message : 'Failed to load reports') })
     return () => { live = false }
   }, [person.user_id, attempt])
@@ -316,7 +322,7 @@ function Section({ title, items, tone }: { title: string; items: DayReportItem[]
           <ul className="space-y-1">
             {list.map(it => (
               <li key={it.task_id} className="text-sm text-ink flex items-baseline gap-2">
-                <Link to={projectLink(it.project_id, 'mission', it.task_id)} className="amp-num text-[11.5px] text-ink-2 underline underline-offset-2 hover:text-ink flex-shrink-0">{it.ref}</Link>
+                <Link to={`/t/${it.ref}`} className="amp-num text-[11.5px] text-ink-2 underline underline-offset-2 hover:text-ink flex-shrink-0">{it.ref}</Link>
                 <span className="min-w-0">
                   {it.name}
                   <span className="text-xs text-ink-3"> — {it.epic_name} › {it.story_name}</span>

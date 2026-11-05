@@ -1111,6 +1111,9 @@ func (s *Service) DeleteTask(ctx context.Context, p authz.Principal, t *domain.T
 		return s.Repo.DeleteTask(ctx, t.ID)
 	}, &actor.MsgDeleteTask{TaskID: t.ID})
 	if err == nil {
+		// The live "re-read" signal (a task.updated that isn't a ticket): every
+		// entry point, REST or MCP, sends it, so open views drop the ticket.
+		s.publishDeleted(t.ProjectID, map[string]interface{}{"task_id": t.ID, "deleted": true})
 		s.audit(ctx, p, domain.AuditEntry{Action: "task.delete", ProjectID: intRef(t.ProjectID), TargetType: "task", TargetID: idStr(t.ID),
 			Summary: fmt.Sprintf("deleted ticket #%d %q", t.ID, t.Name), Details: map[string]any{"story_id": t.StoryID, "state": t.State}})
 	}
@@ -1130,6 +1133,7 @@ func (s *Service) DeleteStory(ctx context.Context, p authz.Principal, st *domain
 		return s.Repo.DeleteStory(ctx, st.ID)
 	}, &actor.MsgDeleteStory{StoryID: st.ID})
 	if err == nil {
+		s.publishDeleted(st.ProjectID, map[string]interface{}{"story_id": st.ID, "task_ids": ids, "deleted": true})
 		s.audit(ctx, p, domain.AuditEntry{Action: "story.delete", ProjectID: intRef(st.ProjectID), TargetType: "story", TargetID: idStr(st.ID),
 			Summary: fmt.Sprintf("deleted story %q and its %d tickets", st.Name, len(ids)), Details: map[string]any{"task_ids": ids}})
 	}
@@ -1150,10 +1154,19 @@ func (s *Service) DeleteEpic(ctx context.Context, p authz.Principal, e *domain.E
 		return s.Repo.DeleteEpic(ctx, e.ID)
 	}, &actor.MsgDeleteEpic{EpicID: e.ID})
 	if err == nil {
+		s.publishDeleted(e.ProjectID, map[string]interface{}{"epic_id": e.ID, "task_ids": ids, "deleted": true})
 		s.audit(ctx, p, domain.AuditEntry{Action: "epic.delete", ProjectID: intRef(e.ProjectID), TargetType: "epic", TargetID: idStr(e.ID),
 			Summary: fmt.Sprintf("deleted epic %q with its stories and %d tickets", e.Name, len(ids)), Details: map[string]any{"task_ids": ids}})
 	}
 	return err
+}
+
+// publishDeleted tells open views something was deleted: a task.updated
+// whose payload isn't a ticket. The UI's board store removes a deleted
+// ticket ({task_id, deleted}) and re-reads the project for a deleted story
+// or epic (lib/boardStore.ts applySignal).
+func (s *Service) publishDeleted(projectID int, payload map[string]interface{}) {
+	s.Registry.Publish(domain.Event{Type: domain.EventTaskUpdated, ProjectID: projectID, Payload: payload, At: time.Now()})
 }
 
 // guardDeletedHumanGates refuses, off the web UI, deleting an open human

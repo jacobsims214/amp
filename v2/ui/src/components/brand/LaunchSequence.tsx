@@ -10,44 +10,43 @@
  * - It plays at most once per browser session, and only when the app is
  *   opened at "/" (see shouldLaunch in lib/launch.ts). Refreshes, deep links
  *   and moving between pages never replay it.
- * - Full (5 s): arriving from the sign-in redirect, or the first visit in
- *   12 hours. Otherwise the short version (2 s).
+ * - Full (5 s): only right after the sign-in redirect. Otherwise the short
+ *   version: at least 600 ms, ending as soon as /api/me answers (2 s at
+ *   most). Timings: LAUNCH_MS in lib/launch.ts, decided in KB
+ *   design/loading.md (tier 0).
  * - Any click or key skips it. With reduced motion, the logo just fades in.
  * - `?launch=full` or `?launch=short` forces a version (for demos).
  */
 import { useEffect, useRef, useState } from 'react'
 import { useAuth } from '../../hooks/useAuth'
-import { forcedLaunch, markLaunched, stations, summary, type Station, type Tone } from '../../lib/launch'
+import { LAUNCH_MS, launchMode, markLaunched, stations, summary, type LaunchMode, type Station, type Tone } from '../../lib/launch'
 
 const BANDS = ['#D9482B', '#EB8A2E', '#EBC34B', '#2C66B8']
 const INK = '#E8ECF2', INK2 = '#9AA4B2', INK3 = '#5E6876', CRT = '#060A0C'
 const TONE: Record<Tone, string> = { go: BANDS[3], nogo: BANDS[0], info: INK, pending: INK3 }
 
-const DUR = { full: 5000, short: 2000, reduced: 700 } as const
+const DUR: Record<LaunchMode, number> = { full: LAUNCH_MS.full, short: LAUNCH_MS.short, reduced: LAUNCH_MS.reduced }
 // Full version: each line is typed, then answers a beat later (once its check is in).
 const stationAt = (i: number) => 1800 + i * 800
 const goAt = (i: number) => stationAt(i) + 600
 const bandAt = (i: number) => goAt(0) + i * 350 // the four bands light in turn
 const ALL_GO = goAt(1) + 500 // the summary line
 const WORDMARK = ALL_GO + 200 // wordmark letters, over 600 ms
-// Short version
-const SHORT_GO = (i: number) => 200 + i * 250
-const SHORT_ALL = SHORT_GO(3) + 200
-const HOLD = goAt(0) // the API line waits for /api/me
-const HOLD_CAP = 4000
-const LAST_KEY = 'amp.launch.last'
-const FULL_EVERY = 12 * 3600 * 1000
+// Short version: the bands light and the summary lands inside the 600 ms floor.
+const SHORT_GO = (i: number) => 60 + i * 80
+const SHORT_ALL = SHORT_GO(3) + 80
+// Where each version waits for /api/me (its API line), and for how long at most.
+const HOLD: Record<LaunchMode, number> = { full: goAt(0), short: SHORT_GO(0), reduced: Infinity }
+const HOLD_CAP: Record<LaunchMode, number> = { full: LAUNCH_MS.fullHoldCap, short: LAUNCH_MS.shortMax - LAUNCH_MS.short, reduced: 0 }
 
-type Mode = keyof typeof DUR
+type Mode = LaunchMode
 
 function pickMode(): Mode {
-  if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return 'reduced'
-  const forced = forcedLaunch(window.location.search)
-  if (forced) return forced
-  let last = 0
-  try { last = Number(localStorage.getItem(LAST_KEY)) || 0 } catch { /* storage blocked: treat as first visit */ }
-  const fromSignIn = /\/(oauth2|dex|auth|login|sso|saml|oidc)\b/i.test(document.referrer)
-  return fromSignIn || Date.now() - last > FULL_EVERY ? 'full' : 'short'
+  return launchMode({
+    reducedMotion: !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches,
+    search: window.location.search,
+    referrer: document.referrer,
+  })
 }
 
 const clamp = (x: number, a = 0, b = 1) => Math.min(b, Math.max(a, x))
@@ -139,7 +138,7 @@ function draw(ctx: CanvasRenderingContext2D, w: number, h: number, t: number, mo
     ctx.fillStyle = rgba(INK, 0.8)
     ctx.fillRect(left, y + lh * 1.05, px * 0.55, px * 0.12)
   }
-  logo(ctx, logoX, logoY, s, bands, full ? seg(t, WORDMARK, WORDMARK + 600) * 3 : 3, full ? 1 : eOut(seg(t, SHORT_ALL, SHORT_ALL + 500)))
+  logo(ctx, logoX, logoY, s, bands, full ? seg(t, WORDMARK, WORDMARK + 600) * 3 : 3, full ? 1 : eOut(seg(t, SHORT_ALL, SHORT_ALL + 150)))
 
   // CRT scanlines and vignette
   ctx.fillStyle = 'rgba(0,0,0,0.22)'
@@ -183,8 +182,6 @@ export function LaunchSequence() {
     const canvas = canvasRef.current
     const ctx = canvas?.getContext('2d')
     if (!canvas || !ctx) return
-    if (mode === 'full') try { localStorage.setItem(LAST_KEY, String(Date.now())) } catch { /* fine: next load plays full again */ }
-
     let w = 0, h = 0
     const size = () => {
       const dpr = Math.min(2, window.devicePixelRatio || 1)
@@ -205,7 +202,7 @@ export function LaunchSequence() {
       const dt = now - prev
       prev = now
       if (skip.current) t = dur
-      else if (mode === 'full' && t >= HOLD && !ready.current && held < HOLD_CAP) held += dt
+      else if (t >= HOLD[mode] && !ready.current && held < HOLD_CAP[mode]) held += dt
       else t = Math.min(dur, t + dt)
       draw(ctx, w, h, t, mode, now, lines.current)
       if (t >= dur) {

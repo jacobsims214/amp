@@ -15,9 +15,11 @@ import { PageHeader, Panel, Readouts } from '../components/ui/PageHeader'
 import { tokens, usd } from '../lib/usage'
 import type { Portfolio as PortfolioData, PortfolioRow, Usage } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
+import { enumParam, useSearchParamState } from '../hooks/useSearchParamState'
 
 const RANGES = { '7d': 7, '30d': 30, '90d': 90, '365d': 365 } as const
 type Range = keyof typeof RANGES
+const RANGE_PARAM = enumParam<Range>(Object.keys(RANGES) as Range[], '30d', true)
 
 const tk = (u?: Usage) => (u ? u.input_tokens + u.output_tokens : 0)
 const SPLIT_KEY = 'amp.portfolio.split'
@@ -47,7 +49,8 @@ export function Portfolio() {
   const org = pick(Number(params.get('org')) || null) ?? pick(Number(load(ORG_KEY)) || null) ?? orgs[0]?.id ?? null
   const orgName = orgs.find(o => o.id === org)?.name
   const switchOrg = (id: number) => { save(ORG_KEY, String(id)); setParams(p => { p.set('org', String(id)); return p }, { replace: true }) }
-  const [range, setRange] = useState<Range>('30d')
+  // ?range= (v2/docs/url-state.md); split and columns stay per-browser preferences.
+  const [range, setRange] = useSearchParamState('range', RANGE_PARAM)
   const [splitBy, setSplitBy] = useState<string>(() => load(SPLIT_KEY) ?? 'capitalizable')
   const [hidden, setHidden] = useState<Set<string>>(() => new Set((load(COLS_KEY) ?? '').split(',').filter(Boolean)))
   const [now] = useState(Date.now)

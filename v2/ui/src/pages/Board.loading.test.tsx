@@ -27,7 +27,7 @@ let epicsCall: ReturnType<typeof deferred<Epic[]>>
 const listTasks = vi.fn(() => Promise.resolve([task(11)]))
 const createTask = vi.fn(() => Promise.resolve(task(12)))
 
-vi.mock('../hooks/useSSE', () => ({ useSSE: () => 'connected' }))
+vi.mock('../hooks/useSSE', () => ({ useSSE: () => 'connected', subscribeSSE: () => () => {} }))
 vi.mock('../hooks/usePlanApproval', () => ({
   usePlanApproval: () => ({ project: null, approving: false, error: null, notice: null, approve: vi.fn() }),
 }))

@@ -9,6 +9,8 @@ import { remoteAvailable, useRemote } from '../../remote/remote-context'
 import type { Project } from '../../types'
 import { refreshWaitCounts, useWaitCounts } from '../../lib/waitCounts'
 import { Avatar } from '../ui/Avatar'
+import { Skeleton } from '../ui/Skeleton'
+import { primeProjects, useProject } from '../../lib/projectCache'
 import { viewLink, type ProjectView } from '../../lib/projectLink'
 
 // The frame around every page: one sidebar to get anywhere, the page beside
@@ -57,6 +59,7 @@ export function AppShell() {
   const projectMatch = useMatch('/project/:projectId/*')
   const currentId = projectMatch?.params.projectId
   const [projects, setProjects] = useState<Project[]>([])
+  const [projectsLoaded, setProjectsLoaded] = useState(false)
   const remote = useRemote()
   // Below md the sidebar is a drawer behind a menu button, so pages fit a phone.
   const [navOpen, setNavOpen] = useState(false)
@@ -64,7 +67,10 @@ export function AppShell() {
   // Refresh the list when moving around (a project may have been created,
   // renamed, or archived on the page just left).
   useEffect(() => {
-    api.listProjects().then(setProjects).catch(() => setProjects([]))
+    api.listProjects()
+      .then(list => { setProjects(list); primeProjects(list) })
+      .catch(() => setProjects([]))
+      .finally(() => setProjectsLoaded(true))
     refreshWaitCounts()
   }, [location.pathname])
   const wait = useWaitCounts()
@@ -76,7 +82,12 @@ export function AppShell() {
   // The role people know themselves by: org owner or admin, else member.
   const orgRole = (me?.orgs ?? []).find(o => o.my_role === 'owner') ?? (me?.orgs ?? []).find(o => o.my_role === 'admin')
   const orgRoleLabel = orgRole ? `${orgRole.my_role}, ${orgRole.name}` : 'member'
-  const current = projects.find(p => String(p.id) === currentId)
+  // The current project's group is drawn from the route at once: its name
+  // and code from the list or the shared project store, and a skeleton bar
+  // until either answers, so the sidebar doesn't shift when they do.
+  const cachedCurrent = useProject(currentId ? Number(currentId) : null)
+  const current = projects.find(p => String(p.id) === currentId) ?? cachedCurrent ?? undefined
+  const showProject = currentId != null && (current != null || !projectsLoaded)
   const others = projects.filter(p => String(p.id) !== currentId).slice(0, 8)
 
   return (
@@ -105,12 +116,17 @@ export function AppShell() {
           {(me?.orgs?.length ?? 0) > 0 && <NavLink to="/portfolio" className={navCls}><PieChart size={14} />Portfolio</NavLink>}
           {me?.user_id != null && <NavLink to="/access" className={navCls}><KeyRound size={14} />Agents & tokens</NavLink>}
 
-          {current && (
+          {showProject && (
             <>
               <Group>Project</Group>
-              <div className="flex items-center gap-2 px-2.5 pb-1.5">
-                <span className="text-[13.5px] font-semibold text-ink truncate" title={current.name}>{current.name}</span>
-                {current.code.length <= 8 && <span className="amp-num text-[10.5px] text-ink-3 border border-line px-1 py-px ml-auto shrink-0">{current.code}</span>}
+              <div className="flex items-center gap-2 px-2.5 pb-1.5 min-h-[22px]">
+                {current ? <>
+                  <span className="text-[13.5px] font-semibold text-ink truncate" title={current.name}>{current.name}</span>
+                  {current.code.length <= 8 && <span className="amp-num text-[10.5px] text-ink-3 border border-line px-1 py-px ml-auto shrink-0">{current.code}</span>}
+                </> : <>
+                  <Skeleton w={110} h={12} />
+                  <Skeleton w={30} h={14} className="ml-auto" />
+                </>}
               </div>
               {PROJECT_VIEWS.map(v => (
                 <NavLink key={v.label} to={viewLink(currentId!, v.view, location.search)} className={p => `${navCls(p)} pl-5`} aria-label={v.badge ? badged(v.label, waitIn(currentId!)) : undefined}>

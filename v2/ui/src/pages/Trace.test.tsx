@@ -103,9 +103,10 @@ describe('Trace in the URL', () => {
     expect(await screen.findByText('Copied')).toBeInTheDocument()
   })
 
-  it('"Open ticket" goes to the Board drawer for that ticket', async () => {
+  it('"Open ticket" and the ref go to the ticket\'s canonical link', async () => {
     renderAt('/trace?q=abc1234')
     await screen.findByText('Ticket 21')
-    expect(screen.getAllByRole('link', { name: 'Open ticket' })[0]).toHaveAttribute('href', '/project/3/board?focus=21')
+    expect(screen.getAllByRole('link', { name: 'Open ticket' })[0]).toHaveAttribute('href', '/t/P-21')
+    expect(screen.getByRole('link', { name: 'P-21' })).toHaveAttribute('href', '/t/P-21')
   })
 })

@@ -15,6 +15,10 @@ Any change an AMP worker made can be traced back to why it exists.
 You get every ticket whose runs produced it, in projects you can see, each with its epic and
 story, comments, runs (agent, model, tokens, cost, branch, commit, PR, merged) and state changes.
 
+Every hit links to its ticket (`/t/<CODE>-<id>`), and every run has its own link, `/r/<run id>`,
+which opens the ticket with that run highlighted. In the ticket's Runs, a commit links to the
+repository its PR is in, and a run recorded from an AMP remote session has **Open session**.
+
 ## Following the thread
 
 From the ticket, the story continues:
