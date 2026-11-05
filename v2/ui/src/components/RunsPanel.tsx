@@ -48,7 +48,7 @@ export function RunsPanel({ taskId, refreshKey }: { taskId: number; refreshKey?:
               <span className="col-span-2 amp-num text-[11px] text-ink-2 flex flex-wrap gap-x-3 gap-y-0.5">
                 {(r.input_tokens != null || r.output_tokens != null) && <span>{tokens(r.input_tokens)} in · {tokens(r.output_tokens)} out{r.cache_read_tokens ? ` · ${tokens(r.cache_read_tokens)} cached` : ''}</span>}
                 {r.cost_usd != null && <span>{usd(r.cost_usd)}</span>}
-                {(r.branch || r.commit) && <span>{r.branch || '?'}{r.commit ? ` @ ${r.commit.slice(0, 9)}` : ''}{r.pushed === false ? ' · not pushed' : r.pushed ? ' · pushed' : ''}</span>}
+                {(r.branch || r.commit) && <span>{r.branch || '?'}{r.commit ? ` @ ${r.commit.slice(0, 9)}` : ''}{r.base_branch ? ` → ${r.base_branch}` : ''}{r.pushed === false ? ' · not pushed' : r.pushed ? ' · pushed' : ''}</span>}
                 {r.merged && <span className="text-success-ink">merged</span>}
                 {r.pr_url && <a href={r.pr_url} target="_blank" rel="noreferrer" className="underline underline-offset-2 hover:text-ink">PR</a>}
               </span>

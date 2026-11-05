@@ -1078,6 +1078,8 @@ export interface Run {
   cost_usd?: number
   branch?: string
   commit?: string
+  /** the branch the work is meant to merge into */
+  base_branch?: string
   pr_url?: string
   pushed?: boolean
   merged?: boolean
