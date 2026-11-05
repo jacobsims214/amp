@@ -393,6 +393,12 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
           <MergeGateNote task={task} />
         </div>
 
+        {/* Everything below the header scrolls as one: a human ticket's panel
+            (the decision card with its actions) can be taller than the
+            viewport, and nested scroll areas would leave its actions out of
+            reach. The tabs stay pinned while their body scrolls under them. */}
+        <div className="flex-1 min-h-0 overflow-y-auto" data-testid="drawer-body">
+
         {/* Dispatched to an agent that hasn't started it (AMP #2801) */}
         {isNotStarted(task) && (
           <div className="px-6 py-4 border-b border-line" data-testid="not-started-note"
@@ -454,7 +460,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
         />
 
         {/* Tabs */}
-        <div className="flex border-b border-line">
+        <div className="flex border-b border-line sticky top-0 z-10 bg-surface" data-testid="drawer-tabs">
           {(['history', 'details'] as const).map(t => (
             <button
               key={t}
@@ -472,7 +478,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto p-6">
+        <div className="p-6" data-testid="drawer-tab-body">
           {editing && canPlan ? (
             <div className="space-y-4">
               <div>
@@ -547,6 +553,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
           ) : (
             <HistorySkeleton />
           )}
+        </div>
         </div>
       </div>
 

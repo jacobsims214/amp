@@ -80,6 +80,21 @@ describe('human ticket brief', () => {
     expect(screen.queryByText('Description')).toBeNull()
   })
 
+  it('scrolls everything below the header as one, so a tall human panel keeps its actions in reach', () => {
+    open(human({ description: 'd', acceptance_criteria: 'a' }))
+    const body = screen.getByTestId('drawer-body')
+    // One scroll container that may shrink below its content (a flex child needs min-h-0).
+    expect(body).toHaveClass('flex-1', 'min-h-0', 'overflow-y-auto')
+    expect(body).toContainElement(panel())
+    expect(body).toContainElement(screen.getByTestId('drawer-tabs'))
+    expect(body).toContainElement(screen.getByTestId('drawer-tab-body'))
+    // No nested scroller under it: the tab body grows, and the tabs stay pinned.
+    expect(screen.getByTestId('drawer-tab-body')).not.toHaveClass('overflow-y-auto')
+    expect(screen.getByTestId('drawer-tabs')).toHaveClass('sticky', 'top-0')
+    // The header stays out of it.
+    expect(body).not.toContainElement(screen.getByRole('button', { name: /close/i }))
+  })
+
   it('shows acceptance criteria as checklist rows', () => {
     open(human({ description: 'd', acceptance_criteria: '- Targets confirmed\n- [x] Doc linked' }))
     const rows = within(panel()).getAllByTestId('checklist-item')

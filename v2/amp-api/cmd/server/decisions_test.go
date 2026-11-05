@@ -900,3 +900,32 @@ func TestDecisions_AskNeedsRecommended(t *testing.T) {
 		map[string]any{"ref": "j", "story_id": float64(w.s.storyID), "name": "Decide", "performer": "human", "human_reason": "judgment",
 			"owner": w.bob.Email, "description": "d", "acceptance_criteria": "a", "ask": ask}}}), `"j"`, "ask needs recommended")
 }
+
+// With auth off (#124) the decider has no user row: the dependents' strip
+// names them as the decision comment does, not "someone".
+func TestDecisions_LocalDevDeciderIsNamedAsInTheComment(t *testing.T) {
+	w := newRBACWorld(t)
+	alice := w.s.as(w.alice)
+	j, dep, _ := judgmentWithDoc(t, w)
+	svc := service.New(w.s.repo, w.s.reg, w.s.kb)
+	local := authz.Principal{Email: "local-dev@amp.local", Super: true, Channel: auth.ChannelUI}
+	ctx := context.Background()
+	one := 1
+	if _, err := svc.RecordDecision(ctx, local, j, service.RecordDecisionRequest{Version: 1, ChosenOption: &one, DecisionText: "Go with B"}); err != nil {
+		t.Fatal(err)
+	}
+	if c := commentBodies(t, alice, j); !strings.Contains(c, "Decision by local-dev@amp.local: ") {
+		t.Fatalf("comments = %s", c)
+	}
+	ups, err := svc.UpstreamDecisions(ctx, local, dep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ups) != 1 || ups[0].By != nil || ups[0].ByName != "local-dev@amp.local" {
+		t.Fatalf("upstream = %+v", ups)
+	}
+	// A signed-in reader of a userless decider still gets no invented name.
+	if ups := upstreamOf(t, alice.call(t, "amp_get_task", map[string]any{"task_id": float64(dep)})); len(ups) != 1 || ups[0]["decided_by_name"] != "" {
+		t.Fatalf("signed-in upstream = %v", ups)
+	}
+}

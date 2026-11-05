@@ -52,14 +52,21 @@ func (s *Service) UpstreamDecisions(ctx context.Context, p authz.Principal, task
 	if err != nil {
 		return nil, err
 	}
-	return s.upstreamDecisionsFor(ctx, t)
+	return s.upstreamDecisionsFor(ctx, p, t)
 }
 
-func (s *Service) upstreamDecisionsFor(ctx context.Context, t *domain.Task) ([]domain.UpstreamDecision, error) {
+// upstreamDecisionsFor names each decider as the decision comment does
+// (userNameOr): display name, else email. A decider with no user row is
+// the local-dev person (auth off, #124): every caller is then local-dev
+// too, so the reader's label is the one the comment used.
+func (s *Service) upstreamDecisionsFor(ctx context.Context, p authz.Principal, t *domain.Task) ([]domain.UpstreamDecision, error) {
 	out := []domain.UpstreamDecision{}
 	names := map[int]string{}
 	nameOf := func(id *int) string {
 		if id == nil {
+			if p.UserID == 0 {
+				return p.Label()
+			}
 			return ""
 		}
 		name, ok := names[*id]
