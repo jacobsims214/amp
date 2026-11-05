@@ -45,3 +45,48 @@ describe('DayReports loading', () => {
     expect(screen.getByText('No saved reports in the last 30 days.')).toBeInTheDocument()
   })
 })
+
+describe('DayReports Your day panel', () => {
+  const draft = (markdown: string, summary = '') => ({
+    user_id: 5, user_email: '', user_name: 'Me', day: '2026-11-03', tz: 'UTC', summary, saved: false, markdown,
+    data: {
+      completed: [], started: [], created: [], in_progress: [], blocked: [], touched: [],
+      stats: { completed: 0, started: 0, created: 0, in_progress: 0, blocked: 0, projects: 0 },
+      generated_at: '2026-11-05T09:30:00Z',
+    },
+  })
+  const open = async (report: ReturnType<typeof draft>, day?: string) => {
+    vi.spyOn(api, 'reportPeople').mockResolvedValue([{ user_id: 5, display_name: 'Me' } as Member])
+    vi.spyOn(api, 'velocity').mockImplementation(never)
+    vi.spyOn(api, 'dayReports').mockResolvedValue([])
+    vi.spyOn(api, 'dayReportDraft').mockResolvedValue(report)
+    render(<MemoryRouter><DayReports /></MemoryRouter>)
+    await act(async () => {})
+    await act(async () => { fireEvent.click(screen.getByText('Me')) })
+    if (day) await act(async () => { fireEvent.change(document.querySelector('input[type=date]')!, { target: { value: day } }) })
+  }
+
+  it('says which sections come from the picked day when it is not today', async () => {
+    await open(draft(''), '2020-01-02')
+    const note = screen.getByTestId('past-day-note')
+    expect(note).toHaveTextContent('Completed, Started, Created and Touched')
+    expect(note).toHaveTextContent('In progress and Blocked show')
+    expect(note).toHaveTextContent('when this report was generated')
+  })
+
+  it('leaves the copy unchanged for today', async () => {
+    await open(draft(''))
+    expect(screen.queryByTestId('past-day-note')).toBeNull()
+    expect(screen.getByText(/Built from today's AMP activity/)).toBeInTheDocument()
+  })
+
+  it('renders a saved summary GFM table as a table', async () => {
+    vi.spyOn(api, 'reportPeople').mockResolvedValue([{ user_id: 6, display_name: 'Ada' } as Member])
+    vi.spyOn(api, 'velocity').mockImplementation(never)
+    vi.spyOn(api, 'dayReports').mockResolvedValue([{ ...draft(''), saved: true, summary: '| a | b |\n|---|---|\n| 1 | 2 |' }])
+    render(<MemoryRouter><DayReports /></MemoryRouter>)
+    await act(async () => {})
+    await act(async () => { fireEvent.click(screen.getByText('Ada')) })
+    expect(screen.getByRole('table')).toBeInTheDocument()
+  })
+})
