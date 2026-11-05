@@ -1,4 +1,4 @@
-// Mission is informational (KB decisions/human-work-ux.md §3, artifact #23):
+// Mission is informational (v2/kb/working/human-work.md, artifact #23):
 // a Waiting-on-you strip into My work, Merge needed and "for you" readouts,
 // outlined squares, and Waiting on people. It has no action buttons.
 import { render, screen, waitFor, within } from '@testing-library/react'

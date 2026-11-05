@@ -1,5 +1,5 @@
 /**
- * My work (`/`): a summary across your projects (KB decisions/human-work-ux.md §3).
+ * My work (`/`): a summary across your projects (v2/kb/working/human-work.md).
  * It only informs. Nothing on it is a button: every row is a link into that
  * project's My work tab with the item focused (`?focus=<ticket id>`), where
  * the action lives. The counts come from the server's one "waiting on you"

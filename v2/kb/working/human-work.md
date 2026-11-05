@@ -90,6 +90,9 @@ project, and every action happens in place:
 - **Start**: the ticket, the agent it went to and how long ago, and **Return to ready** to clear
   the dispatch and dispatch it again. Leaving it alone returns it by itself.
 - **Do**: **Start**, then **Mark done…**, which takes a note, a link and the hours you spent.
+  Each card says **blocks N · waiting Xd** (or **Nothing waits on it · waiting Xd**), where N is
+  every open ticket downstream of it, and the Do cards are sorted by that count, most first.
+  Answer and Merge items count the same way.
 
 Next to the list: **Coming up** (with what each ticket waits on), **Your agents here** (counts,
 linking to the Board), and **Done today**. When nothing waits on you, the tab says you're clear.
@@ -128,11 +131,20 @@ on them.
 - **Its owner does it in AMP**, in their My work tab (or the ticket panel):
   1. Click **Start**.
   2. When you're done, click **Mark done…**. You can add a note, a link and the hours you
-     actually spent.
+     actually spent. On a **Judgment** or **Approval** ticket the note is **Your decision** and
+     it's required ("Write what you decided"): the ticket is a decision others wait on.
 
   Only you can mark it done, and only in the web UI. Your manager agent can't record it for
   you (`amp_complete_task` on a human ticket is refused over MCP); if you tell it you've done
   it, it gives you the link.
+- **Your note reaches whoever waits on it.** Marking a ticket done posts the note as a comment on
+  it, "Decision by <name>: …" for a judgment or approval, "Done by <name>: …" for the other
+  reasons (nothing when the note is empty). Every ticket that depends on it then gets the note
+  with no extra call:
+  - the ticket panel shows **Decided upstream** ("Decided by Jacob on #34: …", linking to #34);
+  - an agent's `amp_get_task` and `amp_claim_task` carry it as `upstream_decisions`, and the claim
+    tells the worker to follow it. Only direct dependencies that are done and have a note are
+    included.
 - **It's never flagged as quiet.** People work in days, not the minutes an agent takes. It shows as
   **stale** after two days with no activity.
 

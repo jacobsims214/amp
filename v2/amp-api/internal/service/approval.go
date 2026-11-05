@@ -31,7 +31,7 @@ func (s *Service) link(path string) string {
 
 // PlanURL is where a person approves the plan: the project's My work tab
 // with the Approve view open on everything awaiting them (KB
-// decisions/human-work-ux.md: approval happens only in My work). Callers keep
+// v2/kb/working/human-work.md: approval happens only in My work). Callers keep
 // returning it as approve_url / plan_url; the old /project/:id/plan link still
 // works, because Flight plan links on to My work.
 func (s *Service) PlanURL(projectID int) string {

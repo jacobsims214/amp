@@ -17,7 +17,7 @@ import (
 	"github.com/simstech/amp-api/internal/service"
 )
 
-// Merge-needed signal (AMP #2475, KB decisions/human-work-ux.md §4).
+// Merge-needed signal (AMP #2475, v2/kb/working/human-work.md).
 
 // mergeChain makes build -> deploy as alice and returns their ids.
 func mergeChain(t *testing.T, w *rbacWorld, name string) (build, deploy int) {

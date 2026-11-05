@@ -10,7 +10,7 @@ import (
 	"github.com/simstech/amp-api/internal/domain"
 )
 
-// Waiting on people (AMP #2496, KB decisions/human-work-ux.md §1 and §3):
+// Waiting on people (AMP #2496, v2/kb/working/human-work.md):
 // what the project waits on each person for, from the one definition
 // (WaitingOn) run for everyone with work in it. Mission's "Waiting on
 // people" panel (GET /api/projects/{id}/waiting-on-people) and MCP's

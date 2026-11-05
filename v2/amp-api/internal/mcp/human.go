@@ -17,7 +17,7 @@ import (
 const HumanStaleAfter = 48 * time.Hour
 
 // PersonWait is one item in amp_list_tasks' waiting_on_people ("Waiting on
-// you", KB decisions/human-work-ux.md §1 and §5): something a person has to
+// you", v2/kb/working/human-work.md): something a person has to
 // do next, of one of five kinds (approve, answer, merge, start, do), or, in
 // coming_up, a human ticket of theirs that isn't actionable yet.
 //

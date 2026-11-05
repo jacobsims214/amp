@@ -8,7 +8,7 @@ const task = (owner_user_id: number | null, created_by: number | null = null): T
 })
 
 describe('board owner filter', () => {
-  it('Mine is tickets I own, nothing else (decisions/human-work-ux.md §1)', () => {
+  it('Mine is tickets I own, nothing else (v2/kb/working/human-work.md)', () => {
     expect(taskMatchesOwner(task(7), 'mine', 7)).toBe(true)
     expect(taskMatchesOwner(task(9, 7), 'mine', 7)).toBe(false)
     // unowned tickets I created, or with no creator, are no longer "mine"

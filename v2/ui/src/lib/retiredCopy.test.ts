@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-// KB decisions/human-work-ux.md §5: copy that was retired when human work moved
+// v2/kb/working/human-work.md: copy that was retired when human work moved
 // to the project's My work tab. None of it may come back in the UI source.
 // Tests are skipped because they assert these strings are absent.
 const RETIRED: RegExp[] = [

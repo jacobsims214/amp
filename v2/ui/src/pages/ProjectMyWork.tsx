@@ -1,5 +1,5 @@
 /**
- * The project's My work tab, `/project/:id/my-work` (KB decisions/human-work-ux.md
+ * The project's My work tab, `/project/:id/my-work` (v2/kb/working/human-work.md
  * §2, mockup artifact #23 "Project › My work"; the Approve card and view are
  * artifact #24 v2). The one place a person acts on this project: approve a
  * plan, answer a question, record a merge, start or finish their own ticket.
@@ -362,6 +362,8 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
     meta.push(it.merge_state === 'abandoned' ? `PR closed ${ago(it.since)}` : `Done ${ago(it.completed_at ?? it.since)}${t?.agent_id ? ` by ${t.agent_id}` : ''}`)
   }
   if (kind === 'do') {
+    const n = it.holding_up?.length ?? 0
+    meta.push(n ? `blocks ${n}` : 'Nothing waits on it', `waiting ${short(it.since)}`)
     meta.push(`${it.state === 'in_progress' ? 'Started' : 'Ready'} ${ago(it.since)}`)
     meta.push(reasonLabel(it.human_reason ?? t?.human_reason))
   }

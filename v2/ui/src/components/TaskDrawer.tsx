@@ -9,6 +9,7 @@ import { useSearchParam } from '../hooks/useSearchParam'
 import { useProjectPlan, type ProjectPlan } from '../hooks/useProjectPlan'
 import { HumanActions } from './human/HumanActions'
 import { HumanWork } from './human/HumanWork'
+import { DecidedUpstream } from './human/DecidedUpstream'
 import { mergeStatusText } from '../lib/humanActions'
 import { effectiveMetadata, integrationBranch, mergedIntoIntegration, waitsForMerge } from '../lib/merge'
 import { api } from '../api/client'
@@ -415,6 +416,9 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
             onChanged={t => { if (t && onTaskUpdated) onTaskUpdated(t); else onRefresh?.() }} />
         )}
 
+        {/* What people decided on the tickets this one depends on */}
+        <DecidedUpstream key={`decided-${task.id}`} taskId={task.id} hasDependencies={(task.dependency_ids?.length ?? 0) > 0} ticketHref={ticketHref} />
+
         {/* A person's own ticket: they start and finish it here */}
         {showHumanWork && (
           <HumanWork key={`human-${task.id}`} task={task} meId={meId} people={people} plan={plan}
@@ -670,7 +674,7 @@ function OwnerSection({ task, people, members, meId, myAccess, openReassign, can
  * Who approved this ticket's plan (#2198), and for whom when it wasn't their
  * own: "Approved by Lee on behalf of Bob · Oct 22". An open ticket whose plan
  * nobody approved says so. Approval happens only in My work (KB
- * decisions/human-work-ux.md §2), so the drawer never approves: for the
+ * v2/kb/working/human-work.md), so the drawer never approves: for the
  * person's own ticket it links there, "Awaiting your approval → My work".
  */
 export function ApprovalLine({ task, people, meId }: { task: Task; people: Map<number, Person>; meId?: number }) {

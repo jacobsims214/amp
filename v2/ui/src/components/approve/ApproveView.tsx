@@ -1,6 +1,6 @@
 /**
  * The Approve view (design #2494, artifact #24 v2; KB
- * decisions/human-work-ux.md §2 "Approve view"). Full width inside the
+ * v2/kb/working/human-work.md). Full width inside the
  * project's My work tab at `?approve=<epic id>[,<epic id>…]&focus=<ticket>`.
  * This is the only place a plan is approved.
  *

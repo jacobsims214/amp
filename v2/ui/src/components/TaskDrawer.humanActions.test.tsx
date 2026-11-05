@@ -1,5 +1,5 @@
 // The TaskDrawer uses HumanActions for Answer, Merge and Do, and never
-// approves: approval is a link to My work (KB decisions/human-work-ux.md §2).
+// approves: approval is a link to My work (v2/kb/working/human-work.md).
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'

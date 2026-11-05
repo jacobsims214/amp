@@ -4,7 +4,7 @@ import type {
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
-  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, GitHubCredentialInfo, GitHubCredentialChange, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
+  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, GitHubCredentialInfo, GitHubCredentialChange, Run, Usage, UpstreamDecision, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
   ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork, MyWorkCounts, PeopleWaiting,
 } from '../types'
 import { auditQuery, auditVerifyUrl, type AuditScope } from '../lib/audit'
@@ -324,6 +324,10 @@ export const api = {
   /** A person marks their human ticket done, with what they want on the record. */
   completeHumanTask: (taskId: number, done: { note?: string; pr_url?: string; hours_worked?: number }) =>
     post<{ task: Task }>(`/tasks/${taskId}/complete`, done).then(r => r.task),
+  /** What people decided on this ticket's dependencies (and, later, its own decision doc). */
+  getTaskDecisions: (taskId: number) =>
+    get<{ upstream: UpstreamDecision[] | null; own: unknown | null }>(`/tasks/${taskId}/decisions`)
+      .then(r => ({ upstream: r.upstream ?? [], own: r.own })),
   /** Answer an agent's flag (a ticket blocked with a reason): posts the
    *  answer as a comment and puts the ticket back to ready (or waiting). */
   answerFlag: (taskId: number, answer: string) =>

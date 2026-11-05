@@ -1,4 +1,4 @@
-// The project's My work tab (KB decisions/human-work-ux.md §2, artifact #23)
+// The project's My work tab (v2/kb/working/human-work.md, artifact #23)
 // and the landing rule (/project/:id opens My work when something waits on you).
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'

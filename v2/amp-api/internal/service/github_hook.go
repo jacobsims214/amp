@@ -19,7 +19,7 @@ import (
 	"github.com/simstech/amp-api/internal/repository"
 )
 
-// ---- Inbound GitHub webhook (AMP #2479, KB decisions/human-work-ux.md §4) ----
+// ---- Inbound GitHub webhook (AMP #2479, v2/kb/working/human-work.md) ----
 //
 // GitHub posts a project's pull_request events to
 // POST /api/hooks/github/{project_id}. The request has no AMP session and is

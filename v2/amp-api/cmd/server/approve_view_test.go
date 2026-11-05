@@ -9,7 +9,7 @@ import (
 )
 
 // The Approve view's data (AMP #2483, design #2494 / artifact #24 v2, KB
-// decisions/human-work-ux.md §2): the approval snapshot returned as
+// v2/kb/working/human-work.md): the approval snapshot returned as
 // changed_since.previous, several epics in one request, and stories listed
 // even when everything in them is approved.
 

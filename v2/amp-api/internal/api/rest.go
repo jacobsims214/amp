@@ -1475,6 +1475,20 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, rec)
 		return
 
+	case "decisions":
+		// GET: what people decided on this ticket's dependencies, and its own
+		// decision doc (none yet).
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET required", 405)
+			return
+		}
+		ups, err := h.svc.UpstreamDecisions(r.Context(), pr, taskID)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]any{"upstream": ups, "own": nil})
+
 	case "runs":
 		if r.Method == http.MethodPost {
 			// Record a run (e.g. a person marking the work merged).

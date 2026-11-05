@@ -1,6 +1,6 @@
 /**
  * The Approve view's model (design #2494, artifact #24 v2; KB
- * decisions/human-work-ux.md §2 "Approve view"). Pure functions over the
+ * v2/kb/working/human-work.md). Pure functions over the
  * ApprovalPlan the server returns, so the outline, the readouts and the
  * approval bar all agree, and so they can be tested without React.
  *

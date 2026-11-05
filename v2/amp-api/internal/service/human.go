@@ -84,6 +84,11 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 	if h := done.HoursWorked; h != nil && (*h < 0 || *h > 1000) {
 		return nil, nil, authz.BadRequest("hours_worked must be between 0 and 1000")
 	}
+	note := strings.TrimSpace(done.Note)
+	decision := isDecisionReason(t.HumanReason)
+	if decision && note == "" {
+		return nil, nil, authz.BadRequest("a decision ticket needs your decision: say what you decided")
+	}
 	pid, err := s.Registry.Get(t.ProjectID)
 	if err != nil {
 		return nil, nil, err
@@ -93,7 +98,6 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 		return nil, nil, reply.Err
 	}
-	note := strings.TrimSpace(done.Note)
 	run, err := s.recordRun(ctx, p, t, domain.Run{
 		AgentID: domain.HumanAgentID, Outcome: domain.RunCompleted,
 		PRURL: strings.TrimSpace(done.PRURL), Note: note, HoursWorked: done.HoursWorked,
@@ -153,9 +157,38 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "task.human.complete", ProjectID: intRef(t.ProjectID), TargetType: "task", TargetID: idStr(taskID),
 		TargetName: t.Name, Summary: fmt.Sprintf("%s marked their ticket %d done", p.Label(), taskID), Details: details})
+	// The note reaches the people and agents waiting on this ticket: it is a
+	// comment on it, and upstream_decisions carries it to its dependents.
+	if note != "" {
+		verb := "Done"
+		if decision {
+			verb = "Decision"
+		}
+		s.comment(t.ProjectID, taskID, p, fmt.Sprintf("%s by %s: %s", verb, s.personName(ctx, p), note))
+	}
 	updated, err := s.Repo.GetTask(ctx, taskID)
 	if err != nil {
 		return nil, nil, err
 	}
 	return updated, &run, nil
+}
+
+// isDecisionReason: a human ticket whose note is a decision other tickets
+// depend on, so the note is required.
+func isDecisionReason(reason string) bool { return reason == "judgment" || reason == "approval" }
+
+// personName is how a person is named in a comment: their display name, else
+// their email.
+func (s *Service) personName(ctx context.Context, p authz.Principal) string {
+	if p.HasUser() {
+		if u, err := s.Repo.GetUserByID(ctx, p.UserID); err == nil && u != nil {
+			if u.DisplayName != "" {
+				return u.DisplayName
+			}
+			if u.Email != "" {
+				return u.Email
+			}
+		}
+	}
+	return p.Label()
 }

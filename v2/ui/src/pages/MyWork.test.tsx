@@ -1,4 +1,4 @@
-// Top-level My work is a summary (KB decisions/human-work-ux.md §3): no action
+// Top-level My work is a summary (v2/kb/working/human-work.md): no action
 // buttons, every row a link into /project/:id/my-work?focus=<ticket id>.
 import { render, screen, waitFor, within } from '@testing-library/react'
 import { http, HttpResponse } from 'msw'

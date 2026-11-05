@@ -1,5 +1,5 @@
 /**
- * Which tab a project opens on (KB decisions/human-work-ux.md, review outcome 3):
+ * Which tab a project opens on (v2/kb/working/human-work.md, review outcome 3):
  * `/project/:id` with no tab opens My work when the viewer has anything waiting
  * on them in the project, and Mission otherwise. A tab in the URL always wins,
  * so `/project/:id/mission` and `/project/:id/my-work` never redirect.

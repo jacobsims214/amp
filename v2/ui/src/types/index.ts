@@ -861,7 +861,7 @@ export interface MyWork {
   flags_truncated?: boolean
 }
 
-// ---- Waiting on you (service.WaitingOn; KB decisions/human-work-ux.md §1) ----
+// ---- Waiting on you (service.WaitingOn; v2/kb/working/human-work.md) ----
 
 export type WaitKind = 'approve' | 'answer' | 'merge' | 'start' | 'do'
 
@@ -942,7 +942,7 @@ export interface WaitItem extends MergeClassifier {
   /** start: the agent it was dispatched to, and how long it has waited (AMP #2801) */
   agent_id?: string
   not_started_minutes?: number
-  /** merge: open tickets that depend on it directly */
+  /** merge, do, answer: open tickets downstream of it, transitively */
   holding_up?: number[]
   /**
    * merge (AMP #3011): the branch the merge would land on, as a run reported it.
@@ -1457,4 +1457,19 @@ export interface ProjectMyWork {
   done_today: DoneItem[]
   agents: { project_id: number; in_progress: number; ready: number; waiting: number; done_today: number }
   day: string
+}
+
+/** What a person decided on a completed human ticket that another ticket depends on (GET /tasks/:id/decisions). */
+export interface UpstreamDecision {
+  task_id: number
+  name: string
+  human_reason: string
+  /** the note, or option + decided text */
+  decision: string
+  option?: string
+  doc_url?: string
+  version?: number
+  decided_by: number | null
+  decided_by_name: string
+  decided_at: string
 }

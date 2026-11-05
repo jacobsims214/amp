@@ -1038,7 +1038,15 @@ func (s *Server) claimTask(rctx context.Context, args map[string]interface{}) (*
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]interface{}{"task": t, "phase": t.Phase, "next": claimNext(t)}
+	next := claimNext(t)
+	ups, _ := s.svc.UpstreamDecisions(rctx, caller(rctx).p, taskID)
+	if len(ups) > 0 {
+		next += upstreamDecisionsNext
+	}
+	out := map[string]interface{}{"task": t, "phase": t.Phase, "next": next}
+	if len(ups) > 0 {
+		out["upstream_decisions"] = ups
+	}
 	if t.StartedAt != nil {
 		out["started_at"] = t.StartedAt
 		out["started_by"] = t.StartedBy
@@ -1702,6 +1710,11 @@ func (s *Server) getTask(ctx context.Context, args map[string]interface{}) (*mcp
 		return nil, err
 	}
 	out := map[string]interface{}{"task": reply.Task, "effective_metadata": eff}
+	// What people decided on the tickets this one depends on, so the worker
+	// needs no extra call to learn it.
+	if ups, err := s.svc.UpstreamDecisions(ctx, caller(ctx).p, taskID); err == nil && len(ups) > 0 {
+		out["upstream_decisions"] = ups
+	}
 	limit := optInt(args, "limit", 30)
 	for _, inc := range optStrSlice(args, "include") {
 		switch inc {

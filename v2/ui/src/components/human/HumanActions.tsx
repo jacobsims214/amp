@@ -1,6 +1,6 @@
 /**
  * HumanActions: every action a person takes on their work, in one component
- * (KB decisions/human-work-ux.md §2, mockup artifact #23). The project's My
+ * (v2/kb/working/human-work.md, mockup artifact #23). The project's My
  * work cards and the TaskDrawer both use it, so a ticket opened from the
  * Board offers the same buttons as My work.
  *
@@ -379,6 +379,9 @@ function DoAction({ task, canAct, ownerName, onChanged }: HumanActionsProps) {
   const { busy, error, run } = useRun(onChanged)
   const hoursNum = hours.trim() === '' ? undefined : Number(hours)
   const hoursBad = hoursNum !== undefined && (Number.isNaN(hoursNum) || hoursNum < 0 || hoursNum > 1000)
+  // A judgment or approval ticket is a decision others wait on: the note is the decision.
+  const decision = task.human_reason === 'judgment' || task.human_reason === 'approval'
+  const [noteMissing, setNoteMissing] = useState(false)
   if (task.state === 'completed') return null
   if (task.state === 'blocked') {
     return <span className="text-[12.5px] text-ink-2" data-action="do">Waiting on #{(task.blocked_by_ids?.length ? task.blocked_by_ids : task.dependency_ids).join(', #')} before it can start.</span>
@@ -389,12 +392,16 @@ function DoAction({ task, canAct, ownerName, onChanged }: HumanActionsProps) {
       <form className="grid gap-2" data-action="do" onSubmit={e => {
         e.preventDefault()
         if (hoursBad) return
+        if (decision && !note.trim()) { setNoteMissing(true); return }
         run('done', () => api.completeHumanTask(task.id, { note: note.trim() || undefined, pr_url: link.trim() || undefined, hours_worked: hoursNum }))
           .then(ok => { if (ok) setFinishing(false) })
       }}>
-        <label htmlFor={`done-note-${task.id}`} className="amp-label">What happened (optional)</label>
-        <textarea id={`done-note-${task.id}`} className="amp-input min-h-[56px] resize-y" value={note} onChange={e => setNote(e.target.value)}
-          placeholder="Anything the next person should know" />
+        <label htmlFor={`done-note-${task.id}`} className="amp-label">{decision ? 'Your decision' : 'What happened (optional)'}</label>
+        <textarea id={`done-note-${task.id}`} className="amp-input min-h-[56px] resize-y" value={note}
+          onChange={e => { setNote(e.target.value); setNoteMissing(false) }}
+          aria-required={decision} aria-invalid={noteMissing}
+          placeholder={decision ? 'What you decided. The tickets waiting on this receive it' : 'Anything the next person should know'} />
+        {noteMissing && <span role="alert" className="text-[12px] text-danger-ink">Write what you decided</span>}
         <div className="grid grid-cols-[1fr_110px] gap-2">
           <div className="grid gap-1">
             <label htmlFor={`done-link-${task.id}`} className="amp-label">Link (optional)</label>

@@ -281,3 +281,134 @@ func TestHuman_OldTrashSnapshotsRestore(t *testing.T) {
 		t.Fatalf("restored legacy ticket: %v", tk)
 	}
 }
+
+func commentBodies(t *testing.T, s *mcpStack, id int) string {
+	t.Helper()
+	out := s.call(t, "amp_get_task", map[string]any{"task_id": float64(id), "include": []any{"comments"}})
+	return fmt.Sprint(out["comments"])
+}
+
+func upstreamOf(t *testing.T, out map[string]any) []map[string]any {
+	t.Helper()
+	var ups []map[string]any
+	if raw, ok := out["upstream_decisions"].([]any); ok {
+		for _, x := range raw {
+			ups = append(ups, x.(map[string]any))
+		}
+	}
+	return ups
+}
+
+// A person's note is the decision other tickets wait on: a judgment or
+// approval ticket needs one, it is posted as a comment, and it reaches the
+// tickets that depend on it (amp_get_task, amp_claim_task, and the REST
+// endpoint) without an extra call. Other reasons keep the note optional.
+func TestHuman_DecisionReachesDependents(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	alice := w.s.as(w.alice)
+	story, pid := float64(w.s.storyID), float64(w.s.projectID)
+	res := alice.call(t, "amp_create_tasks", map[string]any{"project_id": pid, "tasks": []any{
+		map[string]any{"ref": "j", "story_id": story, "name": "Confirm: north-star targets", "performer": "human", "human_reason": "judgment", "owner": w.bob.Email},
+		map[string]any{"ref": "a", "story_id": story, "name": "Sign off the budget", "performer": "human", "human_reason": "approval", "owner": w.bob.Email},
+		map[string]any{"ref": "k", "story_id": story, "name": "Rack the server", "performer": "human", "human_reason": "physical", "owner": w.bob.Email},
+		map[string]any{"ref": "m", "story_id": story, "name": "Pick a vendor", "performer": "human", "human_reason": "judgment", "owner": w.bob.Email},
+		map[string]any{"ref": "d1", "story_id": story, "name": "Build scorecard", "depends_on": []any{"j", "a", "k"}},
+		map[string]any{"ref": "d2", "story_id": story, "name": "Wire vendor", "depends_on": []any{"j", "m"}},
+	}})
+	ids := map[string]int{}
+	for _, c := range res["created"].([]any) {
+		m := c.(map[string]any)
+		ids[m["ref"].(string)] = int(m["id"].(float64))
+	}
+	done := func(who string, id int, body map[string]any) (int, map[string]any) {
+		return ra.do(t, who, http.MethodPost, fmt.Sprintf("/api/tasks/%d/complete", id), body)
+	}
+
+	// A decision ticket needs the decision, on the server too.
+	for _, note := range []any{nil, "", "   "} {
+		body := map[string]any{}
+		if note != nil {
+			body["note"] = note
+		}
+		code, out := done("bob", ids["j"], body)
+		if code != 400 || !strings.Contains(fmt.Sprint(out), "say what you decided") {
+			t.Fatalf("judgment ticket with note %v: %d %v", note, code, out)
+		}
+	}
+	if code, _ := done("bob", ids["a"], map[string]any{}); code != 400 {
+		t.Fatalf("approval ticket with no note: %d, want 400", code)
+	}
+	if st := stateOf(t, alice, ids["j"]); st == "completed" {
+		t.Fatal("a refused completion still completed the ticket")
+	}
+
+	// The note is a comment: Decision by <name> for judgment and approval,
+	// Done by <name> for other reasons, nothing without a note.
+	ra.want(t, 200, "bob", http.MethodPost, fmt.Sprintf("/api/tasks/%d/complete", ids["j"]), map[string]any{"note": "Go with B; keep trial at 14 days"})
+	ra.want(t, 200, "bob", http.MethodPost, fmt.Sprintf("/api/tasks/%d/complete", ids["a"]), map[string]any{"note": "Approved at 40k"})
+	ra.want(t, 200, "bob", http.MethodPost, fmt.Sprintf("/api/tasks/%d/complete", ids["k"]), map[string]any{})
+	if c := commentBodies(t, alice, ids["j"]); !strings.Contains(c, "Decision by bob: Go with B; keep trial at 14 days") {
+		t.Fatalf("judgment comments = %s", c)
+	}
+	if c := commentBodies(t, alice, ids["a"]); !strings.Contains(c, "Decision by bob: Approved at 40k") {
+		t.Fatalf("approval comments = %s", c)
+	}
+	if c := commentBodies(t, alice, ids["k"]); strings.Contains(c, "Done by") || strings.Contains(c, "Decision by") {
+		t.Fatalf("a physical ticket with no note posted a comment: %s", c)
+	}
+	// Another reason, with a note, says Done by.
+	other := alice.call(t, "amp_create_tasks", map[string]any{"project_id": pid, "tasks": []any{
+		map[string]any{"ref": "x", "story_id": story, "name": "Call the bank", "performer": "human", "human_reason": "external", "owner": w.bob.Email}}})
+	xid := int(other["created"].([]any)[0].(map[string]any)["id"].(float64))
+	ra.want(t, 200, "bob", http.MethodPost, fmt.Sprintf("/api/tasks/%d/complete", xid), map[string]any{"note": "Called; they will wire Friday"})
+	if c := commentBodies(t, alice, xid); !strings.Contains(c, "Done by bob: Called; they will wire Friday") {
+		t.Fatalf("external comments = %s", c)
+	}
+
+	// amp_get_task on a dependent: the decided tickets, not the empty-note
+	// one (k) and not the one still open (m).
+	got := upstreamOf(t, alice.call(t, "amp_get_task", map[string]any{"task_id": float64(ids["d1"])}))
+	if len(got) != 2 || int(got[0]["task_id"].(float64)) != ids["j"] || int(got[1]["task_id"].(float64)) != ids["a"] {
+		t.Fatalf("d1 upstream_decisions = %v", got)
+	}
+	j := got[0]
+	if j["decision"] != "Go with B; keep trial at 14 days" || j["human_reason"] != "judgment" || j["name"] != "Confirm: north-star targets" ||
+		j["decided_by_name"] != "bob" || int(j["decided_by"].(float64)) != w.bob.User.ID || j["decided_at"] == nil {
+		t.Fatalf("decision = %v", j)
+	}
+	if ups := upstreamOf(t, alice.call(t, "amp_get_task", map[string]any{"task_id": float64(ids["d2"])})); len(ups) != 1 || int(ups[0]["task_id"].(float64)) != ids["j"] {
+		t.Fatalf("d2 upstream_decisions (m is still open) = %v", ups)
+	}
+	// A ticket with nothing decided upstream has no key at all.
+	if _, has := alice.call(t, "amp_get_task", map[string]any{"task_id": float64(ids["j"])})["upstream_decisions"]; has {
+		t.Fatal("upstream_decisions on a ticket with no dependencies")
+	}
+
+	// amp_claim_task returns it, and says to follow it.
+	d := alice.call(t, "amp_dispatch_task", map[string]any{"task_id": float64(ids["d1"]), "agent_id": "amp-worker"})
+	claim := alice.call(t, "amp_claim_task", map[string]any{"task_id": float64(ids["d1"]), "dispatch_id": d["dispatch_id"]})
+	if ups := upstreamOf(t, claim); len(ups) != 2 || ups[0]["decision"] != "Go with B; keep trial at 14 days" {
+		t.Fatalf("claim upstream_decisions = %v", ups)
+	}
+	if next, _ := claim["next"].(string); !strings.Contains(next, "Decisions people made that this ticket depends on are in upstream_decisions; follow them.") {
+		t.Fatalf("claim next = %q", next)
+	}
+
+	// The drawer's endpoint.
+	rest := ra.want(t, 200, "alice", http.MethodGet, fmt.Sprintf("/api/tasks/%d/decisions", ids["d1"]), nil)
+	if rest["own"] != nil {
+		t.Fatalf("own = %v, want null in Phase 1", rest["own"])
+	}
+	if up, _ := rest["upstream"].([]any); len(up) != 2 || up[0].(map[string]any)["decided_by_name"] != "bob" {
+		t.Fatalf("GET decisions = %v", rest)
+	}
+	// Nothing upstream is an empty list, not null.
+	if up, ok := ra.want(t, 200, "alice", http.MethodGet, fmt.Sprintf("/api/tasks/%d/decisions", ids["j"]), nil)["upstream"].([]any); !ok || len(up) != 0 {
+		t.Fatalf("empty upstream = %v", up)
+	}
+	// Someone outside the project can't read it.
+	if code, _ := ra.do(t, "outsider", http.MethodGet, fmt.Sprintf("/api/tasks/%d/decisions", ids["d1"]), nil); code < 400 {
+		t.Fatalf("outsider read decisions: %d", code)
+	}
+}
