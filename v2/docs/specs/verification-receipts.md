@@ -300,7 +300,7 @@ func New(cfg Config) (Store, error)
   `http.ServeContent` with the sha256 as ETag.
 - **`s3`** (`s3.go`, `RECEIPT_STORE=s3`, #144) is any S3-compatible store, through
   `github.com/minio/minio-go/v7` (Apache-2.0): the bundled SeaweedFS (Apache-2.0, opt-in in
-  compose and Helm), or R2, AWS S3, Garage, MinIO. `Put` spools the body to a temporary file
+  compose and Helm), or any S3-compatible endpoint (R2, AWS S3, Garage). SeaweedFS is the recommended self-hosted store: MinIO is no longer open source, and AMP takes no proprietary dependencies. `Put` spools the body to a temporary file
   while hashing it, reading at most `max+1` bytes, so a body over the cap stores nothing; it
   checks the key with `StatObject` (`ErrExists`), then sends one `PutObject` of known size with
   `If-None-Match: *`, which SeaweedFS, S3 and R2 honour, so a race also ends in `ErrExists`. A
@@ -327,7 +327,7 @@ func New(cfg Config) (Store, error)
   | `RECEIPT_S3_ACCESS_KEY` / `RECEIPT_S3_SECRET_KEY` | (none) | the key pair; the secret is never logged |
   | `RECEIPT_S3_REGION` | `us-east-1` | region (R2: `auto`) |
   | `RECEIPT_S3_USE_SSL` | `true` | https to `host:port` endpoints; `false` for the in-cluster SeaweedFS |
-  | `RECEIPT_S3_PATH_STYLE` | `true` | bucket in the path (SeaweedFS, Garage and MinIO need it) |
+  | `RECEIPT_S3_PATH_STYLE` | `true` | bucket in the path (SeaweedFS and Garage need it) |
   | `RECEIPT_S3_SPOOL_DIR` | system temp dir | where an upload is spooled before it is sent |
   | `RECEIPT_MAX_BYTES` | `209715200` (200 MiB) | per-file cap |
   | `RECEIPT_RETENTION_DAYS` | `90` | how long unkept evidence lives (`<= 0` means the default) |

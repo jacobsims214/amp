@@ -20,7 +20,7 @@ import (
 )
 
 // S3Config configures the S3 backend: any S3-compatible store (AWS S3,
-// Cloudflare R2, SeaweedFS, Garage, MinIO).
+// Cloudflare R2, SeaweedFS, Garage).
 type S3Config struct {
 	// Endpoint is host:port, or a URL (http:// or https://, which then
 	// decides UseSSL). No path.
@@ -34,7 +34,7 @@ type S3Config struct {
 	// UseSSL: https to the endpoint. False for an in-cluster SeaweedFS.
 	UseSSL bool
 	// PathStyle: bucket in the path (endpoint/bucket/key) rather than the
-	// host name. SeaweedFS, Garage and MinIO need it; S3 and R2 accept it.
+	// host name. SeaweedFS and Garage need it; S3 and R2 accept it.
 	PathStyle bool
 	// SpoolDir holds an upload while it is hashed and measured, before it
 	// is sent (os.TempDir() when empty).

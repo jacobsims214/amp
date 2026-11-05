@@ -114,7 +114,7 @@ Note on the internal CA: regardless of `global.tls.enabled`, `templates/cert-iss
 
 ## Not yet production-ready
 
-- **CNPG backups are not configured.** `values-production.yaml` has a commented-out `barmanObjectStore` block as a starting point — needs an S3-compatible endpoint (MinIO on Proxmox, real S3, B2, etc.) before this touches real user data.
+- **CNPG backups are not configured.** `values-production.yaml` has a commented-out `barmanObjectStore` block as a starting point — needs an S3-compatible endpoint before this touches real user data. On-prem, use SeaweedFS (its S3 gateway; the bundled one from #126/#144 works). Any S3-compatible endpoint works, including real S3 or Backblaze B2. See #145.
 - **Typesense's API key is still the local-dev default** (`amp-local-dev`) in `values-production.yaml` — needs a real generated secret before go-live.
 
 ## Deploying to the datacenter cluster (Talos/Proxmox, GitOps via ArgoCD)
