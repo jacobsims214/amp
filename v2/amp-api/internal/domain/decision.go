@@ -56,11 +56,14 @@ type AskOption struct {
 // question, options and recommended index (DecisionAsk) and whose markdown
 // keeps the reason and evidence.
 type Ask struct {
-	Question    string      `json:"question"`
-	Options     []AskOption `json:"options"`     // 2..4
-	Recommended int         `json:"recommended"` // index into Options
-	Reason      string      `json:"recommendation_reason"`
-	Evidence    []string    `json:"evidence,omitempty"` // URLs, "#N", "artifact #N"
+	Question string      `json:"question"`
+	Options  []AskOption `json:"options"` // 2..4
+	// Recommended indexes Options. Required: a pointer so that an ask
+	// without it is refused rather than read as option 0, which would be
+	// a recommendation the agent never made (D8).
+	Recommended *int     `json:"recommended"`
+	Reason      string   `json:"recommendation_reason"`
+	Evidence    []string `json:"evidence,omitempty"` // URLs, "#N", "artifact #N"
 }
 
 // DecisionAsk is a decision doc version's stored options: the part of an ask
@@ -105,6 +108,9 @@ func (a *Ask) Validate() error {
 	if a == nil {
 		return errors.New("ask is missing")
 	}
+	if a.Recommended == nil {
+		return errors.New("ask needs recommended: the index (0-based) of the option you recommend")
+	}
 	stored := a.Stored()
 	if err := stored.Validate(); err != nil {
 		return err
@@ -117,7 +123,10 @@ func (a *Ask) Validate() error {
 
 // Stored is the part of the ask a version keeps as metadata, trimmed.
 func (a *Ask) Stored() DecisionAsk {
-	d := DecisionAsk{Question: strings.TrimSpace(a.Question), Recommended: a.Recommended, Options: make([]AskOption, len(a.Options))}
+	d := DecisionAsk{Question: strings.TrimSpace(a.Question), Options: make([]AskOption, len(a.Options))}
+	if a.Recommended != nil {
+		d.Recommended = *a.Recommended
+	}
 	for i, o := range a.Options {
 		d.Options[i] = AskOption{Label: strings.TrimSpace(o.Label), Consequence: strings.TrimSpace(o.Consequence)}
 	}

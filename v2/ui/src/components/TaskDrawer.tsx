@@ -428,7 +428,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
         )}
 
         {/* What people decided on the tickets this one depends on */}
-        <DecidedUpstream key={`decided-${task.id}`} taskId={task.id} hasDependencies={(task.dependency_ids?.length ?? 0) > 0} ticketHref={ticketHref} />
+        <DecidedUpstream key={`decided-${task.id}`} taskId={task.id} projectId={task.project_id} dependencyIds={task.dependency_ids ?? []} ticketHref={ticketHref} />
 
         {/* A person's own ticket: they start and finish it here */}
         {showHumanWork && (
@@ -494,17 +494,19 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
               </div>
               <div>
                 <label htmlFor="edit-performer" className="text-xs font-medium text-ink-2 block mb-1.5">Done by</label>
-                <select id="edit-performer" value={editForm.performer} disabled={task.state === 'in_progress'}
+                <select id="edit-performer" value={editForm.performer} disabled={task.state === 'in_progress' || !!task.has_decision_doc}
                   onChange={e => setEditForm(f => ({ ...f, performer: e.target.value as 'agent' | 'human' }))} className={inputCls}>
                   <option value="agent">An agent</option>
                   <option value="human">A person: its owner does it in AMP</option>
                 </select>
-                {task.state === 'in_progress' && <p className="text-[11.5px] text-ink-3 mt-1">Finish or stop the work before changing who does it.</p>}
+                {task.has_decision_doc
+                  ? <p className="text-[11.5px] text-ink-3 mt-1">Its decision is in its doc: record it there, or plan a new judgment ticket.</p>
+                  : task.state === 'in_progress' && <p className="text-[11.5px] text-ink-3 mt-1">Finish or stop the work before changing who does it.</p>}
               </div>
               {editForm.performer === 'human' ? (
                 <div>
                   <label htmlFor="edit-reason" className="text-xs font-medium text-ink-2 block mb-1.5">Why a person</label>
-                  <select id="edit-reason" value={editForm.human_reason}
+                  <select id="edit-reason" value={editForm.human_reason} disabled={!!task.has_decision_doc}
                     onChange={e => setEditForm(f => ({ ...f, human_reason: e.target.value as HumanReason }))} className={inputCls}>
                     {HUMAN_REASONS.map(r => <option key={r.value} value={r.value}>{r.label}: {r.hint.toLowerCase()}</option>)}
                   </select>

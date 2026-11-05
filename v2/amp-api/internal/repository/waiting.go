@@ -69,7 +69,14 @@ func (r *Repo) WaitingCandidates(ctx context.Context, userID int, projectIDs []i
 		}
 		out = append(out, w)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	ts := make([]*domain.Task, len(out))
+	for i := range out {
+		ts[i] = &out[i].Task
+	}
+	return out, r.markDecisionDocs(ctx, ts)
 }
 
 // DepSummary is a ticket named as a dependency or dependent of another.

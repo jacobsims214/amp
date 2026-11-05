@@ -763,3 +763,140 @@ func TestDecisions_RecordNeedsACompletableTicket(t *testing.T) {
 	refuse.Store(false)
 	ra.want(t, 200, "bob", http.MethodPost, docPath(j, "/record"), map[string]any{"version": 2, "chosen_option": 1, "decision_text": "Go with B"})
 }
+
+// Final review fixes (#125).
+
+// has_decision_doc is a field of the ticket and of its My work item, so a
+// client never guesses doc existence from human_reason: on the ticket (REST
+// and MCP, list and get), and on a ticket whose doc is drafted after it was
+// created (the actor learns it).
+func TestDecisions_HasDecisionDoc(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	alice := w.s.as(w.alice)
+	j, dep, _ := judgmentWithDoc(t, w)
+
+	if tk := ra.want(t, 200, "bob", http.MethodGet, fmt.Sprintf("/api/tasks/%d", j), nil)["task"].(map[string]any); tk["has_decision_doc"] != true {
+		t.Fatalf("GET task j: %v", tk["has_decision_doc"])
+	}
+	if tk := ra.want(t, 200, "bob", http.MethodGet, fmt.Sprintf("/api/tasks/%d", dep), nil)["task"].(map[string]any); tk["has_decision_doc"] != nil {
+		t.Fatalf("GET task dep: %v", tk["has_decision_doc"])
+	}
+	if tk := humanTask(t, alice, j); tk["has_decision_doc"] != true {
+		t.Fatalf("amp_get_task j: %v", tk["has_decision_doc"])
+	}
+	listed := map[int]any{}
+	for _, x := range ra.want(t, 200, "bob", http.MethodGet, fmt.Sprintf("/api/projects/%d/tasks", w.s.projectID), nil)["tasks"].([]any) {
+		m := x.(map[string]any)
+		listed[int(m["id"].(float64))] = m["has_decision_doc"]
+	}
+	if listed[j] != true || listed[dep] != nil {
+		t.Fatalf("listed has_decision_doc = %v", listed)
+	}
+
+	// My work: bob's Do item for j says it has a doc.
+	var item map[string]any
+	out := ra.want(t, 200, "bob", http.MethodGet, fmt.Sprintf("/api/projects/%d/my-work", w.s.projectID), nil)
+	for _, k := range []string{"do", "approve"} {
+		if xs, ok := out["items"].(map[string]any)[k].([]any); ok {
+			for _, x := range xs {
+				if m := x.(map[string]any); m["task_id"] == float64(j) {
+					item = m
+				}
+			}
+		}
+	}
+	for _, x := range out["coming_up"].([]any) {
+		if m := x.(map[string]any); m["task_id"] == float64(j) {
+			item = m
+		}
+	}
+	if item == nil {
+		t.Fatalf("j not in bob's my work: %v", out)
+	}
+	if item["has_decision_doc"] != true || item["task"].(map[string]any)["has_decision_doc"] != true {
+		t.Fatalf("my work item = %v", item)
+	}
+
+	// A doc drafted after creation (a person's UI ticket, then
+	// amp_update_task(ask)): the ticket the actor serves says so at once.
+	ui := ra.want(t, 200, "alice", http.MethodPost, fmt.Sprintf("/api/projects/%d/tasks", w.s.projectID), map[string]any{
+		"story_id": w.s.storyID, "name": "Pick a vendor", "performer": "human", "human_reason": "judgment",
+		"description": "Choose who hosts us", "acceptance_criteria": "Vendor chosen", "owner": w.bob.Email})
+	k := int(ui["id"].(float64))
+	if tk := ra.want(t, 200, "bob", http.MethodGet, fmt.Sprintf("/api/tasks/%d", k), nil)["task"].(map[string]any); tk["has_decision_doc"] != nil {
+		t.Fatalf("a ticket without a doc: %v", tk["has_decision_doc"])
+	}
+	alice.call(t, "amp_update_task", map[string]any{"task_id": float64(k), "ask": northStarAsk()})
+	if tk := ra.want(t, 200, "bob", http.MethodGet, fmt.Sprintf("/api/tasks/%d", k), nil)["task"].(map[string]any); tk["has_decision_doc"] != true {
+		t.Fatalf("after amp_update_task(ask): %v", tk["has_decision_doc"])
+	}
+}
+
+// Once a ticket has a doc, who does it and why are fixed: a change to
+// human_reason or performer would leave the doc with no card and no way to
+// record it. Refused (409, with the ticket link) over MCP and in the UI.
+func TestDecisions_DocTicketKeepsItsKind(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	alice := w.s.as(w.alice)
+	j, _, _ := judgmentWithDoc(t, w)
+	link := fmt.Sprintf("board?task=%d", j)
+	refusal := "This ticket's decision is in its doc; record it there or plan a new judgment ticket: "
+
+	// MCP: an agent's tidy-up.
+	wantErr(t, alice.callExpectError(t, "amp_update_task", map[string]any{"task_id": float64(j), "human_reason": "approval"}), refusal, link)
+	wantErr(t, alice.callExpectError(t, "amp_update_task", map[string]any{"task_id": float64(j), "performer": "agent"}), refusal, link)
+	// The web UI: the drawer's Edit.
+	for _, body := range []map[string]any{
+		{"performer": "human", "human_reason": "review"},
+		{"performer": "agent"},
+	} {
+		if code, out := ra.do(t, "bob", http.MethodPatch, fmt.Sprintf("/api/tasks/%d", j), body); code != 409 ||
+			!strings.Contains(fmt.Sprint(out), refusal) || !strings.Contains(fmt.Sprint(out), link) {
+			t.Fatalf("UI edit %v: %d %v", body, code, out)
+		}
+	}
+	tk := humanTask(t, alice, j)
+	if tk["performer"] != "human" || tk["human_reason"] != "judgment" || tk["has_decision_doc"] != true {
+		t.Fatalf("a refused edit changed the ticket: %v", tk)
+	}
+	// The same values, and the rest of the ticket, stay editable.
+	alice.call(t, "amp_update_task", map[string]any{"task_id": float64(j), "performer": "human", "human_reason": "judgment", "name": "Confirm: the north star"})
+	ra.want(t, 200, "bob", http.MethodPatch, fmt.Sprintf("/api/tasks/%d", j), map[string]any{"description": "Pick the metric we steer by."})
+	if tk := humanTask(t, alice, j); tk["name"] != "Confirm: the north star" || tk["description"] != "Pick the metric we steer by." {
+		t.Fatalf("allowed edits: %v", tk)
+	}
+}
+
+// Accept recommendation fills the decided text with the option's label: the
+// note, the comment and the dependents' decision say the label once, not
+// "<label> — <label>".
+func TestDecisions_AcceptRecommendationSaysTheLabelOnce(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	alice := w.s.as(w.alice)
+	j, dep, _ := judgmentWithDoc(t, w)
+	label := "B: Activation rate (40%, floor 30%)"
+	ra.want(t, 200, "bob", http.MethodPost, docPath(j, "/record"), map[string]any{"version": 1, "chosen_option": 1, "decision_text": label + " "})
+	c := commentBodies(t, alice, j)
+	if !strings.Contains(c, "Decision by bob: "+label+"\n") || strings.Contains(c, label+" — ") {
+		t.Fatalf("comments = %s", c)
+	}
+	ups := upstreamOf(t, alice.call(t, "amp_get_task", map[string]any{"task_id": float64(dep)}))
+	if len(ups) != 1 || ups[0]["decision"] != label || ups[0]["option"] != label {
+		t.Fatalf("upstream = %v", ups)
+	}
+}
+
+// An ask without recommended is refused: omitted must not mean option 0,
+// a recommendation the agent never made (D8).
+func TestDecisions_AskNeedsRecommended(t *testing.T) {
+	w := newRBACWorld(t)
+	alice := w.s.as(w.alice)
+	ask := northStarAsk()
+	delete(ask, "recommended")
+	wantErr(t, alice.callExpectError(t, "amp_create_tasks", map[string]any{"project_id": float64(w.s.projectID), "tasks": []any{
+		map[string]any{"ref": "j", "story_id": float64(w.s.storyID), "name": "Decide", "performer": "human", "human_reason": "judgment",
+			"owner": w.bob.Email, "description": "d", "acceptance_criteria": "a", "ask": ask}}}), `"j"`, "ask needs recommended")
+}

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/repository"
@@ -30,6 +31,9 @@ const (
 	decisionOptionsRefusal    = "This ticket's options are in its decision doc; the owner edits them in AMP: %s"
 	decisionMarkDoneRefusal   = "Record the decision on its doc: %s"
 	decisionRecordingRefusal  = "This decision is already being recorded: %s"
+	// decisionKindRefusal: performer or human_reason changed on a ticket
+	// that has a doc, which would leave the doc with no way to record it.
+	decisionKindRefusal = "This ticket's decision is in its doc; record it there or plan a new judgment ticket: %s"
 	// DecisionStaleRefusal and DecisionCapRefusal are PUT doc's 409s (§3
 	// Editing); the card shows them and keeps the draft.
 	DecisionStaleRefusal = "The doc changed in another tab. Reload to see it"
@@ -119,11 +123,21 @@ func (s *Service) recordedDecision(ctx context.Context, dep *domain.Task, doc *d
 		if v, err := s.Repo.GetArtifactVersion(ctx, doc.ArtifactID, version); err == nil && v.DecisionAsk != nil {
 			if i := *doc.ChosenOption; i >= 0 && i < len(v.DecisionAsk.Options) {
 				d.Option = v.DecisionAsk.Options[i].Label
-				d.Decision = d.Option + " — " + doc.DecisionText
+				d.Decision = optionNote(d.Option, doc.DecisionText)
 			}
 		}
 	}
 	return d
+}
+
+// optionNote is a recorded decision as text: "<option label> — <decided
+// text>", or the label alone when the text only repeats it (Accept
+// recommendation fills the text with the label).
+func optionNote(label, text string) string {
+	if strings.TrimSpace(text) == strings.TrimSpace(label) {
+		return label
+	}
+	return label + " — " + text
 }
 
 // decisionDocVersionURL is <doc link vN>: /artifacts/<id>?v=N.
@@ -191,7 +205,26 @@ func (s *Service) createDecisionDoc(ctx context.Context, p authz.Principal, t *d
 	s.audit(ctx, p, domain.AuditEntry{Action: "decision.create", ProjectID: intRef(t.ProjectID), TargetType: "task", TargetID: idStr(t.ID),
 		TargetName: t.Name, Summary: fmt.Sprintf("drafted decision doc artifact #%d v1 for ticket %d", a.ID, t.ID),
 		Details: map[string]any{"artifact_id": a.ID, "options": len(ask.Options)}})
+	s.markDecisionDoc(ctx, t)
 	return a, nil
+}
+
+// markDecisionDoc tells the ticket's actor it has a doc now
+// (Task.HasDecisionDoc), so the ticket it serves (and its task.updated
+// event) says so. A failure is logged: the doc exists, and the actor reads
+// the flag from the database when it next loads the ticket.
+func (s *Service) markDecisionDoc(ctx context.Context, t *domain.Task) {
+	if s.Registry == nil {
+		return
+	}
+	reply := make(chan actor.ReplySimple, 1)
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgMarkDecisionDoc{TaskID: t.ID, ReplyCh: reply}); err != nil {
+		slog.Warn("decision doc: actor not told", "task_id", t.ID, "err", err)
+		return
+	}
+	if r := actor.Await(ctx, reply); r.Err != nil {
+		slog.Warn("decision doc: actor not told", "task_id", t.ID, "err", r.Err)
+	}
 }
 
 // draftDecisionDoc creates the doc and turns a failure into the warning the
@@ -389,7 +422,7 @@ func (s *Service) SaveDecisionDoc(ctx context.Context, p authz.Principal, taskID
 	if req.Ask == nil {
 		return nil, authz.BadRequest("ask is missing: the doc's question and options")
 	}
-	ask := (&domain.Ask{Question: req.Ask.Question, Options: req.Ask.Options, Recommended: req.Ask.Recommended}).Stored()
+	ask := (&domain.Ask{Question: req.Ask.Question, Options: req.Ask.Options, Recommended: &req.Ask.Recommended}).Stored()
 	if err := ask.Validate(); err != nil {
 		return nil, authz.BadRequest("%s", err.Error())
 	}
@@ -498,13 +531,13 @@ func (s *Service) RecordDecision(ctx context.Context, p authz.Principal, taskID 
 		return nil, err
 	}
 	// The note is built from the stored record, so a retry records what was
-	// claimed: "<option label> — <text>\n<doc link vN>".
+	// claimed: "<option label> — <text>\n<doc link vN>" (optionNote).
 	version := *rec.DecidedVersion
 	note := rec.DecisionText
 	if rec.ChosenOption != nil {
 		if v, err := s.Repo.GetArtifactVersion(ctx, rec.ArtifactID, version); err == nil && v.DecisionAsk != nil {
 			if i := *rec.ChosenOption; i >= 0 && i < len(v.DecisionAsk.Options) {
-				note = v.DecisionAsk.Options[i].Label + " — " + note
+				note = optionNote(v.DecisionAsk.Options[i].Label, note)
 			}
 		}
 	}

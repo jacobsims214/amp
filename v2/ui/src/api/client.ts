@@ -22,7 +22,7 @@ async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`)
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
-    throw new Error(err.error || `GET ${path}: ${res.status}`)
+    throw Object.assign(new Error(err.error || `GET ${path}: ${res.status}`), { status: res.status })
   }
   return res.json()
 }

@@ -114,6 +114,47 @@ func (r *Repo) DecisionDocTaskIDs(ctx context.Context, projectID int) (map[int]b
 	return out, rows.Err()
 }
 
+// markDecisionDocs sets HasDecisionDoc on each task that has a decision doc,
+// in one query.
+func (r *Repo) markDecisionDocs(ctx context.Context, tasks []*domain.Task) error {
+	if len(tasks) == 0 {
+		return nil
+	}
+	ids := make([]int, len(tasks))
+	for i, t := range tasks {
+		ids[i] = t.ID
+	}
+	rows, err := r.db.Query(ctx, `SELECT task_id FROM decision_docs WHERE task_id = ANY($1)`, ids)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	has := map[int]bool{}
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		has[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, t := range tasks {
+		t.HasDecisionDoc = has[t.ID]
+	}
+	return nil
+}
+
+// markDecisionDocsIn is markDecisionDocs over a slice of tasks.
+func (r *Repo) markDecisionDocsIn(ctx context.Context, tasks []domain.Task) error {
+	ptrs := make([]*domain.Task, len(tasks))
+	for i := range tasks {
+		ptrs[i] = &tasks[i]
+	}
+	return r.markDecisionDocs(ctx, ptrs)
+}
+
 // DecisionDocVersions loads every version of a decision doc with its
 // markdown and options, oldest first.
 func (r *Repo) DecisionDocVersions(ctx context.Context, artifactID int) ([]domain.DecisionDocVersion, error) {

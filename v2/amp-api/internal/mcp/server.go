@@ -1049,7 +1049,11 @@ func (s *Server) claimTask(rctx context.Context, args map[string]interface{}) (*
 		return nil, err
 	}
 	next := claimNext(t)
-	ups, _ := s.svc.UpstreamDecisions(rctx, caller(rctx).p, taskID)
+	ups, err := s.svc.UpstreamDecisions(rctx, caller(rctx).p, taskID)
+	if err != nil {
+		// The claim stands; the worker just misses what was decided upstream.
+		slog.Error("amp_claim_task: upstream decisions", "task_id", taskID, "err", err)
+	}
 	if len(ups) > 0 {
 		next += upstreamDecisionsNext
 	}
@@ -1747,11 +1751,13 @@ func (s *Server) getTask(ctx context.Context, args map[string]interface{}) (*mcp
 	out := map[string]interface{}{"task": reply.Task, "effective_metadata": eff}
 	// What people decided on the tickets this one depends on, so the worker
 	// needs no extra call to learn it.
-	if ups, err := s.svc.UpstreamDecisions(ctx, caller(ctx).p, taskID); err == nil && len(ups) > 0 {
+	if ups, err := s.svc.UpstreamDecisions(ctx, caller(ctx).p, taskID); err != nil {
+		slog.Error("amp_get_task: upstream decisions", "task_id", taskID, "err", err)
+	} else if len(ups) > 0 {
 		out["upstream_decisions"] = ups
 	}
-	// A judgment ticket's decision doc: its current options and markdown.
-	if reply.Task.HumanReason == "judgment" {
+	// A ticket's decision doc: its current options and markdown.
+	if reply.Task.HasDecisionDoc || reply.Task.HumanReason == "judgment" {
 		if doc, err := s.svc.OwnDecision(ctx, caller(ctx).p, taskID); err == nil && doc != nil {
 			out["decision"] = doc
 		}
@@ -2556,7 +2562,6 @@ func optMetadataPatch(args map[string]interface{}) (domain.MetadataPatch, error)
 	return p, nil
 }
 
-// optNewMetadata reads the "metadata" argument for a new item.
 // performerDesc is the performer field's help on the create tools.
 const performerDesc = "Optional. 'agent' (default: dispatched to an agent) or 'human': its owner does it and marks it done in AMP; agents never dispatch it. " +
 	"A human ticket needs description and acceptance_criteria written for the person; merges are not human tickets (a ticket finished with a PR is Merge needed)."
@@ -2618,6 +2623,7 @@ func optAsk(args map[string]interface{}) (*domain.Ask, error) {
 	return &ask, nil
 }
 
+// optNewMetadata reads the "metadata" argument for a new item.
 func optNewMetadata(args map[string]interface{}) (domain.Metadata, error) {
 	p, err := optMetadataPatch(args)
 	if err != nil || p == nil {

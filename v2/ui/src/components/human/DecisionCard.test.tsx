@@ -223,4 +223,51 @@ describe('DecisionCard', () => {
     for (const r of screen.getAllByRole('radio')) expect(r).toBeDisabled()
     expect(screen.getByText('Only Jacob decides this.')).toBeInTheDocument()
   })
+
+  it('says "blocks N · waiting Xd" in its header (J1), and "Nothing waits on it" with none', () => {
+    const now = () => Date.parse('2026-11-04T10:00:00Z')
+    const { rerender } = render(<DecisionCard task={task()} doc={doc} canAct blocks={5} waitingSince="2026-11-02T10:00:00Z" now={now} />)
+    expect(screen.getByTestId('decision-wait')).toHaveTextContent(/^blocks 5 · waiting 2d$/)
+    rerender(<DecisionCard task={task()} doc={doc} canAct blocks={0} waitingSince="2026-11-02T10:00:00Z" now={now} />)
+    expect(screen.getByTestId('decision-wait')).toHaveTextContent(/^Nothing waits on it · waiting 2d$/)
+    // Not known yet (the plan is loading), and not on a done ticket.
+    rerender(<DecisionCard task={task()} doc={doc} canAct waitingSince="2026-11-02T10:00:00Z" now={now} />)
+    expect(screen.queryByTestId('decision-wait')).toBeNull()
+    rerender(<DecisionCard task={task({ state: 'completed' })} doc={recorded} canAct blocks={5} now={now} />)
+    expect(screen.queryByTestId('decision-wait')).toBeNull()
+  })
+
+  it('offers Edit doc while the ticket waits on its dependencies; recording waits for them', async () => {
+    save.mockResolvedValue({ ...doc, current_version: 3, versions: [] })
+    render(<DecisionCard task={task({ state: 'blocked', dependency_ids: [12], blocked_by_ids: [12] })} doc={doc} canAct />)
+    expect(screen.getByText('Waiting on #12 before it can start.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /record decision/i })).toBeNull()
+    for (const r of screen.getAllByRole('radio')) expect(r).toBeDisabled()
+    await userEvent.click(screen.getByRole('button', { name: /edit doc/i }))
+    expect(screen.getByTestId('decision-editor')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(save).toHaveBeenCalledWith(34, expect.objectContaining({ base_version: 2 }))
+  })
+
+  it('a blocked ticket offers no Edit doc to someone else, or once the record is claimed', () => {
+    const blocked = task({ state: 'blocked', dependency_ids: [12], blocked_by_ids: [12] })
+    const { rerender } = render(<DecisionCard task={blocked} doc={doc} canAct={false} />)
+    expect(screen.queryByRole('button', { name: /edit doc/i })).toBeNull()
+    rerender(<DecisionCard task={blocked} doc={{ ...doc, decided_version: 2, chosen_option: 1, recording_started_at: new Date().toISOString() }} canAct />)
+    expect(screen.queryByRole('button', { name: /edit doc/i })).toBeNull()
+  })
+
+  it('clears the picked option when another tab saves a new version', async () => {
+    const { rerender } = render(<DecisionCard task={task()} doc={doc} canAct />)
+    await userEvent.click(screen.getAllByRole('radio')[1])
+    expect(screen.getAllByRole('radio')[1]).toBeChecked()
+    // v3 drops option A: index 1 is now C. The pick is gone, not moved.
+    const v3: DecisionDoc = { ...doc, current_version: 3, ask: { ...doc.ask!, options: doc.ask!.options.slice(1), recommended: 0 } }
+    rerender(<DecisionCard task={task()} doc={v3} canAct />)
+    for (const r of screen.getAllByRole('radio')) expect(r).not.toBeChecked()
+    await userEvent.type(screen.getByLabelText('Your decision'), 'Go')
+    await userEvent.click(screen.getByRole('button', { name: /record decision/i }))
+    expect(done).not.toHaveBeenCalled()
+    expect(screen.getByRole('alert')).toHaveTextContent('Pick an option, or Something else')
+  })
 })

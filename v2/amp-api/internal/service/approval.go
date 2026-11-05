@@ -456,11 +456,19 @@ func (s *Service) checkUpdateBrief(ctx context.Context, p authz.Principal, t *do
 	desc := clr.Apply("description", req.Description, t.Description)
 	criteria := clr.Apply("acceptance_criteria", req.AcceptanceCriteria, t.AcceptanceCriteria)
 
+	// Who does it, or why: a change to either would strand a decision doc.
+	changesKind := performer != t.Performer || reason != t.HumanReason
 	var doc *domain.DecisionDoc
-	if req.Ask != nil || (performer == domain.PerformerHuman && reason == "judgment") {
+	if req.Ask != nil || changesKind || (performer == domain.PerformerHuman && reason == "judgment") {
 		if doc, err = s.Repo.GetDecisionDoc(ctx, t.ID); err != nil {
 			return err
 		}
+	}
+	if doc != nil && changesKind {
+		// The doc is recorded only by Record decision on a judgment
+		// ticket: once a ticket has one it stays a person's judgment
+		// ticket (no repurpose, D11).
+		return &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionKindRefusal, s.TaskURL(t.ProjectID, t.ID))}
 	}
 	if req.Ask != nil && doc != nil {
 		if doc.Claimed() {

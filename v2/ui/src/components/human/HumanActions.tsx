@@ -17,13 +17,17 @@
  *   Merges are recorded once: a repeat says who recorded it first ("already
  *   merged, recorded by github at …"), and so does the linked step when one is
  *   folded in.
- * - Do: Start, and Mark done… with an inline note, link and hours.
+ * - Do: Start, and Mark done… with an inline note, link and hours. A ticket
+ *   with a decision doc is decided on its doc, in its drawer (Record
+ *   decision): Do offers Start and "Decide in the ticket", never Mark done,
+ *   which the server refuses for it.
  *
  * Approval is not here: it happens only in My work's Approve view
  * (ApproveCard / ApproveView). The drawer links there instead.
  */
 import { useState } from 'react'
-import { Check, ExternalLink, GitMerge, Loader2, Play, RotateCcw, Send } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { ArrowRight, Check, ExternalLink, GitMerge, Loader2, Play, RotateCcw, Send } from 'lucide-react'
 import { api } from '../../api/client'
 import { suggestAnswers } from '../../lib/answers'
 import { safeUrl } from '../../lib/safeUrl'
@@ -68,6 +72,8 @@ export interface HumanActionsProps {
   askedBy?: string
   /** do: the owner's name, for "Only <name> starts and finishes it" */
   ownerName?: string
+  /** do, a ticket with a decision doc: where it is decided (its drawer) */
+  decideHref?: string
   /** called with the updated ticket (or null when only a merge record came back) */
   onChanged?: (t: Task | null, note?: string) => void
 }
@@ -371,7 +377,7 @@ function StartAction({ task, canAct, minutes, onChanged }: HumanActionsProps) {
 
 // ---- Do ----
 
-function DoAction({ task, canAct, ownerName, onChanged }: HumanActionsProps) {
+function DoAction({ task, canAct, ownerName, decideHref, onChanged }: HumanActionsProps) {
   const [finishing, setFinishing] = useState(false)
   const [note, setNote] = useState('')
   const [link, setLink] = useState('')
@@ -387,6 +393,21 @@ function DoAction({ task, canAct, ownerName, onChanged }: HumanActionsProps) {
     return <span className="text-[12.5px] text-ink-2" data-action="do">Waiting on #{(task.blocked_by_ids?.length ? task.blocked_by_ids : task.dependency_ids).join(', #')} before it can start.</span>
   }
   if (!canAct) return <span className="text-[12.5px] text-ink-2" data-action="do">Only {ownerName || 'its owner'} starts and finishes it.</span>
+  if (task.has_decision_doc) {
+    // Its decision is recorded on its doc; Mark done would be refused.
+    return (
+      <div className="flex gap-2 flex-wrap items-center" data-action="do">
+        {task.state === 'backlog' && (
+          <button type="button" className="amp-btn amp-btn-sm" disabled={!!busy} onClick={() => run('start', () => api.startHumanTask(task.id))}>
+            {busy === 'start' ? <Spin /> : <Play size={12} aria-hidden="true" />}Start</button>
+        )}
+        {decideHref
+          ? <Link to={decideHref} className="amp-btn amp-btn-primary amp-btn-sm ml-auto">Decide in the ticket<ArrowRight size={12} aria-hidden="true" /></Link>
+          : <span className="text-[12.5px] text-ink-2 ml-auto">Record the decision on its doc, in the ticket.</span>}
+        {error && <span role="alert" className="text-[12px] text-danger-ink w-full">{error}</span>}
+      </div>
+    )
+  }
   if (finishing) {
     return (
       <form className="grid gap-2" data-action="do" onSubmit={e => {

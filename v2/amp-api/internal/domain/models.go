@@ -247,6 +247,12 @@ type Task struct {
 	// client has to do the arithmetic (the board's "18 min", My work's
 	// "not_started_minutes"). Computed on read, never stored.
 	NotStartedMinutes int `json:"not_started_minutes,omitempty"`
+	// HasDecisionDoc says the ticket has a decision doc (a decision_docs
+	// row; docs/specs/human-decision-docs.md): its decision is recorded on
+	// the doc (Record decision), never by Mark done. Read with the ticket
+	// and set by the task actor when the doc is drafted; never stored on
+	// tasks. Once true it stays true: a doc is never removed.
+	HasDecisionDoc bool `json:"has_decision_doc,omitempty"`
 }
 
 // Display phases of an in-progress ticket (Task.Phase, AMP #2801). There is

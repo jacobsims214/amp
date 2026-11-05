@@ -115,6 +115,8 @@ export interface Task {
   waiting_detail?: string
   /** free-form key/value data for integrations (its own, not inherited) */
   metadata?: Metadata
+  /** it has a decision doc: its decision is recorded on the doc (Record decision), never by Mark done (#125) */
+  has_decision_doc?: boolean
   created_at: string
   updated_at: string
 }
@@ -931,6 +933,8 @@ export interface WaitItem extends MergeClassifier {
   performer?: string
   human_reason?: string
   owner_user_id?: number
+  /** the ticket has a decision doc: it is decided in its drawer, not by Mark done (#125) */
+  has_decision_doc?: boolean
   epic_id?: number
   epic_name?: string
   /** approve: how many tickets await */

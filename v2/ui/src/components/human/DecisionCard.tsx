@@ -9,8 +9,14 @@
  * colour and an "Agent" tag on hover; the owner's have no mark (line blame
  * across the doc's versions, lib/provenance.ts).
  *
+ * The header says "blocks N · waiting Xd" (J1) while the ticket is open.
+ *
  * Edit doc opens the markdown (with a preview) and the option editor; Save
- * writes both as one new version. A 409 keeps the draft and says why.
+ * writes both as one new version. A 409 keeps the draft and says why. It is
+ * offered while the ticket still waits on its dependencies too, so the owner
+ * can prepare the decision; recording waits for them. A new current version
+ * (this card's save or another tab's) clears the picked option, whose index
+ * may now mean another option.
  *
  * Record decision freezes the current version with the chosen option and the
  * decided text, completes the ticket and posts the decision. After that the
@@ -21,7 +27,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Check, Eye, Loader2, Pencil, Play, Plus, RotateCcw, Sparkles, Trash2, X } from 'lucide-react'
 import { api } from '../../api/client'
 import { checklistItems } from '../../lib/brief'
-import { CLAIM_STALE_MS, type OptionChoice } from '../../lib/decisions'
+import { CLAIM_STALE_MS, waitLine, type OptionChoice } from '../../lib/decisions'
 import { blame, blameRuns, type Author } from '../../lib/provenance'
 import type { DecisionAsk, DecisionDoc, Task } from '../../types'
 import { Markdown } from '../ui/Markdown'
@@ -36,6 +42,10 @@ export interface DecisionCardProps {
   onChanged?: (t: Task) => void
   /** the doc after an edit or a record */
   onDocChanged?: (d: DecisionDoc) => void
+  /** open tickets downstream of it, transitively (undefined: not known yet) */
+  blocks?: number
+  /** when it started waiting on its person */
+  waitingSince?: string
   /** now, for the claim's age (tests) */
   now?: () => number
 }
@@ -70,8 +80,15 @@ function validDraft(d: Draft): string | null {
   return null
 }
 
-export function DecisionCard({ task, doc, canAct, ownerName, onChanged, onDocChanged, now = Date.now }: DecisionCardProps) {
+export function DecisionCard({ task, doc, canAct, ownerName, onChanged, onDocChanged, blocks, waitingSince, now = Date.now }: DecisionCardProps) {
   const [choice, setChoice] = useState<OptionChoice>(null)
+  // A new current version may reorder or drop options: the index picked on
+  // the old one would silently point at another option.
+  const [choiceVersion, setChoiceVersion] = useState(doc.current_version)
+  if (choiceVersion !== doc.current_version) {
+    setChoiceVersion(doc.current_version)
+    setChoice(null)
+  }
   const [text, setText] = useState('')
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -87,6 +104,8 @@ export function DecisionCard({ task, doc, canAct, ownerName, onChanged, onDocCha
   const claimed = doc.decided_version != null && (doc.recording_started_at != null || decided)
   const claimStale = claimed && !decided && doc.recording_started_at != null && now() - Date.parse(doc.recording_started_at) > CLAIM_STALE_MS
   const actionable = canAct && open && !blocked && !claimed
+  // The server takes an edit until the record is claimed, waiting or not.
+  const editable = canAct && open && !claimed
   // A pending claim turns into "Recording didn't finish. Retry" when it is a
   // minute old: re-render then, since nothing else may.
   const [, setTick] = useState(0)
@@ -172,7 +191,8 @@ export function DecisionCard({ task, doc, canAct, ownerName, onChanged, onDocCha
     try {
       const saved = await api.saveDecisionDoc(task.id, { base_version: doc.current_version, content: draft.content, ask: draft.ask })
       setDraft(null)
-      // The options changed under any choice made before the edit.
+      // The options changed under any choice made before the edit (and the
+      // new current_version clears it too).
       setChoice(null)
       onDocChanged?.(saved)
     } catch (e) {
@@ -189,6 +209,9 @@ export function DecisionCard({ task, doc, canAct, ownerName, onChanged, onDocCha
 
   return (
     <div className="grid gap-3" data-testid="decision-card">
+      {open && blocks !== undefined && (
+        <span className="text-[12.5px] text-ink-2" data-testid="decision-wait">{waitLine(blocks, waitingSince, now())}</span>
+      )}
       <span className="text-[12px] text-ink-3" data-testid="decision-meta">
         Decision doc · drafted by {(doc.versions?.[0]?.author_kind ?? 'agent') === 'agent' ? 'an agent' : 'a person'} · v{doc.current_version}
         {' · '}<a href={`/artifacts/${doc.artifact_id}`} className="underline underline-offset-2 hover:text-ink">open the doc</a>
@@ -301,7 +324,15 @@ export function DecisionCard({ task, doc, canAct, ownerName, onChanged, onDocCha
           {error && <span role="alert" className="text-[12px] text-danger-ink">{error}</span>}
         </div>
       ) : !open ? null : blocked ? (
-        <span className="text-[12.5px] text-ink-2">Waiting on #{(task.blocked_by_ids?.length ? task.blocked_by_ids : task.dependency_ids).join(', #')} before it can start.</span>
+        <div className="grid gap-2">
+          {editable && !draft && (
+            <div>
+              <button type="button" className="amp-btn amp-btn-sm" disabled={!!busy} onClick={beginEdit}>
+                <Pencil size={12} aria-hidden="true" />Edit doc</button>
+            </div>
+          )}
+          <span className="text-[12.5px] text-ink-2">Waiting on #{(task.blocked_by_ids?.length ? task.blocked_by_ids : task.dependency_ids).join(', #')} before it can start.</span>
+        </div>
       ) : !canAct ? (
         <span className="text-[12.5px] text-ink-2">Only {ownerName || 'its owner'} decides this.</span>
       ) : draft ? null : (

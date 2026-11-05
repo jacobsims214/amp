@@ -6,9 +6,12 @@
  *
  * - Readouts: Waiting on you (red above 0), Approve, Answer, Merge, Do, and
  *   Coming up (shown, never counted) or Cleared today.
- * - One list of items, approve → answer → merge → do, oldest first within each
- *   kind (the server's order). Approve items are ApproveCards that open the
- *   Approve view in place (`?approve=`); the rest carry HumanActions.
+ * - One list of items, approve → answer → merge → do, in the server's order:
+ *   oldest first within each kind, and Do items by what they block, then age.
+ *   A Do card says "blocks N · waiting Xd" (or "Nothing waits on it ·
+ *   waiting Xd"); one with a decision doc links to its drawer to decide.
+ *   Approve items are ApproveCards that open the Approve view in place
+ *   (`?approve=`); the rest carry HumanActions.
  * - Side panels: Coming up with what each waits on, Your agents here (links to
  *   the Board), Done today.
  * - Empty: "You're clear in <project>." Done: "You cleared N things today."
@@ -37,6 +40,7 @@ import { reasonLabel } from '../lib/human'
 import { KIND_LABEL, needsLine } from '../lib/humanActions'
 import { startItemText } from '../lib/dispatchState'
 import { mergeCardState } from '../lib/merge'
+import { waitLine } from '../lib/decisions'
 import { projectLink } from '../lib/projectLink'
 import { refreshWaitCounts } from '../lib/waitCounts'
 import { isNoUserError, noMyWorkReason } from '../lib/myWorkAccess'
@@ -362,11 +366,13 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
     meta.push(it.merge_state === 'abandoned' ? `PR closed ${ago(it.since)}` : `Done ${ago(it.completed_at ?? it.since)}${t?.agent_id ? ` by ${t.agent_id}` : ''}`)
   }
   if (kind === 'do') {
-    const n = it.holding_up?.length ?? 0
-    meta.push(n ? `blocks ${n}` : 'Nothing waits on it', `waiting ${short(it.since)}`)
-    meta.push(`${it.state === 'in_progress' ? 'Started' : 'Ready'} ${ago(it.since)}`)
+    // One line, as the spec words it (D9); the server sorts Do items by it.
+    meta.push(waitLine(it.holding_up?.length ?? 0, it.since))
     meta.push(reasonLabel(it.human_reason ?? t?.human_reason))
   }
+  // A ticket with a decision doc is decided in its drawer, not by Mark done.
+  const hasDoc = !!(it.has_decision_doc || t?.has_decision_doc)
+  const actionTask = t && hasDoc && !t.has_decision_doc ? { ...t, has_decision_doc: true } : t
   if (kind === 'start') meta.push(startItemText(it))
   return (
     <>
@@ -383,12 +389,12 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
         <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[12.5px] text-ink-2">{meta.map(m => <span key={m}>{m}</span>)}</div>
         {kind === 'do' && t && <Brief task={t} />}
         <div className="mt-3">
-          {t ? <HumanActions task={t} kind={kind} canAct={!readOnly} prUrl={it.pr_url} branch={it.branch}
+          {actionTask ? <HumanActions task={actionTask} kind={kind} canAct={!readOnly} prUrl={it.pr_url} branch={it.branch}
             baseBranch={it.base_branch} targetSource={it.target_source}
             holdingUp={it.holding_up} notWaiting={it.not_waiting} trackedBy={it.tracked_by}
             alert={it.alert} alertReason={it.alert_reason} rule={it.rule} reviewUrl={it.review_url}
             defaultBranch={it.default_branch}
-            minutes={it.not_started_minutes} onChanged={() => onChanged()} />
+            minutes={it.not_started_minutes} decideHref={hasDoc ? projectLink(pid, 'board', it.task_id) : undefined} onChanged={() => onChanged()} />
             : <span className="text-[12.5px] text-ink-2">{it.question ?? ''}</span>}
         </div>
       </article>

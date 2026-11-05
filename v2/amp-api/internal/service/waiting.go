@@ -105,6 +105,9 @@ type WaitItem struct {
 	Performer   string    `json:"performer,omitempty"`
 	HumanReason string    `json:"human_reason,omitempty"`
 	OwnerUserID *int      `json:"owner_user_id,omitempty"`
+	// HasDecisionDoc: the ticket's decision is recorded on its doc, in the
+	// ticket's drawer, not by Mark done (Task.HasDecisionDoc).
+	HasDecisionDoc bool `json:"has_decision_doc,omitempty"`
 
 	// approve
 	EpicID   int    `json:"epic_id,omitempty"`
@@ -221,7 +224,8 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 		t := &c.Task
 		it := WaitItem{Kind: kind, Key: fmt.Sprintf("task:%d", t.ID), ProjectID: t.ProjectID, ProjectCode: c.ProjectCode,
 			ProjectName: c.ProjectName, TaskID: t.ID, TaskIDs: []int{t.ID}, Name: t.Name, State: string(t.State), Since: since,
-			Performer: t.Performer, HumanReason: t.HumanReason, OwnerUserID: t.OwnerUserID, EpicID: t.EpicID}
+			Performer: t.Performer, HumanReason: t.HumanReason, OwnerUserID: t.OwnerUserID, EpicID: t.EpicID,
+			HasDecisionDoc: t.HasDecisionDoc}
 		if opt.detail {
 			cp := *t
 			it.Task = &cp

@@ -92,7 +92,9 @@ project, and every action happens in place:
 - **Do**: **Start**, then **Mark done…**, which takes a note, a link and the hours you spent.
   Each card says **blocks N · waiting Xd** (or **Nothing waits on it · waiting Xd**), where N is
   every open ticket downstream of it, and the Do cards are sorted by that count, most first.
-  Answer and Merge items count the same way.
+  Answer and Merge items count the same way. A judgment ticket with a decision doc offers
+  **Start** and **Decide in the ticket**, which opens its panel: it is recorded there, on the
+  doc, never by Mark done.
 
 Next to the list: **Coming up** (with what each ticket waits on), **Your agents here** (counts,
 linking to the Board), and **Done today**. When nothing waits on you, the tab says you're clear.
@@ -143,8 +145,10 @@ on them.
   with no extra call:
   - the ticket panel shows **Decided upstream** ("Decided by Jacob on #34: …", linking to #34);
   - an agent's `amp_get_task` and `amp_claim_task` carry it as `upstream_decisions`, and the claim
-    tells the worker to follow it. Only direct dependencies that are done and have a note are
-    included.
+    tells the worker to follow it. Only direct dependencies are included: a ticket that is done
+    and has a note, or one whose decision doc's record is under way (Record decision has claimed
+    it), which is included before the ticket is done. An open panel refreshes when a dependency's
+    decision changes.
 - **A decision opens as a decision doc.** A judgment ticket planned by an agent comes with an
   **ask**: a question, 2 to 4 options with what each costs, the option the agent recommends and
   why. AMP drafts the ticket's decision doc from it (a markdown artifact, kept, never expiring).
@@ -153,14 +157,19 @@ on them.
   trade-offs and reasoning, and **Decided means** (the acceptance criteria).
   - **Who wrote what.** The agent's lines and options have a coloured rule on the left and an
     "Agent" tag when you hover; the lines and options you changed have no mark.
+  - The card's header says **blocks N · waiting Xd**, as on the My work card.
   - **Edit doc** opens the doc's markdown (with a preview) and the option editor: 2 to 4 options,
     each with a label and what it costs, and which one is recommended. **Save** writes both as one
     new version. If the doc changed in another tab meanwhile, your draft stays and AMP says "The
-    doc changed in another tab. Reload to see it". A doc keeps at most 100 versions.
+    doc changed in another tab. Reload to see it". A doc keeps at most 100 versions. You can edit
+    the doc while the ticket still waits on its dependencies, to prepare the decision; recording
+    waits until they're done. A new version clears the option you had picked, since the options
+    may have changed.
   - **Record decision.** Pick an option (or **Accept recommendation**, or **Something else**),
     write **Your decision** and click **Record decision**. AMP freezes the version you decided on
     (its text and its options), approves and keeps it, marks the ticket done and posts "Decision
-    by <name>: <option> — <your decision>" with a link to that version. The tickets that wait on
+    by <name>: <option> — <your decision>" with a link to that version (just "<option>" when your
+    decision only repeats its label, as after Accept recommendation). The tickets that wait on
     it receive the option as it reads on that version, your text and the version number. Mark
     done isn't offered on a ticket with a doc. If recording stops part way, the card says
     "Recording didn't finish" after a minute; **Retry** finishes it with what you sent.
@@ -168,10 +177,13 @@ on them.
     read-only. There is no reopening: to change your mind, plan a new judgment ticket that depends
     on this one and says what it supersedes.
 
-  The doc changes only in AMP, and only its owner changes it, in the web UI: an agent can't
+  The doc changes only in AMP, in the web UI, by a person who can work the ticket (its owner, a
+  project lead or owner, or anyone on an unassigned ticket): an agent can't
   publish to it, edit it, approve or unkeep it, or record the decision (it is told "Only a person
   records a decision, in AMP: <link>"). A judgment ticket you make yourself in the web UI has no
-  doc; you write your decision when you mark it done.
+  doc; you write your decision when you mark it done. Once a ticket has a doc, who does it and
+  why are fixed: changing its **Done by** or reason is refused ("This ticket's decision is in its
+  doc; record it there or plan a new judgment ticket: <link>"), from the web UI and over MCP.
 - **It's never flagged as quiet.** People work in days, not the minutes an agent takes. It shows as
   **stale** after two days with no activity.
 

@@ -10,16 +10,22 @@
  * DecisionCard (question, options, the doc with its provenance, Decided
  * means, Edit doc, Record decision) in place of the brief's checklist and
  * Mark done…; it reloads when the doc changes (decision.updated, and after
- * the card's own edit or record).
+ * the card's own edit or record). Its header says "blocks N · waiting Xd".
+ *
+ * A ticket the server says has a doc (has_decision_doc) never falls back to
+ * Mark done, which the server refuses for it: while the doc loads it says
+ * so, and a failed load shows the error with Retry. Only a confirmed "no doc"
+ * (404) on a judgment ticket shows the J3 brief and Mark done….
  */
 import { useCallback, useEffect, useState } from 'react'
-import { AlertTriangle, ArrowRight, Pencil, Square, SquareCheck, UserRound } from 'lucide-react'
+import { AlertTriangle, ArrowRight, Pencil, RotateCcw, Square, SquareCheck, UserRound } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../../api/client'
 import { useSSE } from '../../hooks/useSSE'
 import { checklistItems } from '../../lib/brief'
 import { isHuman, reasonHint, reasonLabel, reasonVerb } from '../../lib/human'
 import { lookupPerson, type Person } from '../../lib/people'
+import { openDependents, waitingSince } from '../../lib/decisions'
 import type { ProjectPlan } from '../../hooks/useProjectPlan'
 import type { DecisionDoc, Task } from '../../types'
 import { Markdown } from '../ui/Markdown'
@@ -64,17 +70,27 @@ export function HumanWork({ task, meId, people, plan, canPlan, onEdit, ticketHre
   const criteria = task.acceptance_criteria?.trim() ?? ''
   const checklist = checklistItems(criteria)
 
-  // A judgment ticket's decision doc, when it has one.
-  const judgment = task.human_reason === 'judgment'
-  const [doc, setDoc] = useState<DecisionDoc | null>(null)
+  // A judgment ticket's decision doc, when it has one: 'none' once the
+  // server confirms there is none (404), 'error' when it couldn't be read.
+  const hasDoc = !!task.has_decision_doc
+  const wantsDoc = hasDoc || task.human_reason === 'judgment'
+  const [loaded, setLoaded] = useState<DecisionDoc | 'none' | 'error' | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const loadDoc = useCallback(() => {
-    if (!judgment) return
+    if (!wantsDoc) return
     // The doc with its versions, for provenance; 404 when it has none.
-    api.getTaskDecision(task.id).then(d => setDoc(d?.artifact_id ? d : null)).catch(() => {})
-  }, [judgment, task.id])
+    api.getTaskDecision(task.id)
+      .then(d => { setLoaded(d?.artifact_id ? d : 'none'); setLoadError(null) })
+      .catch((e: unknown) => {
+        if ((e as { status?: number } | null)?.status === 404) { setLoaded('none'); setLoadError(null); return }
+        setLoaded(cur => (typeof cur === 'object' && cur ? cur : 'error'))
+        setLoadError(e instanceof Error ? e.message : 'Could not load the decision doc')
+      })
+  }, [wantsDoc, task.id])
   useEffect(() => { loadDoc() }, [loadDoc])
+  const doc = typeof loaded === 'object' ? loaded : null
   // The card's own edit returns the doc with its versions; a record doesn't.
-  const docChanged = useCallback((d: DecisionDoc) => { if (d.versions) setDoc(d); else loadDoc() }, [loadDoc])
+  const docChanged = useCallback((d: DecisionDoc) => { if (d.versions) setLoaded(d); else loadDoc() }, [loadDoc])
   useSSE(task.project_id, e => {
     if (e.type === 'decision.updated' && (e.payload as { task_id?: number } | undefined)?.task_id === task.id) loadDoc()
   })
@@ -158,9 +174,19 @@ export function HumanWork({ task, meId, people, plan, canPlan, onEdit, ticketHre
         </div>
       )}
 
-      {doc
-        ? <DecisionCard task={task} doc={doc} canAct={mine} ownerName={owner?.name} onChanged={onChanged} onDocChanged={docChanged} />
-        : <HumanActions task={task} kind="do" canAct={mine} ownerName={owner?.name} onChanged={t => { if (t) onChanged(t) }} />}
+      {doc ? (
+        <DecisionCard task={task} doc={doc} canAct={mine} ownerName={owner?.name} onChanged={onChanged} onDocChanged={docChanged}
+          blocks={plan.loaded ? openDependents(task.id, plan.tasks).length : undefined} waitingSince={waitingSince(task)} />
+      ) : loaded === 'error' ? (
+        <div className="flex items-start gap-2 text-[13px] text-danger-ink" role="alert" data-testid="decision-load-error">
+          <AlertTriangle size={14} className="mt-[3px] flex-shrink-0" aria-hidden="true" />
+          <span className="flex-1">Couldn't load the decision doc{loadError ? `: ${loadError}` : ''}.</span>
+          <button type="button" className="amp-btn amp-btn-sm" onClick={loadDoc}>
+            <RotateCcw size={11} aria-hidden="true" />Retry</button>
+        </div>
+      ) : hasDoc && loaded !== 'none' ? (
+        <span className="text-[12.5px] text-ink-2" data-testid="decision-loading">Loading the decision doc…</span>
+      ) : <HumanActions task={task} kind="do" canAct={mine} ownerName={owner?.name} onChanged={t => { if (t) onChanged(t) }} />}
     </div>
   )
 }

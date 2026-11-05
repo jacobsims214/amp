@@ -317,6 +317,13 @@ type MsgSetTaskStartAt struct {
 	ReplyCh chan ReplySimple
 }
 
+// MsgMarkDecisionDoc tells a task's actor that its decision doc now exists
+// (Task.HasDecisionDoc): the service drafted it after the ticket was saved.
+type MsgMarkDecisionDoc struct {
+	TaskID  int
+	ReplyCh chan ReplySimple
+}
+
 // MsgApproveTask records a person's approval of one ticket's plan (AMP
 // #2198). The task actor approves it only if, at that moment, it is still
 // open, not already approved as planned now, planned at or before AsOf
