@@ -13,7 +13,7 @@ import { flagParam, useSearchParamState } from '../hooks/useSearchParamState'
 import { FocusNotFound } from '../components/FocusNotFound'
 import { useFocusFallback } from '../hooks/useFocusFallback'
 import { HandoverBar } from '../components/HandoverBar'
-import { CrudModal } from '../components/CrudModal'
+import { CrudModal, FieldError, inputCls, labelCls } from '../components/CrudModal'
 import { MetadataEditor } from '../components/MetadataEditor'
 import { DependencyPicker } from '../components/DependencyPicker'
 import { PlanCheckModal } from '../components/PlanCheckModal'
@@ -59,12 +59,6 @@ const COLUMNS: {
 function isScheduledTask(task: Task): boolean {
   return task.state === 'blocked' && task.block_reason?.startsWith('scheduled:') === true
 }
-
-const inputCls =
-  'w-full bg-bg border border-line rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-3 ' +
-  'focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-all font-[inherit]'
-
-const labelCls = 'text-xs font-medium text-ink-2 block mb-1.5'
 
 // owner: '' = me (server default), 'none' = unassigned, or a member's user id
 const EMPTY_TASK_FORM = { name: '', description: '', acceptance_criteria: '', assigned_to: 'amp-worker', priority: '1', owner: '', dependency_ids: [] as number[],
@@ -147,6 +141,8 @@ export function Board() {
 
   // Task create
   const [taskCreateModal, setTaskCreateModal] = useState<{ story: Story } | null>(null)
+  // The open dialog's Name was left empty on save: said at the field, cleared as you type (#128).
+  const [nameMissing, setNameMissing] = useState(false)
   const [taskForm, setTaskForm] = useState({ ...EMPTY_TASK_FORM })
   const [taskSaving, setTaskSaving] = useState(false)
   const [taskError, setTaskError] = useState<string | null>(null)
@@ -243,11 +239,11 @@ export function Board() {
   const projectMeta = () => api.getProject(pid).then(p => p.metadata ?? {})
 
   const openEpicModal = (m: { mode: 'create' | 'edit'; epic?: Epic }) => {
-    setEpicError(null); setEpicModal(m)
+    setEpicError(null); setNameMissing(false); setEpicModal(m)
     startMeta(setEpicMeta, m.epic?.metadata, m.epic ? api.inheritedMetadata('epic', m.epic.id) : projectMeta())
   }
   const openStoryModal = (m: { mode: 'create' | 'edit'; story?: Story; epicId?: number }) => {
-    setStoryError(null); setStoryModal(m); setStoryEpicId(m.story?.epic_id ?? null)
+    setStoryError(null); setNameMissing(false); setStoryModal(m); setStoryEpicId(m.story?.epic_id ?? null)
     const parent = m.epicId != null ? epics.find(e => e.id === m.epicId) : undefined
     startMeta(setStoryMeta, m.story?.metadata, m.story
       ? api.inheritedMetadata('story', m.story.id)
@@ -255,7 +251,7 @@ export function Board() {
   }
 
   const handleEpicSave = async () => {
-    if (!epicForm.name.trim()) return
+    if (!epicForm.name.trim()) { setNameMissing(true); document.getElementById('dialog-name')?.focus(); return }
     if (epicMeta.error) { setEpicError(epicMeta.error); return }
     setEpicSaving(true)
     setEpicError(null)
@@ -278,7 +274,7 @@ export function Board() {
   }
 
   const handleStorySave = async () => {
-    if (!storyForm.name.trim()) return
+    if (!storyForm.name.trim()) { setNameMissing(true); document.getElementById('dialog-name')?.focus(); return }
     if (storyMeta.error) { setStoryError(storyMeta.error); return }
     setStorySaving(true)
     setStoryError(null)
@@ -304,7 +300,8 @@ export function Board() {
   }
 
   const handleTaskCreate = async () => {
-    if (!taskForm.name.trim() || !taskCreateModal) return
+    if (!taskCreateModal) return
+    if (!taskForm.name.trim()) { setNameMissing(true); document.getElementById('dialog-name')?.focus(); return }
     setTaskSaving(true)
     setTaskError(null)
     try {
@@ -604,7 +601,7 @@ export function Board() {
                               onClick={e => {
                                 e.stopPropagation()
                                 setTaskForm({ ...EMPTY_TASK_FORM })
-                                setTaskError(null)
+                                setTaskError(null); setNameMissing(false)
                                 setTaskCreateModal({ story })
                               }}
                               // A story with no tickets shows "+ Task" in full (#128); otherwise a quiet icon.
@@ -735,8 +732,10 @@ export function Board() {
       {epicModal && (
         <CrudModal title={epicModal.mode === 'create' ? 'New Epic' : 'Edit Epic'} onClose={() => setEpicModal(null)} onSave={handleEpicSave} saving={epicSaving}>
           <div className="space-y-4">
-            <div><label className={labelCls}>Name *</label>
-              <input autoFocus value={epicForm.name} onChange={e => setEpicForm(f => ({ ...f, name: e.target.value }))} className={inputCls} placeholder="Epic name" /></div>
+            <div><label htmlFor="dialog-name" className={labelCls}>Name *</label>
+              <input id="dialog-name" autoFocus value={epicForm.name} onChange={e => { setEpicForm(f => ({ ...f, name: e.target.value })); setNameMissing(false) }}
+                aria-invalid={nameMissing} aria-describedby={nameMissing ? 'dialog-name-error' : undefined} className={inputCls} placeholder="Epic name" />
+              <FieldError id="dialog-name-error">{nameMissing && 'Give it a name.'}</FieldError></div>
             <div><label className={labelCls}>Description</label>
               <textarea value={epicForm.description} onChange={e => setEpicForm(f => ({ ...f, description: e.target.value }))} rows={3} className={`${inputCls} resize-none`} placeholder="Optional description" /></div>
             <div><label className={labelCls}>Priority</label>
@@ -744,7 +743,7 @@ export function Board() {
                 <option value="0">Low</option><option value="1">Normal</option><option value="2">High</option><option value="3">Critical</option>
               </select></div>
             {editingEpic && (
-              <div><label className={labelCls}>Owners</label>
+              <div data-applies-now><label className={labelCls}>Owners</label>
                 <OwnersEditor
                   ownerIds={editingEpic.owner_ids ?? []}
                   people={people}
@@ -774,8 +773,10 @@ export function Board() {
       {storyModal && (
         <CrudModal title={storyModal.mode === 'create' ? 'New Story' : 'Edit Story'} onClose={() => setStoryModal(null)} onSave={handleStorySave} saving={storySaving}>
           <div className="space-y-4">
-            <div><label className={labelCls}>Name *</label>
-              <input autoFocus value={storyForm.name} onChange={e => setStoryForm(f => ({ ...f, name: e.target.value }))} className={inputCls} placeholder="Story name" /></div>
+            <div><label htmlFor="dialog-name" className={labelCls}>Name *</label>
+              <input id="dialog-name" autoFocus value={storyForm.name} onChange={e => { setStoryForm(f => ({ ...f, name: e.target.value })); setNameMissing(false) }}
+                aria-invalid={nameMissing} aria-describedby={nameMissing ? 'dialog-name-error' : undefined} className={inputCls} placeholder="Story name" />
+              <FieldError id="dialog-name-error">{nameMissing && 'Give it a name.'}</FieldError></div>
             <div><label className={labelCls}>Description</label>
               <textarea value={storyForm.description} onChange={e => setStoryForm(f => ({ ...f, description: e.target.value }))} rows={2} className={`${inputCls} resize-none`} /></div>
             <div><label className={labelCls}>Acceptance Criteria</label>
@@ -794,7 +795,7 @@ export function Board() {
                 <option value="0">Low</option><option value="1">Normal</option><option value="2">High</option><option value="3">Critical</option>
               </select></div>
             {editingStory && (
-              <div><label className={labelCls}>Owners</label>
+              <div data-applies-now><label className={labelCls}>Owners</label>
                 <OwnersEditor
                   ownerIds={editingStory.owner_ids ?? []}
                   people={people}
@@ -824,8 +825,10 @@ export function Board() {
       {taskCreateModal && (
         <CrudModal title="New Task" onClose={() => setTaskCreateModal(null)} onSave={handleTaskCreate} saving={taskSaving}>
           <div className="space-y-4">
-            <div><label className={labelCls}>Name *</label>
-              <input autoFocus value={taskForm.name} onChange={e => setTaskForm(f => ({ ...f, name: e.target.value }))} className={inputCls} placeholder="Task name" /></div>
+            <div><label htmlFor="dialog-name" className={labelCls}>Name *</label>
+              <input id="dialog-name" autoFocus value={taskForm.name} onChange={e => { setTaskForm(f => ({ ...f, name: e.target.value })); setNameMissing(false) }}
+                aria-invalid={nameMissing} aria-describedby={nameMissing ? 'dialog-name-error' : undefined} className={inputCls} placeholder="Task name" />
+              <FieldError id="dialog-name-error">{nameMissing && 'Give it a name.'}</FieldError></div>
             <div><label className={labelCls}>Description</label>
               <textarea value={taskForm.description} onChange={e => setTaskForm(f => ({ ...f, description: e.target.value }))} rows={3} className={`${inputCls} resize-none`} /></div>
             <div><label className={labelCls}>Acceptance Criteria</label>

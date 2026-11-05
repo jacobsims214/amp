@@ -12,6 +12,7 @@ let epics: Epic[] = []
 let stories: Story[] = []
 let tasks: Task[] = []
 const createEpic = vi.fn((...args: unknown[]) => { void args; return Promise.resolve({}) })
+const createStory = vi.fn((...args: unknown[]) => { void args; return Promise.resolve({}) })
 
 vi.mock('../hooks/useSSE', () => ({ useSSE: () => 'connected' }))
 vi.mock('../hooks/usePlanApproval', () => ({
@@ -27,6 +28,7 @@ vi.mock('../api/client', () => ({
       if (name === 'getProject') return Promise.resolve({ id: 3, metadata: {} })
       if (name === 'inheritedMetadata') return Promise.resolve({})
       if (name === 'createEpic') return createEpic(...args)
+      if (name === 'createStory') return createStory(...args)
       return Promise.resolve([])
     },
   }),
@@ -51,7 +53,7 @@ const task = (id: number, storyId: number): Task => ({
   state: 'backlog', priority: '1', dependency_ids: [], created_by: 7, owner_user_id: 7, created_at: '', planned_at: '', updated_at: '',
 }) as Task
 
-beforeEach(() => { epics = []; stories = []; tasks = []; createEpic.mockClear() })
+beforeEach(() => { epics = []; stories = []; tasks = []; createEpic.mockClear(); createStory.mockClear() })
 
 describe('Board empty state', () => {
   it('leads with Create your first epic and links the manager agent', async () => {
@@ -83,5 +85,41 @@ describe('Board add controls', () => {
 
     await userEvent.click(screen.getByRole('button', { name: 'Add a task to No tickets' }))
     expect(screen.getByRole('heading', { name: 'New Task' })).toBeInTheDocument()
+  })
+})
+
+describe('Board dialogs', () => {
+  it('New Epic: Enter in Name saves; an empty Name is flagged at the field', async () => {
+    renderBoard()
+    await userEvent.click(await screen.findByRole('button', { name: 'Create your first epic' }))
+    expect(screen.getByRole('dialog', { name: 'New Epic' })).toBeInTheDocument()
+    const name = screen.getByLabelText('Name *')
+    await userEvent.type(name, '{Enter}')
+    expect(createEpic).not.toHaveBeenCalled()
+    expect(name).toHaveAccessibleDescription('Give it a name.')
+    await userEvent.type(name, 'Launch{Enter}')
+    expect(createEpic).toHaveBeenCalledWith(3, expect.objectContaining({ name: 'Launch' }))
+  })
+
+  it('New Epic: Escape with a name typed asks before discarding it', async () => {
+    renderBoard()
+    await userEvent.click(await screen.findByRole('button', { name: 'Create your first epic' }))
+    await userEvent.type(screen.getByLabelText('Name *'), 'Half a thought')
+    await userEvent.keyboard('{Escape}')
+    expect(screen.getByRole('alertdialog', { name: 'Discard changes?' })).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Discard' }))
+    expect(screen.queryByRole('dialog', { name: 'New Epic' })).toBeNull()
+    expect(createEpic).not.toHaveBeenCalled()
+  })
+
+  it('New Story: Enter in Name saves it, and focus goes back to + Story', async () => {
+    epics = [epic(2, 'Empty epic')]
+    renderBoard()
+    const add = await screen.findByRole('button', { name: 'Add a story to Empty epic' })
+    await userEvent.click(add)
+    expect(screen.getByRole('dialog', { name: 'New Story' })).toBeInTheDocument()
+    await userEvent.type(screen.getByLabelText('Name *'), 'Landing page{Enter}')
+    expect(createStory).toHaveBeenCalledWith(2, expect.objectContaining({ name: 'Landing page' }))
+    expect(await screen.findByRole('button', { name: 'Add a story to Empty epic' })).toHaveFocus()
   })
 })

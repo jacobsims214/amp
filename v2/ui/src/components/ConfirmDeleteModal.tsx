@@ -1,4 +1,6 @@
+import { useEffect, useId, useRef } from 'react'
 import { Loader2, X, AlertTriangle } from 'lucide-react'
+import { composing, useDialogFocus } from '../hooks/useDialogFocus'
 
 interface ConfirmDeleteModalProps {
   title: string
@@ -11,6 +13,16 @@ interface ConfirmDeleteModalProps {
 }
 
 export function ConfirmDeleteModal({ title, description, onClose, onConfirm, deleting = false, error = null }: ConfirmDeleteModalProps) {
+  const titleId = useId()
+  const panelRef = useRef<HTMLDivElement>(null)
+  const cancelRef = useRef<HTMLButtonElement>(null)
+  useDialogFocus(panelRef, cancelRef) // focus starts on Cancel, stays inside, and goes back on close
+  // Escape cancels, as in every dialog (#128).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !e.defaultPrevented && !composing(e)) { e.preventDefault(); onClose() } }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [onClose])
   return (
     <>
       <div
@@ -20,6 +32,7 @@ export function ConfirmDeleteModal({ title, description, onClose, onConfirm, del
       />
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4 pointer-events-none">
         <div
+          ref={panelRef} role="alertdialog" aria-modal="true" aria-labelledby={titleId}
           className="w-full max-w-md pointer-events-auto rounded-2xl"
           style={{
             background: 'var(--surface)',
@@ -29,8 +42,8 @@ export function ConfirmDeleteModal({ title, description, onClose, onConfirm, del
         >
           {/* Header */}
           <div className="flex items-center justify-between px-6 py-4 border-b border-line">
-            <h2 className="text-sm font-semibold text-ink">{title}</h2>
-            <button onClick={onClose} className="p-1.5 hover:bg-surface-3 rounded-lg transition-colors cursor-pointer">
+            <h2 id={titleId} className="text-sm font-semibold text-ink">{title}</h2>
+            <button type="button" onClick={onClose} aria-label="Close" title="Close" className="p-1.5 hover:bg-surface-3 rounded-lg transition-colors cursor-pointer">
               <X size={14} className="text-ink-2" />
             </button>
           </div>
@@ -46,6 +59,8 @@ export function ConfirmDeleteModal({ title, description, onClose, onConfirm, del
           {/* Footer */}
           <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-line">
             <button
+              ref={cancelRef}
+              type="button"
               onClick={onClose}
               className="px-4 py-2 text-xs font-medium text-ink-2 hover:text-ink hover:bg-surface-3 rounded-lg transition-colors cursor-pointer"
             >

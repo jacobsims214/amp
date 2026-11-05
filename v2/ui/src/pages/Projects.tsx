@@ -4,7 +4,8 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { Loader2, Clock, Layers, Archive, RotateCcw, ChevronDown, ChevronUp, Download, Upload, Plus } from 'lucide-react'
 import { api } from '../api/client'
 import { useSSE } from '../hooks/useSSE'
-import { CrudModal, inputCls, labelCls } from '../components/CrudModal'
+import { CrudModal, FieldError, inputCls, labelCls } from '../components/CrudModal'
+import { CODE_MAX, cleanCode, suggestCode } from '../lib/projectCode'
 import { ManagerAgent } from '../components/ManagerAgent'
 import { ProjectHomeFields, type ProjectHome } from '../components/ProjectHomeFields'
 import type { Org, Project, SSEEvent } from '../types'
@@ -56,6 +57,10 @@ export function Projects() {
   const [createHome, setCreateHome] = useState<ProjectHome>(NO_HOME)
   const [creating, setCreating] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
+  // Inline, per field, cleared as you type (#128).
+  const [fieldErrors, setFieldErrors] = useState<{ name?: string; code?: string }>({})
+  // The code follows the name until you type one yourself.
+  const [codeTyped, setCodeTyped] = useState(false)
   const [importModalOpen, setImportModalOpen] = useState(false)
   const [importHome, setImportHome] = useState<ProjectHome>(NO_HOME)
   const importHomeRef = useRef<ProjectHome>(NO_HOME)
@@ -80,12 +85,19 @@ export function Projects() {
     setCreateForm({ name: '', code: '', description: '' })
     setCreateHome(defaultHome())
     setCreateError(null)
+    setFieldErrors({})
+    setCodeTyped(false)
     setCreateOpen(true)
   }
 
   const handleCreate = async () => {
-    if (!createForm.name.trim() || !createForm.code.trim()) {
-      setCreateError('Name and code are required')
+    const missing = {
+      ...(!createForm.name.trim() ? { name: 'Give the project a name.' } : {}),
+      ...(!createForm.code.trim() ? { code: 'Give it a code: letters A-Z and digits.' } : {}),
+    }
+    setFieldErrors(missing)
+    if (missing.name || missing.code) {
+      document.getElementById(missing.name ? 'new-project-name' : 'new-project-code')?.focus()
       return
     }
     setCreating(true)
@@ -314,12 +326,26 @@ export function Projects() {
       {createOpen && (
         <CrudModal title="New Project" onClose={() => setCreateOpen(false)} onSave={handleCreate} saving={creating} saveLabel="Create">
           <div className="space-y-4">
-            <div><label className={labelCls}>Name *</label>
-              <input autoFocus value={createForm.name} onChange={e => setCreateForm(f => ({ ...f, name: e.target.value }))} className={inputCls} placeholder="Project name" /></div>
-            <div><label className={labelCls}>Code *</label>
-              <input value={createForm.code} onChange={e => setCreateForm(f => ({ ...f, code: e.target.value.toUpperCase() }))} className={`${inputCls} font-mono`} placeholder="e.g. AMP" maxLength={12} /></div>
-            <div><label className={labelCls}>Description</label>
-              <textarea value={createForm.description} onChange={e => setCreateForm(f => ({ ...f, description: e.target.value }))} rows={3} className={`${inputCls} resize-none`} placeholder="Optional description" /></div>
+            <div><label htmlFor="new-project-name" className={labelCls}>Name *</label>
+              <input id="new-project-name" autoFocus value={createForm.name}
+                onChange={e => {
+                  const name = e.target.value
+                  setCreateForm(f => ({ ...f, name, code: codeTyped ? f.code : suggestCode(name) }))
+                  setFieldErrors(fe => ({ ...fe, name: undefined, ...(codeTyped ? {} : { code: undefined }) }))
+                }}
+                aria-invalid={!!fieldErrors.name} aria-describedby={fieldErrors.name ? 'new-project-name-error' : undefined}
+                className={inputCls} placeholder="Project name" />
+              <FieldError id="new-project-name-error">{fieldErrors.name}</FieldError></div>
+            <div><label htmlFor="new-project-code" className={labelCls}>Code *</label>
+              <input id="new-project-code" value={createForm.code}
+                onChange={e => { setCodeTyped(true); setCreateForm(f => ({ ...f, code: cleanCode(e.target.value) })); setFieldErrors(fe => ({ ...fe, code: undefined })) }}
+                aria-invalid={!!fieldErrors.code} aria-describedby={fieldErrors.code ? 'new-project-code-error' : 'new-project-code-hint'}
+                className={`${inputCls} font-mono`} placeholder="e.g. AMP" maxLength={CODE_MAX} />
+              {fieldErrors.code
+                ? <FieldError id="new-project-code-error">{fieldErrors.code}</FieldError>
+                : <p id="new-project-code-hint" className="text-[11px] text-ink-3 mt-1.5">Letters A-Z and digits, up to {CODE_MAX}.{codeTyped ? '' : ' Suggested from the name.'}</p>}</div>
+            <div><label htmlFor="new-project-description" className={labelCls}>Description</label>
+              <textarea id="new-project-description" value={createForm.description} onChange={e => setCreateForm(f => ({ ...f, description: e.target.value }))} rows={3} className={`${inputCls} resize-none`} placeholder="Optional description" /></div>
             <ProjectHomeFields orgs={orgs} value={createHome} onChange={setCreateHome} />
             {createError && <p className="text-xs text-danger-ink">{createError}</p>}
           </div>

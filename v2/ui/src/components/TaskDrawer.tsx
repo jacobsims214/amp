@@ -177,7 +177,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   useEffect(() => {
     if (!task) return
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !editing && !showDeleteConfirm) onClose()
+      if (e.key === 'Escape' && !e.defaultPrevented && !editing && !showDeleteConfirm) onClose() // a dialog above took it
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)

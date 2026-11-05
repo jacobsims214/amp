@@ -22,6 +22,13 @@ no stories and a story with no tickets show those buttons in full; once they hav
 same action is the **+** icon on the row, next to **⋯** (edit or delete), and both say what
 they do on hover.
 
+In every dialog (New Project, New Epic, New Story, New Task and the edit dialogs) **Enter** in a
+one-line field saves and **Escape** closes. If you've typed something, Escape or a click outside
+asks **Discard what you've entered?** in the dialog first: **Keep editing** or **Discard**. Tab
+stays inside an open dialog, and closing it puts focus back on the button that opened it. A
+missing name or code is flagged at the field and clears as you type. A new project's code takes
+letters A-Z and digits only, and is suggested from the name until you type your own.
+
 Good tickets:
 - **One thing each.** If it needs "and" to describe it, split it.
 - **Say the outcome, not the code.** Exact values that matter (a path, a config key) are fine; a
