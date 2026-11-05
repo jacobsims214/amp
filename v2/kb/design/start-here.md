@@ -42,6 +42,8 @@ process, and skipping steps is how you get generic, forgettable screens.
 - `design/visual-craft.md`: typography, spacing, color, layout, surfaces, motion. How to make it
   look intentional and not generic.
 - `design/ux-patterns.md`: forms, settings, navigation, tables, states, destructive actions, copy.
+- `design/loading.md`: the tiered loading contract AMP's own UI follows (thresholds, components,
+  reduced motion, errors), a worked example of the loading state.
 - `design/accessibility-and-responsive.md`: the checklist every screen must pass.
 - `design/mockups.md`: how to build a mockup artifact that reviews well (with a template).
 - `design/critique.md`: the rubric to critique your own work (and others') before showing it.

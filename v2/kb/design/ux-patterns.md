@@ -38,7 +38,8 @@ Proven answers to the problems most screens have. Deviate when you have a reason
 - **Empty**: say what this is, why it's empty, and the one action that fills it. A first-run
   empty state is a chance to teach.
 - **Loading**: skeletons in the shape of the content for anything over ~300 ms; keep layout
-  stable (no jumping).
+  stable (no jumping). `design/loading.md` is how AMP's own UI tiers its waits (one long wait
+  at cold boot, skeletons inside the shell, stale content kept during refreshes).
 - **Error**: what happened in plain words, whether anything was lost, and what to do (retry,
   contact). Keep what the person typed.
 - **Success**: brief confirmation near where they acted (inline, or a toast for background
