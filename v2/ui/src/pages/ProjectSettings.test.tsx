@@ -40,6 +40,26 @@ function renderAs(access: ProjectAccess) {
   )
 }
 
+/**
+ * Wait until a watchdog input's DOM value is `value`, then hand the input back.
+ *
+ * The minute inputs are controlled React inputs: `user.clear`/`user.type` set the
+ * value through an input event and the DOM only shows it once React commits, which
+ * on a loaded CI runner can land a step later than the `await` returns. Typing
+ * against a stale DOM value is what broke `saves both minutes together` on main @
+ * c596f16 (run 42076021614, "expected 5, received 105"): the typed `5` appended to
+ * the `10` still in the field. Asserting the value on screen before clearing, after
+ * clearing and after typing pins each step to the state the test means, and turns
+ * any future lost/reset keystroke into a failure that names the value instead of a
+ * save that silently sends the wrong number.
+ *
+ * RTL's `waitFor` (not `vi.waitFor`) is used deliberately: it wraps its polling in
+ * `act`, so React work is flushed while waiting instead of racing the assertion.
+ */
+function shownValue(el: HTMLElement, value: string) {
+  return waitFor(() => expect(el).toHaveValue(value))
+}
+
 beforeEach(() => {
   state.update.mockReset()
   state.credential.mockReset()
@@ -155,10 +175,13 @@ describe('ProjectSettings dispatch watchdog', () => {
     const flag = await screen.findByLabelText(/flag it for its owner after/i)
     const save = screen.getByRole('button', { name: /save watchdog/i })
     await vi.waitFor(() => expect(flag).toBeEnabled())
+    await shownValue(flag, '10') // the loaded minutes, not a field mid-load
     expect(save).toBeDisabled() // nothing changed yet
 
     await user.clear(flag)
+    await shownValue(flag, '') // the clear committed, so “5” cannot append to “10”
     await user.type(flag, '5')
+    await shownValue(flag, '5') // exactly what Save will send
     await user.click(save)
     expect(state.update).toHaveBeenLastCalledWith(3, { not_started_flag_minutes: 5, not_started_return_minutes: 30 })
     await vi.waitFor(() => expect(screen.getByText('Saved')).toBeInTheDocument())
@@ -170,8 +193,11 @@ describe('ProjectSettings dispatch watchdog', () => {
     renderAs('owner')
     const ret = await screen.findByLabelText(/return it to ready after/i)
     await vi.waitFor(() => expect(ret).toBeEnabled())
+    await shownValue(ret, '30')
     await user.clear(ret)
+    await shownValue(ret, '')
     await user.type(ret, '0')
+    await shownValue(ret, '0')
     // The hint renders after the input's state update; wait for it rather than racing it on a busy CI runner.
     expect(await screen.findByText('Off: this never happens.')).toBeInTheDocument()
     expect(await screen.findByText(/automatic return is off/i)).toBeInTheDocument()
@@ -184,8 +210,11 @@ describe('ProjectSettings dispatch watchdog', () => {
     renderAs('owner')
     const flag = await screen.findByLabelText(/flag it for its owner after/i)
     await vi.waitFor(() => expect(flag).toBeEnabled())
+    await shownValue(flag, '10')
     await user.clear(flag)
+    await shownValue(flag, '')
     await user.type(flag, '1.5')
+    await shownValue(flag, '1.5')
     expect(screen.getAllByRole('alert').map(e => e.textContent).join(' ')).toMatch(/whole number of minutes, 0 \(off\) to 1440/i)
     expect(screen.getByRole('button', { name: /save watchdog/i })).toBeDisabled()
     expect(state.update).not.toHaveBeenCalled()
@@ -196,8 +225,11 @@ describe('ProjectSettings dispatch watchdog', () => {
     renderAs('owner')
     const flag = await screen.findByLabelText(/flag it for its owner after/i)
     await vi.waitFor(() => expect(flag).toBeEnabled())
+    await shownValue(flag, '10')
     await user.clear(flag)
+    await shownValue(flag, '')
     await user.type(flag, '40')
+    await shownValue(flag, '40')
     expect(screen.getByText(/never reaches the flag first/i)).toBeInTheDocument()
   })
 
