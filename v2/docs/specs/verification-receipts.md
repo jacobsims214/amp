@@ -28,10 +28,10 @@ badge, and Mission's Done readout counts the unverified ones.
   `unverified → self_checked → independently_verified → human_accepted` (V5).
 - Goal: a **per-project receipts setting**, Off / Inform / Require. The org default is Off. In
   Require mode a ticket can't be marked done below a minimum level.
-- Goal: **evidence storage and playback**. The `ReceiptStore` keeps evidence on local disk,
-  amp-api serves it with Range, and the drawer plays it.
-- Non-goal (follow-ups, see the end): the recorder, the gate model and independent verifier, and
-  the S3 backend.
+- Goal: **evidence storage and playback**. The `ReceiptStore` keeps evidence on local disk (or,
+  opt-in, in S3: the bundled SeaweedFS or a store you run), amp-api serves it with Range, and the
+  drawer plays it.
+- Non-goal (follow-ups, see the end): the recorder, and the gate model and independent verifier.
 - Non-goal: putting evidence in **artifacts** or in the artifact review queue (V3).
 - Non-goal: the live step viewer, `check_suite` ingestion, day-report counts, a harness verifier.
 - Non-goal: **receipts on human tickets.**
@@ -294,23 +294,49 @@ func ValidateKey(key string) error // no "..", leading "/", "\\" or empty segmen
 func New(cfg Config) (Store, error)
 ```
 
-- **`local`** is the only backend in v1. Its root is `RECEIPT_DIR`, default `data/receipts` under
+- **`local`** is the default backend. Its root is `RECEIPT_DIR`, default `data/receipts` under
   amp-api's working directory (git-ignored). `Put` writes a temp file while hashing and
   `os.Link`s it into place, which is atomic and once-only, on NFS too. `Serve` uses
   `http.ServeContent` with the sha256 as ETag.
-- The interface is shaped so the S3 follow-up adds `s3.go` and a `RECEIPT_STORE` value without
-  touching callers. The sweep is driven by Postgres, so retention needs no bucket rules.
+- **`s3`** (`s3.go`, `RECEIPT_STORE=s3`, #144) is any S3-compatible store, through
+  `github.com/minio/minio-go/v7` (Apache-2.0): the bundled SeaweedFS (Apache-2.0, opt-in in
+  compose and Helm), or R2, AWS S3, Garage, MinIO. `Put` spools the body to a temporary file
+  while hashing it, reading at most `max+1` bytes, so a body over the cap stores nothing; it
+  checks the key with `StatObject` (`ErrExists`), then sends one `PutObject` of known size with
+  `If-None-Match: *`, which SeaweedFS, S3 and R2 honour, so a race also ends in `ErrExists`. A
+  store that refuses the header (501) gets a plain PUT. Only SeaweedFS is tested.
+  `Serve` stats the object and hands the `*minio.Object` (an `io.ReadSeeker`) to
+  `http.ServeContent`, so Range turns into ranged GETs; a missing key is `ErrNotFound`. `Delete`
+  is `RemoveObject`, and a missing key isn't an error. The bucket is created at startup if it is
+  missing.
+- **Serving stays proxied, on both backends.** No presigned URLs, no media origin in the CSP, no
+  Envoy route to the store. amp-api keeps the members-only check, Range/206, `nosniff`, the
+  sandbox CSP, CORP and the allowlisted Content-Type in one place, and an in-cluster SeaweedFS
+  has no public host name to presign for anyway.
+- **Retention is Postgres's**, on both backends: the sweep (`service.RunReceiptSweep`) calls
+  `Store.Delete`. Don't give the bucket lifecycle rules: a rule can't tell kept receipts from
+  unkept ones and would delete them too.
 - **Config** (env, read in `cmd/server/main.go`):
 
   | Variable | Default | What it sets |
   |---|---|---|
+  | `RECEIPT_STORE` | `local` | `local` or `s3` |
   | `RECEIPT_DIR` | `data/receipts` | local root |
+  | `RECEIPT_S3_ENDPOINT` | (none) | `host:port`, or a URL whose scheme decides TLS |
+  | `RECEIPT_S3_BUCKET` | (none) | the bucket, created at startup if missing |
+  | `RECEIPT_S3_ACCESS_KEY` / `RECEIPT_S3_SECRET_KEY` | (none) | the key pair; the secret is never logged |
+  | `RECEIPT_S3_REGION` | `us-east-1` | region (R2: `auto`) |
+  | `RECEIPT_S3_USE_SSL` | `true` | https to `host:port` endpoints; `false` for the in-cluster SeaweedFS |
+  | `RECEIPT_S3_PATH_STYLE` | `true` | bucket in the path (SeaweedFS, Garage and MinIO need it) |
+  | `RECEIPT_S3_SPOOL_DIR` | system temp dir | where an upload is spooled before it is sent |
   | `RECEIPT_MAX_BYTES` | `209715200` (200 MiB) | per-file cap |
   | `RECEIPT_RETENTION_DAYS` | `90` | how long unkept evidence lives (`<= 0` means the default) |
 
   If the store fails to start, amp-api logs it and keeps running. Evidence calls answer "evidence
   storage isn't configured: <why>", and visual checks then downgrade, so Require holds them for a
-  person.
+  person. For `s3` that covers a bad config and credentials the store refuses. A store that
+  can't be reached yet (SeaweedFS still starting) is kept, logged as a warning, and tried again
+  at the first upload.
 - **Allowlisted names:** `video.mp4` (`video/mp4`), `poster.gif` (`image/gif`), `contact.png`
   and `screenshot-<n>.png` (`image/png`), `trace.zip` (`application/zip`), `har.json` and
   `receipt.json` (`application/json`), `console.txt` and `transcript.txt` (`text/plain;
@@ -318,7 +344,18 @@ func New(cfg Config) (Store, error)
 - **Deploy.** Compose: amp-api gets `RECEIPT_DIR=/data/receipts` and a named volume
   `amp-receipts`. Helm: a ReadWriteMany PVC (`nfs-storage` in production, default 20Gi), so any
   number of amp-api replicas sees the same files. Both are created whatever the mode, and they
-  stay empty while every project is Off.
+  stay empty while every project is Off. SeaweedFS is opt-in. In compose it is the `seaweedfs`
+  profile plus `docker-compose.seaweedfs.yml`. In Helm it is `seaweedfs.enabled`: a one-replica
+  StatefulSet with its own PVC, a ClusterIP Service on the S3 port, a generated key Secret, and a
+  NetworkPolicy that admits amp-api only, to the S3 port. The policy is always rendered with
+  SeaweedFS, whatever `networkPolicy.enabled` says. Master, volume and filer listen on loopback
+  only (`-ip.bind=127.0.0.1 -s3.ip.bind=0.0.0.0`), and Iceberg and Lance are off. The S3 gRPC
+  port can't be moved off the network, so its admin calls need a token signed with SeaweedFS's
+  `jwt.filer_signing.key` (`WEED_JWT_FILER_SIGNING_KEY`, a third key in the Secret). Compose
+  uses the same flags and key. The amp-receipts PVC isn't rendered then, and any
+  number of replicas works without ReadWriteMany. An S3 store you run is
+  `ampApi.receipts.s3.endpoint` plus `existingSecret`. `values-production.yaml` stays on the
+  PVC.
 
 ### HTTP routes (`amp-api/internal/api/receipts.go`)
 
@@ -435,7 +472,7 @@ generated and drift-checked in CI).
 | ID | Decision or assumption | Why | By |
 |----|------------------------|-----|----|
 | D1 | The recorder follows Piquette/SPF (see Follow-ups). v1's evidence names and `tree_sha` binding are built to fit it. | Owner decision V1 | human |
-| D2 | Storage is local by default and S3 optional, behind one `ReceiptStore`. v1 ships local; S3 is a follow-up. | Owner decision V2 | human |
+| D2 | Storage is local by default and S3 optional, behind one `ReceiptStore`. Both landed: S3 with a bundled, opt-in SeaweedFS (2026-11-05). Serving stays proxied through amp-api. | Owner decision V2; owner, 2026-11-05 ("add SeaweedFS as part of the receipts") | human |
 | D3 | Evidence is not an artifact. Postgres holds metadata only. | Owner decision V3 | human |
 | D4 | **Amends V4:** receipts are a per-project setting, Off / Inform / Require. Inform never blocks. Require holds a ticket below its minimum until a person Accepts. | Owner, 2026-11-04 | human |
 | D5 | Status ladder: unverified → self_checked → independently_verified → human_accepted. | Owner decision V5 | human |
@@ -445,12 +482,12 @@ generated and drift-checked in CI).
 | D9 | Only project owners and org admins change the setting, in the web UI. Agents never do. | Same as `require_merge` | human |
 | D10 | Accept always satisfies Require. A failed or impossible check holds the ticket for a person. It never passes silently and never stops the project. | Owner, 2026-11-04 | human |
 | D11 | Per-ticket overrides may only raise the requirement, unless a person in the web UI lowers it. | Owner, 2026-11-04 | human |
-| D12 | v1 is Phases 1–3. The recorder, the gate model and verifier, and the S3 backend are follow-ups. | Owner, 2026-11-04 | human |
+| D12 | v1 is Phases 1–3. The recorder and the gate model and verifier are follow-ups. The S3 backend landed with it (#144). | Owner, 2026-11-04; 2026-11-05 | human |
 | D13 | Unkept attempts expire after 90 days. A ticket's receipts are kept forever once it merges or a person Accepts. | Owner, 2026-11-04 | human |
 | D14 | A CI pass is a worker check: `self_checked` at most. | Owner, 2026-11-04 | human |
 | D15 | No receipts on human tickets in this change. | Owner, 2026-11-04 | human |
 | D16 | The `VERIFIED` comment stays as a display fallback for one release. | Owner, 2026-11-04 | human |
-| D17 | No in-cluster S3 now (future: #144). Database backups to an S3-compatible store are tracked in #145. The S3 backend can reuse either store by config. | Owner, 2026-11-04 | human |
+| D17 | In-cluster S3 is SeaweedFS (#144), opt-in, and amp-api only reaches it. It is never exposed: amp-api serves the files, so the auth and headers stay in one place, and the store needs no public host name. Production stays on the PVC until someone turns it on. Database backups to an S3-compatible store are tracked in #145; the S3 backend can point at that store by config. | Owner, 2026-11-04; 2026-11-05 | human |
 | D18 | No verifier token budget. | Owner, 2026-11-04 | human |
 | D19 | The worker writes and commits `.amp/journeys/<task_id>.json`, and the verifier adds an unhappy path. Follow-up. | Owner, 2026-11-04 | human |
 | D20 | There is one receipt per completing run. It opens as a draft before completion so evidence can upload first. | The run doesn't exist at upload time | agent |
@@ -565,10 +602,12 @@ Each phase ends with the Verification commands passing. All three ship in one PR
   journeys plus its own unhappy path, and records a verdict that can reach
   `independently_verified`. A verifier `fail` creates a "Fixes #N" ticket. Unlocks
   `independently_verified` as a Require minimum.
-- **Optional S3 backend.** `s3.go` behind the same `Store` with `RECEIPT_STORE=s3` (R2, S3,
-  MinIO, Garage). Short-lived presigned GETs minted on view, and a media origin added to the CSP.
-  Production would point it at the store from #144 or #145; until then production uses the local
-  PVC.
+- **S3 backend: landed** (#144, 2026-11-05). See "Evidence store". `s3.go` is behind the same
+  `Store` with `RECEIPT_STORE=s3`, and SeaweedFS is bundled, opt-in. Unlike the earlier plan
+  there are no presigned GETs and no CSP media origin: amp-api proxies the bytes, so the
+  members-only check and safety headers live in one place, and the in-cluster store has no
+  public host name. Left open: moving production from the PVC to SeaweedFS, which is config
+  only, plus copying existing evidence (KB `operations/where-amp-keeps-data`).
 
 ## Verification
 

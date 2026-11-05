@@ -32,6 +32,7 @@ cert-manager, with authn/authz for humans (browser/UI) and machines
 | **amp-api** | Existing Go service (MCP tools + REST/SSE) | Adds JWT validation middleware (validates Dex JWKS-signed tokens on both the MCP and REST listeners) and a `users`/`user_roles` migration + `/api/me` endpoint. Trusts Envoy for edge auth but re-validates the token itself (defense in depth, per user request). |
 | **ui** | Existing React app | Adds an `AuthContext` (calls `/api/me`), a login redirect handler, and a `Users` admin page calling `amp-authadmin`. |
 | **typesense**, **ollama** | Unchanged | Same images, now as k8s Deployments+PVCs instead of compose volumes. Post-install Job pulls `nomic-embed-text` into Ollama (replaces `make kb-setup`). |
+| **seaweedfs** (opt-in, `seaweedfs.enabled`) | S3 store for verification receipt evidence (#126, #144) | SeaweedFS (Apache-2.0), one-replica StatefulSet with its own PVC, non-root (uid 1000), telemetry off. Only amp-api reaches it (ClusterIP Service on the S3 port, NetworkPolicy), with a chart-generated key pair (`amp-seaweedfs-s3`). No Envoy route: amp-api proxies every evidence read. Off by default; then evidence is on the `amp-receipts` PVC. See KB `operations/where-amp-keeps-data`. |
 
 ## Namespaces
 

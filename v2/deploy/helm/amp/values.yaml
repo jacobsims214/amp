@@ -36,6 +36,11 @@ global:
     # only; see relay.database and relay.clusterToken).
     relayDbPassword: ""
     relayClusterToken: ""
+    # The bundled SeaweedFS's S3 key pair (seaweedfs.enabled only, and only
+    # without seaweedfs.existingSecret).
+    seaweedfsAccessKey: ""
+    seaweedfsSecretKey: ""
+    seaweedfsJwtSigningKey: ""
 
 # Client IP in the audit log (KB decisions/audit-log-v2.md; #2430, #2469).
 #
@@ -151,11 +156,39 @@ ampApi:
   # (derived from MCP_PUBLIC_URL).
   appPublicUrl: ""
   # Verification receipt evidence (#126, KB operations/where-amp-keeps-data):
-  # the screenshots, videos and logs workers attach to their receipts. Kept on
-  # a PVC (amp-receipts) mounted at /data/receipts in every replica; never in Postgres, never artifacts. Created whatever the
-  # receipts setting, it stays empty while every project is Off (the
-  # default). Sizing: about 5-20 MB per recorded journey.
+  # the screenshots, videos and logs workers attach to their receipts. Never
+  # in Postgres, never artifacts. Sizing: about 5-20 MB per recorded journey.
+  # Created whatever the receipts setting, the store stays empty while every
+  # project is Off (the default). Three places, one at a time:
+  #   - a PVC (amp-receipts) mounted at /data/receipts in every replica: the
+  #     default (storage, below);
+  #   - the bundled SeaweedFS (seaweedfs.enabled, at the end of this file);
+  #   - an S3 store you run (receipts.s3, below: R2, AWS S3, Garage).
+  # With S3 the PVC isn't rendered (an existing one is kept, with its files)
+  # and any number of replicas works without ReadWriteMany. Either way
+  # browsers get evidence from amp-api (members only), never from the store.
   receipts:
+    # An S3-compatible store you run, instead of the PVC. Setting endpoint
+    # turns it on. Don't give the bucket lifecycle rules: AMP deletes unkept
+    # evidence itself (retentionDays), and a rule would delete kept receipts.
+    s3:
+      endpoint: ""          # host:port or https://host, e.g. https://<account>.r2.cloudflarestorage.com
+      bucket: amp-receipts  # created at startup if missing (needs the permission)
+      region: us-east-1     # R2: auto
+      useSSL: true          # ignored when endpoint is a URL (its scheme decides)
+      pathStyle: true
+      # Required: a Secret holding the key pair, e.g.
+      #   kubectl -n amp create secret generic amp-receipts-s3 \
+      #     --from-literal=access-key=... --from-literal=secret-key=...
+      existingSecret: ""
+      accessKeyKey: access-key
+      secretKeyKey: secret-key
+    # With S3, an upload is spooled here (hashed and measured) before it is
+    # sent: an emptyDir, up to maxBytes per upload in flight. Size it for
+    # maxBytes x the uploads one replica takes at once (4Gi is about 20 at
+    # 200 MiB): past sizeLimit the kubelet evicts the pod, and every upload
+    # in flight with it, rather than failing the one write.
+    spoolSizeLimit: 4Gi
     storage:
       size: 20Gi
       # ReadWriteOnce works on any cluster (local-path included) with one
@@ -469,6 +502,36 @@ valkey:
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 300m, memory: 256Mi }
+
+# The bundled S3 store for receipt evidence (#126, #144): SeaweedFS
+# (Apache-2.0), one replica, opt-in. enabled renders a StatefulSet
+# (amp-seaweedfs, `weed server -s3`) with its own PVC, a ClusterIP Service
+# with the S3 port only, the keys' Secret, and a NetworkPolicy that admits
+# amp-api alone to the S3 port (always rendered, whatever networkPolicy.enabled
+# says; it needs a CNI that enforces it); amp-api then stores evidence there
+# (RECEIPT_STORE=s3) and the amp-receipts PVC isn't rendered. Never exposed
+# outside the cluster: no Envoy route, no Ingress; amp-api serves the files.
+# Back up the PVC (data-amp-seaweedfs-0), or see KB
+# operations/where-amp-keeps-data for `weed filer.backup`.
+seaweedfs:
+  enabled: false
+  image: chrislusf/seaweedfs
+  tag: "4.52"
+  bucket: amp-receipts
+  # A Secret with access-key and secret-key, and ideally jwt-signing-key
+  # (SeaweedFS's own admin signing key; without it, SeaweedFS's S3 gRPC
+  # admin calls are allowed from inside its pod). Empty: the chart makes
+  # amp-seaweedfs-s3 (random, kept across upgrades; pin with
+  # global.secretOverrides.seaweedfsAccessKey/SecretKey under ArgoCD), and a
+  # change to it restarts SeaweedFS. After rotating an existingSecret,
+  # restart amp-seaweedfs and amp-api together.
+  existingSecret: ""
+  storage:
+    size: 20Gi
+    storageClassName: ""   # empty = cluster default
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 1Gi }
 
 asynqmon:
   image: hibiken/asynqmon

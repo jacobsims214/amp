@@ -212,3 +212,26 @@ runAsUser: 0
 {{- define "amp.relayTokenSecret" -}}
 {{- .Values.relay.clusterToken.existingSecret | default "amp-relay-cluster-token" -}}
 {{- end -}}
+
+{{/* amp.receiptStore: where receipt evidence lives (#126, #144): "seaweedfs"
+     (the bundled store, seaweedfs.enabled), "s3" (ampApi.receipts.s3.endpoint)
+     or "local" (the amp-receipts PVC, the default). Both S3 settings at
+     once is refused: one store at a time. */}}
+{{- define "amp.receiptStore" -}}
+{{- $ext := .Values.ampApi.receipts.s3 | default dict -}}
+{{- if and .Values.seaweedfs.enabled $ext.endpoint -}}
+{{- fail "seaweedfs.enabled and ampApi.receipts.s3.endpoint are both set: receipt evidence goes to one store; unset one" -}}
+{{- end -}}
+{{- if .Values.seaweedfs.enabled -}}
+seaweedfs
+{{- else if $ext.endpoint -}}
+s3
+{{- else -}}
+local
+{{- end -}}
+{{- end -}}
+
+{{/* amp.seaweedfsSecret: the Secret with the bundled SeaweedFS's key pair. */}}
+{{- define "amp.seaweedfsSecret" -}}
+{{- .Values.seaweedfs.existingSecret | default "amp-seaweedfs-s3" -}}
+{{- end -}}

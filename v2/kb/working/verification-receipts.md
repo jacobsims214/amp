@@ -115,7 +115,9 @@ queue.
 **Retention.** Evidence of a receipt nobody kept is deleted after 90 days, and the drawer then says
 "Evidence expired on <date>". A ticket's receipts are kept for good once it merges or a person
 accepts it. Deleting a ticket keeps them while it is in the trash; purging it, or resetting the
-project, deletes them. Where the files live: `operations/where-amp-keeps-data.md`.
+project, deletes them. Where the files live (a volume by default, or an S3 bucket: the bundled,
+opt-in SeaweedFS, or R2, S3 or Garage): `operations/where-amp-keeps-data.md`. Either way the
+files are served by AMP itself, so who can open them doesn't depend on the store.
 
 To try it locally (`make dev`): `scripts/seed-sample-receipt.sh <ready ticket id>` sets that
 ticket's project to Inform, records a 3 s test clip with ffmpeg, uploads it and completes the

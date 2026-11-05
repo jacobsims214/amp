@@ -330,8 +330,8 @@ func main() {
 	mergeFacts := githubFactsCoordinator(repo)
 	mcpTools.SetMergeFacts(mergeFacts)
 	// Verification receipt evidence (#126): the local store under
-	// RECEIPT_DIR. If it can't start, amp-api keeps running: evidence calls
-	// say why, and visual checks can't count.
+	// RECEIPT_DIR, or S3 (RECEIPT_STORE=s3). If it can't start, amp-api
+	// keeps running: evidence calls say why, and visual checks can't count.
 	evidence := receiptStoreFromEnv()
 	mcpTools.SetReceiptStore(evidence)
 	mcpSrv := newMCPServer(mcpTools)
@@ -609,10 +609,14 @@ func appPublicURL() string {
 	return ""
 }
 
-// receiptStoreFromEnv opens the receipt evidence store: RECEIPT_DIR
-// (default data/receipts), RECEIPT_MAX_BYTES (default 200 MiB) and
-// RECEIPT_RETENTION_DAYS (default 90; <= 0 means the default). A store that
-// can't start is logged and left out, never fatal.
+// receiptStoreFromEnv opens the receipt evidence store: RECEIPT_STORE
+// (local, the default, or s3; receipts.ConfigFromEnv has the s3 settings),
+// RECEIPT_DIR (local; default data/receipts), RECEIPT_MAX_BYTES (default
+// 200 MiB) and RECEIPT_RETENTION_DAYS (default 90; <= 0 means the default).
+// A store that can't start is logged and left out, never fatal. For s3 the
+// bucket is created if missing; a store that can't be reached yet (still
+// starting) is kept and tried again at the first upload, but one that
+// refuses the credentials is left out like a bad config.
 func receiptStoreFromEnv() *service.EvidenceStore {
 	e := &service.EvidenceStore{MaxBytes: receipts.DefaultMaxBytes, Retention: receipts.DefaultRetentionDays * 24 * time.Hour}
 	if n, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("RECEIPT_MAX_BYTES")), 10, 64); err == nil && n > 0 {
@@ -621,15 +625,34 @@ func receiptStoreFromEnv() *service.EvidenceStore {
 	if d, err := strconv.Atoi(strings.TrimSpace(os.Getenv("RECEIPT_RETENTION_DAYS"))); err == nil && d > 0 {
 		e.Retention = time.Duration(d) * 24 * time.Hour
 	}
-	store, err := receipts.New(receipts.Config{Backend: os.Getenv("RECEIPT_STORE"), Dir: os.Getenv("RECEIPT_DIR")})
-	if err != nil {
+	unavailable := func(err error) *service.EvidenceStore {
 		slog.Error("receipt evidence store unavailable: evidence uploads are refused and visual checks can't count", "err", err)
 		e.Err = err.Error()
 		return e
 	}
+	cfg, err := receipts.ConfigFromEnv(os.Getenv)
+	if err != nil {
+		return unavailable(err)
+	}
+	store, err := receipts.New(cfg)
+	if err != nil {
+		return unavailable(err)
+	}
+	where := []any{"backend", "local", "dir", envOrDefault("RECEIPT_DIR", receipts.DefaultDir)}
+	if s3, ok := store.(*receipts.S3); ok {
+		where = []any{"backend", "s3", "endpoint", s3.Endpoint(), "bucket", s3.Bucket()}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err := s3.Ready(ctx)
+		cancel()
+		if err != nil && receipts.AuthError(err) {
+			return unavailable(err)
+		}
+		if err != nil {
+			slog.Warn("receipt evidence store not reachable yet: tried again at the first upload", append(where, "err", err)...)
+		}
+	}
 	e.Store = store
-	slog.Info("receipt evidence store", "dir", envOrDefault("RECEIPT_DIR", receipts.DefaultDir), "max_bytes", e.MaxBytes,
-		"retention_days", int(e.Retention.Hours()/24))
+	slog.Info("receipt evidence store", append(where, "max_bytes", e.MaxBytes, "retention_days", int(e.Retention.Hours()/24))...)
 	return e
 }
 

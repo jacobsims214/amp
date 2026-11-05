@@ -71,13 +71,52 @@ services:
       # docker-compose.remote-dev.yml.
       # Verification receipt evidence (#126): screenshots and videos, on the
       # amp-receipts volume. It stays empty while every project's receipts
-      # setting is Off (the default).
+      # setting is Off (the default). To keep them in the bundled SeaweedFS
+      # (S3) instead, add docker-compose.seaweedfs.yml (see the seaweedfs
+      # service below).
       RECEIPT_DIR: /data/receipts
     volumes:
       - amp-receipts:/data/receipts
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
+
+  # Opt-in S3 store for receipt evidence (#126, #144): SeaweedFS
+  # (Apache-2.0). Off by default: the seaweedfs profile starts it, and
+  # docker-compose.seaweedfs.yml points amp-api at it:
+  #   docker compose -f docker-compose.yml -f docker-compose.seaweedfs.yml --profile seaweedfs up -d
+  # No host port: only amp-api reaches it, on this network. Evidence is still
+  # served to browsers by amp-api, never by SeaweedFS. The access key pair
+  # is SEAWEEDFS_ACCESS_KEY / SEAWEEDFS_SECRET_KEY: the defaults are
+  # well-known local-dev values, so set both on any shared host. The
+  # inline `configs:` entry below needs Docker Compose v2.23.1 or later.
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.52
+    container_name: amp-seaweedfs
+    profiles: ["seaweedfs"]
+    # One process: master, volume, filer and the S3 gateway on :8333. The
+    # image's entrypoint adds -dir=/data -volume.max=0
+    # -master.volumeSizeLimitMB=1024 and drops to its seaweed user (uid 1000).
+    # Master, volume and filer listen on loopback only; only S3 and its gRPC
+    # port are on the compose network. That gRPC port's admin calls, and
+    # filer writes, need a token signed with WEED_JWT_FILER_SIGNING_KEY
+    # (SEAWEEDFS_JWT_SIGNING_KEY; set it on a shared host too). Iceberg and
+    # Lance are off; no telemetry.
+    command: ["server", "-ip=127.0.0.1", "-ip.bind=127.0.0.1", "-s3", "-s3.ip.bind=0.0.0.0", "-s3.port=8333",
+              "-s3.port.iceberg=0", "-s3.port.lance=0", "-s3.config=/etc/seaweedfs/s3.json", "-master.telemetry=false"]
+    environment:
+      WEED_JWT_FILER_SIGNING_KEY: ${SEAWEEDFS_JWT_SIGNING_KEY:-amp-local-dev-seaweedfs-jwt-signing-key}
+    configs:
+      - source: seaweedfs-s3
+        target: /etc/seaweedfs/s3.json
+    volumes:
+      - amp-seaweedfs:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8333/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     restart: unless-stopped
 
   ui:
@@ -91,8 +130,17 @@ services:
       - amp-api
     restart: unless-stopped
 
+# SeaweedFS's S3 identities: one key pair, allowed only the receipts bucket.
+configs:
+  seaweedfs-s3:
+    content: |
+      {"identities": [{"name": "amp-api",
+        "credentials": [{"accessKey": "${SEAWEEDFS_ACCESS_KEY:-amp-local-dev}", "secretKey": "${SEAWEEDFS_SECRET_KEY:-amp-local-dev-secret}"}],
+        "actions": ["Admin:amp-receipts", "Read:amp-receipts", "Write:amp-receipts", "List:amp-receipts", "Tagging:amp-receipts"]}]}
+
 volumes:
   amp-pgdata:
   amp-receipts:
+  amp-seaweedfs:
   amp-tsdata:
   amp-ollama:

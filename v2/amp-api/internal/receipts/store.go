@@ -3,11 +3,14 @@
 // receipt's screenshots, videos and logs. Postgres holds only their metadata
 // (receipt_evidence); evidence is never an artifact (D3).
 //
-// v1 has one backend, local (a directory: a docker volume, or a
-// ReadWriteMany PVC in Helm). The Store interface is shaped so an S3
-// backend can be added behind RECEIPT_STORE without touching callers.
-// Retention is driven by Postgres (service.RunReceiptSweep), so a backend
-// needs no lifecycle rules of its own.
+// Two backends, chosen by RECEIPT_STORE: local (the default; a directory: a
+// docker volume, or a ReadWriteMany PVC in Helm) and s3 (any S3-compatible
+// store: the bundled, opt-in SeaweedFS, or AWS S3, R2, Garage). Either way
+// evidence is served through amp-api (Serve), never by a presigned URL, so
+// the members-only check and the safety headers stay in one place.
+// Retention is driven by Postgres (service.RunReceiptSweep calls Delete), so
+// a backend needs no lifecycle rules of its own, and must not have any: a
+// bucket rule would also delete kept receipts.
 package receipts
 
 import (
@@ -51,10 +54,12 @@ const (
 
 // Config selects and configures the store.
 type Config struct {
-	// Backend is "local" (the default, and the only one in v1).
+	// Backend is "local" (the default) or "s3".
 	Backend string
 	// Dir is local's root (DefaultDir when empty).
 	Dir string
+	// S3 configures the s3 backend.
+	S3 S3Config
 }
 
 // New opens the configured store. An error means evidence storage isn't
@@ -67,6 +72,8 @@ func New(cfg Config) (Store, error) {
 			dir = DefaultDir
 		}
 		return NewLocal(dir)
+	case "s3":
+		return NewS3(cfg.S3)
 	}
-	return nil, fmt.Errorf("unknown receipt store %q (v1 supports local)", cfg.Backend)
+	return nil, fmt.Errorf("unknown receipt store %q (local or s3)", cfg.Backend)
 }

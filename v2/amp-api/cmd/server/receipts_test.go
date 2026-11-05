@@ -19,7 +19,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -603,28 +602,56 @@ func TestReceipts_MoveGuardsFailClosed(t *testing.T) {
 
 // ---- Phase 3: the evidence store, serving, retention ----
 
-// evidenceWorld is an Inform-or-Require world with a local receipt store
-// in a temporary directory, on both the MCP tools and the REST routes.
+// evidenceWorld is an Inform-or-Require world with a receipt store, on both
+// the MCP tools and the REST routes: local, in a temporary directory, or S3
+// when RECEIPT_S3_TEST_ENDPOINT is set (see testEvidenceStore).
 type evidenceWorld struct {
 	w     *rbacWorld
 	ra    *restAs
 	ev    *service.EvidenceStore
-	local *receipts.Local
+	store receipts.Store
+}
+
+// s3TestBucket is one bucket per test process, so keys (project and task
+// ids) from an earlier run against the same store never collide.
+var s3TestBucket = fmt.Sprintf("amp-cmd-test-%d", time.Now().UnixNano())
+
+// testEvidenceStore is the store an evidence test runs on: local in a
+// temporary directory, or, with RECEIPT_S3_TEST_ENDPOINT (and _ACCESS_KEY,
+// _SECRET_KEY; _USE_SSL defaults to false), S3 in a bucket of its own.
+func testEvidenceStore(t *testing.T) receipts.Store {
+	t.Helper()
+	if ep := os.Getenv("RECEIPT_S3_TEST_ENDPOINT"); ep != "" {
+		s3, err := receipts.NewS3(receipts.S3Config{
+			Endpoint: ep, Bucket: s3TestBucket, PathStyle: true, SpoolDir: t.TempDir(),
+			AccessKey: os.Getenv("RECEIPT_S3_TEST_ACCESS_KEY"), SecretKey: os.Getenv("RECEIPT_S3_TEST_SECRET_KEY"),
+			UseSSL: os.Getenv("RECEIPT_S3_TEST_USE_SSL") == "true",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s3.Ready(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return s3
+	}
+	local, err := receipts.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return local
 }
 
 func newEvidenceWorld(t *testing.T, mode string) *evidenceWorld {
 	t.Helper()
 	w := newRBACWorld(t)
-	local, err := receipts.NewLocal(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	ev := &service.EvidenceStore{Store: local, MaxBytes: 1 << 20, Retention: 90 * 24 * time.Hour}
+	store := testEvidenceStore(t)
+	ev := &service.EvidenceStore{Store: store, MaxBytes: 1 << 20, Retention: 90 * 24 * time.Hour}
 	w.s.tools.SetReceiptStore(ev)
 	t.Cleanup(func() { w.s.tools.SetReceiptStore(nil) })
 	ra := newRestAsWith(t, w, func(h *api.RestHandler) { h.SetReceiptStore(ev) })
 	setReceiptsMode(t, ra, w.s.projectID, mode)
-	return &evidenceWorld{w: w, ra: ra, ev: ev, local: local}
+	return &evidenceWorld{w: w, ra: ra, ev: ev, store: store}
 }
 
 // svc is a service on the world's store, as main's background jobs get.
@@ -634,8 +661,9 @@ func (e *evidenceWorld) svc() *service.Service {
 	return s
 }
 
-func (e *evidenceWorld) onDisk(key string) bool {
-	_, err := os.Stat(filepath.Join(e.local.Root(), filepath.FromSlash(key)))
+// inStore reports whether the store holds key.
+func (e *evidenceWorld) inStore(key string) bool {
+	err := e.store.Serve(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil), key)
 	return err == nil
 }
 
@@ -769,21 +797,21 @@ func TestReceipts_EvidenceUploadAndServe(t *testing.T) {
 
 	// A sha256 mismatch (same length) is 422 and stores nothing.
 	bad := bytes.Repeat([]byte("x"), len(png))
-	if code, _ := e.put(t, shot.url, bad); code != 422 {
-		t.Fatalf("mismatched upload: %d, want 422", code)
+	if code, out := e.put(t, shot.url, bad); code != 422 {
+		t.Fatalf("mismatched upload: %d, want 422 (%v)", code, out)
 	}
-	if e.onDisk(shot.key) || evidenceStatus(t, shot.key) != "pending" {
-		t.Fatalf("a mismatched upload stored something: on disk %v, %s", e.onDisk(shot.key), evidenceStatus(t, shot.key))
+	if e.inStore(shot.key) || evidenceStatus(t, shot.key) != "pending" {
+		t.Fatalf("a mismatched upload stored something: in the store %v, %s", e.inStore(shot.key), evidenceStatus(t, shot.key))
 	}
 	// So is a longer body.
-	if code, _ := e.put(t, shot.url, append(append([]byte{}, png...), 'x')); code != 422 || e.onDisk(shot.key) {
+	if code, _ := e.put(t, shot.url, append(append([]byte{}, png...), 'x')); code != 422 || e.inStore(shot.key) {
 		t.Fatalf("long upload: %d", code)
 	}
 	// The same URL then works (the retry), once.
 	if code, out := e.put(t, shot.url, png); code != 200 || out["status"] != "stored" {
 		t.Fatalf("upload: %d %v", code, out)
 	}
-	if !e.onDisk(shot.key) || evidenceStatus(t, shot.key) != "stored" {
+	if !e.inStore(shot.key) || evidenceStatus(t, shot.key) != "stored" {
 		t.Fatal("upload not stored")
 	}
 	if code, _ := e.put(t, shot.url, png); code != 404 {
@@ -1000,10 +1028,10 @@ func TestReceipts_SweepPurgeReset(t *testing.T) {
 	if err != nil || expired != 1 || dropped != 1 {
 		t.Fatalf("sweep: %d expired, %d dropped, %v", expired, dropped, err)
 	}
-	if e.onDisk(unkeptKey) || evidenceStatus(t, unkeptKey) != "expired" {
+	if e.inStore(unkeptKey) || evidenceStatus(t, unkeptKey) != "expired" {
 		t.Fatal("unkept evidence past retention wasn't expired")
 	}
-	if !e.onDisk(keptKey) || evidenceStatus(t, keptKey) != "stored" || !e.onDisk(freshKey) || evidenceStatus(t, freshKey) != "stored" {
+	if !e.inStore(keptKey) || evidenceStatus(t, keptKey) != "stored" || !e.inStore(freshKey) || evidenceStatus(t, freshKey) != "stored" {
 		t.Fatal("kept or fresh evidence was expired")
 	}
 	if evidenceStatus(t, pend["screenshot-1.png"].key) != "none" || evidenceStatus(t, pend["screenshot-2.png"].key) != "pending" {
@@ -1026,20 +1054,20 @@ func TestReceipts_SweepPurgeReset(t *testing.T) {
 
 	// A ticket purged from the trash takes its receipts and evidence.
 	e.w.as(e.w.root).call(t, "amp_delete_task", map[string]any{"task_id": float64(kept)})
-	if !e.onDisk(keptKey) || receiptRows(t, kept) == 0 {
+	if !e.inStore(keptKey) || receiptRows(t, kept) == 0 {
 		t.Fatal("deleting (to the trash) dropped the evidence")
 	}
 	execSQL(t, `UPDATE deleted_tasks SET deleted_at = NOW() - INTERVAL '31 days' WHERE task_id = $1`, kept)
 	if _, err := e.svc().PurgeTrash(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if e.onDisk(keptKey) || receiptRows(t, kept) != 0 || evidenceStatus(t, keptKey) != "none" {
+	if e.inStore(keptKey) || receiptRows(t, kept) != 0 || evidenceStatus(t, keptKey) != "none" {
 		t.Fatal("purge left the ticket's receipts or evidence")
 	}
 
 	// A reset deletes the project's receipts and evidence.
 	e.ra.want(t, 200, "owner", http.MethodPost, fmt.Sprintf("/api/projects/%d/reset", e.w.s.projectID), nil)
-	if e.onDisk(freshKey) || receiptRows(t, fresh) != 0 || receiptRows(t, unkept) != 0 {
+	if e.inStore(freshKey) || receiptRows(t, fresh) != 0 || receiptRows(t, unkept) != 0 {
 		t.Fatal("reset left receipts or evidence")
 	}
 }
@@ -1101,7 +1129,7 @@ func TestReceipts_PurgeResetKeepEvidenceTheyCantDelete(t *testing.T) {
 
 	keep := func(what string) {
 		t.Helper()
-		if !e.onDisk(up.key) || receiptRows(t, id) == 0 || evidenceStatus(t, up.key) != "stored" {
+		if !e.inStore(up.key) || receiptRows(t, id) == 0 || evidenceStatus(t, up.key) != "stored" {
 			t.Fatalf("%s: dropped the receipt or its evidence", what)
 		}
 	}
@@ -1113,7 +1141,7 @@ func TestReceipts_PurgeResetKeepEvidenceTheyCantDelete(t *testing.T) {
 	keep("purge with no store")
 	// A delete that fails.
 	failing := service.New(e.w.s.repo, e.w.s.reg, nil)
-	failing.Evidence = &service.EvidenceStore{Store: failingStore{e.local}}
+	failing.Evidence = &service.EvidenceStore{Store: failingStore{e.store}}
 	if _, err := failing.PurgeTrash(ctx); err == nil {
 		t.Fatal("purge with failing deletes: no error")
 	}
@@ -1129,7 +1157,7 @@ func TestReceipts_PurgeResetKeepEvidenceTheyCantDelete(t *testing.T) {
 	if _, err := e.svc().PurgeTrash(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if e.onDisk(up.key) || receiptRows(t, id) != 0 {
+	if e.inStore(up.key) || receiptRows(t, id) != 0 {
 		t.Fatal("purge with the store back left the evidence")
 	}
 }
@@ -1191,7 +1219,7 @@ func TestReceipts_ConcurrentSameTokenUpload(t *testing.T) {
 	if code := <-first; code != 200 {
 		t.Fatalf("first upload: %d", code)
 	}
-	if evidenceStatus(t, up.key) != "stored" || !e.onDisk(up.key) {
+	if evidenceStatus(t, up.key) != "stored" || !e.inStore(up.key) {
 		t.Fatal("first upload not stored")
 	}
 	if resp, got := e.get(t, "bob", up.key, ""); resp.StatusCode != 200 || !bytes.Equal(got, body) {
@@ -1494,5 +1522,47 @@ func uiSetState(t *testing.T, w *rbacWorld, who *auth.Identity, id int, state do
 	}
 	if _, err := service.New(w.s.repo, w.s.reg, nil).SetTaskState(ctx, p, id, state, ""); err != nil {
 		t.Fatalf("UI state %s: %v", state, err)
+	}
+}
+
+// receiptStoreFromEnv with RECEIPT_STORE=s3: a bad config leaves the store
+// out (evidence calls refuse, amp-api runs on); a store that can't be
+// reached yet is kept, to be tried again at the first upload; refused
+// credentials leave it out. The secret is never in the error.
+func TestReceiptStoreFromEnv_S3(t *testing.T) {
+	set := func(kv map[string]string) {
+		for _, k := range []string{"RECEIPT_STORE", "RECEIPT_S3_ENDPOINT", "RECEIPT_S3_BUCKET", "RECEIPT_S3_ACCESS_KEY",
+			"RECEIPT_S3_SECRET_KEY", "RECEIPT_S3_USE_SSL", "RECEIPT_S3_SPOOL_DIR"} {
+			t.Setenv(k, kv[k])
+		}
+	}
+	set(map[string]string{"RECEIPT_STORE": "s3", "RECEIPT_S3_ENDPOINT": "127.0.0.1:1", "RECEIPT_S3_SECRET_KEY": "hunter2-secret"})
+	if e := receiptStoreFromEnv(); e.Store != nil || !strings.Contains(e.Err, "RECEIPT_S3_BUCKET") || strings.Contains(e.Err, "hunter2") {
+		t.Fatalf("missing bucket: %+v", e)
+	}
+	set(map[string]string{"RECEIPT_STORE": "s3", "RECEIPT_S3_ENDPOINT": "127.0.0.1:1", "RECEIPT_S3_BUCKET": "ev", "RECEIPT_S3_USE_SSL": "maybe",
+		"RECEIPT_S3_ACCESS_KEY": "a", "RECEIPT_S3_SECRET_KEY": "s"})
+	if e := receiptStoreFromEnv(); e.Store != nil || !strings.Contains(e.Err, "RECEIPT_S3_USE_SSL") {
+		t.Fatalf("malformed boolean: %+v", e)
+	}
+	set(map[string]string{"RECEIPT_STORE": "s3", "RECEIPT_S3_ENDPOINT": "127.0.0.1:1", "RECEIPT_S3_BUCKET": "ev", "RECEIPT_S3_USE_SSL": "false",
+		"RECEIPT_S3_ACCESS_KEY": "a", "RECEIPT_S3_SECRET_KEY": "s", "RECEIPT_S3_SPOOL_DIR": t.TempDir()})
+	if e := receiptStoreFromEnv(); e.Store == nil || e.Err != "" {
+		t.Fatalf("store not up yet: %+v, want it kept", e)
+	}
+	ep := os.Getenv("RECEIPT_S3_TEST_ENDPOINT")
+	if ep == "" {
+		return
+	}
+	set(map[string]string{"RECEIPT_STORE": "s3", "RECEIPT_S3_ENDPOINT": ep, "RECEIPT_S3_BUCKET": s3TestBucket + "-env", "RECEIPT_S3_USE_SSL": "false",
+		"RECEIPT_S3_ACCESS_KEY": "nobody", "RECEIPT_S3_SECRET_KEY": "hunter2-secret", "RECEIPT_S3_SPOOL_DIR": t.TempDir()})
+	if e := receiptStoreFromEnv(); e.Store != nil || e.Err == "" || strings.Contains(e.Err, "hunter2") {
+		t.Fatalf("refused credentials: %+v", e)
+	}
+	set(map[string]string{"RECEIPT_STORE": "s3", "RECEIPT_S3_ENDPOINT": ep, "RECEIPT_S3_BUCKET": s3TestBucket, "RECEIPT_S3_USE_SSL": "false",
+		"RECEIPT_S3_ACCESS_KEY": os.Getenv("RECEIPT_S3_TEST_ACCESS_KEY"), "RECEIPT_S3_SECRET_KEY": os.Getenv("RECEIPT_S3_TEST_SECRET_KEY"),
+		"RECEIPT_S3_SPOOL_DIR": t.TempDir()})
+	if e := receiptStoreFromEnv(); e.Store == nil || e.Err != "" {
+		t.Fatalf("s3 store: %+v", e)
 	}
 }
