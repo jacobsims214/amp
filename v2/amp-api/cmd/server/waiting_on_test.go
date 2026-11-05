@@ -10,7 +10,7 @@ import (
 	"github.com/simstech/amp-api/internal/domain"
 )
 
-// Waiting on you (AMP #2478, KB decisions/human-work-ux.md §1 and §3):
+// Waiting on you (AMP #2478, v2/kb/working/human-work.md):
 // WaitingOn's four kinds and coming_up over a seeded project, served by the
 // project's My work tab, the top-level summary and the badge counts.
 
@@ -19,7 +19,7 @@ type waitFixture struct {
 	ra *restAs
 	// alice's tickets in the shared project
 	build, deploy, solo, q1, q2, doReady, doStarted, comingDeps, comingApproval, bobsHuman, epic2Task int
-	epic2                                                                                           int
+	epic2                                                                                             int
 	// a second project with one question for alice
 	proj2, q3 int
 }
@@ -180,6 +180,8 @@ func TestWaitingOn_ProjectTabKindsOrderAndPlan(t *testing.T) {
 		t.Fatalf("merge = %v", ids)
 	}
 	m := merge[0].(map[string]any)
+	// A merge card counts the direct dependents that wait for the merge
+	// (TrueWaiters, AMP #3011); do and answer items count transitively.
 	if m["merge_state"] != domain.MergeNeeded || m["pr_url"] == nil || fmt.Sprint(m["holding_up"]) != fmt.Sprintf("[%d]", f.deploy) {
 		t.Fatalf("merge item = %v", m)
 	}
@@ -390,5 +392,66 @@ func TestWaitingOn_Permissions(t *testing.T) {
 	// The outsider's summary and badge hold nothing of this project.
 	if c := countsOf(f.ra.want(t, 200, "outsider", http.MethodGet, "/api/my-work/counts", nil)["counts"]); c["waiting"] != 0 {
 		t.Fatalf("outsider counts = %v", c)
+	}
+}
+
+// Do and answer items carry holding_up too, counted transitively (the open
+// tickets downstream, through any depth), exactly as MCP's waiting_on_people
+// counts it; Do items sort by how many they hold up, then by age.
+func TestWaitingOn_DoAndAnswerHoldingUpIsTransitive(t *testing.T) {
+	f := newWaitFixture(t)
+	w := f.w
+	alice := w.s.as(w.alice)
+	pid, story := w.s.projectID, w.s.storyID
+
+	// doReady holds one ticket; doStarted holds two directly and a third through one of them;
+	// q1 holds one that holds another.
+	r1 := mkIn(t, alice, story, "after sign-off", f.doReady)
+	s1 := mkIn(t, alice, story, "after vendor call a", f.doStarted)
+	s2 := mkIn(t, alice, story, "after vendor call b", f.doStarted)
+	s3 := mkIn(t, alice, story, "later still", s1)
+	a1 := mkIn(t, alice, story, "after answer", f.q1)
+	a2 := mkIn(t, alice, story, "after after answer", a1)
+
+	out := f.ra.want(t, 200, "alice", http.MethodGet, fmt.Sprintf("/api/projects/%d/my-work", pid), nil)
+	items := out["items"].(map[string]any)
+	hold := func(kind string) map[int][]int {
+		m := map[int][]int{}
+		for _, x := range items[kind].([]any) {
+			it := x.(map[string]any)
+			var ids []int
+			hs, _ := it["holding_up"].([]any)
+			for _, h := range hs {
+				ids = append(ids, int(h.(float64)))
+			}
+			m[int(it["task_id"].(float64))] = ids
+		}
+		return m
+	}
+	do, answer := hold("do"), hold("answer")
+	if !slices.Equal(do[f.doReady], []int{r1}) || !slices.Equal(do[f.doStarted], []int{s1, s2, s3}) {
+		t.Fatalf("do holding_up = %v", do)
+	}
+	if !slices.Equal(answer[f.q1], []int{a1, a2}) {
+		t.Fatalf("answer holding_up = %v", answer)
+	}
+	// Do items sort by what they hold up, most first, though doReady is older.
+	if ids := itemTaskIDs(items["do"]); !slices.Equal(ids, []int{f.doStarted, f.doReady}) {
+		t.Fatalf("do order = %v, want [%d %d]", ids, f.doStarted, f.doReady)
+	}
+
+	// MCP's waiting_on_people says the same.
+	board := alice.call(t, "amp_list_tasks", map[string]any{"project_id": float64(pid), "owner": "any"})
+	_, byID := waitKinds(board["waiting_on_people"])
+	for id, want := range map[int][]int{f.doReady: do[f.doReady], f.doStarted: do[f.doStarted], f.q1: answer[f.q1]} {
+		var got []int
+		hs, _ := byID[id]["holding_up"].([]any)
+		for _, h := range hs {
+			got = append(got, int(h.(float64)))
+		}
+		slices.Sort(got)
+		if !slices.Equal(got, want) {
+			t.Fatalf("waiting_on_people holding_up for #%d = %v, My work says %v", id, got, want)
+		}
 	}
 }

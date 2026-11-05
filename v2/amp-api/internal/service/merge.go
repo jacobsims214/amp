@@ -12,7 +12,7 @@ import (
 	"github.com/simstech/amp-api/internal/domain"
 )
 
-// ---- Merge signal (AMP #2475, KB decisions/human-work-ux.md §4) ----
+// ---- Merge signal (AMP #2475, v2/kb/working/human-work.md) ----
 //
 // A ticket that completes with a run carrying a PR or a pushed branch, in a
 // project that requires merges, is done with merge_state "needed": the

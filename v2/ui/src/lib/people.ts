@@ -107,7 +107,7 @@ export function ownerFilterNarrows(filter: OwnerFilter, meId: number | undefined
 }
 
 /**
- * Mine = tickets I own (owner_user_id = me), nothing else (decisions/human-work-ux.md §1).
+ * Mine = tickets I own (owner_user_id = me), nothing else (v2/kb/working/human-work.md).
  * Unowned = tickets nobody owns, including ones I created, so they stay findable.
  */
 export function taskMatchesOwner(task: Task, filter: OwnerFilter, meId: number | undefined): boolean {

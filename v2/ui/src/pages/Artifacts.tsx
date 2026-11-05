@@ -8,21 +8,30 @@ import { ArtifactKindIcon, ArtifactStatusTag } from '../components/artifacts/Art
 import { KIND_LABEL, STATUS_LABEL, expiresIn } from '../lib/artifacts'
 import type { Artifact, ArtifactStatus } from '../types'
 
-const FILTERS: (ArtifactStatus | 'all')[] = ['all', 'in_review', 'changes_requested', 'approved']
+type Filter = ArtifactStatus | 'all' | 'decisions'
+
+/** 'decisions': recorded decision docs (role decision, approved by Record decision); there is no separate decision log. */
+const FILTERS: Filter[] = ['all', 'in_review', 'changes_requested', 'approved', 'decisions']
+
+function matches(a: Artifact, f: Filter): boolean {
+  if (f === 'all') return true
+  if (f === 'decisions') return a.role === 'decision' && a.status === 'approved'
+  return a.status === f
+}
 
 /** A project's artifacts: mockups, diagrams, images and documents its agents
  *  published for review, waiting-for-you first. */
 export function Artifacts() {
   const pid = Number(useParams().projectId)
   const [list, setList] = useState<Artifact[] | null>(null)
-  const [filter, setFilter] = useState<ArtifactStatus | 'all'>('all')
+  const [filter, setFilter] = useState<Filter>('all')
   const load = useCallback(() => { api.listArtifacts(pid).then(setList).catch(() => setList([])) }, [pid])
   useEffect(load, [load])
   useSSE(pid, e => { if (e.type === 'artifact.updated') load() })
 
   const shown = useMemo(() => {
     const rank: Record<ArtifactStatus, number> = { in_review: 0, changes_requested: 1, approved: 2 }
-    return (list ?? []).filter(a => filter === 'all' || a.status === filter)
+    return (list ?? []).filter(a => matches(a, filter))
       .sort((a, b) => rank[a.status] - rank[b.status] || b.updated_at.localeCompare(a.updated_at))
   }, [list, filter])
 
@@ -33,7 +42,7 @@ export function Artifacts() {
           {FILTERS.map(f => (
             <button key={f} type="button" onClick={() => setFilter(f)} aria-pressed={filter === f}
               className={`font-label text-[10.5px] font-semibold uppercase tracking-[0.12em] px-2.5 py-2 border-l border-line first:border-l-0 cursor-pointer ${filter === f ? 'bg-ink text-on-ink' : 'bg-surface text-ink-2 hover:text-ink'}`}>
-              {f === 'all' ? 'All' : STATUS_LABEL[f]}
+              {f === 'all' ? 'All' : f === 'decisions' ? 'Decisions' : STATUS_LABEL[f]}
             </button>
           ))}
         </div>
@@ -43,7 +52,7 @@ export function Artifacts() {
           <div className="flex justify-center py-16"><Loader2 size={20} className="animate-spin text-ink-2" /></div>
         ) : shown.length === 0 ? (
           <div className="amp-panel p-8 max-w-[640px] grid gap-2">
-            <h2 className="amp-heading m-0 text-[17px]">{list.length ? 'Nothing here with that status' : 'No artifacts yet'}</h2>
+            <h2 className="amp-heading m-0 text-[17px]">{filter === 'decisions' && list.length ? 'No recorded decisions yet' : list.length ? 'Nothing here with that status' : 'No artifacts yet'}</h2>
             <p className="m-0 text-[13px] text-ink-2 leading-relaxed">
               Artifacts are what agents make for you to look at before code: UI mockups, prototypes, diagrams, images and documents.
               Ask your manager agent to put a design step in the plan, or have any agent call <code>amp_publish_artifact</code>.

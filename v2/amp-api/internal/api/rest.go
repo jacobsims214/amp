@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -1092,6 +1093,9 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 				fail(w, err, 500)
 				return
 			}
+			if req.Ask != nil && !slices.Contains(warnings, service.DecisionDocWarning) {
+				h.publishDecision(task.ProjectID, task.ID, 1)
+			}
 			jsonOK(w, struct {
 				*domain.Task
 				Warnings []string `json:"warnings,omitempty"`
@@ -1409,16 +1413,24 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			// Off the web UI, a person's ticket isn't switched to agent work.
-			if err := h.svc.UpdateTask(r.Context(), pr, task, req); err != nil {
+			warnings, err := h.svc.UpdateTask(r.Context(), pr, task, req)
+			if err != nil {
 				fail(w, err, 400)
 				return
+			}
+			if req.Ask != nil && len(warnings) == 0 {
+				h.publishDecision(task.ProjectID, taskID, 1)
 			}
 			updated, err := h.repo.GetTask(r.Context(), taskID)
 			if err != nil {
 				jsonErr(w, err, 500)
 				return
 			}
-			jsonOK(w, map[string]interface{}{"task": updated})
+			out := map[string]interface{}{"task": updated}
+			if len(warnings) > 0 {
+				out["warnings"] = warnings
+			}
+			jsonOK(w, out)
 
 		case http.MethodDelete:
 			if _, err := h.svc.DeleteTask(r.Context(), pr, task); err != nil {
@@ -1474,6 +1486,80 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonOK(w, rec)
 		return
+
+	case "decisions":
+		// GET: what people decided on this ticket's dependencies, and its own
+		// decision doc (null when it has none), without its versions.
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET required", 405)
+			return
+		}
+		ups, err := h.svc.UpstreamDecisions(r.Context(), pr, taskID)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		own, err := h.svc.OwnDecision(r.Context(), pr, taskID)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]any{"upstream": ups, "own": own})
+
+	case "decision":
+		// GET: the ticket's decision doc: the current version's options and
+		// markdown, and every version with its options. 404 without one.
+		// PUT /decision/doc {base_version, content, ask}: a person's edit,
+		// one new version. POST /decision/record {version, chosen_option,
+		// decision_text}: Record decision. Both are the web UI's only.
+		switch {
+		case r.Method == http.MethodGet && len(parts) == 2:
+			doc, err := h.svc.GetDecision(r.Context(), pr, taskID)
+			if err != nil {
+				fail(w, err, 500)
+				return
+			}
+			jsonOK(w, doc)
+		case r.Method == http.MethodPut && len(parts) == 3 && parts[2] == "doc":
+			var req service.SaveDecisionDocRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				jsonErr(w, err, 400)
+				return
+			}
+			doc, err := h.svc.SaveDecisionDoc(r.Context(), pr, taskID, req)
+			if err != nil {
+				fail(w, err, 500)
+				return
+			}
+			h.publishDecision(task.ProjectID, taskID, doc.CurrentVersion)
+			h.publishDecisionArtifact(r, doc.ArtifactID)
+			jsonOK(w, doc)
+		case r.Method == http.MethodPost && len(parts) == 3 && parts[2] == "record":
+			var req service.RecordDecisionRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				jsonErr(w, err, 400)
+				return
+			}
+			doc, err := h.svc.RecordDecision(r.Context(), pr, taskID, req)
+			if err != nil {
+				if doc != nil && doc.DecidedVersion != nil {
+					// The record claimed and then stopped: dependents already
+					// read the claim, and open drawers should show the retry.
+					h.publishDecision(task.ProjectID, taskID, *doc.DecidedVersion)
+				}
+				fail(w, err, 500)
+				return
+			}
+			version := doc.CurrentVersion
+			if doc.DecidedVersion != nil {
+				version = *doc.DecidedVersion
+			}
+			h.publishDecision(task.ProjectID, taskID, version)
+			h.publishDecisionArtifact(r, doc.ArtifactID)
+			jsonOK(w, doc)
+		default:
+			http.Error(w, "method not allowed", 405)
+		}
 
 	case "runs":
 		if r.Method == http.MethodPost {
@@ -1775,6 +1861,20 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 // needs. Reading and commenting need only project access; assign and
 // dispatch are checked in full by the service; everything else that changes
 // the ticket is "work" on it.
+// publishDecision tells open drawers a ticket's decision doc changed.
+func (h *RestHandler) publishDecision(projectID, taskID, version int) {
+	h.hub.Publish(domain.Event{Type: domain.EventDecisionUpdated, ProjectID: projectID,
+		Payload: map[string]any{"task_id": taskID, "version": version}, At: time.Now()})
+}
+
+// publishDecisionArtifact tells an open artifact page its decision doc
+// changed (a new version, or approved by Record decision).
+func (h *RestHandler) publishDecisionArtifact(r *http.Request, artifactID int) {
+	if a, err := h.repo.GetArtifact(r.Context(), artifactID); err == nil {
+		h.publishArtifactEvent(a)
+	}
+}
+
 func taskActionFor(method, sub string) authz.TaskAction {
 	switch {
 	case method == http.MethodGet, sub == "comments", sub == "history", sub == "runs", sub == "assign", sub == "dispatch", sub == "merge":

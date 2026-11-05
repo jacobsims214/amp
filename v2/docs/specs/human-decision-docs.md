@@ -203,7 +203,7 @@ func (a *Ask) Validate() error
 
 ### 3. The decision doc
 
-**Storage (Phase 2, migration `043_decision_docs.sql`).** It reuses artifacts: kind `markdown`, a
+**Storage (Phase 2, migration `046_decision_docs.sql`).** It reuses artifacts: kind `markdown`, a
 new nullable `artifacts.role` (`'decision'`), one doc per ticket.
 
 ```sql
@@ -371,7 +371,7 @@ provenance marks and Record decision inside the same card. It replaces nothing.
 - **Decisions waiting too long.** Mitigation in v1: "blocks N · waiting Xd" and the sort order.
   Deadlines and escalation are in #146.
 - **Migration number collision** with PRs in flight (#126). Mitigation: one additive file
-  (`043_decision_docs.sql`), renumbered on rebase if another PR takes 043.
+  (`046_decision_docs.sql`), renumbered on rebase when another PR takes the number (it was 043 until #143 took 043–045).
 - **Rollback.** New columns are nullable or defaulted, and old clients ignore new keys. The brief
   rule is one function and can be reverted alone.
 
@@ -457,7 +457,7 @@ One PR (D5), three commits, with the build green after each. Paths are relative 
 
 ### Phase 2: Brief rule, structured ask, option picker
 
-- `amp-api/cmd/server/migrations/043_decision_docs.sql` (create): §3 storage.
+- `amp-api/cmd/server/migrations/046_decision_docs.sql` (create): §3 storage.
 - `amp-api/internal/domain/decision.go`: `AskOption`, `Ask`, `Validate`, `HumanBriefMissing`,
   `DecisionDoc`.
 - `amp-api/internal/domain/artifact.go`, `repository/artifacts.go`: `Role`, `AuthorKind`,

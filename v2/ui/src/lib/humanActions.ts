@@ -1,7 +1,7 @@
 /**
  * Helpers for HumanActions (components/human/HumanActions.tsx): which action a
  * ticket asks of a person, the kinds' labels and colours, and a done ticket's
- * merge status line (KB decisions/human-work-ux.md §2, §4, §5), and the one
+ * merge status line (v2/kb/working/human-work.md), and the one
  * line that says what a My work item needs from the person (needsLine).
  *
  * The Merge card's copy (why it's shown, where the target came from) lives in

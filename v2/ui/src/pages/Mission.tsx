@@ -1,5 +1,5 @@
 /**
- * Mission — the project for everyone, informational (KB decisions/human-work-ux.md §3).
+ * Mission — the project for everyone, informational (v2/kb/working/human-work.md).
  * Built for hundreds of tickets:
  *   - A "Waiting on you" strip that leads to My work, where every action lives.
  *   - Six readouts: in progress, ready, waiting, questions (N · M for you),

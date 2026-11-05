@@ -200,6 +200,14 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 		}
 		ctx.Send(pid, msg)
 
+	case *MsgMarkDecisionDoc:
+		pid, ok := a.tasks[msg.TaskID]
+		if !ok {
+			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("task %d not found in story %d", msg.TaskID, a.story.ID)}
+			return
+		}
+		ctx.Send(pid, msg)
+
 	case *MsgApproveTask:
 		pid, ok := a.tasks[msg.TaskID]
 		if !ok {

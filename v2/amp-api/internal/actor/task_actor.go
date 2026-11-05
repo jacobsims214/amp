@@ -186,6 +186,13 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		err := a.handleSetTaskStartAt(msg.StartAt)
 		msg.ReplyCh <- ReplySimple{Err: err}
 
+	case *MsgMarkDecisionDoc:
+		if !a.task.HasDecisionDoc {
+			a.task.HasDecisionDoc = true
+			a.publish(domain.EventTaskUpdated, a.withBlockedBy())
+		}
+		msg.ReplyCh <- ReplySimple{}
+
 	case *MsgApproveTask:
 		msg.ReplyCh <- a.handleApprove(msg)
 

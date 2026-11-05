@@ -13,7 +13,7 @@ import (
 	"github.com/simstech/amp-api/internal/repository"
 )
 
-// Waiting on you (AMP #2478, KB decisions/human-work-ux.md §1 and §3).
+// Waiting on you (AMP #2478, KB docs/specs/human-decision-docs.md, v2/kb/working/human-work.md).
 //
 // WaitingOn is the one definition of what waits on a person. Every view
 // reads it: the project's My work tab (ProjectMyWork), the top-level
@@ -105,6 +105,9 @@ type WaitItem struct {
 	Performer   string    `json:"performer,omitempty"`
 	HumanReason string    `json:"human_reason,omitempty"`
 	OwnerUserID *int      `json:"owner_user_id,omitempty"`
+	// HasDecisionDoc: the ticket's decision is recorded on its doc, in the
+	// ticket's drawer, not by Mark done (Task.HasDecisionDoc).
+	HasDecisionDoc bool `json:"has_decision_doc,omitempty"`
 
 	// approve
 	EpicID   int    `json:"epic_id,omitempty"`
@@ -155,10 +158,12 @@ type WaitItem struct {
 	// classified against, for the card's repo chip. "" when it could not be
 	// read: never a guess.
 	DefaultBranch string `json:"default_branch,omitempty"`
-	// HoldingUp: the open tickets that wait for this merge and actually need
-	// it, so the count on the card is what the action unblocks. A dependent
-	// with waits_for_merge: false is in NotWaiting: it started when the work
-	// completed, so it is named but never counted.
+	// HoldingUp: on a merge item, the open tickets that wait for this merge
+	// and actually need it, so the count on the card is what the action
+	// unblocks. A dependent with waits_for_merge: false is in NotWaiting: it
+	// started when the work completed, so it is named but never counted. On a
+	// do or answer item, the open tickets downstream of it, transitively (the
+	// same count as MCP's waiting_on_people, #125).
 	HoldingUp  []int `json:"holding_up,omitempty"`
 	NotWaiting []int `json:"not_waiting,omitempty"`
 	// TrackedBy: the plan's human merge step for this PR (its merge_for names
@@ -219,7 +224,8 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 		t := &c.Task
 		it := WaitItem{Kind: kind, Key: fmt.Sprintf("task:%d", t.ID), ProjectID: t.ProjectID, ProjectCode: c.ProjectCode,
 			ProjectName: c.ProjectName, TaskID: t.ID, TaskIDs: []int{t.ID}, Name: t.Name, State: string(t.State), Since: since,
-			Performer: t.Performer, HumanReason: t.HumanReason, OwnerUserID: t.OwnerUserID, EpicID: t.EpicID}
+			Performer: t.Performer, HumanReason: t.HumanReason, OwnerUserID: t.OwnerUserID, EpicID: t.EpicID,
+			HasDecisionDoc: t.HasDecisionDoc}
 		if opt.detail {
 			cp := *t
 			it.Task = &cp
@@ -349,6 +355,27 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 		w.Items, w.ComingUp = dedupFoldedSteps(w.Items, w.ComingUp)
 	}
 
+	// What waits on each do and answer item: the open tickets downstream of
+	// it, transitively (the same count as MCP's waiting_on_people, #125). A
+	// merge item's count comes from fillMergeItems above (TrueWaiters).
+	var holdIDs []int
+	for _, it := range w.Items {
+		if it.Kind == WaitDo || it.Kind == WaitAnswer {
+			holdIDs = append(holdIDs, it.TaskID)
+		}
+	}
+	if len(holdIDs) > 0 {
+		deps, err := s.Repo.OpenDownstream(ctx, holdIDs)
+		if err != nil {
+			return nil, err
+		}
+		for i := range w.Items {
+			if it := &w.Items[i]; it.Kind == WaitDo || it.Kind == WaitAnswer {
+				it.HoldingUp = deps[it.TaskID]
+			}
+		}
+	}
+
 	// Coming up: which dependencies still hold each one.
 	if opt.detail && len(comingDeps) > 0 {
 		sums, err := s.Repo.DepSummaries(ctx, comingDeps)
@@ -378,6 +405,10 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 		a, b := w.Items[i], w.Items[j]
 		if rank[a.Kind] != rank[b.Kind] {
 			return rank[a.Kind] < rank[b.Kind]
+		}
+		// Do items: the ones holding up the most work first.
+		if a.Kind == WaitDo && len(a.HoldingUp) != len(b.HoldingUp) {
+			return len(a.HoldingUp) > len(b.HoldingUp)
 		}
 		if !a.Since.Equal(b.Since) {
 			return a.Since.Before(b.Since)

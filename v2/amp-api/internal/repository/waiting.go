@@ -8,7 +8,7 @@ import (
 	"github.com/simstech/amp-api/internal/domain"
 )
 
-// Waiting on you (AMP #2478, KB decisions/human-work-ux.md §1). These
+// Waiting on you (AMP #2478, v2/kb/working/human-work.md). These
 // queries fetch the candidate tickets; service.WaitingOn classifies them, so
 // every view (the project's My work tab, the top-level summary, the badge
 // counts) reads one definition.
@@ -69,7 +69,14 @@ func (r *Repo) WaitingCandidates(ctx context.Context, userID int, projectIDs []i
 		}
 		out = append(out, w)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	ts := make([]*domain.Task, len(out))
+	for i := range out {
+		ts[i] = &out[i].Task
+	}
+	return out, r.markDecisionDocs(ctx, ts)
 }
 
 // DepSummary is a ticket named as a dependency or dependent of another.
@@ -388,6 +395,38 @@ func (r *Repo) ActiveProjectRefs(ctx context.Context, ids []int) ([]ProjectRef, 
 			return nil, err
 		}
 		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// OpenDownstream maps each of ids to the open (not completed) tickets
+// downstream of it, transitively, by id. A completed ticket in between does
+// not cut the chain: the same count as MCP's waiting_on_people. Do and answer
+// items state it as what they hold up (#125); a Merge card states
+// TrueWaiters instead, which is direct and leaves out what the merge doesn't
+// hold.
+func (r *Repo) OpenDownstream(ctx context.Context, ids []int) (map[int][]int, error) {
+	out := map[int][]int{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := r.db.Query(ctx, `WITH RECURSIVE down(root, id) AS (
+			SELECT d.depends_on, d.task_id FROM task_dependencies d WHERE d.depends_on = ANY($1)
+			UNION
+			SELECT down.root, d.task_id FROM down JOIN task_dependencies d ON d.depends_on = down.id
+		)
+		SELECT down.root, down.id FROM down JOIN tasks t ON t.id = down.id
+		WHERE t.state <> 'completed' ORDER BY down.root, down.id`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var root, task int
+		if err := rows.Scan(&root, &task); err != nil {
+			return nil, err
+		}
+		out[root] = append(out[root], task)
 	}
 	return out, rows.Err()
 }

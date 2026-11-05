@@ -545,8 +545,10 @@ func (r *Repo) GetTask(ctx context.Context, id int) (*domain.Task, error) {
 	if err != nil {
 		return nil, err
 	}
-	t.DependencyIDs, err = r.getTaskDeps(ctx, id)
-	return t, err
+	if t.DependencyIDs, err = r.getTaskDeps(ctx, id); err != nil {
+		return t, err
+	}
+	return t, r.markDecisionDocs(ctx, []*domain.Task{t})
 }
 
 func (r *Repo) ListTasks(ctx context.Context, projectID int, state string) ([]domain.Task, error) {
@@ -577,7 +579,7 @@ func (r *Repo) ListTasks(ctx context.Context, projectID int, state string) ([]do
 			out[i].DependencyIDs = depMap[out[i].ID]
 		}
 	}
-	return out, nil
+	return out, r.markDecisionDocsIn(ctx, out)
 }
 
 // ListTasksByStory returns all tasks for a story. Used by StoryActor on startup.
@@ -597,7 +599,7 @@ func (r *Repo) ListTasksByStory(ctx context.Context, storyID int) ([]domain.Task
 		}
 		out[i].DependencyIDs = deps
 	}
-	return out, nil
+	return out, r.markDecisionDocsIn(ctx, out)
 }
 
 // ListTaskIDsByEpic returns a map[task_id]story_id for all tasks in an epic.

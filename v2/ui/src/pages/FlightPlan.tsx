@@ -10,7 +10,7 @@
  * on it; the critical path is outlined. AMP's plan check sits beside it as a
  * GO / NO-GO poll.
  *
- * It is for reading the plan, not approving it (decisions/human-work-ux.md §2):
+ * It is for reading the plan, not approving it (v2/kb/working/human-work.md):
  * approving happens only in the project's My work tab. A one-line link at the
  * top says how many tickets await your approval and goes there.
  */

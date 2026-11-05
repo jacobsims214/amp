@@ -9,6 +9,7 @@ import { useSearchParam } from '../hooks/useSearchParam'
 import { useProjectPlan, type ProjectPlan } from '../hooks/useProjectPlan'
 import { HumanActions } from './human/HumanActions'
 import { HumanWork } from './human/HumanWork'
+import { DecidedUpstream } from './human/DecidedUpstream'
 import { mergeStatusText } from '../lib/humanActions'
 import { effectiveMetadata, integrationBranch, mergedIntoIntegration, waitsForMerge } from '../lib/merge'
 import { api } from '../api/client'
@@ -184,6 +185,17 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   }, [task, editing, showDeleteConfirm, onClose])
 
   const handleEditSave = async () => {
+    // A person's ticket needs its brief. Checked like the server: when the
+    // edit makes it a person's ticket or empties a brief field, so a legacy
+    // ticket without one can still be edited.
+    if (editForm.performer === 'human') {
+      const becomesHuman = !isHuman(task!)
+      const cleared = (!editForm.description.trim() && !!task!.description?.trim()) || (!editForm.acceptance_criteria.trim() && !!task!.acceptance_criteria?.trim())
+      if ((becomesHuman || cleared) && (!editForm.description.trim() || !editForm.acceptance_criteria.trim())) {
+        setEditError("A person's ticket needs a description (what they must do) and acceptance criteria (what done means).")
+        return
+      }
+    }
     setEditSaving(true)
     setEditError(null)
     try {
@@ -381,6 +393,12 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
           <MergeGateNote task={task} />
         </div>
 
+        {/* Everything below the header scrolls as one: a human ticket's panel
+            (the decision card with its actions) can be taller than the
+            viewport, and nested scroll areas would leave its actions out of
+            reach. The tabs stay pinned while their body scrolls under them. */}
+        <div className="flex-1 min-h-0 overflow-y-auto" data-testid="drawer-body">
+
         {/* Dispatched to an agent that hasn't started it (AMP #2801) */}
         {isNotStarted(task) && (
           <div className="px-6 py-4 border-b border-line" data-testid="not-started-note"
@@ -415,6 +433,9 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
             onChanged={t => { if (t && onTaskUpdated) onTaskUpdated(t); else onRefresh?.() }} />
         )}
 
+        {/* What people decided on the tickets this one depends on */}
+        <DecidedUpstream key={`decided-${task.id}`} taskId={task.id} projectId={task.project_id} dependencyIds={task.dependency_ids ?? []} ticketHref={ticketHref} />
+
         {/* A person's own ticket: they start and finish it here */}
         {showHumanWork && (
           <HumanWork key={`human-${task.id}`} task={task} meId={meId} people={people} plan={plan}
@@ -439,7 +460,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
         />
 
         {/* Tabs */}
-        <div className="flex border-b border-line">
+        <div className="flex border-b border-line sticky top-0 z-10 bg-surface" data-testid="drawer-tabs">
           {(['history', 'details'] as const).map(t => (
             <button
               key={t}
@@ -457,7 +478,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto p-6">
+        <div className="p-6" data-testid="drawer-tab-body">
           {editing && canPlan ? (
             <div className="space-y-4">
               <div>
@@ -466,28 +487,32 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
                   className={inputCls} />
               </div>
               <div>
-                <label className="text-xs font-medium text-ink-2 block mb-1.5">Description</label>
-                <textarea value={editForm.description} onChange={e => setEditForm(f => ({ ...f, description: e.target.value }))}
-                  rows={4} className={`${inputCls} resize-none`} />
+                <label htmlFor="edit-description" className="text-xs font-medium text-ink-2 block mb-1.5">Description{editForm.performer === 'human' ? ' *' : ''}</label>
+                <textarea id="edit-description" value={editForm.description} onChange={e => setEditForm(f => ({ ...f, description: e.target.value }))}
+                  rows={4} className={`${inputCls} resize-none`} aria-required={editForm.performer === 'human'}
+                  placeholder={editForm.performer === 'human' ? 'What the person must do, written for them' : undefined} />
               </div>
               <div>
-                <label className="text-xs font-medium text-ink-2 block mb-1.5">Acceptance Criteria</label>
-                <textarea value={editForm.acceptance_criteria} onChange={e => setEditForm(f => ({ ...f, acceptance_criteria: e.target.value }))}
-                  rows={3} className={`${inputCls} resize-none`} />
+                <label htmlFor="edit-criteria" className="text-xs font-medium text-ink-2 block mb-1.5">Acceptance Criteria{editForm.performer === 'human' ? ' *' : ''}</label>
+                <textarea id="edit-criteria" value={editForm.acceptance_criteria} onChange={e => setEditForm(f => ({ ...f, acceptance_criteria: e.target.value }))}
+                  rows={3} className={`${inputCls} resize-none`} aria-required={editForm.performer === 'human'}
+                  placeholder={editForm.performer === 'human' ? 'What done means, one item per line' : undefined} />
               </div>
               <div>
                 <label htmlFor="edit-performer" className="text-xs font-medium text-ink-2 block mb-1.5">Done by</label>
-                <select id="edit-performer" value={editForm.performer} disabled={task.state === 'in_progress'}
+                <select id="edit-performer" value={editForm.performer} disabled={task.state === 'in_progress' || !!task.has_decision_doc}
                   onChange={e => setEditForm(f => ({ ...f, performer: e.target.value as 'agent' | 'human' }))} className={inputCls}>
                   <option value="agent">An agent</option>
                   <option value="human">A person: its owner does it in AMP</option>
                 </select>
-                {task.state === 'in_progress' && <p className="text-[11.5px] text-ink-3 mt-1">Finish or stop the work before changing who does it.</p>}
+                {task.has_decision_doc
+                  ? <p className="text-[11.5px] text-ink-3 mt-1">Its decision is in its doc: record it there, or plan a new judgment ticket.</p>
+                  : task.state === 'in_progress' && <p className="text-[11.5px] text-ink-3 mt-1">Finish or stop the work before changing who does it.</p>}
               </div>
               {editForm.performer === 'human' ? (
                 <div>
                   <label htmlFor="edit-reason" className="text-xs font-medium text-ink-2 block mb-1.5">Why a person</label>
-                  <select id="edit-reason" value={editForm.human_reason}
+                  <select id="edit-reason" value={editForm.human_reason} disabled={!!task.has_decision_doc}
                     onChange={e => setEditForm(f => ({ ...f, human_reason: e.target.value as HumanReason }))} className={inputCls}>
                     {HUMAN_REASONS.map(r => <option key={r.value} value={r.value}>{r.label}: {r.hint.toLowerCase()}</option>)}
                   </select>
@@ -528,6 +553,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
           ) : (
             <HistorySkeleton />
           )}
+        </div>
         </div>
       </div>
 
@@ -670,7 +696,7 @@ function OwnerSection({ task, people, members, meId, myAccess, openReassign, can
  * Who approved this ticket's plan (#2198), and for whom when it wasn't their
  * own: "Approved by Lee on behalf of Bob · Oct 22". An open ticket whose plan
  * nobody approved says so. Approval happens only in My work (KB
- * decisions/human-work-ux.md §2), so the drawer never approves: for the
+ * v2/kb/working/human-work.md), so the drawer never approves: for the
  * person's own ticket it links there, "Awaiting your approval → My work".
  */
 export function ApprovalLine({ task, people, meId }: { task: Task; people: Map<number, Person>; meId?: number }) {
