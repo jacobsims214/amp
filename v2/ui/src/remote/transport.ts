@@ -8,6 +8,7 @@
  */
 import type { PairMessage } from './protocol'
 import type { CommandEnvelope, RelayFrame, SessionDetail, SessionSummary } from './types'
+import { apiErrorMessage } from '../lib/apiError'
 
 export class RelayError extends Error {
   status: number
@@ -69,7 +70,7 @@ async function errorFrom(res: Response): Promise<RelayError> {
   if (!body.code && (res.status === 502 || res.status === 503 || res.status === 504)) {
     return new RelayError(res.status, 'relay_down', RELAY_DOWN_MESSAGE)
   }
-  return new RelayError(res.status, body.code ?? `http_${res.status}`, body.error ?? `Request failed (${res.status})`)
+  return new RelayError(res.status, body.code ?? `http_${res.status}`, apiErrorMessage(res.status, body.error, `Request failed (${res.status})`))
 }
 
 const enc = encodeURIComponent
