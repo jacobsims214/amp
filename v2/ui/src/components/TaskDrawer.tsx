@@ -185,6 +185,17 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   }, [task, editing, showDeleteConfirm, onClose])
 
   const handleEditSave = async () => {
+    // A person's ticket needs its brief. Checked like the server: when the
+    // edit makes it a person's ticket or empties a brief field, so a legacy
+    // ticket without one can still be edited.
+    if (editForm.performer === 'human') {
+      const becomesHuman = !isHuman(task!)
+      const cleared = (!editForm.description.trim() && !!task!.description?.trim()) || (!editForm.acceptance_criteria.trim() && !!task!.acceptance_criteria?.trim())
+      if ((becomesHuman || cleared) && (!editForm.description.trim() || !editForm.acceptance_criteria.trim())) {
+        setEditError("A person's ticket needs a description (what they must do) and acceptance criteria (what done means).")
+        return
+      }
+    }
     setEditSaving(true)
     setEditError(null)
     try {
@@ -470,14 +481,16 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
                   className={inputCls} />
               </div>
               <div>
-                <label className="text-xs font-medium text-ink-2 block mb-1.5">Description</label>
-                <textarea value={editForm.description} onChange={e => setEditForm(f => ({ ...f, description: e.target.value }))}
-                  rows={4} className={`${inputCls} resize-none`} />
+                <label htmlFor="edit-description" className="text-xs font-medium text-ink-2 block mb-1.5">Description{editForm.performer === 'human' ? ' *' : ''}</label>
+                <textarea id="edit-description" value={editForm.description} onChange={e => setEditForm(f => ({ ...f, description: e.target.value }))}
+                  rows={4} className={`${inputCls} resize-none`} aria-required={editForm.performer === 'human'}
+                  placeholder={editForm.performer === 'human' ? 'What the person must do, written for them' : undefined} />
               </div>
               <div>
-                <label className="text-xs font-medium text-ink-2 block mb-1.5">Acceptance Criteria</label>
-                <textarea value={editForm.acceptance_criteria} onChange={e => setEditForm(f => ({ ...f, acceptance_criteria: e.target.value }))}
-                  rows={3} className={`${inputCls} resize-none`} />
+                <label htmlFor="edit-criteria" className="text-xs font-medium text-ink-2 block mb-1.5">Acceptance Criteria{editForm.performer === 'human' ? ' *' : ''}</label>
+                <textarea id="edit-criteria" value={editForm.acceptance_criteria} onChange={e => setEditForm(f => ({ ...f, acceptance_criteria: e.target.value }))}
+                  rows={3} className={`${inputCls} resize-none`} aria-required={editForm.performer === 'human'}
+                  placeholder={editForm.performer === 'human' ? 'What done means, one item per line' : undefined} />
               </div>
               <div>
                 <label htmlFor="edit-performer" className="text-xs font-medium text-ink-2 block mb-1.5">Done by</label>

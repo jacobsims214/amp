@@ -46,6 +46,10 @@ Good tickets:
   - `coupled_gate`: one ticket joins different people's work, so neither can finish alone.
   - `metadata_drift`: an epic is missing metadata keys its siblings carry (often a near-miss
     key like `jira_key` where the others say `jira_epic`).
+  - `human_without_brief`: an open human ticket with an empty description or acceptance
+    criteria. New ones are refused at creation; this catches older tickets.
+  - `judgment_without_doc`: an open judgment ticket with no decision doc, so its owner has no
+    question or options. Give it an ask with `amp_update_task`; AMP drafts the doc from it.
 - **GO** otherwise.
 
 It also lists `human_gates`: each open human ticket and how many tickets wait on it.

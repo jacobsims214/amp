@@ -395,6 +395,7 @@ export interface SSEEvent {
     | 'epic.updated'
     | 'story.updated'
     | 'artifact.updated'
+    | 'decision.updated'
   project_id?: number
   payload?: unknown
   at?: string
@@ -1249,6 +1250,8 @@ export interface Artifact {
   expires_at: string | null
   expiry_dismissed_at: string | null
   url?: string
+  /** 'decision' for a ticket's decision doc */
+  role?: string
 }
 
 export interface ArtifactVersion {
@@ -1472,4 +1475,55 @@ export interface UpstreamDecision {
   decided_by: number | null
   decided_by_name: string
   decided_at: string
+}
+
+/** One answer a person can choose on a judgment ticket (the agent questions of #130 reuse it). */
+export interface AskOption {
+  label: string
+  consequence: string
+}
+
+/** A decision doc version's options: its stored metadata. */
+export interface DecisionAsk {
+  question: string
+  options: AskOption[]
+  /** index into options; only marks a badge, never chooses */
+  recommended: number
+}
+
+/** A judgment ticket's ask as tool input (it drafts the doc; not stored on the ticket). */
+export interface Ask extends DecisionAsk {
+  recommendation_reason: string
+  evidence?: string[]
+}
+
+export interface DecisionDocVersion {
+  version: number
+  author_kind: 'person' | 'agent'
+  text: string
+  ask: DecisionAsk | null
+  created_by: number | null
+  created_at: string
+}
+
+/** A judgment ticket's decision doc (GET /tasks/:id/decision, and /decisions' own). */
+export interface DecisionDoc {
+  task_id: number
+  artifact_id: number
+  doc_url?: string
+  current_version: number
+  /** who wrote the current version */
+  author_kind: 'person' | 'agent'
+  /** the current version's options */
+  ask: DecisionAsk | null
+  /** the current version's markdown (prose only) */
+  text: string
+  decided_version: number | null
+  chosen_option: number | null
+  decision_text?: string
+  decided_by: number | null
+  decided_by_name?: string
+  recording_started_at: string | null
+  decided_at: string | null
+  versions?: DecisionDocVersion[]
 }

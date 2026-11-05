@@ -6,16 +6,23 @@
  *
  * Everything here comes from the ticket and the project's plan as the API
  * already returns them; dependents are worked out client-side from each
- * ticket's dependency_ids.
+ * ticket's dependency_ids. A judgment ticket with a decision doc shows the
+ * DecisionCard (question, options, the doc, Decided means, Mark done) in
+ * place of the brief's checklist and Mark done…; it reloads when the doc
+ * changes (decision.updated).
  */
+import { useCallback, useEffect, useState } from 'react'
 import { AlertTriangle, ArrowRight, Pencil, Square, SquareCheck, UserRound } from 'lucide-react'
 import { Link } from 'react-router-dom'
+import { api } from '../../api/client'
+import { useSSE } from '../../hooks/useSSE'
 import { checklistItems } from '../../lib/brief'
 import { isHuman, reasonHint, reasonLabel, reasonVerb } from '../../lib/human'
 import { lookupPerson, type Person } from '../../lib/people'
 import type { ProjectPlan } from '../../hooks/useProjectPlan'
-import type { Task } from '../../types'
+import type { DecisionDoc, Task } from '../../types'
 import { Markdown } from '../ui/Markdown'
+import { DecisionCard } from './DecisionCard'
 import { HumanActions } from './HumanActions'
 
 /** How many dependents are listed by name before "+N more". */
@@ -56,6 +63,18 @@ export function HumanWork({ task, meId, people, plan, canPlan, onEdit, ticketHre
   const criteria = task.acceptance_criteria?.trim() ?? ''
   const checklist = checklistItems(criteria)
 
+  // A judgment ticket's decision doc, when it has one.
+  const judgment = task.human_reason === 'judgment'
+  const [doc, setDoc] = useState<DecisionDoc | null>(null)
+  const loadDoc = useCallback(() => {
+    if (!judgment) return
+    api.getTaskDecisions(task.id).then(r => setDoc(r.own)).catch(() => {})
+  }, [judgment, task.id])
+  useEffect(() => { loadDoc() }, [loadDoc])
+  useSSE(task.project_id, e => {
+    if (e.type === 'decision.updated' && (e.payload as { task_id?: number } | undefined)?.task_id === task.id) loadDoc()
+  })
+
   return (
     <div className="px-6 py-4 border-b border-line grid gap-3" data-testid="human-work"
       style={{ background: 'var(--surface-2)', boxShadow: 'inset 3px 0 0 var(--ink)' }}>
@@ -71,7 +90,12 @@ export function HumanWork({ task, meId, people, plan, canPlan, onEdit, ticketHre
       </div>
 
       {/* The brief: capped so a long one scrolls here and the actions stay in reach. */}
-      {description || criteria ? (
+      {doc ? (description && (
+        <div className="max-h-[24vh] overflow-y-auto pr-1" data-testid="human-brief">
+          <div className="amp-label mb-1.5">What you need to do</div>
+          <Markdown size="compact">{description}</Markdown>
+        </div>
+      )) : description || criteria ? (
         <div className="grid gap-3 max-h-[38vh] overflow-y-auto pr-1" data-testid="human-brief">
           {description && (
             <div>
@@ -130,7 +154,9 @@ export function HumanWork({ task, meId, people, plan, canPlan, onEdit, ticketHre
         </div>
       )}
 
-      <HumanActions task={task} kind="do" canAct={mine} ownerName={owner?.name} onChanged={t => { if (t) onChanged(t) }} />
+      {doc
+        ? <DecisionCard task={task} doc={doc} canAct={mine} ownerName={owner?.name} onChanged={onChanged} />
+        : <HumanActions task={task} kind="do" canAct={mine} ownerName={owner?.name} onChanged={t => { if (t) onChanged(t) }} />}
     </div>
   )
 }

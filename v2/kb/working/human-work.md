@@ -145,6 +145,16 @@ on them.
   - an agent's `amp_get_task` and `amp_claim_task` carry it as `upstream_decisions`, and the claim
     tells the worker to follow it. Only direct dependencies that are done and have a note are
     included.
+- **A decision opens as a decision doc.** A judgment ticket planned by an agent comes with an
+  **ask**: a question, 2 to 4 options with what each costs, the option the agent recommends and
+  why. AMP drafts the ticket's decision doc from it (a markdown artifact, kept, never expiring).
+  The ticket panel shows it as a card: the **Question**, the **Options** with the recommended one
+  marked **Recommended** (nothing is chosen for you), **Something else**, the doc's context,
+  trade-offs and reasoning, and **Decided means** (the acceptance criteria). Pick an option (or
+  **Accept recommendation**), write **Your decision** and click **Mark done**: the note is
+  "<option> — <your decision>", posted and passed on as above. The doc changes only in AMP: an
+  agent can't publish to it, approve or unkeep it, or mark the ticket done. A judgment ticket you
+  make yourself in the web UI has no doc; you write your decision when you mark it done.
 - **It's never flagged as quiet.** People work in days, not the minutes an agent takes. It shows as
   **stale** after two days with no activity.
 
@@ -186,8 +196,13 @@ A good human ticket:
 
 Managers plan these with `amp_create_tasks`: `performer: "human"`, a `human_reason`, and `owner`
 set to the person. A human ticket must have an owner; the plan check calls one without an owner a
-NO-GO, since nobody would ever do it. `amp_check_plan` lists every human ticket under
-`human_gates`, with how much work waits on each.
+NO-GO, since nobody would ever do it. It must also have its **brief**: a description and acceptance
+criteria written for the person. A ticket without them is refused, from any agent and in the web
+UI (the new-ticket and edit forms mark both required for a person's ticket); older tickets without
+one stay editable and get a plan-check warning (`human_without_brief`). An agent's judgment ticket
+also needs an **ask**, which drafts its decision doc (above); one without a doc gets
+`judgment_without_doc`. `amp_check_plan` lists every human ticket under `human_gates`, with how
+much work waits on each.
 
 Older projects may still have unlinked "review and merge" human tickets. They keep working exactly
 as before: marking one done with the PR link also records that PR as merged on the tickets that
@@ -210,7 +225,9 @@ recorded by github") and no run is recorded for its owner.
     checklist when they're written as a list). When both are empty it says **The planner left no
     instructions**, names who to ask, and offers **Edit** to whoever can change the plan;
   - **Unblocks N**: the open tickets that depend on it, each a link, or **Nothing waits on this**;
-  - for its owner, **Start** and **Mark done…**.
+  - for its owner, **Start** and **Mark done…**; on a judgment ticket with a decision doc, the
+    decision card in place of the checklist and Mark done….
+- **Artifacts:** the **Decisions** filter lists recorded decision docs.
 
   The rules (agents never pick it up or mark it done) are in the heading's tooltip.
   - To change who does it: **Edit → Done by** (an agent or a person). You can't change it while

@@ -493,6 +493,9 @@ type CreateTaskRequest struct {
 	// Performer: "agent" (default) or "human"; HumanReason with "human".
 	Performer   string `json:"performer,omitempty"`
 	HumanReason string `json:"human_reason,omitempty"`
+	// Ask: a judgment ticket's question and options. Input only: it renders
+	// the ticket's decision doc and is not stored on the ticket.
+	Ask *Ask `json:"ask,omitempty"`
 }
 
 type UpdateTaskRequest struct {
@@ -512,6 +515,9 @@ type UpdateTaskRequest struct {
 	Metadata MetadataPatch `json:"metadata,omitempty"`
 	// Clear names fields to blank (see TaskClearable); "" otherwise means keep.
 	Clear []string `json:"clear,omitempty"`
+	// Ask creates a judgment ticket's missing decision doc (input only; see
+	// CreateTaskRequest.Ask). Refused once the ticket has a doc.
+	Ask *Ask `json:"ask,omitempty"`
 }
 
 type UpdateEpicRequest struct {
@@ -590,6 +596,9 @@ const (
 	EventEpicUpdated       EventType = "epic.updated"
 	EventStoryUpdated      EventType = "story.updated"
 	EventArtifactUpdated   EventType = "artifact.updated"
+	// EventDecisionUpdated: a ticket's decision doc was written; payload
+	// {task_id, version}.
+	EventDecisionUpdated EventType = "decision.updated"
 )
 
 // AllEventTypes lists every event the hub publishes.
@@ -599,7 +608,7 @@ var AllEventTypes = []EventType{
 	EventStoryCreated, EventStoryStateChanged, EventStoryUpdated,
 	EventTaskCreated, EventTaskUpdated, EventTaskDispatched, EventTaskCompleted,
 	EventTaskBlocked, EventTaskUnblocked, EventTaskAssigned, EventCommentAdded,
-	EventArtifactUpdated,
+	EventArtifactUpdated, EventDecisionUpdated,
 }
 
 type Event struct {

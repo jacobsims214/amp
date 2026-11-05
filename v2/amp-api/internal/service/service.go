@@ -58,6 +58,10 @@ type Service struct {
 	// a rule that names someone stays the honest unknown arm; see
 	// MergeAlertPersonSource.
 	MergeAlertPerson MergeAlertPersonSource
+	// DecisionDocFault, when set, is called before a decision doc is written
+	// and fails the write with its error. Tests use it to force the "ticket
+	// created, doc not" path.
+	DecisionDocFault func(taskID int) error
 }
 
 func New(repo *repository.Repo, registry *actor.Registry, kbSvc *kb.Service) *Service {

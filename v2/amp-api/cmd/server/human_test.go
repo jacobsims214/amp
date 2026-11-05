@@ -21,7 +21,7 @@ func humanChain(t *testing.T, w *rbacWorld) (build, review, deploy int) {
 	res := w.s.as(w.alice).call(t, "amp_create_tasks", map[string]any{"project_id": float64(w.s.projectID), "tasks": []any{
 		map[string]any{"ref": "build", "story_id": float64(w.s.storyID), "name": "Build the quotes API"},
 		map[string]any{"ref": "review", "story_id": float64(w.s.storyID), "name": "Review and merge the quotes PR",
-			"performer": "human", "human_reason": "review", "owner": w.bob.Email, "depends_on": []any{"build"}},
+			"performer": "human", "human_reason": "review", "owner": w.bob.Email, "depends_on": []any{"build"}, "description": "What the person does", "acceptance_criteria": "Done when it is done"},
 		map[string]any{"ref": "deploy", "story_id": float64(w.s.storyID), "name": "Deploy quotes", "depends_on": []any{"review"}},
 	}})
 	ids := map[string]int{}
@@ -234,7 +234,7 @@ func TestHuman_SwitchingAndRules(t *testing.T) {
 		t.Fatalf("ownerless human ticket: %q", msg)
 	}
 	res := alice.call(t, "amp_create_tasks", map[string]any{"project_id": float64(w.s.projectID), "tasks": []any{
-		map[string]any{"ref": "call", "story_id": float64(w.s.storyID), "name": "Call the bank", "performer": "human", "human_reason": "external"},
+		map[string]any{"ref": "call", "story_id": float64(w.s.storyID), "name": "Call the bank", "performer": "human", "human_reason": "external", "description": "What the person does", "acceptance_criteria": "Done when it is done"},
 		map[string]any{"ref": "after", "story_id": float64(w.s.storyID), "name": "Wire the bank's settings", "depends_on": []any{"call"}}}})
 	call := int(res["created"].([]any)[0].(map[string]any)["id"].(float64))
 	if tk := humanTask(t, alice, call); int(tk["owner_user_id"].(float64)) != w.alice.User.ID {
@@ -309,10 +309,10 @@ func TestHuman_DecisionReachesDependents(t *testing.T) {
 	alice := w.s.as(w.alice)
 	story, pid := float64(w.s.storyID), float64(w.s.projectID)
 	res := alice.call(t, "amp_create_tasks", map[string]any{"project_id": pid, "tasks": []any{
-		map[string]any{"ref": "j", "story_id": story, "name": "Confirm: north-star targets", "performer": "human", "human_reason": "judgment", "owner": w.bob.Email},
-		map[string]any{"ref": "a", "story_id": story, "name": "Sign off the budget", "performer": "human", "human_reason": "approval", "owner": w.bob.Email},
-		map[string]any{"ref": "k", "story_id": story, "name": "Rack the server", "performer": "human", "human_reason": "physical", "owner": w.bob.Email},
-		map[string]any{"ref": "m", "story_id": story, "name": "Pick a vendor", "performer": "human", "human_reason": "judgment", "owner": w.bob.Email},
+		map[string]any{"ref": "j", "story_id": story, "name": "Confirm: north-star targets", "performer": "human", "human_reason": "judgment", "owner": w.bob.Email, "description": "What the person does", "acceptance_criteria": "Done when it is done", "ask": northStarAsk()},
+		map[string]any{"ref": "a", "story_id": story, "name": "Sign off the budget", "performer": "human", "human_reason": "approval", "owner": w.bob.Email, "description": "What the person does", "acceptance_criteria": "Done when it is done"},
+		map[string]any{"ref": "k", "story_id": story, "name": "Rack the server", "performer": "human", "human_reason": "physical", "owner": w.bob.Email, "description": "What the person does", "acceptance_criteria": "Done when it is done"},
+		map[string]any{"ref": "m", "story_id": story, "name": "Pick a vendor", "performer": "human", "human_reason": "judgment", "owner": w.bob.Email, "description": "What the person does", "acceptance_criteria": "Done when it is done", "ask": northStarAsk()},
 		map[string]any{"ref": "d1", "story_id": story, "name": "Build scorecard", "depends_on": []any{"j", "a", "k"}},
 		map[string]any{"ref": "d2", "story_id": story, "name": "Wire vendor", "depends_on": []any{"j", "m"}},
 	}})
@@ -359,7 +359,7 @@ func TestHuman_DecisionReachesDependents(t *testing.T) {
 	}
 	// Another reason, with a note, says Done by.
 	other := alice.call(t, "amp_create_tasks", map[string]any{"project_id": pid, "tasks": []any{
-		map[string]any{"ref": "x", "story_id": story, "name": "Call the bank", "performer": "human", "human_reason": "external", "owner": w.bob.Email}}})
+		map[string]any{"ref": "x", "story_id": story, "name": "Call the bank", "performer": "human", "human_reason": "external", "owner": w.bob.Email, "description": "What the person does", "acceptance_criteria": "Done when it is done"}}})
 	xid := int(other["created"].([]any)[0].(map[string]any)["id"].(float64))
 	ra.want(t, 200, "bob", http.MethodPost, fmt.Sprintf("/api/tasks/%d/complete", xid), map[string]any{"note": "Called; they will wire Friday"})
 	if c := commentBodies(t, alice, xid); !strings.Contains(c, "Done by bob: Called; they will wire Friday") {

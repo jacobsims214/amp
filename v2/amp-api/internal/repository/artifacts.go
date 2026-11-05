@@ -15,7 +15,7 @@ import (
 const artifactCols = `a.id, a.project_id, a.task_id, COALESCE(t.name, ''), COALESCE(p.code, ''), a.title, a.kind, a.status,
 	a.current_version, a.approved_version, a.reviewed_by, COALESCE(ru.email, ''), a.reviewed_at,
 	a.created_by, COALESCE(cu.email, ''), a.created_at, a.updated_at,
-	a.keep, a.kept_by, a.kept_at, a.expires_at, a.expiry_dismissed_at`
+	a.keep, a.kept_by, a.kept_at, a.expires_at, a.expiry_dismissed_at, COALESCE(a.role, '')`
 
 const artifactFrom = ` FROM artifacts a
 	JOIN projects p ON p.id = a.project_id
@@ -28,7 +28,7 @@ func scanArtifact(row pgx.Row, a *domain.Artifact) error {
 	if err := row.Scan(&a.ID, &a.ProjectID, &a.TaskID, &a.TaskName, &code, &a.Title, &a.Kind, &a.Status,
 		&a.CurrentVersion, &a.ApprovedVersion, &a.ReviewedBy, &a.ReviewedByEmail, &a.ReviewedAt,
 		&a.CreatedBy, &a.CreatedByEmail, &a.CreatedAt, &a.UpdatedAt,
-		&a.Keep, &a.KeptBy, &a.KeptAt, &a.ExpiresAt, &a.ExpiryDismissedAt); err != nil {
+		&a.Keep, &a.KeptBy, &a.KeptAt, &a.ExpiresAt, &a.ExpiryDismissedAt, &a.Role); err != nil {
 		return err
 	}
 	if a.TaskID != nil {
@@ -129,7 +129,7 @@ func (r *Repo) ListArtifacts(ctx context.Context, projectID int, taskID *int) ([
 // ListArtifactVersions lists an artifact's versions, newest first, without content.
 func (r *Repo) ListArtifactVersions(ctx context.Context, id int) ([]domain.ArtifactVersion, error) {
 	rows, err := r.db.Query(ctx, `SELECT v.artifact_id, v.version, v.content_type, v.size_bytes, v.sha256, v.note,
-		v.created_by, COALESCE(u.email, ''), v.created_at
+		v.created_by, COALESCE(u.email, ''), v.created_at, v.author_kind, v.decision_ask
 		FROM artifact_versions v LEFT JOIN users u ON u.id = v.created_by
 		WHERE v.artifact_id = $1 ORDER BY v.version DESC`, id)
 	if err != nil {
@@ -140,7 +140,7 @@ func (r *Repo) ListArtifactVersions(ctx context.Context, id int) ([]domain.Artif
 	for rows.Next() {
 		var v domain.ArtifactVersion
 		if err := rows.Scan(&v.ArtifactID, &v.Version, &v.ContentType, &v.SizeBytes, &v.SHA256, &v.Note,
-			&v.CreatedBy, &v.CreatedByEmail, &v.CreatedAt); err != nil {
+			&v.CreatedBy, &v.CreatedByEmail, &v.CreatedAt, &v.AuthorKind, &v.DecisionAsk); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -152,11 +152,11 @@ func (r *Repo) ListArtifactVersions(ctx context.Context, id int) ([]domain.Artif
 func (r *Repo) GetArtifactVersion(ctx context.Context, id, version int) (*domain.ArtifactVersion, error) {
 	v := &domain.ArtifactVersion{}
 	err := r.db.QueryRow(ctx, `SELECT v.artifact_id, v.version, v.content_type, v.size_bytes, v.sha256, v.note,
-		v.created_by, COALESCE(u.email, ''), v.created_at, v.content
+		v.created_by, COALESCE(u.email, ''), v.created_at, v.author_kind, v.decision_ask, v.content
 		FROM artifact_versions v LEFT JOIN users u ON u.id = v.created_by
 		WHERE v.artifact_id = $1 AND v.version = CASE WHEN $2 > 0 THEN $2 ELSE (SELECT current_version FROM artifacts WHERE id = $1) END`,
 		id, version).Scan(&v.ArtifactID, &v.Version, &v.ContentType, &v.SizeBytes, &v.SHA256, &v.Note,
-		&v.CreatedBy, &v.CreatedByEmail, &v.CreatedAt, &v.Content)
+		&v.CreatedBy, &v.CreatedByEmail, &v.CreatedAt, &v.AuthorKind, &v.DecisionAsk, &v.Content)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("artifact %d has no version %d", id, version)
 	}

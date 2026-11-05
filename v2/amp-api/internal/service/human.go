@@ -66,6 +66,9 @@ func (s *Service) StartHumanTask(ctx context.Context, p authz.Principal, taskID 
 // so only the person marks it done, in the web UI; an agent recording it
 // for them (viaAgent, over MCP) is refused with the ticket's link.
 func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, taskID int, done HumanDone, viaAgent bool) (*domain.Task, *domain.Run, error) {
+	if err := s.refuseAgentDecision(ctx, p, taskID, viaAgent); err != nil {
+		return nil, nil, err
+	}
 	if err := refuseAgentAccount(p); err != nil {
 		return nil, nil, err
 	}
