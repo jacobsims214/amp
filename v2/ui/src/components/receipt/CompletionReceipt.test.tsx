@@ -193,4 +193,18 @@ describe('CompletionReceipt links (security)', () => {
     render(<CompletionReceipt task={task()} runs={[]} comments={[]} receipt={r} />)
     expect(screen.getByTestId('evidence-video')).toHaveAttribute('src', '/api/receipts/2/5/attempts/11/abc/video.mp4')
   })
+
+  it("shows the comment view when the ticket completed again after its receipt (an earlier attempt's)", () => {
+    const r = serverReceipt()
+    if (r.receipt) r.receipt.finalized_at = '2026-11-01T10:00:00Z'
+    render(<CompletionReceipt task={task({ completed_at: '2026-11-04T10:00:00Z' })} runs={[run()]} comments={[comment(CHECK)]} receipt={r} />)
+    expect(screen.getByTestId('receipt-check')).toHaveTextContent('Self-checked (from comment) 3/4')
+  })
+
+  it('keeps an accepted receipt that completed the held ticket later', () => {
+    const r = serverReceipt({ status: 'human_accepted' })
+    if (r.receipt) r.receipt.finalized_at = '2026-11-01T10:00:00Z'
+    render(<CompletionReceipt task={task({ completed_at: '2026-11-04T10:00:00Z' })} runs={[]} comments={[]} receipt={r} />)
+    expect(screen.getByTestId('receipt-status')).toHaveTextContent('Accepted')
+  })
 })

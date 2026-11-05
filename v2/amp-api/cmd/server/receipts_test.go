@@ -1235,36 +1235,41 @@ func TestReceipts_UploadPrefixTraversal(t *testing.T) {
 
 func urlUnescape(p string) (string, error) { return url.PathUnescape(p) }
 
-// Off the web UI an item's own receipts values only rise: lowering an
-// epic's minimum level, which a ticket under it that sets Require itself
-// inherits, is refused even though the epic itself is only Inform.
+// Off the web UI an item's own receipts values only rise: removing an
+// epic's own minimum level or lowering its own mode is refused, even where
+// the epic's effective setting wouldn't change (a ticket under it may set
+// Require itself). v1 accepts self_checked as the only minimum level.
 func TestReceipts_OwnValuesOnlyRiseOffUI(t *testing.T) {
 	w := newRBACWorld(t)
 	ra := newRestAs(t, w)
 	alice, owner := w.as(w.alice), w.as(w.owner)
 	setReceiptsMode(t, ra, w.s.projectID, "inform")
 	epic := float64(w.s.epicID)
-	owner.call(t, "amp_update_epic", map[string]any{"epic_id": epic, "metadata": map[string]any{"receipts_min_level": "independently_verified"}})
+	owner.call(t, "amp_update_epic", map[string]any{"epic_id": epic, "metadata": map[string]any{"receipts_min_level": "self_checked"}})
 	id := mkIn(t, alice, w.s.storyID, "require under the epic")
 	alice.call(t, "amp_update_task", map[string]any{"task_id": float64(id), "metadata": map[string]any{"receipts": "require"}})
-	if s := getReceipt(t, ra, "alice", id)["settings"].(map[string]any); s["mode"] != "require" || s["min_level"] != "independently_verified" {
+	if s := getReceipt(t, ra, "alice", id)["settings"].(map[string]any); s["mode"] != "require" || s["min_level"] != "self_checked" {
 		t.Fatalf("settings: %v", s)
 	}
-	wantErr(t, owner.callExpectError(t, "amp_update_epic", map[string]any{"epic_id": epic, "metadata": map[string]any{"receipts_min_level": "self_checked"}}),
-		"web UI")
 	wantErr(t, owner.callExpectError(t, "amp_update_epic", map[string]any{"epic_id": epic, "metadata": map[string]any{"receipts_min_level": nil}}),
 		"web UI")
-	if s := getReceipt(t, ra, "alice", id)["settings"].(map[string]any); s["min_level"] != "independently_verified" {
-		t.Fatalf("the ticket's minimum fell: %v", s)
+	// independently_verified isn't available in v1, as metadata or as the
+	// project's minimum.
+	wantErr(t, owner.callExpectError(t, "amp_update_epic", map[string]any{"epic_id": epic,
+		"metadata": map[string]any{"receipts_min_level": "independently_verified"}}), "self_checked only")
+	if code, out := ra.do(t, "owner", http.MethodPatch, fmt.Sprintf("/api/projects/%d", w.s.projectID),
+		map[string]any{"receipts_min_level": "independently_verified"}); code != 400 || !strings.Contains(fmt.Sprint(out), "self_checked only") {
+		t.Fatalf("project minimum independently_verified: %d %v", code, out)
 	}
 	// An own mode only rises too, even where the effective one doesn't change.
 	owner.call(t, "amp_update_epic", map[string]any{"epic_id": epic, "metadata": map[string]any{"receipts": "require"}})
 	wantErr(t, owner.callExpectError(t, "amp_update_epic", map[string]any{"epic_id": epic, "metadata": map[string]any{"receipts": "inform"}}), "web UI")
-	// Raising is fine, and a person in the web UI may lower it.
+	wantErr(t, owner.callExpectError(t, "amp_update_epic", map[string]any{"epic_id": epic, "metadata": map[string]any{"receipts": nil}}), "web UI")
+	// A person in the web UI may lower or remove them.
 	ra.want(t, 200, "owner", http.MethodPatch, fmt.Sprintf("/api/epics/%d", w.s.epicID),
-		map[string]any{"metadata": map[string]any{"receipts_min_level": "self_checked", "receipts": nil}})
-	if s := getReceipt(t, ra, "alice", id)["settings"].(map[string]any); s["min_level"] != "self_checked" {
-		t.Fatalf("UI lowering: %v", s)
+		map[string]any{"metadata": map[string]any{"receipts_min_level": nil, "receipts": nil}})
+	if s := getReceipt(t, ra, "alice", id)["settings"].(map[string]any); s["mode"] != "require" {
+		t.Fatalf("after the UI change: %v", s)
 	}
 }
 
@@ -1282,7 +1287,7 @@ func TestReceipts_NewAndImportedProjects(t *testing.T) {
 	wantErr(t, admin.callExpectError(t, "amp_create_project", map[string]any{"name": "bad", "code": "rb-" + sfx, "org_id": org,
 		"metadata": map[string]any{"receipts": "sometimes"}}), "off, inform or require")
 	admin.call(t, "amp_create_project", map[string]any{"name": "strict", "code": "rs-" + sfx, "org_id": org,
-		"metadata": map[string]any{"receipts": "require", "receipts_min_level": "independently_verified"}})
+		"metadata": map[string]any{"receipts": "require", "receipts_min_level": "self_checked"}})
 	// REST: an API token is refused; the web UI may.
 	if code, _ := ra.doVia(t, auth.ChannelToken, "orgadmin", http.MethodPost, "/api/projects",
 		map[string]any{"name": "weak", "code": "rt-" + sfx, "org_id": w.org.ID, "metadata": map[string]any{"receipts": "inform"}}); code != 403 {
@@ -1317,5 +1322,80 @@ func TestReceipts_NewAndImportedProjects(t *testing.T) {
 	}
 	if len(tasks) != 1 {
 		t.Fatalf("imported %d tickets", len(tasks))
+	}
+}
+
+// Off the web UI nothing completes a held ticket: not its worker again with
+// a passing check, not a closeout, not set_task_state or a REST call with a
+// token. It stays held, with one receipt, until a person acts.
+func TestReceipts_HeldTicketWaitsForAPerson(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	alice := w.as(w.alice)
+	setReceiptsMode(t, ra, w.s.projectID, "require")
+	x := mkIn(t, alice, w.s.storyID, "held")
+	dx := dispatchClaims(t, alice, x)
+	if out := alice.call(t, "amp_complete_task", map[string]any{"task_id": float64(x), "dispatch_id": dx}); out["held"] != true {
+		t.Fatalf("no checks under Require: %v", out)
+	}
+	pass := []any{passCheck("1")}
+	wantErr(t, alice.callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(x), "checks": pass}), "is held", "web UI")
+	wantErr(t, alice.callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(x), "dispatch_id": dx, "checks": pass}), "")
+	wantErr(t, w.as(w.orgadmin).callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(x), "checks": pass,
+		"closeout_reason": "looks done"}), "is held")
+	wantErr(t, alice.callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(x), "closeout_reason": "stuck"}), "is held")
+	wantErr(t, alice.callExpectError(t, "amp_set_task_state", map[string]any{"task_id": float64(x), "state": "completed"}), "is held")
+	if code, out := ra.doVia(t, auth.ChannelToken, "alice", http.MethodPost, fmt.Sprintf("/api/tasks/%d/complete", x), nil); code != 409 {
+		t.Fatalf("REST complete with a token: %d %v", code, out)
+	}
+	if st := taskState(t, alice, x); st != domain.TaskStateInProgress {
+		t.Fatalf("held ticket is %s", st)
+	}
+	if got := getReceipt(t, ra, "alice", x); got["held"] != true {
+		t.Fatalf("receipt: %v", got)
+	}
+	if n := receiptRows(t, x); n != 1 {
+		t.Fatalf("refused completions made %d receipts", n)
+	}
+	// A person accepts it in the web UI.
+	ra.want(t, 200, "alice", http.MethodPost, fmt.Sprintf("/api/tasks/%d/receipt/accept", x), nil)
+	if st := taskState(t, alice, x); st != domain.TaskStateCompleted {
+		t.Fatalf("accepted ticket is %s", st)
+	}
+	// Rework: a person rejects it (back to ready), and a new dispatch's
+	// worker completes it.
+	y := mkIn(t, alice, w.s.storyID, "rework")
+	dy := dispatchClaims(t, alice, y)
+	alice.call(t, "amp_complete_task", map[string]any{"task_id": float64(y), "dispatch_id": dy})
+	ra.want(t, 200, "alice", http.MethodPost, fmt.Sprintf("/api/tasks/%d/receipt/reject", y), map[string]any{"note": "add the test"})
+	dy2 := dispatchClaims(t, alice, y)
+	if out := alice.call(t, "amp_complete_task", map[string]any{"task_id": float64(y), "dispatch_id": dy2, "checks": pass}); out["state"] != "completed" {
+		t.Fatalf("rework: %v", out)
+	}
+}
+
+// Moving a project to another org off the web UI can't weaken its receipts
+// setting: one that follows a Require org's default can't move to an Off
+// org. Into another Require org, or in the web UI, it can.
+func TestReceipts_OrgMoveCantWeaken(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	ra.want(t, 200, "orgadmin", http.MethodPut, fmt.Sprintf("/api/orgs/%d/receipts", w.org.ID), map[string]any{"mode": "require"})
+	root := w.as(w.root)
+	move := func(org int) map[string]any {
+		return map[string]any{"project_id": float64(w.s.projectID), "action": "set_org", "org_id": float64(org)}
+	}
+	wantErr(t, root.callExpectError(t, "amp_manage_project_teams", move(w.other.ID)), "web UI", "require")
+	if code, out := ra.doVia(t, auth.ChannelToken, "root", http.MethodPost, fmt.Sprintf("/api/projects/%d/org", w.s.projectID),
+		map[string]any{"org_id": w.other.ID}); code != 403 {
+		t.Fatalf("REST move with a token: %d %v", code, out)
+	}
+	if p, _ := w.s.repo.GetProject(context.Background(), w.s.projectID); p.OrgID == nil || *p.OrgID != w.org.ID {
+		t.Fatalf("project moved: %v", p.OrgID)
+	}
+	ra.want(t, 200, "outsider", http.MethodPut, fmt.Sprintf("/api/orgs/%d/receipts", w.other.ID), map[string]any{"mode": "require"})
+	root.call(t, "amp_manage_project_teams", move(w.other.ID))
+	if p, _ := w.s.repo.GetProject(context.Background(), w.s.projectID); p.OrgID == nil || *p.OrgID != w.other.ID {
+		t.Fatalf("move into another Require org: %v", p.OrgID)
 	}
 }

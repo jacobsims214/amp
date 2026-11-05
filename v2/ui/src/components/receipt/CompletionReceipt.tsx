@@ -41,7 +41,12 @@ const ROLE_LABEL = { worker: 'Worker', verifier: 'Verifier', human: 'Person' } a
  */
 export function CompletionReceipt({ task, runs, comments, receipt, canWork = false, onChanged }: Props) {
   const [artifacts, setArtifacts] = useState(0)
-  const server = receipt && receipt.receipt ? (receipt as ReceiptView & { attempts?: number }) : null
+  const latest = receipt && receipt.receipt ? (receipt as ReceiptView & { attempts?: number }) : null
+  // A receipt from an earlier attempt isn't this completion's: the ticket
+  // completed again later (e.g. after its project went Off), so it shows the
+  // comment-based view instead. An accepted one is kept: Accept completes a
+  // held ticket after its receipt was finalized.
+  const server = latest && !staleReceipt(latest, task) ? latest : null
   const held = !!server?.held
   const show = !isHuman(task) && (task.state === 'completed' || held)
   useEffect(() => {
@@ -118,6 +123,16 @@ export function CompletionReceipt({ task, runs, comments, receipt, canWork = fal
       )}
     </section>
   )
+}
+
+/** Slack between a completion and its receipt's finalize (they're written in that order). */
+const STALE_SLACK_MS = 60_000
+
+function staleReceipt(view: ReceiptView, task: Task): boolean {
+  if (view.held || view.status === 'human_accepted' || task.state !== 'completed') return false
+  const fin = view.receipt.finalized_at ? Date.parse(view.receipt.finalized_at) : NaN
+  const done = task.completed_at ? Date.parse(task.completed_at) : NaN
+  return Number.isFinite(fin) && Number.isFinite(done) && done - fin > STALE_SLACK_MS
 }
 
 /** Line 3 from a server receipt: the status and the worker's count, or the Reject. */

@@ -181,6 +181,7 @@ func TestDowngradeVisualChecks(t *testing.T) {
 	}{
 		{"stored screenshot", "abcdef0123456789", "", vis("k/shot", VerdictPass), VerdictPass, "looked"},
 		{"abbreviated tree", "abcdef012345", "", vis("k/video", VerdictPass), VerdictPass, "looked"},
+		{"too short to compare", "abcdef01", "", vis("k/video", VerdictPass), VerdictCantTell, "evidence recorded on another revision: looked"},
 		{"no key", "", "", vis("", VerdictPass), VerdictCantTell, "evidence missing: looked"},
 		{"foreign key", "", "", vis("other/receipt/shot", VerdictPass), VerdictCantTell, "evidence missing: looked"},
 		{"pending", "", "", vis("k/pending", VerdictPass), VerdictCantTell, "evidence missing (pending): looked"},

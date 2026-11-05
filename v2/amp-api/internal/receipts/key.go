@@ -48,10 +48,10 @@ func KeyProject(key string) int {
 	return n
 }
 
-var treeRe = regexp.MustCompile(`^[0-9a-fA-F]{4,64}$`)
+var treeRe = regexp.MustCompile(`^[0-9a-fA-F]{12,64}$`)
 
-// ValidTreeSHA reports whether s looks like a git object id (4 to 64 hex
-// digits: abbreviated, SHA-1 or SHA-256).
+// ValidTreeSHA reports whether s looks like a git object id: 12 to 64 hex
+// digits (abbreviated to at least the key's 12, SHA-1 or SHA-256).
 func ValidTreeSHA(s string) bool { return treeRe.MatchString(s) }
 
 // Key is the store key of a receipt's file:

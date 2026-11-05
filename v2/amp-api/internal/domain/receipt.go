@@ -471,9 +471,17 @@ func DowngradeVisualChecks(checks []ReceiptCheck, evidence []ReceiptEvidence, tr
 	return out
 }
 
-// sameTree compares two tree ids, either of which may be abbreviated.
+// MinTreePrefix is the shortest tree id two revisions are compared on: the
+// length an evidence key keeps.
+const MinTreePrefix = 12
+
+// sameTree compares two tree ids, either of which may be abbreviated to at
+// least MinTreePrefix characters; a shorter one never matches.
 func sameTree(a, b string) bool {
 	a, b = strings.ToLower(a), strings.ToLower(b)
+	if len(a) < MinTreePrefix || len(b) < MinTreePrefix {
+		return false
+	}
 	if len(a) > len(b) {
 		a, b = b, a
 	}

@@ -107,7 +107,20 @@ func (s *Service) ProjectReceiptSettings(ctx context.Context, projectID int) (Re
 // EffectiveReceipts is ticket t's receipts setting: its metadata (project →
 // epic → story → ticket), then the project's setting, then the org's. A
 // person's ticket never has receipts (D15).
+// For display, an unreadable inheritance falls back to the project's own
+// metadata; completions use effectiveReceiptsStrict, which fails closed.
 func (s *Service) EffectiveReceipts(ctx context.Context, t *domain.Task) (ReceiptSettings, error) {
+	return s.effectiveReceipts(ctx, t, false)
+}
+
+// effectiveReceiptsStrict is EffectiveReceipts that returns an
+// InheritedMetadata error instead of falling back: a completion must not
+// miss an epic's or story's Require because a read failed.
+func (s *Service) effectiveReceiptsStrict(ctx context.Context, t *domain.Task) (ReceiptSettings, error) {
+	return s.effectiveReceipts(ctx, t, true)
+}
+
+func (s *Service) effectiveReceipts(ctx context.Context, t *domain.Task, strict bool) (ReceiptSettings, error) {
 	proj, err := s.Repo.GetProject(ctx, t.ProjectID)
 	if err != nil {
 		return ReceiptSettings{}, err
@@ -115,6 +128,9 @@ func (s *Service) EffectiveReceipts(ctx context.Context, t *domain.Task) (Receip
 	rs := s.projectReceipts(ctx, proj)
 	inherited, err := s.Repo.InheritedMetadata(ctx, "task", t.ID)
 	if err != nil {
+		if strict {
+			return ReceiptSettings{}, err
+		}
 		inherited = proj.Metadata
 	}
 	rs = withOverride(rs, inherited.Merge(t.Metadata))
@@ -169,7 +185,21 @@ func (s *Service) prepareReceipt(ctx context.Context, p authz.Principal, t *doma
 	if t.IsHuman() || t.State == domain.TaskStateCompleted || (in != nil && in.skip) {
 		return nil, nil
 	}
-	rs, err := s.EffectiveReceipts(ctx, t)
+	// A held ticket waits for a person (D10): off the web UI nothing
+	// completes it, not its worker trying again with new checks, nor a
+	// closeout. Rework goes through a new dispatch, which ends the hold.
+	if !p.InUI() && t.State == domain.TaskStateInProgress && t.DispatchID == "" {
+		rc, err := s.latestFinal(ctx, t.ID)
+		if err != nil && authz.StatusOf(err, 0) != 404 {
+			return nil, &authz.Error{Status: 503, Msg: fmt.Sprintf("ticket %d: couldn't read its receipt (%v); nothing changed, try again", t.ID, err)}
+		}
+		if err == nil && liveHeld(*rc, t.State, t.DispatchID) {
+			return nil, &authz.Error{Status: 409, Msg: fmt.Sprintf("ticket %d is held: its verification receipt couldn't be verified and it "+
+				"waits for a person to Accept (which completes it) or Reject it in the AMP web UI: %s. Don't complete it again; "+
+				"rework needs a new dispatch.", t.ID, s.TaskURL(t.ProjectID, t.ID))}
+		}
+	}
+	rs, err := s.effectiveReceiptsStrict(ctx, t)
 	if err != nil {
 		return nil, &authz.Error{Status: 503, Msg: fmt.Sprintf("ticket %d: couldn't read its receipts setting (%v); nothing changed, try again", t.ID, err)}
 	}
@@ -641,9 +671,11 @@ func (s *Service) verdict(ctx context.Context, p authz.Principal, taskID int, ve
 	if verdict == domain.VerdictFail {
 		what, action = "Rejecting a receipt", "receipt.reject"
 	}
-	cur, err := s.Repo.GetTask(ctx, taskID)
+	// Authorized first, so a caller who can't see the ticket learns nothing
+	// about it.
+	cur, _, err := s.LoadTask(ctx, p, taskID, authz.TaskRead)
 	if err != nil {
-		return nil, authz.NotFound("task %d not found", taskID)
+		return nil, err
 	}
 	if err := authz.RequireUI(p, what, s.TaskURL(cur.ProjectID, taskID)); err != nil {
 		s.auditTaskDenied(ctx, p, action, cur, err, nil)
@@ -665,16 +697,22 @@ func (s *Service) verdict(ctx context.Context, p authz.Principal, taskID int, ve
 		return nil, err
 	}
 	held := liveHeld(*rc, t.State, t.DispatchID)
-	// The move first: if completing (or returning) a held ticket fails,
-	// nothing is recorded and a retry starts clean.
+	// The verdict first, then the move: a completed ticket never lacks the
+	// Accept that completed it. If the move fails, the verdict is taken
+	// back, so nothing is recorded and a retry starts clean.
+	check, err := s.Repo.AddReceiptCheck(ctx, domain.ReceiptCheck{ReceiptID: rc.ID, Role: domain.CheckRoleHuman, Kind: domain.CheckKindVerdict,
+		Verdict: verdict, Note: note, CheckedBy: p.Label(), UserID: p.UserRef()})
+	if err != nil {
+		return nil, err
+	}
 	if held {
 		if err := s.releaseHeld(ctx, p, t, rc, verdict, note); err != nil {
+			if derr := s.Repo.DeleteReceiptCheck(context.WithoutCancel(ctx), check.ID); derr != nil {
+				slog.Error("receipt verdict: the move failed and the verdict couldn't be taken back", "task_id", taskID,
+					"check_id", check.ID, "err", derr)
+			}
 			return nil, err
 		}
-	}
-	if _, err := s.Repo.AddReceiptCheck(ctx, domain.ReceiptCheck{ReceiptID: rc.ID, Role: domain.CheckRoleHuman, Kind: domain.CheckKindVerdict,
-		Verdict: verdict, Note: note, CheckedBy: p.Label(), UserID: p.UserRef()}); err != nil {
-		return nil, err
 	}
 	if verdict == domain.VerdictPass {
 		// Accepted work's receipts are all kept (D13).
@@ -790,8 +828,8 @@ func (s *Service) checkReceiptsSettings(p authz.Principal, projectID int, u *dom
 	}
 	if u.ReceiptsMinLevel != nil {
 		l := strings.ToLower(strings.TrimSpace(*u.ReceiptsMinLevel))
-		if !domain.ValidMinLevel(l) {
-			return authz.BadRequest("receipts_min_level must be self_checked or independently_verified")
+		if err := v1MinLevel(l); err != nil {
+			return err
 		}
 		u.ReceiptsMinLevel = &l
 	}
@@ -861,11 +899,29 @@ func validReceiptsPatch(patch domain.MetadataPatch) error {
 		}
 	}
 	if v, ok := patch[domain.MetaReceiptsMinLevel]; ok && v != nil {
-		if str, isStr := v.(string); !isStr || !domain.ValidMinLevel(strings.ToLower(strings.TrimSpace(str))) {
-			return authz.BadRequest("metadata %s must be self_checked or independently_verified (null removes it)", domain.MetaReceiptsMinLevel)
+		str, isStr := v.(string)
+		if !isStr {
+			return authz.BadRequest("metadata %s must be self_checked (null removes it)", domain.MetaReceiptsMinLevel)
+		}
+		if err := v1MinLevel(strings.ToLower(strings.TrimSpace(str))); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// v1MinLevel refuses a minimum level v1 can't reach without a person:
+// independently_verified arrives with the verifier, so until then only
+// self_checked can be set (owner decision).
+func v1MinLevel(l string) error {
+	switch {
+	case l == domain.StatusSelfChecked:
+		return nil
+	case l == domain.StatusIndependentlyVerified:
+		return authz.BadRequest("receipts_min_level independently_verified isn't available yet: it arrives with the independent " +
+			"verifier. v1 supports self_checked only")
+	}
+	return authz.BadRequest("receipts_min_level must be self_checked (v1 supports self_checked only)")
 }
 
 // ownValuesRise checks that patch only raises (or first sets) the receipts
@@ -1153,4 +1209,52 @@ func (s *Service) StripImportedReceipts(p authz.Principal, b *domain.ExportBundl
 		strip(b.Tasks[i].Metadata)
 	}
 	return n
+}
+
+// guardReceiptsOrgMove refuses, off the web UI, moving project proj into
+// org orgID when that weakens its effective receipts setting (D9): a
+// project that follows its org's default would otherwise leave a Require
+// org for an Off one, which turns Require off for every ticket in it. Both
+// orgs are read strictly: one that can't be read refuses the move.
+func (s *Service) guardReceiptsOrgMove(ctx context.Context, p authz.Principal, proj *domain.Project, orgID int) error {
+	if p.InUI() {
+		return nil
+	}
+	orgMode := func(id *int) (string, error) {
+		if id == nil {
+			return domain.ReceiptsOff, nil
+		}
+		org, err := s.Repo.GetOrg(ctx, *id)
+		if err != nil {
+			return "", guardReadError(fmt.Sprintf("org %d", *id), err)
+		}
+		if domain.ValidReceiptsMode(org.ReceiptsMode) {
+			return org.ReceiptsMode, nil
+		}
+		return domain.ReceiptsOff, nil
+	}
+	settings := func(orgMode string) ReceiptSettings {
+		rs := ReceiptSettings{Mode: orgMode, MinLevel: proj.ReceiptsMinLevel}
+		if domain.ValidReceiptsMode(proj.ReceiptsMode) {
+			rs.Mode = proj.ReceiptsMode
+		}
+		if !domain.ValidMinLevel(rs.MinLevel) {
+			rs.MinLevel = domain.StatusSelfChecked
+		}
+		return withOverride(rs, proj.Metadata)
+	}
+	from, err := orgMode(proj.OrgID)
+	if err != nil {
+		return err
+	}
+	to, err := orgMode(&orgID)
+	if err != nil {
+		return err
+	}
+	before, after := settings(from), settings(to)
+	if weakens(before, after) {
+		return authz.UIOnly(fmt.Sprintf("Moving project %d to org %d, which weakens its verification receipts setting (from %s to %s),",
+			proj.ID, orgID, describeReceipts(before), describeReceipts(after)), s.SettingsURL(proj.ID))
+	}
+	return nil
 }

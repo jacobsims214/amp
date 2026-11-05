@@ -423,16 +423,23 @@ export function ReceiptsSetting({ project, org, pid, canManage, onSaved, onError
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [wouldHold, setWouldHold] = useState<number | null>(null)
+  // The org's default comes from the project's receipts summary, which any
+  // member can read; the org itself (GET /api/orgs/:id) is only readable by
+  // org members, so a project owner outside the org would see "Off".
+  const [summaryOrgMode, setSummaryOrgMode] = useState<ReceiptsMode | null>(null)
   useEffect(() => { setChoice(current) }, [current])
-  const orgMode: ReceiptsMode = org?.receipts_mode ?? 'off'
+  useEffect(() => {
+    let live = true
+    api.receiptSummary(pid).then(s => {
+      if (!live) return
+      setSummaryOrgMode(s.org_mode)
+      setWouldHold(s.would_hold_last_7_days)
+    }).catch(() => {})
+    return () => { live = false }
+  }, [pid, current])
+  const orgMode: ReceiptsMode = summaryOrgMode ?? org?.receipts_mode ?? 'off'
   const effective: ReceiptsMode = choice === '' ? orgMode : choice
   const becomesRequire = effective === 'require' && (current === '' ? orgMode : current) !== 'require'
-  useEffect(() => {
-    if (!becomesRequire) return
-    let live = true
-    api.receiptSummary(pid).then(s => { if (live) setWouldHold(s.would_hold_last_7_days) }).catch(() => {})
-    return () => { live = false }
-  }, [becomesRequire, pid])
   const dirty = choice !== current
 
   const save = async () => {

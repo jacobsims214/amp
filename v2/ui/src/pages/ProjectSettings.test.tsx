@@ -9,6 +9,7 @@ import type { Project, ProjectAccess } from '../types'
 const project: Project = { id: 3, name: 'P', code: 'P', description: '', state: 'active', created_at: '', updated_at: '', require_merge: true }
 const state = vi.hoisted(() => ({
   access: 'owner' as string,
+  orgMode: 'off' as string,
   update: vi.fn<(id: number, s: Partial<Project>) => Promise<Project>>(),
   // Every GitHub-token call the page makes, so a test can prove a non-owner's
   // page never even asks (the server would refuse it anyway).
@@ -24,7 +25,7 @@ vi.mock('../api/client', () => ({
       if (name === 'getGitHubHook') return Promise.resolve({ configured: false, url: '/api/hooks/github/3', deliveries: [], encrypted: true })
       if (name === 'getGitHubCredential') return state.credential(args[0] as number)
       if (name === 'updateProjectSettings') return state.update(args[0] as number, args[1] as Partial<Project>)
-      if (name === 'receiptSummary') return Promise.resolve({ mode: 'off', min_level: 'self_checked', project_mode: '', org_mode: 'off', tasks: [], would_hold_last_7_days: 4 })
+      if (name === 'receiptSummary') return Promise.resolve({ mode: 'off', min_level: 'self_checked', project_mode: '', org_mode: state.orgMode, tasks: [], would_hold_last_7_days: 4 })
       return Promise.reject(new Error(`not mocked: ${String(name)}`))
     },
   }),
@@ -44,6 +45,7 @@ function renderAs(access: ProjectAccess) {
 beforeEach(() => {
   state.update.mockReset()
   state.credential.mockReset()
+  state.orgMode = 'off'
   state.credential.mockResolvedValue({ configured: false, host: 'github.com', encrypted: true })
 })
 
@@ -235,6 +237,12 @@ describe('ProjectSettings verification receipts (#126)', () => {
     expect(await screen.findByTestId('receipts-require-warning')).toHaveTextContent('4 agent tickets completed in the last 7 days would have been held')
     expect(screen.getByLabelText('Minimum level')).toHaveValue('self_checked')
     expect(state.update).not.toHaveBeenCalled()
+  })
+
+  it("names the org's default from the receipts summary, even without access to the org", async () => {
+    state.orgMode = 'require'
+    renderAs('owner')
+    expect(await screen.findByRole('radio', { name: 'Use org default (Require)' })).toBeInTheDocument()
   })
 
   it('is read-only for a lead', async () => {

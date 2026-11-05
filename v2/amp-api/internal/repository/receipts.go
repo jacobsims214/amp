@@ -136,6 +136,12 @@ func (r *Repo) AddReceiptCheck(ctx context.Context, c domain.ReceiptCheck) (doma
 	return out, err
 }
 
+// DeleteReceiptCheck deletes one check (a verdict whose move failed).
+func (r *Repo) DeleteReceiptCheck(ctx context.Context, id int64) error {
+	_, err := r.db.Exec(ctx, `DELETE FROM receipt_checks WHERE id = $1`, id)
+	return err
+}
+
 // ReceiptChecks lists the checks of the given receipts, oldest first, by
 // receipt.
 func (r *Repo) ReceiptChecks(ctx context.Context, ids []int64) (map[int64][]domain.ReceiptCheck, error) {

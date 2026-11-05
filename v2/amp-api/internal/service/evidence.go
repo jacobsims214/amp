@@ -145,7 +145,7 @@ func (s *Service) AddEvidence(ctx context.Context, p authz.Principal, receiptID 
 	treeSHA = strings.ToLower(strings.TrimSpace(treeSHA))
 	commit = strings.TrimSpace(commit)
 	if !receipts.ValidTreeSHA(treeSHA) {
-		return nil, authz.BadRequest("tree_sha is required: the git tree of the revision you recorded on (git rev-parse HEAD^{tree})")
+		return nil, authz.BadRequest("tree_sha is required (12 to 64 hex digits): the git tree of the revision you recorded on (git rev-parse HEAD^{tree})")
 	}
 	if commit != "" && !commitRe.MatchString(commit) {
 		return nil, authz.BadRequest("commit must be a git commit SHA")
