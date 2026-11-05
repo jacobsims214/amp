@@ -11,6 +11,7 @@ import { questionOptions } from '../lib/answers'
 import { PriorityMark } from './ui/PriorityMark'
 import { Avatar } from './ui/Avatar'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
+import { stripMarkdown } from '../lib/stripMarkdown'
 
 interface Props {
   task: Task
@@ -71,7 +72,7 @@ export function TaskCard({ task, onClick, dimmed = false, owner = null, notStart
       <span className="text-[13px] font-medium text-ink leading-snug line-clamp-2">{task.name}</span>
 
       {state === 'flag' && task.block_reason && (
-        <span className="text-[12px] leading-snug text-danger-ink line-clamp-3">{task.block_reason}</span>
+        <span className="text-[12px] leading-snug text-danger-ink line-clamp-3">{stripMarkdown(task.block_reason)}</span>
       )}
       {/* The agent's options (#130), the recommended one marked: answered in the drawer or My work. */}
       {options && (

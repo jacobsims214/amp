@@ -124,3 +124,11 @@ describe('TaskCard question options (#130)', () => {
     expect(screen.queryByTestId('card-options')).toBeNull()
   })
 })
+
+describe('TaskCard question text (#133)', () => {
+  it('shows a markdown question as plain words, no asterisks or brackets', () => {
+    card(task({ state: 'blocked', block_reason: '**Pick** [one](https://x)' }))
+    expect(screen.getByText('Pick one')).toBeInTheDocument()
+    expect(screen.queryByText(/\*\*|\[one\]/)).toBeNull()
+  })
+})

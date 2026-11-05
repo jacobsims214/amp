@@ -59,11 +59,19 @@ copy the address bar to share exactly what you see.
   approved yet shows **Needs approval** on its card and in its drawer, and the drawer's State
   uses the same words as its badge (Ready, Waiting, Question …). A done ticket whose PR isn't
   merged shows **Merge needed**.
-  **Hand over …** moves the filtered tickets to someone else with a reason.
+  **Hand over …** moves the filtered tickets to someone else with a reason. A ticket's drawer
+  has **Story context** under its story (on Details): the story's description and acceptance
+  criteria and the epic's description, as the planner wrote them. The Approve view has the same
+  for each story (**About this story**).
 - **Flight plan** — the plan as epics, stories and tickets in order, and the plan check verdict
   (GO / WARN / NO-GO). It's for reading: when tickets await your approval it says so and links
   to My work.
 - **Graph** — the dependency graph.
+- Text people and agents write (descriptions, questions, comments, day-report summaries, KB
+  annotations, artifact version notes, the plan check) is rendered as markdown everywhere it
+  has room; one-line and clamped places (a card's question, a Graph node, a project card) show
+  its words without the markdown syntax. A link to another AMP page opens in-app (a preview
+  instead is proposed in `design/link-previews.md`).
 - **Reports** — progress, velocity, people (with who each person is blocked by), the standup
   sheet, tokens and cost by model, epic, person and metadata, with a Markdown export.
 - **Artifacts** — mockups, diagrams and other pages agents published for review

@@ -35,6 +35,7 @@ import { PriorityMark } from '../components/ui/PriorityMark'
 import { displayState, STATE_LABEL, STATE_VAR, type DisplayState } from '../lib/ticketState'
 import type { PlanIssue, PlanReport, Task } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
+import { Markdown } from '../components/ui/Markdown'
 
 /** Each ticket's stage (dependency depth) and the plan's critical path. */
 function planShape(tasks: Task[]) {
@@ -175,7 +176,9 @@ export function FlightPlan() {
       <div key={kind} className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 px-4 py-2.5 border-t border-line first:border-t-0" data-check={kind}>
         <span className="text-[13px] text-ink">{ISSUE_TITLE[kind] ?? kind.replace(/_/g, ' ')}</span>
         <Verdict key={`${poll}-${kind}`} ok={!issue} warn={issue?.severity === 'warn'} stampDelay={stamp} />
-        <span className="col-span-2 text-[11.5px] text-ink-2 leading-snug">{issue ? issue.message : okDetail}</span>
+        {issue
+          ? <div className="col-span-2"><Markdown size="compact" projectId={pid}>{issue.message}</Markdown></div>
+          : <span className="col-span-2 text-[11.5px] text-ink-2 leading-snug">{okDetail}</span>}
         {issue?.task_ids && issue.task_ids.length > 0 && (
           <span className="col-span-2 flex flex-wrap gap-1">
             {issue.task_ids.slice(0, 18).map(id => (
@@ -311,7 +314,7 @@ export function FlightPlan() {
                     ? `Repaired ${report.repaired_task_ids.length} blocked on finished work: #${report.repaired_task_ids.join(', #')}`
                     : 'Nothing is blocked on finished work.'}</span>
                 </div>
-                <p className="m-0 px-4 py-2.5 border-t border-line text-[11.5px] text-ink-3">{report.summary}</p>
+                <div className="px-4 py-2.5 border-t border-line" data-testid="plan-summary"><Markdown size="compact" projectId={pid}>{report.summary}</Markdown></div>
               </>}
             </Panel>
 
