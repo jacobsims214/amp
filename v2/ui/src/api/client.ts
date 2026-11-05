@@ -106,6 +106,16 @@ export const api = {
   getEpic: (id: number) => get<{ epic: Epic }>(`/epics/${id}`).then(r => r.epic),
 
   // Stories
+  /**
+   * Every story in the project, in one request. Rejects when the API doesn't
+   * have the endpoint yet (an older server), so callers fall back to
+   * listStories per epic.
+   */
+  listProjectStories: (projectId: number) =>
+    get<{ stories?: Story[] | null }>(`/projects/${projectId}/stories`).then(r => {
+      if (!r || !('stories' in r)) throw new Error('GET /projects/:id/stories: not supported')
+      return r.stories ?? []
+    }),
   listStories: (epicId: number) =>
     get<{ stories: Story[] }>(`/epics/${epicId}/stories`).then(r => r.stories ?? []),
   getStory: (id: number) => get<{ story: Story }>(`/stories/${id}`).then(r => r.story),

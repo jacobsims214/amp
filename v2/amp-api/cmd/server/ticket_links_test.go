@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/simstech/amp-api/internal/domain"
 )
 
 // amp_get_task carries the ticket's canonical web UI link, /t/<CODE>-<id>,
@@ -74,4 +77,76 @@ func TestRuns_GetRunByIDAndSession(t *testing.T) {
 	// A run whose ticket was deleted is not found either: there's nothing to open.
 	root.call(t, "amp_delete_task", map[string]any{"task_id": float64(a)})
 	ra.want(t, 404, "root", http.MethodGet, fmt.Sprintf("/api/runs/%d", runID), nil)
+}
+
+// GET /api/projects/:id/stories lists every story in the project in one
+// request (#132: the board no longer fetches stories once per epic).
+func TestREST_ProjectStories(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	got := ra.want(t, 200, "root", http.MethodGet, fmt.Sprintf("/api/projects/%d/stories", w.s.projectID), nil)
+	stories, _ := got["stories"].([]any)
+	found := false
+	for _, s := range stories {
+		if int(s.(map[string]any)["id"].(float64)) == w.s.storyID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("project stories = %v, want story %d", got, w.s.storyID)
+	}
+	ra.want(t, 404, "outsider", http.MethodGet, fmt.Sprintf("/api/projects/%d/stories", w.s.projectID), nil)
+}
+
+// Every delete, over MCP or REST, of a ticket, a story or an epic sends the
+// live "deleted" signal (a task.updated whose payload isn't a ticket), so open
+// board views drop what was deleted (#132 review N1).
+func TestDeletesPublishTheDeletedSignal(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	root := w.s.as(w.root)
+	var mu sync.Mutex
+	var got []map[string]interface{}
+	w.s.hub.AddSink(func(e domain.Event) {
+		if p, ok := e.Payload.(map[string]interface{}); ok && e.Type == domain.EventTaskUpdated && e.ProjectID == w.s.projectID && p["deleted"] == true {
+			mu.Lock()
+			got = append(got, p)
+			mu.Unlock()
+		}
+	})
+	take := func() []map[string]interface{} {
+		mu.Lock()
+		defer mu.Unlock()
+		out := got
+		got = nil
+		return out
+	}
+
+	viaMCP := mkIn(t, root, w.s.storyID, "delete me over MCP")
+	root.call(t, "amp_delete_task", map[string]any{"task_id": float64(viaMCP)})
+	if sig := take(); len(sig) != 1 || sig[0]["task_id"] != viaMCP {
+		t.Fatalf("MCP ticket delete signals = %v, want one {task_id: %d, deleted}", sig, viaMCP)
+	}
+
+	viaREST := mkIn(t, root, w.s.storyID, "delete me over REST")
+	ra.want(t, 200, "root", http.MethodDelete, fmt.Sprintf("/api/tasks/%d", viaREST), nil)
+	if sig := take(); len(sig) != 1 || sig[0]["task_id"] != viaREST {
+		t.Fatalf("REST ticket delete signals = %v, want exactly one {task_id: %d, deleted}", sig, viaREST)
+	}
+
+	epicID := intField(t, root.call(t, "amp_create_epic", map[string]any{"project_id": float64(w.s.projectID), "name": "doomed epic"}), "id")
+	storyID := intField(t, root.call(t, "amp_create_story", map[string]any{"project_id": float64(w.s.projectID), "epic_id": float64(epicID),
+		"name": "doomed story", "acceptance_criteria": "x"}), "id")
+	inStory := intField(t, root.call(t, "amp_create_task", map[string]any{"project_id": float64(w.s.projectID), "epic_id": float64(epicID),
+		"story_id": float64(storyID), "name": "goes with its story", "description": ".", "acceptance_criteria": "."}), "id")
+	root.call(t, "amp_delete_story", map[string]any{"story_id": float64(storyID)})
+	sig := take()
+	if len(sig) != 1 || sig[0]["story_id"] != storyID || fmt.Sprint(sig[0]["task_ids"]) != fmt.Sprint([]int{inStory}) {
+		t.Fatalf("story delete signals = %v, want one {story_id: %d, task_ids: [%d], deleted}", sig, storyID, inStory)
+	}
+
+	root.call(t, "amp_delete_epic", map[string]any{"epic_id": float64(epicID)})
+	if sig := take(); len(sig) != 1 || sig[0]["epic_id"] != epicID {
+		t.Fatalf("epic delete signals = %v, want one {epic_id: %d, deleted}", sig, epicID)
+	}
 }

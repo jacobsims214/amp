@@ -30,6 +30,7 @@ import (
 //	POST /api/projects/import
 //	GET  /api/projects/:id
 //	GET  /api/projects/:id/epics
+//	GET  /api/projects/:id/stories   every story in the project (one request, not one per epic)
 //	GET  /api/projects/:id/tasks
 //	POST /api/projects/:id/tasks
 //	GET  /api/projects/:id/export
@@ -1009,6 +1010,19 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, p)
 		return
 
+	case "stories":
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET required", 405)
+			return
+		}
+		stories, err := h.repo.ListStoriesByProject(r.Context(), projectID)
+		if err != nil {
+			jsonErr(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"stories": stories})
+		return
+
 	case "epics":
 		switch r.Method {
 		case http.MethodGet:
@@ -1427,12 +1441,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 				fail(w, err, 500)
 				return
 			}
-			h.hub.Publish(domain.Event{
-				Type:      domain.EventTaskUpdated,
-				ProjectID: task.ProjectID,
-				Payload:   map[string]interface{}{"task_id": taskID, "deleted": true},
-				At:        time.Now(),
-			})
+			// service.DeleteTask sends the live deleted signal.
 			jsonOK(w, map[string]interface{}{"task_id": taskID, "deleted": true})
 
 		default:

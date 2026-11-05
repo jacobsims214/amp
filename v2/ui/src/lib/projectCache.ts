@@ -74,3 +74,6 @@ export function useProject(id: number | null | undefined): Project | null {
   }, [id, valid])
   return project
 }
+
+// Test setup resets every shared store after each test (src/test/setup.ts).
+;((globalThis as { __ampStoreResets?: Set<() => void> }).__ampStoreResets ??= new Set()).add(resetProjectCache)

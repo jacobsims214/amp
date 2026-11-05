@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Loader2, RotateCcw } from 'lucide-react'
 import { api } from '../api/client'
+import { invalidateBoard } from '../lib/boardStore'
 import type { DeletedGroup, DeletedTask, ProjectTrash } from '../types'
 
 const when = (at: string) =>
@@ -22,6 +23,8 @@ export function TrashPanel({ projectId }: { projectId: number }) {
     setBusy(true); setMsg(null)
     try {
       const r = await api.restoreTasks(projectId, taskIds, { epicIds, storyIds })
+      // The board views show the restored tickets on their next look, even from cache.
+      invalidateBoard(projectId)
       const groups = r.groups ?? []
       const tickets = [...r.results, ...groups.flatMap(g => g.tickets ?? [])]
       const failed = [
