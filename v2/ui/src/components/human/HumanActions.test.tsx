@@ -1,5 +1,5 @@
 // HumanActions (KB decisions/human-work-ux.md §2): each action and the API call it makes.
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
@@ -55,6 +55,52 @@ describe('Answer', () => {
     render(<HumanActions task={q} canAct={false} />)
     expect(screen.queryByRole('button')).toBeNull()
     expect(screen.getByText(/only people who can work this ticket/i)).toBeInTheDocument()
+  })
+})
+
+describe('Answer with the agent\'s options (#130)', () => {
+  const q = task({ state: 'blocked', agent_id: 'amp-worker', block_reason: 'Which CRM should the lead import write to: HubSpot or Pipedrive?',
+    question: { options: [{ label: 'HubSpot', consequence: 'Holds the marketing contacts' }, { label: 'Pipedrive', consequence: '' }], recommended: 1 } })
+
+  it('shows the options as choices, marks the recommended one without choosing it, and guesses nothing from the text', () => {
+    render(<HumanActions task={q} canAct />)
+    const group = screen.getByRole('radiogroup', { name: 'Choose an answer' })
+    const radios = within(group).getAllByRole('radio')
+    expect(radios.map(r => r.closest('label')!.textContent)).toEqual(['HubSpotHolds the marketing contacts', 'PipedriveRecommended', 'Other: write your own answer below'])
+    expect(radios.every(r => !(r as HTMLInputElement).checked)).toBe(true)
+    expect(screen.queryByRole('group', { name: 'Suggested answers' })).toBeNull()
+    expect(screen.getByRole('button', { name: /send answer/i })).toBeDisabled()
+  })
+
+  it('sends the chosen option, with a note when there is one', async () => {
+    const onChanged = vi.fn()
+    render(<HumanActions task={q} canAct onChanged={onChanged} />)
+    await userEvent.click(screen.getByRole('radio', { name: /Pipedrive/ }))
+    await userEvent.type(screen.getByLabelText('Add a note (optional)'), 'sales owns leads')
+    await userEvent.click(screen.getByRole('button', { name: /send answer/i }))
+    await waitFor(() => expect(onChanged).toHaveBeenCalled())
+    expect(calls).toEqual([{ method: 'POST', path: '/api/tasks/5/unblock', body: { answer: 'sales owns leads', option: 1, option_label: 'Pipedrive' } }])
+  })
+
+  it('says so when the question changed since it was shown (409), and keeps the choice', async () => {
+    server.use(http.post('*/api/tasks/:id/unblock', () => HttpResponse.json(
+      { error: 'The question on ticket 5 changed since it was shown: "Pipedrive" is no longer one of its options. Reload the ticket and choose again.' }, { status: 409 })))
+    const onChanged = vi.fn()
+    render(<HumanActions task={q} canAct onChanged={onChanged} />)
+    await userEvent.click(screen.getByRole('radio', { name: /Pipedrive/ }))
+    await userEvent.click(screen.getByRole('button', { name: /send answer/i }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(/changed since it was shown/)
+    expect(onChanged).not.toHaveBeenCalled()
+    expect(screen.getByRole('radio', { name: /Pipedrive/ })).toBeChecked()
+  })
+
+  it('Other sends the person\'s own words, no option', async () => {
+    render(<HumanActions task={q} canAct onChanged={() => {}} />)
+    await userEvent.click(screen.getByRole('radio', { name: /Other/ }))
+    await userEvent.type(screen.getByLabelText('Your answer'), 'Neither: use the CSV export')
+    await userEvent.click(screen.getByRole('button', { name: /send answer/i }))
+    await waitFor(() => expect(calls).toHaveLength(1))
+    expect(calls[0].body).toEqual({ answer: 'Neither: use the CSV export' })
   })
 })
 

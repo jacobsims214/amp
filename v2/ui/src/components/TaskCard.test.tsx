@@ -111,3 +111,16 @@ describe('TaskCard approval tag (#129)', () => {
     expect(screen.queryByTestId('needs-approval')).toBeNull()
   })
 })
+
+describe('TaskCard question options (#130)', () => {
+  it('a question with options lists them, the recommended one marked', () => {
+    card(task({ state: 'blocked', block_reason: 'HubSpot or Pipedrive?',
+      question: { options: [{ label: 'HubSpot', consequence: '' }, { label: 'Pipedrive', consequence: '' }], recommended: 1 } }))
+    const opts = screen.getByTestId('card-options')
+    expect(opts).toHaveTextContent('HubSpotPipedrive (recommended)')
+  })
+  it('a question in words only lists none', () => {
+    card(task({ state: 'blocked', block_reason: 'HubSpot or Pipedrive?' }))
+    expect(screen.queryByTestId('card-options')).toBeNull()
+  })
+})

@@ -81,3 +81,12 @@ describe('TaskDrawer speaks one status vocabulary (#129)', () => {
     expect(screen.queryByTestId('needs-approval')).toBeNull()
   })
 })
+
+describe('TaskDrawer shows an agent question\'s options (#130)', () => {
+  it('as choices, the recommended one marked', async () => {
+    open(trustTask({ state: 'blocked', agent_id: 'amp-worker', block_reason: 'Daily or hourly?', approved_at: '2026-11-05T10:05:00Z', approved_by: 9,
+      question: { options: [{ label: 'Daily', consequence: 'Cheaper' }, { label: 'Hourly', consequence: '' }], recommended: 0 } }))
+    const group = await screen.findByRole('radiogroup', { name: 'Choose an answer' })
+    expect(within(group).getByRole('radio', { name: /Daily/ }).closest('label')).toHaveTextContent('Recommended')
+  })
+})

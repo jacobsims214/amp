@@ -106,7 +106,7 @@ as before, so an old plugin is not broken by this — it simply never claims.
 | `amp_claim_task(task_id, dispatch_id?)` | worker | Starts the ticket: stamps `started_at`/`started_by` and posts "<agent> picked this up". With a token it must be the ticket's current one; a stale one is refused ("no longer current … the ticket was returned and dispatched again"). Idempotent (`already_started: true`). Without a token it still starts a dispatched, unstarted ticket the caller owns (the older-worker path), and it keeps its old job of taking an unassigned ticket. |
 | `amp_return_task(task_id, reason, dispatch_id?)` | harness or manager | Releases a dispatched ticket back to ready (or to waiting, if it still has open dependencies): clears the dispatch and any start, records `returned_at`/`returned_reason`, history action `returned`, audit entry. A never-started ticket needs no `dispatch_id`. **A started ticket is returned only with its current `dispatch_id`** (a harness giving back its own worker's ticket); without one it is refused — block it or close it out instead. A stale `dispatch_id` is always refused. |
 | `amp_complete_task(…, dispatch_id?)` | worker, or a manager closing out | With the current `dispatch_id`: the worker's own completion. Without it: a **closeout** (see below). |
-| `amp_block_task(task_id, dispatch_id?, reason)` | worker | Blocks on a question. `dispatch_id` only annotates the run; the block starts the ticket by itself when needed. |
+| `amp_block_task(task_id, dispatch_id?, reason, options?, recommended?)` | worker | Blocks on a question. `options` (2 to 4 `{label, consequence}`) and `recommended` (0-based index) make it a one-tap choice in AMP. `dispatch_id` only annotates the run; the block starts the ticket by itself when needed. |
 
 **`next` on every state-changing result.** Each mutating tool returns a `next` written for its
 caller — the dispatch result says to launch the worker now with `worker_prompt`; the claim result
@@ -186,11 +186,16 @@ opens") — not as a substitute for `depends_on` when the real gate is another t
 
 A subagent can't wait for an answer, so a question lives on the ticket:
 
-- `amp_block_task` {task_id, reason} — the worker's way to stop and ask. `reason` is required and
-  is the question people see in AMP ("Avalara or Stripe Tax? …"). Not for waiting on other
-  tickets — that's a dependency.
+- `amp_block_task` {task_id, reason, options?, recommended?} — the worker's way to stop and ask.
+  `reason` is required and is the question people see in AMP ("Avalara or Stripe Tax? …"). A
+  choice also gives `options` (2 to 4 `{label, consequence}`) and `recommended` (the 0-based index
+  it would pick): AMP shows them as one-tap choices, the recommended one marked, beside a free-text
+  answer. Not for waiting on other tickets — that's a dependency.
 - `amp_list_tasks` returns a `questions` list: each blocked ticket with its question.
-- `amp_answer_question` {task_id, answer} — the orchestrator's way to relay the user's answer:
+- `amp_answer_question` {task_id, answer, option?, option_label?} — the orchestrator's way to relay the
+  user's answer (`option`: the 0-based index of the option they chose, when the question has
+  `options`, with `option_label` its label as `amp_get_task` showed it; a question that changed since
+  is refused; the comment reads `Chose: <label>` with any answer text after it):
   it's posted as a comment marked "relayed by agent" and the ticket goes back to ready (or to
   waiting, if it still depends on unfinished tickets). People answering in the AMP UI do exactly
   the same, under their own name. Never answer from your own judgment.

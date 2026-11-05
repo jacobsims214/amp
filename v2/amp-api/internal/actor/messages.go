@@ -236,10 +236,13 @@ type ReplyMergeState struct {
 }
 
 type MsgBlockTask struct {
-	TaskID  int
-	Reason  string
-	By      *int
-	ReplyCh chan ReplySimple
+	TaskID int
+	Reason string
+	// Question is the options the agent gave with its question (#130); nil
+	// for a question in words only. Validated by the caller.
+	Question *domain.Question
+	By       *int
+	ReplyCh  chan ReplySimple
 }
 
 // MsgAssignTask changes a ticket's single owner as a compare-and-set: it is

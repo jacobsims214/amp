@@ -1300,11 +1300,46 @@ func (s *Service) deleteTickets(ctx context.Context, p authz.Principal, projectI
 // the ticket goes back to ready, or to waiting if it still depends on
 // unfinished work.
 func (s *Service) AnswerQuestion(ctx context.Context, p authz.Principal, taskID int, answer string) (*domain.Task, error) {
+	return s.AnswerWithOption(ctx, p, taskID, answer, nil, "")
+}
+
+// AnswerWithOption answers a ticket's question, choosing one of its options
+// when option is set (#130): the answer posted is "Chose: <label>" with any
+// note after it, so the agent receives the option itself. Without option
+// it's AnswerQuestion.
+//
+// The caller sends the label it showed with the index: the question may have
+// changed since (a new block with other options), and an index alone would
+// then choose an option the person never saw. A label that no longer matches
+// the stored option is refused with 409.
+func (s *Service) AnswerWithOption(ctx context.Context, p authz.Principal, taskID int, answer string, option *int, label string) (*domain.Task, error) {
 	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskWork)
 	if err != nil {
 		return nil, err
 	}
+	if option != nil {
+		if !openQuestion(t) {
+			return nil, authz.BadRequest("ticket %d has no open question: only a ticket blocked with a reason (amp_block_task) can be answered", taskID)
+		}
+		if t.Question == nil || len(t.Question.Options) == 0 {
+			return nil, authz.BadRequest("ticket %d's question has no options to choose from: answer it in words", taskID)
+		}
+		label = strings.TrimSpace(label)
+		if label == "" {
+			return nil, authz.BadRequest("option_label is required with option: the label of the option that was chosen, so an answer never lands on a question that changed")
+		}
+		stored, err := t.Question.Choose(*option)
+		if err != nil || !strings.EqualFold(strings.TrimSpace(stored), label) {
+			return nil, &authz.Error{Status: 409, Msg: fmt.Sprintf("The question on ticket %d changed since it was shown: %q is no longer one of its options. Reload the ticket and choose again.", taskID, label)}
+		}
+		answer = domain.ChosenAnswer(stored, answer)
+	}
 	return s.answer(ctx, p, t, answer)
+}
+
+// openQuestion reports whether t is blocked on a question a person answers.
+func openQuestion(t *domain.Task) bool {
+	return t.State == domain.TaskStateBlocked && t.BlockReason != "" && !strings.HasPrefix(t.BlockReason, "scheduled:")
 }
 
 // answerAttribution is how an answer is recorded: by the person in the web
@@ -1321,7 +1356,7 @@ func answerAttribution(p authz.Principal) (author, detail string) {
 // answer posts answer on t (already checked) and sends it back to ready.
 func (s *Service) answer(ctx context.Context, p authz.Principal, t *domain.Task, answer string) (*domain.Task, error) {
 	taskID := t.ID
-	if t.State != domain.TaskStateBlocked || t.BlockReason == "" || strings.HasPrefix(t.BlockReason, "scheduled:") {
+	if !openQuestion(t) {
 		return nil, authz.BadRequest("ticket %d has no open question: only a ticket blocked with a reason (amp_block_task) can be answered", taskID)
 	}
 	author, detail := answerAttribution(p)

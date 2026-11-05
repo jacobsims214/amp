@@ -657,7 +657,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 
 	mcp.AddTool(tool("amp_block_task",
 		"Stop work on a ticket because it needs a person: a question, a decision, missing information, or access you don't have. "+
-			"The reason is shown to people in AMP as the question to answer, so write it as one, with the options if there are any. "+
+			"The reason is shown to people in AMP as the question to answer, so write it as one. When there are options, also give them "+
+			"as options (with the one you recommend): the person then answers with one tap, and the answer you get is the option they chose. "+
 			"The ticket leaves in-progress and appears in amp_list_tasks' questions list. When someone answers (in the AMP UI, or with "+
 			"amp_answer_question) the answer is posted on the ticket and it goes back to ready to be dispatched again. "+
 			"Not for waiting on other tickets: that's what dependencies are for.",
@@ -665,6 +666,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"task_id":     num("REQUIRED. Task ID."),
 			"reason":      str("REQUIRED. The question for a person, e.g. 'Avalara or Stripe Tax? Both work in the sandbox; Stripe is cheaper under 10k invoices a month.'"),
 			"dispatch_id": str("Optional. The dispatch_id you were dispatched with (records which run stopped; the ticket is started either way)."),
+			"options":     questionProps()["options"],
+			"recommended": questionProps()["recommended"],
 		})), wrap(ctx, s.guard(authz.Member, s.blockTask)))
 	mcp.AddTool(tool("amp_return_task",
 		"Send a dispatched ticket back to ready because its worker never started it or ended without closing it: a harness "+
@@ -685,7 +688,10 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"agent. People can also answer in the AMP UI.",
 		props{
 			"task_id": num("REQUIRED. Task ID of the ticket with the question."),
-			"answer":  str("REQUIRED. The answer, as the person gave it, with any detail the next worker needs."),
+			"answer":  str("REQUIRED unless option is given. The answer, as the person gave it, with any detail the next worker needs. With option, a note added to the choice."),
+			"option": map[string]interface{}{"type": "integer",
+				"description": "Optional. When the question has options (amp_get_task's question.options) and the person chose one: its 0-based index, with option_label. The answer posted is 'Chose: <label>' and any answer text after it."},
+			"option_label": str("With option: the chosen option's label exactly as amp_get_task showed it. If the question changed since, the answer is refused rather than given to an option the person never saw."),
 		}), wrap(ctx, s.guard(authz.Member, s.answerQuestion)))
 
 	s.registerArtifacts(mcp)
@@ -2007,6 +2013,10 @@ func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*
 	if strings.HasPrefix(reason, "scheduled:") {
 		return nil, fmt.Errorf("reason can't start with \"scheduled:\"; use amp_set_task_start_at to schedule a ticket")
 	}
+	question, err := optQuestion(args)
+	if err != nil {
+		return nil, err
+	}
 	task, err := s.repo.GetTask(context.Background(), taskID)
 	if err != nil {
 		return nil, err
@@ -2019,12 +2029,15 @@ func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*
 	if err != nil {
 		return nil, err
 	}
-	s.registry.System().Root.Send(pid, &actor.MsgBlockTask{TaskID: taskID, Reason: reason, By: caller(rctx).p.UserRef(), ReplyCh: replyCh})
+	s.registry.System().Root.Send(pid, &actor.MsgBlockTask{TaskID: taskID, Reason: reason, Question: question, By: caller(rctx).p.UserRef(), ReplyCh: replyCh})
 	reply := actor.Await(rctx, replyCh)
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
 	out := map[string]interface{}{"task_id": taskID, "state": "blocked"}
+	if question != nil {
+		out["question"] = question
+	}
 	if t, err := s.repo.GetTask(rctx, taskID); err == nil {
 		out["next"] = blockNext(t)
 	} else {
@@ -2043,18 +2056,25 @@ func (s *Server) answerQuestion(rctx context.Context, args map[string]interface{
 	if err != nil {
 		return nil, err
 	}
-	answer, err := reqStr(args, "answer")
-	if err != nil || strings.TrimSpace(answer) == "" {
-		return nil, fmt.Errorf("answer is required")
-	}
-	t, err := s.repo.GetTask(rctx, taskID)
+	answer := optStr(args, "answer", "")
+	// Authorized first: nothing about the ticket (its question, its
+	// options) is read for a caller who can't answer it, and a missing
+	// ticket and one they can't see give the same error.
+	t, _, err := s.svc.LoadTask(rctx, caller(rctx).p, taskID, authz.TaskWork)
 	if err != nil {
-		return nil, fmt.Errorf("task %d not found", taskID)
+		return nil, err
+	}
+	option, label, err := chosenOption(args)
+	if err != nil {
+		return nil, err
+	}
+	if option == nil && strings.TrimSpace(answer) == "" {
+		return nil, fmt.Errorf("answer is required (or option, when the question has options)")
 	}
 	if err := s.checkProjectNotArchived(rctx, t.ProjectID); err != nil {
 		return nil, err
 	}
-	task, err := s.svc.AnswerQuestion(rctx, caller(rctx).p, taskID, answer)
+	task, err := s.svc.AnswerWithOption(rctx, caller(rctx).p, taskID, answer, option, label)
 	if err != nil {
 		return nil, err
 	}

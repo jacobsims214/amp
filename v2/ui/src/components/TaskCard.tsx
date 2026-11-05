@@ -7,6 +7,7 @@ import { mergeBadge, mergeWait } from '../lib/merge'
 import { returnedHint, returnedLine } from '../lib/dispatchState'
 import { NotStartedTag, ReturnedTag } from './DispatchTags'
 import { ApprovalTag } from './ApprovalTag'
+import { questionOptions } from '../lib/answers'
 import { PriorityMark } from './ui/PriorityMark'
 import { Avatar } from './ui/Avatar'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
@@ -40,6 +41,7 @@ export function TaskCard({ task, onClick, dimmed = false, owner = null, notStart
   const merge = mergeBadge(task)
   const mergeWaiting = state === 'wait' ? mergeWait(task) : null
   const returned = returnedLine(task)
+  const options = state === 'flag' ? questionOptions(task) : null
 
   return (
     <button
@@ -70,6 +72,17 @@ export function TaskCard({ task, onClick, dimmed = false, owner = null, notStart
 
       {state === 'flag' && task.block_reason && (
         <span className="text-[12px] leading-snug text-danger-ink line-clamp-3">{task.block_reason}</span>
+      )}
+      {/* The agent's options (#130), the recommended one marked: answered in the drawer or My work. */}
+      {options && (
+        <span className="flex flex-wrap gap-1" data-testid="card-options">
+          {options.options.map((o, i) => (
+            <span key={i} className={`text-[10.5px] leading-tight px-1.5 py-[3px] border ${i === options.recommended ? 'border-success text-success-ink font-semibold' : 'border-line text-ink-2'}`}
+              style={{ borderRadius: 'var(--radius)' }} title={i === options.recommended ? 'Recommended by the agent' : undefined}>
+              {o.label}{i === options.recommended && <span className="sr-only"> (recommended)</span>}
+            </span>
+          ))}
+        </span>
       )}
       {returned && (
         <span className="text-[11.5px] leading-snug text-ink-2 line-clamp-2" title={returnedHint(task.returned_reason)}>{returned}</span>

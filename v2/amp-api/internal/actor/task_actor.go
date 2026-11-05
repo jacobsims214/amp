@@ -142,7 +142,7 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplyGetTask{Task: &t, Err: err}
 
 	case *MsgBlockTask:
-		err := a.handleBlock(msg.Reason, msg.By)
+		err := a.handleBlock(msg.Reason, msg.Question, msg.By)
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgAssignTask:
@@ -659,7 +659,7 @@ func (a *TaskActor) ownerPhrase() string {
 	return fmt.Sprintf("its owner (user %d) does it", *a.task.OwnerUserID)
 }
 
-func (a *TaskActor) handleBlock(reason string, by *int) error {
+func (a *TaskActor) handleBlock(reason string, q *domain.Question, by *int) error {
 	if a.task.State == domain.TaskStateInProgress && a.task.StartedAt == nil {
 		// A block is one of the fallback start signals (AMP #2801): a worker
 		// whose plugin doesn't claim is still visibly working the ticket.
@@ -672,9 +672,12 @@ func (a *TaskActor) handleBlock(reason string, by *int) error {
 	a.task.BlockReason = reason
 	a.task.UpdatedAt = time.Now()
 
-	if err := a.saveState(domain.TaskStateBlocked, reason); err != nil {
+	// The state, the question and its options (#130) in one write.
+	if err := a.repo.BlockTask(context.Background(), a.task.ID, reason, q); err != nil {
 		return fmt.Errorf("db block: %w", err)
 	}
+	a.task.Question = q
+	a.task.CompletedAt = nil
 
 	a.publish(domain.EventTaskBlocked, a.withBlockedBy())
 	a.logActivityBy("system", by, "blocked", "", "blocked", reason)
@@ -765,6 +768,9 @@ func (a *TaskActor) saveState(state domain.TaskState, blockReason string) error 
 	if err := a.repo.SetTaskState(context.Background(), a.task.ID, state, blockReason); err != nil {
 		return err
 	}
+	// Any state change ends the open question's options, as in the database
+	// (#130); handleBlock sets the new question's after.
+	a.task.Question = nil
 	switch {
 	case state != domain.TaskStateCompleted:
 		a.task.CompletedAt = nil
@@ -781,6 +787,12 @@ func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *in
 	}
 	from := string(a.task.State)
 	action, detail := "state_change", reason
+	// Re-setting the same question keeps its options (#130); any other
+	// change ends them (saveState).
+	var keepQuestion *domain.Question
+	if state == domain.TaskStateBlocked && a.task.State == domain.TaskStateBlocked && reason == a.task.BlockReason {
+		keepQuestion = a.task.Question
+	}
 	if state == domain.TaskStateCompleted && a.task.State != domain.TaskStateCompleted && !a.task.IsHuman() {
 		// A completion made this way is the worker's only when it presented
 		// the current dispatch; anything else is a closeout (AMP #2801).
@@ -829,6 +841,12 @@ func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *in
 
 	if err := a.saveState(state, blockReason); err != nil {
 		return fmt.Errorf("db set state: %w", err)
+	}
+	if keepQuestion != nil {
+		if err := a.repo.SetTaskQuestion(context.Background(), a.task.ID, keepQuestion); err != nil {
+			return fmt.Errorf("db keep question: %w", err)
+		}
+		a.task.Question = keepQuestion
 	}
 	if err := a.repo.LogActivity(context.Background(), domain.ActivityLog{
 		TaskID:    a.task.ID,
