@@ -19,6 +19,7 @@ import { DependencyPicker } from '../components/DependencyPicker'
 import { PlanCheckModal } from '../components/PlanCheckModal'
 import { metadataPatch } from '../lib/metadata'
 import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal'
+import { ManagerAgent } from '../components/ManagerAgent'
 import { ProjectNav } from '../components/ProjectNav'
 import { OwnerStack } from '../components/OwnerAvatar'
 import { OwnersEditor } from '../components/OwnersEditor'
@@ -459,7 +460,7 @@ export function Board() {
       {/* Board scroll area */}
       <div className="flex-1 overflow-auto">
         {epics.length === 0 ? (
-          <EmptyState />
+          <EmptyState onCreate={() => { setEpicForm({ name: '', description: '', priority: '1' }); openEpicModal({ mode: 'create' }) }} />
         ) : (
           <div style={{ minWidth: LABEL_COL + COLUMNS.length * TASK_COL }}>
             {/* Column headers — sticky */}
@@ -909,7 +910,7 @@ function BoardSkeleton() {
   )
 }
 
-function EmptyState() {
+function EmptyState({ onCreate }: { onCreate: () => void }) {
   return (
     <div className="flex flex-col items-center justify-center h-64 gap-4">
       <div
@@ -918,10 +919,11 @@ function EmptyState() {
       >
         <GitBranch size={22} className="text-line-str" />
       </div>
-      <div className="text-center">
-        <p className="text-sm font-semibold text-ink">No epics yet</p>
-        <p className="text-xs text-ink-2 mt-1.5 max-w-xs leading-relaxed">
-          Ask the amp-manager to plan your project — tasks will appear here in real time.
+      <div className="text-center grid justify-items-center gap-3">
+        <p className="m-0 text-sm font-semibold text-ink">No epics yet</p>
+        <button type="button" onClick={onCreate} className="amp-btn amp-btn-primary"><Plus size={12} />Create your first epic</button>
+        <p className="m-0 text-xs text-ink-2 max-w-xs leading-relaxed">
+          Or ask your <ManagerAgent /> to plan the project: its tickets appear here as it files them.
         </p>
       </div>
     </div>

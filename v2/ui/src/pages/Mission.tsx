@@ -23,6 +23,7 @@ import { useBoardData } from '../hooks/useBoardData'
 import { useAuth } from '../hooks/useAuth'
 import { useProjectPeople } from '../hooks/useProjectPeople'
 import { ProjectNav } from '../components/ProjectNav'
+import { ManagerAgent } from '../components/ManagerAgent'
 import { TaskDrawer } from '../components/TaskDrawer'
 import { Panel, Readouts } from '../components/ui/PageHeader'
 import { StateBar, StateDot } from '../components/ui/StateTag'
@@ -322,8 +323,10 @@ export function Mission() {
         <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1fr)_340px]">
           <div className="grid grid-cols-1 gap-3 min-w-0">
             {open.length === 0 && finished.length === 0 && (
-              <div className="amp-panel px-5 py-8 text-center text-[13.5px] text-ink-2">
-                No epics yet. Ask your planner agent to plan this project, or add an epic from the Board view.
+              <div className="amp-panel px-5 py-8 text-center text-[13.5px] text-ink-2 grid justify-items-center gap-3">
+                <span className="text-ink font-semibold">No epics yet</span>
+                <Link to={projectLink(pid, 'board')} className="amp-btn amp-btn-primary amp-btn-sm">Add the first epic on the Board</Link>
+                <span>Or ask your <ManagerAgent /> to plan this project.</span>
               </div>
             )}
             <div className="grid gap-3 grid-cols-[repeat(auto-fill,minmax(310px,1fr))] items-start">

@@ -27,6 +27,8 @@ import { useProjectPeople } from '../hooks/useProjectPeople'
 import { usePlanApproval } from '../hooks/usePlanApproval'
 import { awaitingApproval } from '../lib/approval'
 import { ApprovalLink } from '../components/ApprovalLink'
+import { ManagerAgent } from '../components/ManagerAgent'
+import { projectLink } from '../lib/projectLink'
 import { ProjectNav } from '../components/ProjectNav'
 import { TaskDrawer } from '../components/TaskDrawer'
 import { Panel, Readouts } from '../components/ui/PageHeader'
@@ -212,7 +214,7 @@ export function FlightPlan() {
         <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1fr)_340px]">
           <section className="amp-panel min-w-0 overflow-x-auto" aria-label="Plan by stage">
             {tasks.length === 0 ? (
-              <p className="m-0 px-5 py-8 text-center text-[13.5px] text-ink-2">No tickets yet. When your planner agent files a plan, it shows up here stage by stage.</p>
+              <p className="m-0 px-5 py-8 text-center text-[13.5px] text-ink-2">No tickets yet. When your <ManagerAgent /> files a plan, or you add tickets on the <Link to={projectLink(pid, 'board')} className="underline underline-offset-2 hover:text-ink">Board</Link>, it shows up here stage by stage.</p>
             ) : (
               <table className="w-full border-collapse" style={{ minWidth: 160 + shape.stages * 70, tableLayout: 'fixed' }}>
                 <colgroup><col style={{ width: 160 }} />{stageCounts.map((_, i) => <col key={i} />)}</colgroup>

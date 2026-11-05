@@ -5,6 +5,7 @@ import { Loader2, Clock, Layers, Archive, RotateCcw, ChevronDown, ChevronUp, Dow
 import { api } from '../api/client'
 import { useSSE } from '../hooks/useSSE'
 import { CrudModal, inputCls, labelCls } from '../components/CrudModal'
+import { ManagerAgent } from '../components/ManagerAgent'
 import { ProjectHomeFields, type ProjectHome } from '../components/ProjectHomeFields'
 import type { Org, Project, SSEEvent } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
@@ -223,17 +224,11 @@ export function Projects() {
             >
               <Layers size={26} className="text-line-str" />
             </div>
-            <div className="text-center">
-              <p className="text-base font-semibold text-ink">No projects yet</p>
-              <p className="text-sm text-ink-2 mt-2 max-w-xs leading-relaxed">
-                Ask the{' '}
-                <code
-                  className="text-link font-mono text-xs px-1.5 py-0.5 rounded-md"
-                  style={{ background: 'color-mix(in srgb, var(--link) 10%, transparent)' }}
-                >
-                  amp-manager
-                </code>
-                {' '}to create a project — it will appear here instantly.
+            <div className="text-center grid justify-items-center gap-3">
+              <p className="m-0 text-base font-semibold text-ink">No projects yet</p>
+              <button onClick={openCreate} className="amp-btn amp-btn-primary"><Plus size={12} />Create your first project</button>
+              <p className="m-0 text-sm text-ink-2 max-w-xs leading-relaxed">
+                Or describe what you want to your <ManagerAgent /> and it creates the project. It appears here at once.
               </p>
             </div>
           </div>

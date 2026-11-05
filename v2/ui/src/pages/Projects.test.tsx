@@ -1,4 +1,5 @@
 import { render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
@@ -34,5 +35,14 @@ describe('Projects', () => {
     renderAt('/projects?new=1')
     expect(await screen.findByRole('heading', { name: 'New Project' })).toBeInTheDocument()
     expect(await screen.findByText('/projects', { exact: true })).toHaveAttribute('data-testid', 'where') // ?new dropped
+  })
+
+  it('with no projects, leads with Create your first project and links the manager agent', async () => {
+    renderAt('/projects')
+    const create = await screen.findByRole('button', { name: 'Create your first project' })
+    expect(screen.getByRole('link', { name: 'manager agent' })).toHaveAttribute('href', '/guide?doc=setup/connect-your-agent.md')
+    expect(screen.queryByText(/amp-manager/)).toBeNull()
+    await userEvent.click(create)
+    expect(screen.getByRole('heading', { name: 'New Project' })).toBeInTheDocument()
   })
 })
