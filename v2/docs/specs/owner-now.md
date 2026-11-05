@@ -54,7 +54,14 @@ disagree about what waits on the owner.
   in day reports, and a server-side aggregate endpoint. These are Phases 2–3 and the Follow-ups.
 - Non-goal: changing what waits on whom. Lane membership reads `WaitingOn`
   (`service/waiting.go:201`) and does not redefine it.
-- Non-goal: new verification behaviour. The Done lanes only display #126's status.
+- Goal: Phase 1 ships with **three small, additive API fields** so that every row it shows
+  can be built (see "Phase 1 API additions"). Everything else in Phase 1 is UI.
+- Goal: the landing change Q1 asks for is scheduled (Phase 1b), and it ships only if the owner
+  says yes.
+- Non-goal: new verification behaviour. The Done lanes only display #126's status. The issue
+  mentions a **Verify** action on Done but unverified. #149 v1 has nothing to trigger: the
+  independent verifier is one of its follow-ups. So Now offers only Accept (and Reject in the
+  drawer), and adds a Verify button once that follow-up exists.
 
 ## Journeys
 
@@ -84,14 +91,16 @@ Ticket numbers are illustrative.
 ### Overview
 
 ```
-                    existing endpoints (Phase 1, no API change)                Now lanes
+            existing endpoints, plus the Phase 1 API additions (†)             Now lanes
 GET /api/my-work … /projects/:id/my-work ─ items (approve/answer/verify*/merge/start/do) ─▶ Needs you
-GET /api/projects/:id/waiting-on-people ─ everyone else's items ───────────────────────▶ Blocked
+GET /api/projects/:id/waiting-on-people ─ everyone else's items, † pr_url/branch/name ─▶ Blocked
 board tasks (useBoardData, SSE) ─ in_progress, blocked-with-question, unowned, done ───▶ Running / Blocked / Done
 GET /api/projects/:id/activity?since=<3 days ago> ─ latest `comment` detail per task ───────────▶ Running (last step)
-GET /api/projects/:id/receipts/summary* ─ status, held, has_media per task ────────────▶ Done split
-                                                                     * = from PR #149 (#126)
-Phase 2: WaitItem.ask + .unblocks, PersonWaitItem.ask, unowned items, latest comments (server)
+GET /api/projects/:id/receipts/summary* ─ status, held, has_media, † checks/verdict ───▶ Done split
+my-work items ─ † decision_question on judgment do items ───────────────────────────────▶ Needs you ask
+                                             * = from PR #149 (#126)   † = Phase 1 API additions
+Phase 2: WaitItem.ask + .unblocks, PersonWaitItem.ask, unowned items,
+         latest comments without a window (GET /api/projects/:id/running)
 Phase 3: summary poster_key, comment-derived rows, day-report verified counts
 ```
 
@@ -133,19 +142,34 @@ editing a ticket changes it at once.
 | `approve` | "Approve N tickets in `<epic>`" | `count`, `epic_name` | was "Review and approve N tickets" |
 | `answer` | "Answer: `<first sentence of the question>`", else "Answer: open the ticket for the question" | `question` (the block reason) | none |
 | `verify` (#126) | "Check #N: `<hold reason>`" | `hold_reason` | was "Couldn't verify #N: … Accept or reject it on the ticket" |
-| `merge` | "Merge PR #N" (or "the PR", or "branch `<b>`"); a rule alert: "Review PR #N on GitHub"; a closed PR: today's text | `pr_url`, `branch`, `alert`, `merge_state` | the "N tickets wait" suffix moves to the unblock count |
+| `merge` | "Merge PR #N" (or "the PR", or "branch `<b>`"); a rule alert: "Review PR #N on GitHub"; a closed PR: today's text | `pr_url`, `branch`, `alert`, `merge_state` (on `WaitItem` today; on `PersonWaitItem` from the Phase 1 additions, for Blocked rows) | the "N tickets wait" suffix moves to the unblock count |
 | `start` | "Launch its run, or return #N to ready" | `task_id` | none |
-| `do`, judgment with a decision doc (#125) | "Decide: `<the doc's question>`" | the current doc version's `decision_ask.question` | new |
+| `do`, judgment with a decision doc (#125) | "Decide: `<the doc's question>`" | `WaitItem.decision_question` (Phase 1 addition: the current doc version's `decision_ask.question`). Without it (an older server): "Decide: open the ticket for the options" | new |
 | `do`, other | "`<reason verb>`: `<first sentence of description>`", else "`<verb>`: `<first acceptance criterion>`", else "No instructions: open the ticket" | `human_reason`, `description`, `acceptance_criteria` (`checklistItems`, `lib/brief.ts:16`) | the first criterion replaces "see the acceptance criteria in the brief" |
 
 Rows that aren't wait items use the same helpers:
 
 - Blocked rows prefix the ask with "Waits on `<name>` ·" or "Waits on nobody ·".
-- Done but unverified rows show the first criterion that isn't `VERIFIED` (or a failed check),
-  when there is one.
+- Done but unverified rows show the summary's `first_open` (the first worker check that isn't a
+  pass), when there is one.
 - Running rows show the last step (below).
 
 The ask is never more than 140 characters (`NEEDS_MAX`), and it is one line.
+
+### Phase 1 API additions
+
+All three are additive JSON fields. Old clients ignore them, and the UI falls back when they are
+absent. Phase 1 is therefore "UI plus three fields", not UI only.
+
+| Endpoint | New fields | Filled from | Why |
+|----------|-----------|-------------|-----|
+| `GET /api/projects/:id/receipts/summary` (#149, `ReceiptSummaryRow`, `service/receipts.go:621`) | `checks: {pass, fail, cant_tell, total}` (worker checks); `verdict: {by, at, note}` for the latest human verdict (`by` is the person's name; `note` only on a Reject, capped at 140 characters); `first_open` (the first worker check that isn't `pass`: its criterion and note, 90 characters) | the checks `ProjectReceiptSummary` already loads through `receiptViews` (used for the held reason today), `domain.Rejection` and the latest human check | "Self-checked 2/2", "Accepted by `<name>`", "Rejected by `<name>`: `<note>`" and the unverified criterion. `VerificationBadge` takes only status, held and media, and has nothing to show these from |
+| `GET /api/projects/:id/waiting-on-people` (`PersonWaitItem`, `waiting_people.go:86`) | `name`, and for merge items `pr_url`, `branch`, `merge_state`, `alert` | the `WaitItem` the row is already built from (`waiting_people.go:115-125` copies only kind, ids, epic and since) | "Waits on Sam · Merge PR #61" in Blocked. The board `Task` carries no `pr_url` |
+| `GET /api/projects/:id/my-work` (`WaitItem`, after #148) | `decision_question` on a judgment `do` item with a doc | #148's `decision_docs` and the current version's `decision_ask.question`, in one query for the listed items | "Decide: `<question>`" without a `GET /tasks/:id/decision` call per row |
+
+Tests: `cmd/server/receipts_test.go` (counts, Accept and Reject verdicts, `first_open`),
+`cmd/server/waiting_on_test.go` (a merge item in waiting-on-people carries its PR; a judgment do
+item carries its question, and one without a doc carries none).
 
 ### Unblock count and ordering
 
@@ -201,7 +225,7 @@ The status comes from #126's `GET /api/projects/:id/receipts/summary`, read with
 |-----------|-----------------|---------------------|
 | #149 not merged (the summary route 404s) | Empty: "Verification isn't available on this AMP yet" | Every completed agent ticket in the window: "No receipt" |
 | #149 merged, project **Off** (the default, #126 D8) | Empty: "Nothing verified here. Receipts are off in this project" (Settings link for owners) | Every completed agent ticket in the window: "No receipt". Phase 3 adds "Self-checked (from comment) 3/4" from the server-side comment parse, still unverified (#126 D28) |
-| **Inform** or **Require** | `independently_verified` ("Verified"), `human_accepted` ("Accepted by `<name>`") | `self_checked` ("Self-checked 2/2"), `unverified`, and a Reject ("Rejected by `<name>`: `<note>`") |
+| **Inform** or **Require** | `independently_verified` ("Verified"), `human_accepted` ("Accepted by `<verdict.by>`") | `self_checked` ("Self-checked `<checks.pass>`/`<checks.total>`"), `unverified`, and a Reject ("Rejected by `<verdict.by>`: `<verdict.note>`"). All from the Phase 1 summary fields. On a summary without them, the row shows only the `STATUS_LABEL` |
 | A **held** receipt (Require) | — | — (it is a `verify` item: Needs you for its owner, or Blocked for others) |
 | A **human** ticket (no receipts, #126 D15) | see Q7 (recommended: here, as "Done by `<name>`") | — |
 
@@ -214,6 +238,9 @@ The status comes from #126's `GET /api/projects/:id/receipts/summary`, read with
   the worker's checks (often `self_checked`) and the receipt shows "Rejected by `<name>`: `<note>`"
   (`domain.Rejection`). Either way the ticket is Done but unverified. If #149 adds `failed` before
   it merges, those tickets are shown in `--danger-ink`.
+- Why Phase 1 doesn't reuse #149's client `parseSelfCheck` for Off projects: it needs each
+  ticket's comments, which means one request per done ticket, or else the activity feed, which
+  only covers 3 days. Phase 3 parses on the server instead, so a lane never runs N requests.
 - Badges reuse #149's `VerificationBadge` and `STATUS_LABEL` / `STATUS_TONE`. A row with
   `has_media` shows the media icon in Phase 1. Thumbnails come in Phase 3.
 
@@ -234,7 +261,7 @@ already share, so the buttons, guards and copy are the same everywhere.
 | Needs you · verify (held) | Accept | Reject, which needs a note, in the drawer's receipt |
 | Running now | — | The drawer |
 | Blocked | — | The drawer. An unowned row's "Take it" opens the drawer with Reassign focused (`openReassign`). |
-| Done but unverified | Accept, with receipts on, for a person with `canWork` | Reject and the full receipt, in the drawer |
+| Done but unverified | Accept, with receipts on, for a person with `canWork`. No Verify button: #149 v1 has no verifier to trigger (Non-goals) | Reject and the full receipt, in the drawer |
 | Done & verified | — | The drawer, at the receipt |
 
 After an inline action the page refetches. The row leaves when the server no longer lists it,
@@ -243,8 +270,8 @@ because the page never removes a row on its own. An undo toast is a follow-up.
 ### UI
 
 - **Route and tab.** `/project/:id/now` and a **Now** tab first in `ProjectNav`
-  (`components/ProjectNav.tsx:22`). Phase 1 doesn't change the landing (`lib/landing.ts`). Q1
-  decides that.
+  (`components/ProjectNav.tsx:22`). Phase 1 leaves the landing as it is. Phase 1b changes
+  `lib/landing.ts` only if the owner chooses Q1 (a) or (b).
 - **Layout.** One column of five lane sections, top to bottom, in the display order (Q3). Each
   has a header with its label and count, rows as above, and an empty line ("Nothing needs you
   here.", "Nothing running.", "Nothing stuck.", "Nothing finished in the last 7 days."). The
@@ -277,6 +304,15 @@ because the page never removes a row on its own. An undo toast is a follow-up.
 
 - **Now and My work disagree.** Mitigation: Needs you is the my-work response itself, and the
   ask is one function. Phase 2 moves both to the server.
+- **My work's wording changes too.** Because `needsLine` is shared, Phase 1 changes four of My
+  work's lines:
+  - "Review and approve 5 tickets" becomes "Approve 5 tickets in Onboarding";
+  - "Couldn't verify #48: … Accept or reject it on the ticket" becomes "Check #48: …";
+  - "Merge PR #88, 2 tickets wait" becomes "Merge PR #88", with "blocks 2" beside it;
+  - "Decide: see the acceptance criteria in the brief" becomes "Decide: `<first criterion>`".
+
+  Only the approve wording comes from the issue. The rest keeps the two pages identical (Q5
+  covers the rule). The PR description lists the changes with before and after.
 - **Two unblock counts in Phase 1** (the server's `holding_up` and the client graph).
   Mitigation: the server value wins whenever it is present, and Phase 2 sends `unblocks` for
   every item. A test pins that the two agree on a fixture without `waits_for_merge: false`.
@@ -288,11 +324,14 @@ because the page never removes a row on its own. An undo toast is a follow-up.
   before <date>", linking to the Board's done filter.
 - **Load.** Five requests per view, in the same family as Mission's (board, waiting-on-people,
   activity, audit, counts). No new queries in Phase 1.
-- **Merge order.** Phase 1 builds on PR #148 and PR #149, reusing `useReceiptSummary`,
-  `VerificationBadge` and the `verify` kind. If it must start earlier, the fallbacks above apply,
-  and those PRs' files aren't duplicated.
-- **Rollback.** Phase 1 is UI only: one new tab and a changed `needsLine`. Phases 2–3 add
-  optional JSON fields that old clients ignore.
+- **Merge order.** The plan is to start Phase 1 once PR #148 and PR #149 have merged, reusing
+  `useReceiptSummary`, `VerificationBadge` and the `verify` kind, and extending their endpoints.
+  The fallback rows exist only for AMP servers that are older than the UI, not to start early.
+  The one part that needs neither PR is Mission's last-step line (D15). If the owner wants it
+  sooner, it can go first as a separate commit in the same PR.
+- **Rollback.** Phase 1 adds a tab, changes `needsLine`, and adds three optional JSON fields that
+  old clients ignore. Phase 1b is a single function (`landingTab`), and reverting it restores
+  today's rule. Phases 2–3 only add optional fields.
 
 ## Decisions & Assumptions
 
@@ -308,9 +347,10 @@ because the page never removes a row on its own. An undo toast is a follow-up.
 | D8 | Related changes ship in one PR per phase | Owner process constraint | human |
 | D9 | Lane membership is exclusive and checked in a fixed order (Needs you, Blocked, Running, Done) | A ticket shown twice reads as two things | agent |
 | D10 | Blocked lists root blockers (wait items of others, and unowned questions and merges), and counts their waiting dependents | Short lane, and every row names who clears it | agent |
-| D11 | Needs you sorts by unblocks across kinds. My work keeps its kind grouping | Different jobs: what first vs work through | agent |
-| D12 | Inline actions are exactly `HumanActions` plus receipt Accept. Judgment, approve and Reject go to the drawer or the Approve view | One set of guards. Decisions and approvals need their full view | agent |
-| D13 | Phase 1 is UI only, on existing endpoints. The server ask and unblocks come in Phase 2 | Smallest first phase that meets the acceptance | agent |
+| D11 | Needs you sorts by unblocks across kinds. My work keeps its kind grouping. Assumption, pending Q3 (lane order) and the owner's read of the sort | Different jobs: what first vs work through | agent |
+| D12 | If Q9 is yes: inline actions are exactly `HumanActions` plus receipt Accept, and judgment, approve and Reject go to the drawer or the Approve view. If Q9 is no, every row opens the drawer. Pending Q9 | One set of guards. Decisions and approvals need their full view | agent |
+| D13 | Phase 1 is UI plus three additive API fields (summary checks and verdict, the PR on others' merge items, the judgment question). The server ask and unblocks come in Phase 2 | Every Phase 1 row must be buildable from what the server sends (review #1, #2) | agent |
+| D17 | The landing change is its own step (Phase 1b), gated on Q1 | The issue's headline outcome, not shipped before the owner answers | agent |
 | D14 | The ask text is derived on read, never stored | Edits show at once, and there is no backfill | agent |
 | D15 | Mission Crew's last-step line ships in Phase 1, sharing `lastSteps` with Now | The issue's quick-fix, with one helper | agent |
 | D16 | Five stacked lanes, 8 rows each with "Show all" | Fits a laptop, and reads top to bottom (north star) | agent |
@@ -350,12 +390,19 @@ because the page never removes a row on its own. An undo toast is a follow-up.
 
 ## Implementation plan
 
-v1 is Phase 1. Phases 2 and 3 are follow-up PRs, each one PR (D8). Each phase ends with the
-Verification commands passing.
+v1 is Phase 1, plus Phase 1b if the owner answers Q1 (a) or (b). Both go in one PR (D8).
+Phases 2 and 3 are follow-up PRs, one PR each. Each phase ends with the Verification commands
+passing.
 
-### Phase 1: the Now page on existing endpoints (UI only, v1)
+### Phase 1: the Now page (UI plus three API fields, v1)
 
-Built on main after PR #148 and PR #149 merge.
+Built on main after PR #148 and PR #149 merge (Risks, Merge order).
+
+- `amp-api/internal/service/receipts.go` (modify): `ReceiptSummaryRow.Checks`, `Verdict`,
+  `FirstOpen`. `service/waiting_people.go` (modify): `PersonWaitItem.Name`, `PRURL`, `Branch`,
+  `MergeState`, `Alert`. `service/waiting.go` (modify): `WaitItem.DecisionQuestion`, filled for
+  judgment do items with a doc (one query). Tests as in "Phase 1 API additions".
+- `ui/src/types/index.ts` (modify): the same fields, all optional.
 
 - `ui/src/lib/now.ts` (create):
   - `assignLanes` with the membership table, `unblocksOf` (server `holding_up`, else
@@ -381,6 +428,20 @@ Built on main after PR #148 and PR #149 merge.
   yet", and the ellipsis (the issue's quick-fix acceptance).
 - `kb/ui-tour.md` (modify): the Now page.
 
+### Phase 1b: Now as the project landing (only if Q1 is (a) or (b))
+
+- `ui/src/lib/landing.ts` (modify): `LandingTab` gains `'now'`, and `landingTab` returns
+  `'now'` whenever `fixedTab` is null, no longer depending on the waiting count. `fixedTab` keeps
+  `?approve=` → My work and the old ticket params (`focus`, `ticket`, `task`) → Mission, so old
+  links still open where they did. Under Q1 (b), those params go to Now and Mission's route
+  redirects to Now.
+- `ui/src/pages/ProjectLanding.tsx` (modify): no `refreshWaitCounts` wait when the tab doesn't
+  depend on counts. The page navigates at once.
+- `lib/landing.test.ts` and `ProjectLanding` tests (modify): no tab means Now with and without
+  waiting items; `?approve=` means My work; `?focus=` keeps its target; an explicit tab never
+  redirects.
+- `kb/ui-tour.md`: the project opens on Now.
+
 ### Phase 2: the ask and unblocks on the server (follow-up)
 
 - `amp-api/internal/service/ask.go` (create): `WaitAsk`, the Go port of the ask table, with a
@@ -394,7 +455,8 @@ Built on main after PR #148 and PR #149 merge.
 - `mcp/human.go` (modify): `ask` and `unblocks` on `waiting_on_people` items.
 - `repository/mywork.go` (modify): `LatestComments(ctx, taskIDs) map[int]ActivityLog`, using
   `DISTINCT ON (task_id)`. It is exposed as `last_step` on a new `GET
-  /api/projects/:id/running`, or folded into the Follow-ups' aggregate if that comes first.
+  /api/projects/:id/running` (`{tasks: [{task_id, last_step: {text, at}}]}`, any member). If the
+  Follow-ups' aggregate comes first, it goes there instead.
 - UI: `it.ask ?? needsLine(it)`, `it.unblocks ?? unblocksOf(...)`, and the unowned rows from the
   server.
 - `cmd/server/waiting_on_test.go` (modify): ask per kind; unblocks equal to `holding_up` for
@@ -418,7 +480,8 @@ Built on main after PR #148 and PR #149 merge.
 - A cross-project Now (`/now`) if Q2 says so, built on `MyWorkSummaryFor` and per-project
   summaries.
 - `GET /api/projects/:id/now`: one server response with lane membership, if the client rule
-  proves hard to keep in step.
+  proves hard to keep in step. It would absorb Phase 2's `GET /api/projects/:id/running`.
+- A **Verify** action on Done but unverified, once #126's independent verifier exists.
 - A per-project quiet threshold (Q4), an undo toast after inline actions, the critical-path band,
   and Flight-plan stage progress on running rows (north star).
 - Skeleton loading in under 300 ms after the first visit (north star).
@@ -433,7 +496,8 @@ Run after every phase, from `v2/`:
   TEST_DATABASE_URL=postgres://amp:amp@localhost:5432/amp_test?sslmode=disable go test ./cmd/server/ -run 'Waiting|MyWork|Receipt|DayReport')
 ```
 
-Phase 1 changes no Go code, but runs the Go suite anyway to catch API contract drift.
+Phase 1 changes Go only for the three additive fields, which the `Receipt` and `Waiting` runs
+above cover.
 `git diff --exit-code plugins/` stays clean, because no plugin source changes.
 
 Manual acceptance (`make dev`, receipts Inform on one project and Off on another):
@@ -452,3 +516,5 @@ Manual acceptance (`make dev`, receipts Inform on one project and Off on another
 - On the Off project, Done & verified reads "Receipts are off in this project", and every
   recently completed agent ticket is "No receipt".
 - My work's cards show the same ask text as Now's Needs you rows, for every kind.
+- Phase 1b (if shipped): `/project/:id` opens Now with and without waiting items, `?approve=<epic>`
+  opens My work's Approve view, and `/project/:id/mission` stays on Mission.
