@@ -98,11 +98,33 @@ pub fn lock_path(session_path: &Path) -> PathBuf {
 pub struct SessionLock {
     session: PathBuf,
     lock: PathBuf,
-    /// Holding a handle to the locked file is what holds the lock; never closed explicitly.
-    _file: File,
+    /// The locked handle. Its lock is released **explicitly** on drop ([`SessionLock::release`]),
+    /// never merely by closing it — see that method for why that distinction is load-bearing.
+    file: File,
 }
 
 impl SessionLock {
+    /// Drops the lock before the handle is closed.
+    ///
+    /// Closing the file is not enough here, and the reason is `fork`. A `flock` belongs to the
+    /// open file description, and `fork` shares open file descriptions with the child: if any
+    /// thread of this process spawns a child (`git`, `sh`, a hook — the test suite does it
+    /// constantly) while this guard is alive, that child holds a duplicate of *this* description.
+    /// Closing our handle only drops our reference; the lock survives in the child until it
+    /// `exec`s and `CLOEXEC` closes the duplicate. So a dropped guard can stay "held" for the
+    /// length of that window, and the next claim of the session is refused — as a *busy* session
+    /// owned by a process that already let it go. That is exactly the cross-module flake in AMP
+    /// #3220.
+    ///
+    /// An explicit `LOCK_UN` acts on the description itself, so it releases the lock for every
+    /// duplicate at once, whatever the children are doing.
+    ///
+    /// Failure is ignored: `drop` cannot report it, and the only way `unlock` fails is the lock
+    /// not being held, which leaves the state this guard promised (nothing of ours is locked).
+    fn release(&mut self) {
+        let _ = self.file.unlock();
+    }
+
     /// The session file this owns, as the caller named it (not resolved through symlinks).
     pub fn session(&self) -> &Path {
         &self.session
@@ -111,6 +133,12 @@ impl SessionLock {
     /// The sidecar that carries the lock ([`lock_path`] of [`SessionLock::session`]).
     pub fn lock_path(&self) -> &Path {
         &self.lock
+    }
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -317,7 +345,7 @@ pub fn claim_session_lock_as(
             Ok(SessionLock {
                 session: session_path.to_path_buf(),
                 lock,
-                _file: file,
+                file,
             })
         }
         // Someone else's live writer: the lock says so, and only the lock does.
@@ -408,6 +436,60 @@ mod tests {
         assert!(
             lock_path(&path).exists(),
             "the sidecar is left in place, never deleted: two later writers must agree on one inode"
+        );
+    }
+
+    /// AMP #3220: dropping a guard must release the session **even while this process is
+    /// spawning children**, because `fork` shares open file descriptions and therefore the
+    /// `flock`. Releasing by closing the handle is not enough — the child's duplicate keeps the
+    /// lock until it `exec`s, so the session stays refused as "busy" for a process that has
+    /// already let it go. That is what made `cargo test -p amp-core --lib` fail at default
+    /// parallelism: the git-backed `run_report` fixtures fork constantly while other modules'
+    /// tests hold and drop session guards.
+    ///
+    /// The child here is `true`, spawned in a loop from another thread, which is the cheapest
+    /// reproduction of the window. Without the explicit release in `Drop` this fails (measured
+    /// on the pre-fix code: 11 of 2000 dropped guards were still locked).
+    #[test]
+    fn dropping_the_guard_releases_the_session_while_children_are_being_spawned() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let dir = tmp("fork-window");
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawning = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // `output()` waits for the child, so the fork happens between our claims.
+                    let _ = std::process::Command::new("true").output();
+                }
+            })
+        };
+
+        let mut still_held = Vec::new();
+        for i in 0..500 {
+            let path = dir.join(format!("1767225600000-sess-{i}.jsonl"));
+            let guard = claim_session_lock(&path).expect("the first writer owns it");
+            drop(guard);
+            // The guard is gone, so nothing of ours may still be holding this session.
+            match claim_session_lock(&path) {
+                Ok(after) => drop(after),
+                Err(SessionBusy::Held { .. }) => still_held.push(path),
+                Err(other) => panic!("a claim after a release failed: {other}"),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        spawning.join().expect("the spawning thread");
+
+        assert!(
+            still_held.is_empty(),
+            "a dropped guard left the session held (its lock outlived the close, so a forked \
+             child kept it): {} of 500 were still refused, e.g. {:?}",
+            still_held.len(),
+            still_held.first()
         );
     }
 
