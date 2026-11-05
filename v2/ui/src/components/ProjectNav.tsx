@@ -3,6 +3,7 @@ import { useLocation } from 'react-router-dom'
 import { api } from '../api/client'
 import type { Project } from '../types'
 import { PageHeader } from './ui/PageHeader'
+import { Skeleton } from './ui/Skeleton'
 import { viewLink } from '../lib/projectLink'
 import { projectCounts, useWaitCounts } from '../lib/waitCounts'
 
@@ -48,7 +49,7 @@ export function ProjectNav({ projectId, rightSlot, project: given, meta }: Proje
   return (
     <PageHeader
       crumb={<>Projects{project ? <> · <span className="amp-num tracking-normal">{project.code}</span></> : null}</>}
-      title={project ? project.name : <span className="text-ink-3">Loading…</span>}
+      title={project ? project.name : <span aria-busy="true" className="inline-flex"><span className="sr-only">Project name is loading</span><Skeleton w={180} h={22} /></span>}
       meta={meta}
       actions={rightSlot}
       tabs={TABS.map(t => t.view === 'my-work'
