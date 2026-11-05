@@ -367,7 +367,7 @@ func (a *TaskActor) handleDispatch(msg *MsgDispatchTask, ctx actor.Context) erro
 
 	a.publish(domain.EventTaskDispatched, a.withBlockedBy())
 	if msg.Human {
-		a.logActivityBy(agentID, msg.By, "started", "backlog", "in_progress", "Started by its owner (human work)")
+		a.logActivityBy(agentID, msg.By, "started", "backlog", "in_progress", humanWorkDetail("Started", msg.By, a.task.OwnerUserID))
 	} else {
 		a.logActivityBy(agentID, msg.By, "dispatched", "backlog", "in_progress",
 			fmt.Sprintf("Dispatched to agent %q", agentID))
@@ -479,7 +479,7 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 		a.logActivityBy(who, by, "completed", string(prevState), "completed",
 			fmt.Sprintf("Its tracked merge (#%d) was recorded by %s: the step is complete", msg.MergeStepFor, nameOr(msg.Source, "a merge report")))
 	case a.task.IsHuman():
-		a.logActivityBy(domain.HumanAgentID, by, "completed", string(prevState), "completed", "Done by its owner (human work)")
+		a.logActivityBy(domain.HumanAgentID, by, "completed", string(prevState), "completed", humanWorkDetail("Done", by, a.task.OwnerUserID))
 	case closeout:
 		// Not the worker's own completion: labelled, with why if the caller
 		// said (AMP #2801). Never dressed up as the worker's work.
@@ -1463,4 +1463,15 @@ func (a *TaskActor) releaseFromSchedule(why string) error {
 	a.publish(domain.EventTaskUnblocked, a.withBlockedBy())
 	a.logActivity("system", "unblocked", "blocked", "backlog", why)
 	return nil
+}
+
+// humanWorkDetail is the history line for a person starting or finishing a
+// human ticket: "by its owner" only when the one acting is its owner, so the
+// history never claims an owner the ticket doesn't have (#129). The entry's
+// actor names who it was.
+func humanWorkDetail(verb string, by, owner *int) string {
+	if by != nil && owner != nil && *by == *owner {
+		return verb + " by its owner (human work)"
+	}
+	return verb + " (human work)"
 }

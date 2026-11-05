@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { cleanup, render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { TaskCard } from './TaskCard'
 import { mergeBadge, mergeWait } from '../lib/merge'
@@ -8,8 +8,8 @@ const task = (over: Partial<Task> = {}): Task => ({
   id: 2471, project_id: 3, epic_id: 1, story_id: 1, name: 'Build it', description: '', acceptance_criteria: '',
   state: 'completed', priority: '1', dependency_ids: [], created_at: '', updated_at: '', ...over,
 })
-const card = (t: Task, notStartedFlagMinutes?: number) =>
-  render(<TaskCard task={t} onClick={() => {}} notStartedFlagMinutes={notStartedFlagMinutes} />)
+const card = (t: Task, notStartedFlagMinutes?: number, requireApproval = true) =>
+  render(<TaskCard task={t} onClick={() => {}} notStartedFlagMinutes={notStartedFlagMinutes} requireApproval={requireApproval} />)
 
 describe('merge signal helpers', () => {
   it('badges only done tickets that need a merge or whose PR closed', () => {
@@ -88,5 +88,26 @@ describe('TaskCard dispatch integrity', () => {
   it('shows no returned tag once the ticket is dispatched again', () => {
     card(task({ state: 'in_progress', phase: 'not_started', returned_at: null }))
     expect(screen.queryByTestId('returned')).toBeNull()
+  })
+})
+
+describe('TaskCard approval tag (#129)', () => {
+  it('a ready ticket nobody approved says Needs approval', () => {
+    card(task({ state: 'backlog', created_at: '2026-11-05T10:00:00Z' }))
+    expect(screen.getByTestId('needs-approval')).toHaveTextContent('Needs approval')
+  })
+  it('not when the project does not require approval, nor on a ticket already in progress', () => {
+    card(task({ state: 'backlog', created_at: '2026-11-05T10:00:00Z' }), undefined, false)
+    expect(screen.queryByTestId('needs-approval')).toBeNull()
+    cleanup()
+    card(task({ state: 'in_progress', created_at: '2026-11-05T10:00:00Z' }))
+    expect(screen.queryByTestId('needs-approval')).toBeNull()
+  })
+  it('an approved or done ticket does not', () => {
+    card(task({ state: 'backlog', created_at: '2026-11-05T10:00:00Z', approved_at: '2026-11-05T10:01:00Z' }))
+    expect(screen.queryByTestId('needs-approval')).toBeNull()
+    cleanup()
+    card(task({ state: 'completed' }))
+    expect(screen.queryByTestId('needs-approval')).toBeNull()
   })
 })

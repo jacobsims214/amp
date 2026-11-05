@@ -18,7 +18,8 @@ import { TicketArtifacts } from './artifacts/ArtifactBits'
 import { withClears } from '../lib/clear'
 import { StatusBadge } from './StatusBadge'
 import { PriorityMark } from './ui/PriorityMark'
-import { displayState } from '../lib/ticketState'
+import { displayState, STATE_LABEL } from '../lib/ticketState'
+import { ApprovalTag } from './ApprovalTag'
 import { ConfirmDeleteModal } from './ConfirmDeleteModal'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
 import { activityActor, canPlanTask, canTakeOverTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
@@ -45,6 +46,8 @@ interface Props {
   onTaskUpdated?: (task: Task) => void
   /** the project's not_started_flag_minutes: past it the amber badge is filled (0 = flag off) */
   notStartedFlagMinutes?: number
+  /** the project's require_plan_approval: only then does an unapproved ready ticket say Needs approval */
+  requireApproval?: boolean
 }
 
 function relativeTime(iso: string) {
@@ -114,7 +117,7 @@ const inputCls =
   'w-full bg-bg border border-line rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-3 ' +
   'focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-all font-[inherit]'
 
-export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAccess = null, openReassign = false, onTaskUpdated, notStartedFlagMinutes }: Props) {
+export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAccess = null, openReassign = false, onTaskUpdated, notStartedFlagMinutes, requireApproval = false }: Props) {
   // History and comments, tagged with the ticket they were read for: until
   // the first read for this ticket answers, the History tab shows a skeleton;
   // a reread (state or owner changed) keeps the rows on screen meanwhile.
@@ -273,6 +276,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
             <div className="flex items-center gap-2.5 mb-2.5 flex-wrap">
               <span className="amp-num text-[13px] text-ink-3">#{task.id}</span>
               <StatusBadge state={task.state} blockReason={task.block_reason} />
+              <ApprovalTag task={task} requireApproval={requireApproval} />
               <NotStartedTag task={task} flagMinutes={notStartedFlagMinutes} />
               <ReturnedTag task={task} />
               <PriorityMark priority={task.priority} showLabel={task.priority === '2' || task.priority === '3'} />
@@ -558,6 +562,7 @@ function OwnerSection({ task, people, members, meId, myAccess, openReassign, can
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const owner = lookupPerson(people, task.owner_user_id)
+  // lookupPerson names a recorded id even when it isn't a project member ("User #5").
   const creator = lookupPerson(people, task.created_by)
   const isMine = meId != null && task.owner_user_id === meId
   const ownedByOther = !!owner && meId != null && !isMine
@@ -649,7 +654,7 @@ function OwnerSection({ task, people, members, meId, myAccess, openReassign, can
         Created by{' '}
         {creator
           ? <span className="text-ink-2" title={creator.email}>{creator.name}{task.created_by === meId ? ' (you)' : ''}</span>
-          : <span className="italic">unknown</span>}
+          : <span className="italic" title={NOT_RECORDED_HINT}>not recorded</span>}
       </div>
       <ApprovalLine task={task} people={people} meId={meId} />
       {!canWork && owner && (
@@ -665,6 +670,9 @@ function OwnerSection({ task, people, members, meId, myAccess, openReassign, can
     </div>
   )
 }
+
+/** Why the drawer names nobody: no person was recorded for it. */
+const NOT_RECORDED_HINT = 'AMP has no person on record for this: it predates AMP recording people, was kept by an AMP upgrade, or was done without a signed-in account (local dev).'
 
 /**
  * Who approved this ticket's plan (#2198), and for whom when it wasn't their
@@ -695,7 +703,9 @@ export function ApprovalLine({ task, people, meId }: { task: Task; people: Map<n
       <ShieldCheck size={12} className="text-success-ink" aria-hidden="true" />
       <span>
         {a.approvedBy == null
-          ? <>Approved by <span className="text-ink-2">the AMP upgrade</span> (kept from an earlier approval)</>
+          // Nobody recorded: an approval the AMP upgrade kept, or one made without an account (local dev). Say
+          // only what's known rather than naming either (#129).
+          ? <>Approved <span className="text-ink-2" title={NOT_RECORDED_HINT}>(approver not recorded)</span></>
           : <>Approved by <span className="text-ink-2">{name(a.approvedBy)}</span>
               {a.onBehalfOf != null && <> on behalf of <span className="text-ink-2">{name(a.onBehalfOf)}</span></>}</>}
         {formatWhen(a.at) && <> · <span className="tabular-nums">{formatWhen(a.at)}</span></>}
@@ -862,7 +872,8 @@ function DetailsTab({ task, plan, hideBrief, onClose, onRefresh, canWork, canPla
       <RunsPanel taskId={task.id} refreshKey={task.state} />
       <div className="grid grid-cols-2 gap-2.5">
         <MetaItem label="Task ID" value={`#${task.id}`} />
-        <MetaItem label="State" value={task.state} />
+        {/* The header's words, never the stored state name ("backlog"), so the drawer says one thing (#129). */}
+        <MetaItem label="State" value={STATE_LABEL[displayState(task)]} />
         <MetaItem label="Created" value={relativeTime(task.created_at)} />
         <MetaItem label="Updated" value={relativeTime(task.updated_at)} />
         {task.dependency_ids?.length > 0 && (

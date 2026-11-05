@@ -320,7 +320,8 @@ export function FlightPlan() {
       </div>
 
       <TaskDrawer task={opened} onClose={() => setOpenId(null)} onRefresh={refresh}
-        members={members} meId={me?.user_id} myAccess={myAccess} openReassign={openReassign} onTaskUpdated={applyTask} />
+        members={members} meId={me?.user_id} myAccess={myAccess} openReassign={openReassign} onTaskUpdated={applyTask}
+        requireApproval={!!approval.project?.require_plan_approval} />
     </div>
   )
 }

@@ -675,6 +675,7 @@ export function Board() {
                                         isScheduled={col.state === 'scheduled'}
                                         owner={lookupPerson(people, task.owner_user_id)}
                                         notStartedFlagMinutes={notStartedFlagMinutes}
+                                        requireApproval={!!approval.project?.require_plan_approval}
                                       />
                                     ))}
                                     {colTasks.length === 0 && <div className="h-8" />}
@@ -706,6 +707,7 @@ export function Board() {
         openReassign={openReassign}
         onTaskUpdated={applyTask}
         notStartedFlagMinutes={notStartedFlagMinutes}
+        requireApproval={!!approval.project?.require_plan_approval}
       />
 
       {planCheckOpen && (

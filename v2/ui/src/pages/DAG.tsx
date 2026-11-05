@@ -24,6 +24,8 @@ import { api } from '../api/client'
 import { stripMarkdown } from '../lib/stripMarkdown'
 import { useBoardData } from '../hooks/useBoardData'
 import { useAuth } from '../hooks/useAuth'
+import { usePlanApproval } from '../hooks/usePlanApproval'
+import { useProjectPeople } from '../hooks/useProjectPeople'
 import { TaskDrawer } from '../components/TaskDrawer'
 import { FocusNotFound } from '../components/FocusNotFound'
 import { useFocusParam } from '../hooks/useFocusParam'
@@ -180,8 +182,11 @@ export function DAGView() {
 function DAGCanvas() {
   const { projectId } = useParams<{ projectId: string }>()
   const pid = Number(projectId)
-  const { epics, stories, tasks, loading, error, refresh } = useBoardData(pid)
+  const { epics, stories, tasks, loading, error, refresh, applyTask } = useBoardData(pid)
   const { me } = useAuth()
+  // The drawer needs the people and settings the Board gives it, or it can't name the owner and creator (#129).
+  const { members, myAccess, openReassign } = useProjectPeople(pid)
+  const approval = usePlanApproval(pid)
   const meId = me?.user_id
   const flow = useReactFlow()
 
@@ -501,7 +506,9 @@ function DAGCanvas() {
         )}
       </div>
 
-      <TaskDrawer task={drawerTask} onClose={() => setFocusId(null)} onRefresh={refresh} />
+      <TaskDrawer task={drawerTask} onClose={() => setFocusId(null)} onRefresh={refresh}
+        members={members} meId={me?.user_id} myAccess={myAccess} openReassign={openReassign} onTaskUpdated={applyTask}
+        requireApproval={!!approval.project?.require_plan_approval} />
     </div>
   )
 }
