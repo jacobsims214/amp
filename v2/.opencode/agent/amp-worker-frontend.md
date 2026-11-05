@@ -64,4 +64,25 @@ any deliberate differences in your completion summary.
 Follow `amp-execution`'s steps to the letter: post progress comments as you work, verify every
 acceptance criterion, post a completion summary, then call `amp_complete_task`.
 
+**Upload your screenshots as receipt evidence.** When `amp_open_receipt` returns a mode other
+than `"off"`, the screenshots you took to check your work (and to compare with an approved
+design) are the evidence for your `visual` checks. Save them as `screenshot-1.png`,
+`screenshot-2.png`, … (PNG only, nothing else in the name), then:
+
+```
+tree=$(git rev-parse HEAD^{tree})            # the revision you checked; after your last commit
+sha256sum screenshot-1.png; wc -c < screenshot-1.png
+amp_add_evidence(receipt_id=<from amp_open_receipt>, dispatch_id="<your dispatch ID>",
+  commit="$(git rev-parse HEAD)", tree_sha="$tree",
+  files=[{name: "screenshot-1.png", bytes: <size>, sha256: "<hex>"}, …])
+curl -fsS -T screenshot-1.png "<url>"        # each upload's url, once; prefix a bare /api/... with $AMP_URL
+```
+
+Cite each file's `key` in its check: `{criterion_ref: "2", kind: "visual", verdict: "pass",
+evidence_key: "<key>", note: "what the screenshot shows"}`, and pass the same `tree_sha` to
+`amp_complete_task`. A visual pass without its own uploaded screenshot, or with one taken on
+another revision, counts as `cant_tell`. If an upload fails, call `amp_add_evidence` again for a
+fresh URL. If it says evidence storage isn't configured, complete without evidence and record
+the visual check as `cant_tell`. Not in git: skip the evidence and say so in the check's note.
+
 After finding useful tech documentation from Context7 or research, write a KB doc with `amp_kb_write` so the knowledge is cached for future agents. Include the source URL as a reference.

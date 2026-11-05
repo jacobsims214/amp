@@ -158,6 +158,11 @@ func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("/api/trace/merged", h.traceMerged)
 	mux.HandleFunc("/api/metadata/", h.metadata)
 	mux.HandleFunc("/api/artifacts/", h.artifactSub)
+	mux.HandleFunc(ReceiptEvidencePrefix, h.receiptEvidence)
+	// Receipt evidence uploads: no session, the one-time token in the path
+	// is the credential (main leaves this prefix out of the auth
+	// middleware, #126).
+	mux.mux.HandleFunc(ReceiptUploadPrefix, h.receiptUpload)
 	// GitHub's deliveries: no AMP session, authenticated by their HMAC
 	// signature only (main leaves this prefix out of the auth middleware).
 	mux.mux.HandleFunc(GitHubHookPrefix, h.githubHook)
@@ -524,6 +529,10 @@ func (h *RestHandler) projects(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.OrgID, req.TeamID, req.CreatedBy = home.OrgID, home.TeamID, home.CreatedBy
+		if err := h.svc.GuardReceiptsNewProject(r.Context(), pr, req.OrgID, req.Metadata); err != nil {
+			fail(w, err, 400)
+			return
+		}
 		p, err := h.repo.CreateProject(r.Context(), req)
 		if err != nil {
 			fail(w, err, 500)
@@ -571,6 +580,8 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Off the web UI, receipts keys aren't imported (#126).
+		h.svc.StripImportedReceipts(pr, &bundle)
 		// Call ImportBundle to create the project hierarchy
 		newProject, err := h.repo.ImportBundle(r.Context(), bundle, newCode, newName, home)
 		if err != nil {
@@ -900,7 +911,12 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			fail(w, authz.Forbidden("resetting a project requires project owner access"), 403)
 			return
 		}
-		// 1. Wipe postgres
+		// 1. Wipe postgres. Receipts have no FK to tasks: they and their
+		// evidence go first (#126).
+		if err := h.svc.DeleteProjectReceipts(r.Context(), projectID); err != nil {
+			jsonErr(w, err, 500)
+			return
+		}
 		if err := h.repo.ResetProject(r.Context(), projectID); err != nil {
 			jsonErr(w, err, 500)
 			return

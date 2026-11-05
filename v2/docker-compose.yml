@@ -69,6 +69,12 @@ services:
       # amp-relay, which this stack doesn't run (amp-api serves no relay
       # route). A warned, loopback-only dev override that adds it is
       # docker-compose.remote-dev.yml.
+      # Verification receipt evidence (#126): screenshots and videos, on the
+      # amp-receipts volume. It stays empty while every project's receipts
+      # setting is Off (the default).
+      RECEIPT_DIR: /data/receipts
+    volumes:
+      - amp-receipts:/data/receipts
     depends_on:
       postgres:
         condition: service_healthy
@@ -87,5 +93,6 @@ services:
 
 volumes:
   amp-pgdata:
+  amp-receipts:
   amp-tsdata:
   amp-ollama:

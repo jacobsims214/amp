@@ -947,6 +947,9 @@ func (s *Server) createProject(rctx context.Context, args map[string]interface{}
 		return nil, err
 	}
 	req.OrgID, req.TeamID, req.CreatedBy = home.OrgID, home.TeamID, home.CreatedBy
+	if err := s.svc.GuardReceiptsNewProject(rctx, caller(rctx).p, req.OrgID, req.Metadata); err != nil {
+		return nil, err
+	}
 	p, err := s.repo.CreateProject(context.Background(), req)
 	if err != nil {
 		return nil, err
@@ -2222,7 +2225,11 @@ func (s *Server) resetProject(rctx context.Context, args map[string]interface{})
 	if p.State == domain.ProjectStateArchived {
 		return nil, fmt.Errorf("⚠️  Project %d (%s) is archived. Restore it first with amp_restore_project before making changes.", p.ID, p.Name)
 	}
-	// 1. Wipe postgres
+	// 1. Wipe postgres. Receipts have no FK to tasks: they and their
+	// evidence go first (#126).
+	if err := s.svc.DeleteProjectReceipts(rctx, projectID); err != nil {
+		return nil, fmt.Errorf("reset project: %w", err)
+	}
 	if err := s.repo.ResetProject(context.Background(), projectID); err != nil {
 		return nil, fmt.Errorf("reset project: %w", err)
 	}
@@ -2485,6 +2492,9 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 	if err != nil {
 		return nil, err
 	}
+	// Off the web UI, receipts keys aren't imported (the new project follows
+	// the org default until a person sets it, #126).
+	stripped := s.svc.StripImportedReceipts(caller(rctx).p, &bundle)
 	newProject, err := s.repo.ImportBundle(ctx, bundle, newCode, newName, home)
 	if err != nil {
 		return nil, fmt.Errorf("import bundle: %w", err)
@@ -2517,7 +2527,12 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 	// 4. Publish event for real-time UI updates
 	s.hub.Publish(domain.Event{Type: domain.EventProjectCreated, ProjectID: newProject.ID, Payload: newProject, At: time.Now()})
 
-	return jsonResult(map[string]interface{}{"project": newProject, "kb_docs_imported": imported, "kb_docs_failed": failed})
+	out := map[string]interface{}{"project": newProject, "kb_docs_imported": imported, "kb_docs_failed": failed}
+	if stripped > 0 {
+		out["receipts_keys_removed"] = stripped
+		out["note"] = "The bundle's verification receipts metadata wasn't imported: a person sets it in the AMP web UI."
+	}
+	return jsonResult(out)
 }
 
 // ---- Metadata ----

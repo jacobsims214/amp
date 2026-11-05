@@ -1,3 +1,7 @@
+{{- $receiptsMode := .Values.ampApi.receipts.storage.accessMode | default "ReadWriteOnce" }}
+{{- if and (gt (int .Values.ampApi.replicas) 1) (ne $receiptsMode "ReadWriteMany") }}
+{{- fail (printf "ampApi.replicas is %d but ampApi.receipts.storage.accessMode is %s: every amp-api replica mounts the receipt evidence volume, so more than one replica needs ReadWriteMany storage (nfs-storage in production)" (int .Values.ampApi.replicas) $receiptsMode) }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -19,7 +23,9 @@ spec:
         app: amp-api
     spec:
       securityContext:
-        {{- include "amp.podSecurityContext" . | nindent 8 }}
+        # fsGroup: the receipt evidence volume is group-writable by uid 1000
+        # whatever the storage backend's default ownership.
+        {{- include "amp.podSecurityContext" (dict "fsGroup" 1000) | nindent 8 }}
       {{- if gt (int .Values.ampApi.replicas) 1 }}
       # Spread replicas over nodes, so losing one node doesn't take them all.
       topologySpreadConstraints:
@@ -31,6 +37,20 @@ spec:
               app: amp-api
       {{- end }}
       initContainers:
+        # The receipt evidence volume belongs to uid 1000 (amp-api), as the
+        # chart does for every PVC-owning pod: fsGroup isn't applied on
+        # hostPath or local-path. Only the top directory: everything under it
+        # is created by amp-api itself, so a large volume isn't walked on
+        # every start. Non-fatal: if the chown is refused (e.g. root_squash),
+        # amp-api still starts and logs that the store is unavailable.
+        - name: fix-permissions
+          image: busybox:1.36
+          securityContext:
+            {{- include "amp.chownInitSecurityContext" . | nindent 12 }}
+          command: ["sh", "-c", "chown 1000:1000 /data/receipts && chmod 0750 /data/receipts || echo 'warning: could not chown /data/receipts'"]
+          volumeMounts:
+            - name: receipts
+              mountPath: /data/receipts
         - name: wait-for-postgres
           image: busybox:1.36
           securityContext:
@@ -167,6 +187,15 @@ spec:
             - name: APP_PUBLIC_URL
               value: {{ . | trimSuffix "/" | quote }}
             {{- end }}
+            # Verification receipt evidence (#126): the local store on the
+            # amp-receipts PVC (ReadWriteMany, so every replica sees the same
+            # files). It stays empty while every project's setting is Off.
+            - name: RECEIPT_DIR
+              value: /data/receipts
+            - name: RECEIPT_MAX_BYTES
+              value: {{ .Values.ampApi.receipts.maxBytes | int64 | toString | quote }}
+            - name: RECEIPT_RETENTION_DAYS
+              value: {{ .Values.ampApi.receipts.retentionDays | int | toString | quote }}
             {{- if .Values.valkey.enabled }}
             - name: REDIS_ADDR
               value: "amp-valkey.{{ .Values.global.namespace }}.svc.cluster.local:6379"
@@ -188,8 +217,35 @@ spec:
             httpGet: { path: /health, port: rest }
             initialDelaySeconds: 10
             periodSeconds: 15
+          volumeMounts:
+            - name: receipts
+              mountPath: /data/receipts
           resources:
             {{- toYaml .Values.ampApi.resources | nindent 12 }}
+      volumes:
+        - name: receipts
+          persistentVolumeClaim:
+            claimName: amp-receipts
+---
+# Verification receipt evidence (#126): screenshots, videos and logs, up to
+# ampApi.receipts.maxBytes a file, deleted after retentionDays unless kept.
+# ReadWriteOnce by default (one replica); ReadWriteMany (production, on
+# nfs-storage) lets any number of amp-api replicas share it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: amp-receipts
+  namespace: {{ .Values.global.namespace }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [{{ $receiptsMode | quote }}]
+  {{- if .Values.ampApi.receipts.storage.storageClassName }}
+  storageClassName: {{ .Values.ampApi.receipts.storage.storageClassName }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.ampApi.receipts.storage.size }}
 ---
 apiVersion: v1
 kind: Service

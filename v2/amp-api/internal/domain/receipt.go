@@ -117,7 +117,7 @@ type ReceiptCheck struct {
 }
 
 // ReceiptEvidence is the metadata of one evidence file. The bytes live in
-// the receipt store (Phase 3), never in Postgres (D3).
+// the receipt store (internal/receipts), never in Postgres (D3).
 type ReceiptEvidence struct {
 	ID          int64      `json:"id"`
 	ReceiptID   int64      `json:"receipt_id"`
@@ -132,6 +132,10 @@ type ReceiptEvidence struct {
 	Status      string     `json:"status"`
 	CreatedAt   time.Time  `json:"created_at"`
 	StoredAt    *time.Time `json:"stored_at,omitempty"`
+	// ExpiresAt is when unkept evidence is (or was) deleted: the receipt's
+	// created_at plus the retention period. Unset when the receipt is kept.
+	// Derived on read, never stored.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 // ValidReceiptsMode reports whether m is a mode (not "": that is a
@@ -409,4 +413,69 @@ func (p MetadataPatch) TouchesReceipts() bool {
 	_, a := p[MetaReceipts]
 	_, b := p[MetaReceiptsMinLevel]
 	return a || b
+}
+
+// Evidence statuses.
+const (
+	EvidencePending = "pending"
+	EvidenceStored  = "stored"
+	EvidenceExpired = "expired"
+)
+
+// DowngradeVisualChecks makes cant_tell every passing visual check that
+// its evidence doesn't back: a visual pass counts only when its
+// evidence_key names a stored file of this receipt (evidence, the receipt's
+// own rows) that isn't a zero-frame recording, recorded on the receipt's
+// revision (treeSHA) when both name one. A missing tree_sha on either side
+// isn't a mismatch. storeErr, when set, is why there is no evidence store
+// at all: then no visual pass counts. A visual fail stays a fail (turning it
+// into cant_tell would raise the status). Each downgraded check's note says
+// why. checks is not modified.
+func DowngradeVisualChecks(checks []ReceiptCheck, evidence []ReceiptEvidence, treeSHA, storeErr string) []ReceiptCheck {
+	byKey := make(map[string]ReceiptEvidence, len(evidence))
+	for _, e := range evidence {
+		byKey[e.Key] = e
+	}
+	out := make([]ReceiptCheck, len(checks))
+	for i, c := range checks {
+		out[i] = c
+		if c.Kind != CheckKindVisual || c.Verdict != VerdictPass {
+			continue
+		}
+		why := ""
+		e, ok := byKey[c.EvidenceKey]
+		switch {
+		case storeErr != "":
+			why = "evidence storage isn't configured"
+		case c.EvidenceKey == "" || !ok:
+			why = "evidence missing"
+		case e.Status != EvidenceStored:
+			why = "evidence missing (" + e.Status + ")"
+		case e.Frames != nil && *e.Frames == 0:
+			why = "no frames"
+		case treeSHA != "" && e.TreeSHA != "" && !sameTree(treeSHA, e.TreeSHA):
+			why = "evidence recorded on another revision"
+		}
+		if why == "" {
+			continue
+		}
+		out[i].Verdict = VerdictCantTell
+		if c.Note != "" {
+			why += ": " + c.Note
+		}
+		if len(why) > MaxCheckNoteBytes {
+			why = why[:MaxCheckNoteBytes]
+		}
+		out[i].Note = why
+	}
+	return out
+}
+
+// sameTree compares two tree ids, either of which may be abbreviated.
+func sameTree(a, b string) bool {
+	a, b = strings.ToLower(a), strings.ToLower(b)
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	return strings.HasPrefix(b, a)
 }

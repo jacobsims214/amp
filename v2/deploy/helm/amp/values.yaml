@@ -150,6 +150,31 @@ ampApi:
   # remote control relay's Origin check use it. Empty: https://<global.domain>
   # (derived from MCP_PUBLIC_URL).
   appPublicUrl: ""
+  # Verification receipt evidence (#126, KB operations/where-amp-keeps-data):
+  # the screenshots, videos and logs workers attach to their receipts. Kept on
+  # a PVC (amp-receipts) mounted at /data/receipts in every replica; never in Postgres, never artifacts. Created whatever the
+  # receipts setting, it stays empty while every project is Off (the
+  # default). Sizing: about 5-20 MB per recorded journey.
+  receipts:
+    storage:
+      size: 20Gi
+      # ReadWriteOnce works on any cluster (local-path included) with one
+      # replica. More than one amp-api replica needs ReadWriteMany (the chart
+      # refuses to render otherwise): values-production.yaml sets it, on
+      # nfs-storage. Note that a rolling update (maxSurge 1) with
+      # ReadWriteOnce only works when the cluster has one node.
+      accessMode: ReadWriteOnce
+      storageClassName: ""   # empty = cluster default
+    # Unkept evidence (no merge, no Accept) is deleted after this many days.
+    retentionDays: 90
+    # Per-file cap, in bytes (200 MiB).
+    maxBytes: 209715200
+    # Envoy's limits for an upload (ext_authz is off for that route only: the
+    # one-time token is the credential). uploadTimeout bounds the whole
+    # request: an hour lets a 200 MiB file through at under 1 Mbit/s.
+    # uploadIdleTimeout cuts off a stalled one.
+    uploadTimeout: 3600s
+    uploadIdleTimeout: 120s
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: 500m, memory: 512Mi }

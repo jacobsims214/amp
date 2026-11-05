@@ -110,6 +110,13 @@ image:
 ampApi:
   tag: ""   # empty = use global.imageTag
   replicas: 1
+  # Verification receipt evidence (#126) on NFS: ReadWriteMany, so every
+  # replica sees the same files. Backed up with the rest of nfs-storage.
+  receipts:
+    storage:
+      size: 20Gi
+      accessMode: ReadWriteMany
+      storageClassName: nfs-storage
   # Audit checkpoint signing key (#2439 H2). The Secret's value is never in
   # git. Create it once, before this chart version reaches prod:
   #   amp-api audit keygen -out signing-key   # prints the public key and key id: keep a copy off-box

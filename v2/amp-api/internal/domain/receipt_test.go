@@ -159,3 +159,47 @@ func TestReceiptsOverride(t *testing.T) {
 		t.Fatalf("invalid values: %q %q", m, l)
 	}
 }
+
+// A visual pass counts only with its own receipt's stored evidence, on the
+// receipt's revision.
+func TestDowngradeVisualChecks(t *testing.T) {
+	zero, five := 0, 5
+	ev := []ReceiptEvidence{
+		{Key: "k/shot", Status: EvidenceStored, TreeSHA: "abcdef0123456789"},
+		{Key: "k/video", Status: EvidenceStored, TreeSHA: "abcdef0123456789", Frames: &five},
+		{Key: "k/empty", Status: EvidenceStored, TreeSHA: "abcdef0123456789", Frames: &zero},
+		{Key: "k/pending", Status: EvidencePending, TreeSHA: "abcdef0123456789"},
+		{Key: "k/notree", Status: EvidenceStored},
+	}
+	vis := func(key, verdict string) ReceiptCheck {
+		return ReceiptCheck{Role: CheckRoleWorker, Kind: CheckKindVisual, Verdict: verdict, EvidenceKey: key, Note: "looked"}
+	}
+	cases := []struct {
+		name, tree, storeErr string
+		in                   ReceiptCheck
+		want, note           string
+	}{
+		{"stored screenshot", "abcdef0123456789", "", vis("k/shot", VerdictPass), VerdictPass, "looked"},
+		{"abbreviated tree", "abcdef012345", "", vis("k/video", VerdictPass), VerdictPass, "looked"},
+		{"no key", "", "", vis("", VerdictPass), VerdictCantTell, "evidence missing: looked"},
+		{"foreign key", "", "", vis("other/receipt/shot", VerdictPass), VerdictCantTell, "evidence missing: looked"},
+		{"pending", "", "", vis("k/pending", VerdictPass), VerdictCantTell, "evidence missing (pending): looked"},
+		{"zero frames", "", "", vis("k/empty", VerdictPass), VerdictCantTell, "no frames: looked"},
+		{"tree mismatch", "0000000000aa", "", vis("k/shot", VerdictPass), VerdictCantTell, "evidence recorded on another revision: looked"},
+		{"receipt has no tree", "", "", vis("k/shot", VerdictPass), VerdictPass, "looked"},
+		{"evidence has no tree", "0000000000aa", "", vis("k/notree", VerdictPass), VerdictPass, "looked"},
+		{"no store", "abcdef0123456789", "disk gone", vis("k/shot", VerdictPass), VerdictCantTell, "evidence storage isn't configured: looked"},
+		{"a fail stays a fail", "", "", vis("", VerdictFail), VerdictFail, "looked"},
+		{"not visual", "", "", ReceiptCheck{Kind: CheckKindTest, Verdict: VerdictPass}, VerdictPass, ""},
+	}
+	for _, c := range cases {
+		in := []ReceiptCheck{c.in}
+		got := DowngradeVisualChecks(in, ev, c.tree, c.storeErr)
+		if got[0].Verdict != c.want || got[0].Note != c.note {
+			t.Errorf("%s: %s %q, want %s %q", c.name, got[0].Verdict, got[0].Note, c.want, c.note)
+		}
+		if in[0].Verdict != c.in.Verdict {
+			t.Errorf("%s: modified its input", c.name)
+		}
+	}
+}

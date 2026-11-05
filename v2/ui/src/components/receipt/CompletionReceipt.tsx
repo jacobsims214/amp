@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Bot, Check, GitBranch, GitMerge, Loader2, Paperclip, ShieldAlert, ShieldCheck, X } from 'lucide-react'
 import { api } from '../../api/client'
+import { EvidencePlayer } from './EvidencePlayer'
 import { mergeStatusText } from '../../lib/humanActions'
 import { agoText, isCloseout, latestRunWith, parseSelfCheck, STATUS_LABEL, STATUS_TONE, summarizeChecks } from '../../lib/receipt'
 import { isHuman } from '../../lib/human'
@@ -110,11 +111,7 @@ export function CompletionReceipt({ task, runs, comments, receipt, canWork = fal
         </div>
       )}
       {server && <ChecksByRole checks={server.checks} />}
-      {server && server.evidence.length > 0 && (
-        <div className="text-ink-2" data-testid="receipt-evidence">
-          {server.evidence.length} evidence file{server.evidence.length === 1 ? '' : 's'}: {server.evidence.map(e => e.name).join(', ')}
-        </div>
-      )}
+      {server && server.evidence.length > 0 && <EvidencePlayer evidence={server.evidence} />}
       {server && canWork && <Verdict taskId={task.id} held={held} accepted={server.status === 'human_accepted'} onChanged={onChanged} />}
       {attempts > 0 && (
         <div className="text-ink-3" data-testid="receipt-attempts">{attempts} earlier attempt{attempts === 1 ? '' : 's'}</div>

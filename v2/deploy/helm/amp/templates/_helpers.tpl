@@ -147,6 +147,25 @@ runAsUser: 0
 {{- end }}
 {{- end -}}
 
+{{/* amp.receiptUploadRoutes: verification receipt evidence uploads (#126).
+     The one-time token in the path is the credential, checked by amp-api,
+     so ext_authz is off for this prefix only. Uploads are up to
+     ampApi.receipts.maxBytes (200 MiB), so the route timeout is long and a
+     stalled upload is cut off by idle_timeout instead. Every other receipts route (GET /api/receipts/<key>) stays
+     behind the session under the /api prefix. */}}
+{{- define "amp.receiptUploadRoutes" -}}
+# ---- Receipt evidence uploads: one-time token checked by amp-api, not ext_authz ----
+- match: { prefix: "/api/receipt-uploads/" }
+  route:
+    cluster: amp_api_rest
+    timeout: {{ .Values.ampApi.receipts.uploadTimeout | default "3600s" }}
+    idle_timeout: {{ .Values.ampApi.receipts.uploadIdleTimeout | default "120s" }}
+  typed_per_filter_config:
+    envoy.filters.http.ext_authz:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+      disabled: true
+{{- end -}}
+
 {{/* amp.relayBrowserRoutes: the relay's browser leg, /api/sessions, goes to
      amp-relay behind the cookie session (ext_authz stays on). Its
      per-session SSE stream is long-lived like the harness's command stream

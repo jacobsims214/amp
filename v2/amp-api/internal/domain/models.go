@@ -601,7 +601,9 @@ const (
 	EventStoryUpdated      EventType = "story.updated"
 	EventArtifactUpdated   EventType = "artifact.updated"
 	// EventReceiptUpdated: a verification receipt changed (#126); payload
-	// {task_id, receipt_id, status, held}.
+	// {task_id, receipt_id, status, held}, or {task_id, receipt_id,
+	// evidence_key} when an evidence upload finished (the status and hold
+	// aren't re-derived by an upload, so they are left out).
 	EventReceiptUpdated EventType = "receipt.updated"
 )
 

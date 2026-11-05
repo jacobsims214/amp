@@ -186,4 +186,11 @@ describe('CompletionReceipt links (security)', () => {
     render(<CompletionReceipt task={task()} runs={[]} comments={[]} receipt={bad} />)
     expect(screen.queryByRole('link', { name: 'PR' })).toBeNull()
   })
+
+  it('plays the evidence of the receipt in the drawer', () => {
+    const r = serverReceipt({ evidence: [{ id: 1, receipt_id: 11, key: '2/5/attempts/11/abc/video.mp4', name: 'video.mp4', content_type: 'video/mp4',
+      bytes: 1000, status: 'stored', created_at: '2026-11-04T10:00:00Z' }] })
+    render(<CompletionReceipt task={task()} runs={[]} comments={[]} receipt={r} />)
+    expect(screen.getByTestId('evidence-video')).toHaveAttribute('src', '/api/receipts/2/5/attempts/11/abc/video.mp4')
+  })
 })

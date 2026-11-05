@@ -2,9 +2,15 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/simstech/amp-api/internal/authz"
+	"github.com/simstech/amp-api/internal/receipts"
+	"github.com/simstech/amp-api/internal/service"
 )
 
 // Verification receipts (#126). Rules live in internal/service/receipts.go.
@@ -16,6 +22,8 @@ import (
 //	GET  /api/projects/:id/receipts/summary        {mode, min_level, ..., tasks: [{task_id, status, held, has_media}], would_hold_last_7_days}
 //	GET  /api/orgs/:id/receipts                    {mode}   org admin
 //	PUT  /api/orgs/:id/receipts {mode}             org admin, web UI only
+//	PUT  /api/receipt-uploads/<token>              evidence bytes; no session, the one-time token is the credential
+//	GET  /api/receipts/<key>                       evidence (Range works); anyone who can read the ticket
 
 // taskReceipt serves /api/tasks/:id/receipt[/accept|/reject] and
 // /api/tasks/:id/receipts. parts is the path after /api/tasks/.
@@ -129,5 +137,93 @@ func (h *RestHandler) orgReceipts(w http.ResponseWriter, r *http.Request, p auth
 		jsonOK(w, map[string]any{"mode": org.ReceiptsMode, "org": org})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// Evidence routes (#126, Phase 3).
+const (
+	// ReceiptUploadPrefix is the upload route; main leaves it out of the
+	// auth middleware, like GitHubHookPrefix.
+	ReceiptUploadPrefix = service.UploadPath
+	// ReceiptEvidencePrefix serves stored evidence by key.
+	ReceiptEvidencePrefix = "/api/receipts/"
+)
+
+// SetReceiptStore sets the receipt evidence store (nil: none configured).
+func (h *RestHandler) SetReceiptStore(e *service.EvidenceStore) { h.svc.Evidence = e }
+
+// receiptUpload serves PUT /api/receipt-uploads/<token>.
+func (h *RestHandler) receiptUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		w.Header().Set("Allow", http.MethodPut)
+		http.Error(w, "PUT required", http.StatusMethodNotAllowed)
+		return
+	}
+	token := strings.TrimPrefix(r.URL.Path, ReceiptUploadPrefix)
+	// The instance cap, whatever the store's own limit (the declared size,
+	// at most this, is enforced by Put).
+	body := http.MaxBytesReader(w, r.Body, h.svc.MaxEvidenceBytes()+1)
+	ev, err := h.svc.StoreUpload(r.Context(), token, body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			err = &authz.Error{Status: 422, Msg: "the upload is longer than allowed; nothing was stored"}
+		}
+		fail(w, err, 500)
+		return
+	}
+	jsonOK(w, map[string]any{"key": ev.Key, "name": ev.Name, "bytes": ev.Bytes, "sha256": ev.SHA256, "status": ev.Status})
+}
+
+// receiptEvidence serves GET /api/receipts/<key>: the evidence file, under
+// the same safety headers as an artifact's content (writeArtifactContent):
+// the content type from the allowlisted name, nosniff, the sandbox CSP, no
+// referrer, same-origin CORP, and inline for media and text but attachment
+// for trace.zip and har.json. HTML and SVG are never on the allowlist.
+func (h *RestHandler) receiptEvidence(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+	key := strings.TrimPrefix(r.URL.Path, ReceiptEvidencePrefix)
+	se, err := h.svc.EvidenceForServe(r.Context(), p, key)
+	if err != nil {
+		fail(w, err, 500)
+		return
+	}
+	ct, ok := receipts.ContentType(se.Evidence.Name)
+	if !ok {
+		// A name that is no longer allowed is never served.
+		fail(w, authz.NotFound("evidence not found"), 404)
+		return
+	}
+	disp := "inline"
+	if receipts.Attachment(se.Evidence.Name) {
+		disp = "attachment"
+	}
+	hd := w.Header()
+	hd.Set("Content-Type", ct)
+	hd.Set("X-Content-Type-Options", "nosniff")
+	hd.Set("Content-Security-Policy", artifactSandbox)
+	hd.Set("Referrer-Policy", "no-referrer")
+	hd.Set("Cross-Origin-Resource-Policy", "same-origin")
+	hd.Set("Content-Disposition", fmt.Sprintf("%s; filename=%q", disp, se.Evidence.Name))
+	hd.Set("ETag", `"`+se.Evidence.SHA256+`"`)
+	hd.Set("Cache-Control", "private, no-cache")
+	if err := se.Store.Serve(w, r, se.Evidence.Key); err != nil {
+		for _, k := range []string{"Content-Disposition", "ETag", "Cache-Control"} {
+			hd.Del(k)
+		}
+		if errors.Is(err, receipts.ErrNotFound) {
+			slog.Warn("receipt evidence is stored in Postgres but missing from the store", "key", se.Evidence.Key)
+			fail(w, authz.NotFound("evidence file is missing from the store"), 404)
+			return
+		}
+		fail(w, err, 500)
 	}
 }

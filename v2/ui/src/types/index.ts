@@ -80,10 +80,18 @@ export interface ReceiptEvidence {
   receipt_id: number
   key: string
   name: string
+  /** the revision it was recorded on */
+  tree_sha?: string
   content_type: string
   bytes: number
+  sha256?: string
+  duration_ms?: number
+  frames?: number
   status: 'pending' | 'stored' | 'expired'
   created_at: string
+  stored_at?: string
+  /** when unkept evidence is (or was) deleted; unset once kept (merged or accepted) */
+  expires_at?: string
 }
 
 export interface ReceiptSettings {

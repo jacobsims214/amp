@@ -221,6 +221,8 @@ export const api = {
   expiringArtifacts: (days = 14) => get<{ artifacts: Artifact[] }>(`/artifacts/expiring?days=${days}`).then(r => r.artifacts ?? []),
   /** Where a version's content is served (sandboxed). */
   artifactContentUrl: (id: number, version?: number) => `${BASE}/artifacts/${id}/content${version ? `?version=${version}` : ''}`,
+  /** a receipt evidence file (#126): served with Range, so a video seeks */
+  receiptEvidenceUrl: (key: string) => `${BASE}/receipts/${key.split('/').map(encodeURIComponent).join('/')}`,
 
   // Comments
   getComments: (taskId: number) =>

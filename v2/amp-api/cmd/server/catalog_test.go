@@ -15,7 +15,7 @@ import (
 
 // Every tool AMP has ever listed. Superseded ones are hidden from tools/list
 // but must stay callable: prompts, skills and clients name them.
-var everyToolName = strings.Fields(`amp_add_task_comment amp_answer_question amp_approve_plan amp_archive_project
+var everyToolName = strings.Fields(`amp_add_evidence amp_add_task_comment amp_answer_question amp_approve_plan amp_archive_project
 amp_assign_task amp_audit_log amp_block_task amp_check_plan amp_claim_task amp_complete_task amp_create_epic
 amp_create_org amp_create_project amp_create_story amp_create_task amp_create_tasks amp_day_report amp_delete_epic
 amp_delete_story amp_delete_task amp_design_context amp_design_system_publish amp_design_system_start

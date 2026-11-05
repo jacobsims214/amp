@@ -195,6 +195,7 @@ func (s *Service) prepareReceipt(ctx context.Context, p authz.Principal, t *doma
 	} else if rc, err := s.Repo.NewestReceiptDraft(ctx, t.ID); err == nil && rc != nil {
 		plan.draft = rc
 	}
+	s.downgradeVisual(ctx, plan)
 	agent := t.AgentID
 	if plan.draft != nil && plan.draft.AgentID != "" {
 		agent = plan.draft.AgentID
@@ -213,6 +214,33 @@ func (s *Service) prepareReceipt(ctx context.Context, p authz.Principal, t *doma
 		}
 	}
 	return plan, nil
+}
+
+// downgradeVisual makes cant_tell each passing visual check of plan that
+// its draft's stored evidence doesn't back (domain.DowngradeVisualChecks):
+// before the status is derived, so Require holds on it. A completion with
+// no draft has no evidence; evidence that can't be read counts as missing.
+func (s *Service) downgradeVisual(ctx context.Context, plan *receiptPlan) {
+	visual := false
+	for _, c := range plan.in.Checks {
+		visual = visual || (c.Kind == domain.CheckKindVisual && c.Verdict == domain.VerdictPass)
+	}
+	if !visual {
+		return
+	}
+	var ev []domain.ReceiptEvidence
+	tree := plan.in.TreeSHA
+	if plan.draft != nil {
+		if rows, err := s.Repo.ReceiptEvidence(ctx, plan.draft.ID); err == nil {
+			ev = rows
+		} else {
+			slog.Warn("receipt: read evidence for visual checks", "receipt_id", plan.draft.ID, "err", err)
+		}
+		if tree == "" {
+			tree = plan.draft.TreeSHA
+		}
+	}
+	plan.in.Checks = domain.DowngradeVisualChecks(plan.in.Checks, ev, tree, s.storeErr())
 }
 
 // holdReason says why a receipt is below its minimum, in a person's words.
@@ -430,6 +458,7 @@ func (s *Service) receiptViews(ctx context.Context, list []domain.Receipt, withE
 		}
 		if withEvidence {
 			if ev, err := s.Repo.ReceiptEvidence(ctx, rc.ID); err == nil {
+				s.withExpiry(rc, ev)
 				out[i].Evidence = ev
 			}
 		}
@@ -795,18 +824,17 @@ func (s *Service) guardReceiptsMeta(ctx context.Context, p authz.Principal, proj
 	if !patch.TouchesReceipts() {
 		return nil
 	}
-	if v, ok := patch[domain.MetaReceipts]; ok && v != nil {
-		if str, isStr := v.(string); !isStr || !domain.ValidReceiptsMode(strings.ToLower(strings.TrimSpace(str))) {
-			return authz.BadRequest("metadata %s must be off, inform or require (null removes it)", domain.MetaReceipts)
-		}
-	}
-	if v, ok := patch[domain.MetaReceiptsMinLevel]; ok && v != nil {
-		if str, isStr := v.(string); !isStr || !domain.ValidMinLevel(strings.ToLower(strings.TrimSpace(str))) {
-			return authz.BadRequest("metadata %s must be self_checked or independently_verified (null removes it)", domain.MetaReceiptsMinLevel)
-		}
+	if err := validReceiptsPatch(patch); err != nil {
+		return err
 	}
 	if p.InUI() {
 		return nil
+	}
+	// An item's own values only rise off the web UI, whatever its effective
+	// mode: lowering an epic's or story's minimum while it inherits Inform
+	// would otherwise weaken a ticket under it that sets Require itself.
+	if err := ownValuesRise(own, patch); err != "" {
+		return authz.UIOnly(fmt.Sprintf("Lowering or removing %s's own %s", where, err), s.SettingsURL(projectID))
 	}
 	proj, err := s.Repo.GetProject(ctx, projectID)
 	if err != nil {
@@ -823,6 +851,45 @@ func (s *Service) guardReceiptsMeta(ctx context.Context, p authz.Principal, proj
 			describeReceipts(before), describeReceipts(after)), s.SettingsURL(projectID))
 	}
 	return nil
+}
+
+// validReceiptsPatch refuses invalid receipts values in a metadata change.
+func validReceiptsPatch(patch domain.MetadataPatch) error {
+	if v, ok := patch[domain.MetaReceipts]; ok && v != nil {
+		if str, isStr := v.(string); !isStr || !domain.ValidReceiptsMode(strings.ToLower(strings.TrimSpace(str))) {
+			return authz.BadRequest("metadata %s must be off, inform or require (null removes it)", domain.MetaReceipts)
+		}
+	}
+	if v, ok := patch[domain.MetaReceiptsMinLevel]; ok && v != nil {
+		if str, isStr := v.(string); !isStr || !domain.ValidMinLevel(strings.ToLower(strings.TrimSpace(str))) {
+			return authz.BadRequest("metadata %s must be self_checked or independently_verified (null removes it)", domain.MetaReceiptsMinLevel)
+		}
+	}
+	return nil
+}
+
+// ownValuesRise checks that patch only raises (or first sets) the receipts
+// values own already has: removing one, or setting a lower mode or minimum
+// level, is refused. It returns the key that would fall ("" when none).
+func ownValuesRise(own domain.Metadata, patch domain.MetadataPatch) string {
+	norm := func(v any) string {
+		str, _ := v.(string)
+		return strings.ToLower(strings.TrimSpace(str))
+	}
+	for key, rank := range map[string]func(string) int{domain.MetaReceipts: domain.ModeRank, domain.MetaReceiptsMinLevel: domain.StatusRank} {
+		nv, touched := patch[key]
+		if !touched {
+			continue
+		}
+		old := norm(own[key])
+		if rank(old) < 0 {
+			continue // no valid own value: nothing to lower
+		}
+		if nv == nil || rank(norm(nv)) < rank(old) {
+			return fmt.Sprintf("metadata %s (%s)", key, old)
+		}
+	}
+	return ""
 }
 
 // weakens reports whether after is a weaker receipts requirement than
@@ -1022,4 +1089,68 @@ func (s *Service) GuardReceiptsCreate(ctx context.Context, p authz.Principal, pa
 		inherited = domain.Metadata{}
 	}
 	return s.guardReceiptsMeta(ctx, p, projectID, inherited.Merge(parentOwn), domain.Metadata{}, patch, "a new item under "+parentKind+" "+idStr(parentID))
+}
+
+// GuardReceiptsNewProject refuses a new project's metadata when its
+// receipts keys are invalid (anyone), or, off the web UI, when they weaken
+// the org's default (D9, D11): an agent can't create its way out of the
+// org's setting.
+func (s *Service) GuardReceiptsNewProject(ctx context.Context, p authz.Principal, orgID *int, meta domain.Metadata) error {
+	patch := domain.MetadataPatch(meta)
+	if !patch.TouchesReceipts() {
+		return nil
+	}
+	if err := validReceiptsPatch(patch); err != nil {
+		return err
+	}
+	if p.InUI() {
+		return nil
+	}
+	base := ReceiptSettings{Mode: domain.ReceiptsOff, MinLevel: domain.StatusSelfChecked}
+	if orgID != nil {
+		org, err := s.Repo.GetOrg(ctx, *orgID)
+		if err != nil {
+			return guardReadError(fmt.Sprintf("org %d", *orgID), err)
+		}
+		if domain.ValidReceiptsMode(org.ReceiptsMode) {
+			base.Mode = org.ReceiptsMode
+		}
+	}
+	if after := withOverride(base, meta); weakens(base, after) {
+		return authz.UIOnly(fmt.Sprintf("Creating a project whose metadata weakens the org's verification receipts default (from %s to %s)",
+			describeReceipts(base), describeReceipts(after)), s.link("/projects"))
+	}
+	return nil
+}
+
+// StripImportedReceipts removes, off the web UI, every receipts metadata key
+// from an import bundle's project, epics, stories and tickets, so an agent
+// can't import a weaker setting: the new project follows the org default
+// until a person sets it. It returns how many keys it removed. In the web UI
+// the bundle is kept as it is (invalid values are dropped by the import's
+// metadata cleaning either way).
+func (s *Service) StripImportedReceipts(p authz.Principal, b *domain.ExportBundle) int {
+	if p.InUI() {
+		return 0
+	}
+	n := 0
+	strip := func(m domain.Metadata) {
+		for _, k := range []string{domain.MetaReceipts, domain.MetaReceiptsMinLevel} {
+			if _, ok := m[k]; ok {
+				delete(m, k)
+				n++
+			}
+		}
+	}
+	strip(b.Project.Metadata)
+	for i := range b.Epics {
+		strip(b.Epics[i].Metadata)
+	}
+	for i := range b.Stories {
+		strip(b.Stories[i].Metadata)
+	}
+	for i := range b.Tasks {
+		strip(b.Tasks[i].Metadata)
+	}
+	return n
 }

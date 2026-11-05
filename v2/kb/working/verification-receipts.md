@@ -1,6 +1,6 @@
 ---
 title: Verification receipts — how a finished ticket was checked
-tags: [receipts, verification, checks, accept, reject, require, inform, self-checked, held]
+tags: [receipts, verification, checks, accept, reject, require, inform, self-checked, held, evidence, screenshots, video]
 ---
 
 # Verification receipts
@@ -24,7 +24,11 @@ on the Orgs page and is **Off** until an org admin changes it.
 Only project owners and org admins change the setting, in the web UI. Agents never do. A ticket,
 story or epic can override it with the metadata keys `receipts` (`off`, `inform`, `require`) and
 `receipts_min_level`. An agent may only make the override stricter; lowering it takes a person in
-the web UI. The drawer says "Requires receipt" when a ticket's effective setting is Require.
+the web UI. Off the web UI an item's own value can only rise or be set for the first time: removing
+it, or lowering it, is refused even where the item's own effective setting wouldn't change, since a
+ticket under it may depend on it. A project created off the web UI can't weaken the org default,
+and a project imported off the web UI comes without the bundle's receipts keys (a person sets
+them). The drawer says "Requires receipt" when a ticket's effective setting is Require.
 
 Changing the setting affects only later completions. Held tickets stay held until a person acts.
 Turn Require on only after an AMP upgrade has finished rolling out: while older and newer servers
@@ -72,4 +76,38 @@ where `verdict` is `pass`, `fail` or `cant_tell`. A completion that comes back `
 done: the worker stops and says why. Older plugins that send no checks keep working in Off and
 Inform projects; under Require their completions are held.
 
-Evidence uploads (screenshots, video) and their playback arrive in the next phase.
+## Evidence: screenshots, video, logs
+
+A `visual` check counts only with evidence: a file the worker uploaded for **this** receipt, on the
+revision it completed. The worker declares its files with
+`amp_add_evidence(receipt_id, dispatch_id, tree_sha, commit?, files: [{name, bytes, sha256, duration_ms?, frames?}])`
+and gets a one-time upload URL for each: an HTTP `PUT` of the bytes, with no auth header, single
+use and valid 15 minutes (`curl -fsS -T screenshot-1.png "<url>"`). It then cites each file's
+`key` as a visual check's `evidence_key`. A visual pass is shown as "can't tell" when:
+
+- its evidence is missing, wasn't uploaded, or belongs to another receipt ("evidence missing");
+- its video recorded no frames ("no frames");
+- it was recorded on another revision than the one completed ("evidence recorded on another
+  revision": both `tree_sha`s are known and differ);
+- the AMP server has no evidence storage ("evidence storage isn't configured").
+
+Allowed names (the server sets the content type from the name): `video.mp4`, `poster.gif`,
+`contact.png`, `screenshot-<n>.png`, `trace.zip`, `har.json`, `receipt.json`, `console.txt`,
+`transcript.txt`. Each file is at most 200 MiB. An upload whose size or sha256 differs from what
+was declared is refused (422) and nothing is stored; calling `amp_add_evidence` again gives a new
+URL. A used URL is gone (404) and an expired one says so (410). A file already stored with the
+same sha256 needs no upload; the same name with different bytes on the same revision is refused.
+
+The drawer plays the video (seeking works), shows screenshots, and links each file for download.
+Only project members who can see the ticket can open them, and they are served so a browser never
+runs them as a page. Evidence is not an artifact: it doesn't appear in Artifacts or the review
+queue.
+
+**Retention.** Evidence of a receipt nobody kept is deleted after 90 days, and the drawer then says
+"Evidence expired on <date>". A ticket's receipts are kept for good once it merges or a person
+accepts it. Deleting a ticket keeps them while it is in the trash; purging it, or resetting the
+project, deletes them. Where the files live: `operations/where-amp-keeps-data.md`.
+
+To try it locally (`make dev`): `scripts/seed-sample-receipt.sh <ready ticket id>` sets that
+ticket's project to Inform, records a 3 s test clip with ffmpeg, uploads it and completes the
+ticket with a visual check citing it.

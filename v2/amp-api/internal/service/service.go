@@ -62,6 +62,9 @@ type Service struct {
 	// (receipt.updated, #126): the REST and MCP handlers point it at their
 	// hub. nil drops them.
 	Notify func(domain.Event)
+	// Evidence is the receipt evidence store (#126; nil: not configured,
+	// so evidence calls are refused and visual checks can't count).
+	Evidence *EvidenceStore
 }
 
 func New(repo *repository.Repo, registry *actor.Registry, kbSvc *kb.Service) *Service {

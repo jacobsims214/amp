@@ -29,6 +29,7 @@ import (
 	"github.com/simstech/amp-api/internal/kb"
 	"github.com/simstech/amp-api/internal/mcp"
 	"github.com/simstech/amp-api/internal/queue"
+	"github.com/simstech/amp-api/internal/receipts"
 	"github.com/simstech/amp-api/internal/relayctl"
 	"github.com/simstech/amp-api/internal/repository"
 	"github.com/simstech/amp-api/internal/reqctx"
@@ -328,6 +329,11 @@ func main() {
 	// in the background, so a slow or unreachable GitHub can never slow a page.
 	mergeFacts := githubFactsCoordinator(repo)
 	mcpTools.SetMergeFacts(mergeFacts)
+	// Verification receipt evidence (#126): the local store under
+	// RECEIPT_DIR. If it can't start, amp-api keeps running: evidence calls
+	// say why, and visual checks can't count.
+	evidence := receiptStoreFromEnv()
+	mcpTools.SetReceiptStore(evidence)
 	mcpSrv := newMCPServer(mcpTools)
 
 	// Token audience (RFC 8707 / MCP 2026-07-28 "token audience binding").
@@ -378,6 +384,7 @@ func main() {
 	restHandler.SetAppURL(appPublicURL())
 	restHandler.SetArtifactRetention(artifactRetention())
 	restHandler.SetMergeFacts(mergeFacts)
+	restHandler.SetReceiptStore(evidence)
 	// ---- 6a. Remote control (epic 165) ----
 	// The relay itself is its own service, amp-relay (cmd/relay): amp-api
 	// serves none of its routes (/relay/, /api/sessions). It keeps the org
@@ -400,7 +407,15 @@ func main() {
 	go restHandler.RunArtifactPurge(context.Background(), time.Hour)
 	// Trash rows (deleted tickets, epics, stories) past the 30-day retention
 	// are deleted. Idempotent, so every replica can run it.
-	go service.New(repo, registry, kbSvc).RunTrashPurge(context.Background(), time.Hour)
+	// It deletes purged tickets' receipt evidence first.
+	trashSvc := service.New(repo, registry, kbSvc)
+	trashSvc.Evidence = evidence
+	go trashSvc.RunTrashPurge(context.Background(), time.Hour)
+	// Unkept receipt evidence past RECEIPT_RETENTION_DAYS is deleted
+	// hourly, on one replica at a time (advisory lock).
+	sweepSvc := service.New(repo, registry, kbSvc)
+	sweepSvc.Evidence = evidence
+	go sweepSvc.RunReceiptSweep(ctx, time.Hour, repo.TryNamedLock)
 
 	// Audit log integrity (#2429): sign each chain's head hourly, and
 	// delete entries past AUDIT_RETENTION_DAYS daily through the anchored
@@ -522,11 +537,14 @@ func envOrDefault(key, def string) string {
 // authExceptHealth applies the auth verifier to every path except /health
 // and /ready, which k8s liveness/readiness probes hit unauthenticated, and
 // GitHub's webhook deliveries (api.GitHubHookPrefix), which carry no AMP
-// session and are authenticated by their HMAC signature instead.
+// session and are authenticated by their HMAC signature instead, and
+// receipt evidence uploads (api.ReceiptUploadPrefix), whose one-time token
+// in the path is the credential.
 func authExceptHealth(v *auth.Verifier, next http.Handler) http.Handler {
 	authed := v.Middleware(next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" || r.URL.Path == "/ready" || strings.HasPrefix(r.URL.Path, api.GitHubHookPrefix) {
+		if r.URL.Path == "/health" || r.URL.Path == "/ready" || strings.HasPrefix(r.URL.Path, api.GitHubHookPrefix) ||
+			strings.HasPrefix(r.URL.Path, api.ReceiptUploadPrefix) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -589,6 +607,30 @@ func appPublicURL() string {
 		return strings.TrimSuffix(strings.TrimSuffix(u, "/"), "/mcp")
 	}
 	return ""
+}
+
+// receiptStoreFromEnv opens the receipt evidence store: RECEIPT_DIR
+// (default data/receipts), RECEIPT_MAX_BYTES (default 200 MiB) and
+// RECEIPT_RETENTION_DAYS (default 90; <= 0 means the default). A store that
+// can't start is logged and left out, never fatal.
+func receiptStoreFromEnv() *service.EvidenceStore {
+	e := &service.EvidenceStore{MaxBytes: receipts.DefaultMaxBytes, Retention: receipts.DefaultRetentionDays * 24 * time.Hour}
+	if n, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("RECEIPT_MAX_BYTES")), 10, 64); err == nil && n > 0 {
+		e.MaxBytes = n
+	}
+	if d, err := strconv.Atoi(strings.TrimSpace(os.Getenv("RECEIPT_RETENTION_DAYS"))); err == nil && d > 0 {
+		e.Retention = time.Duration(d) * 24 * time.Hour
+	}
+	store, err := receipts.New(receipts.Config{Backend: os.Getenv("RECEIPT_STORE"), Dir: os.Getenv("RECEIPT_DIR")})
+	if err != nil {
+		slog.Error("receipt evidence store unavailable: evidence uploads are refused and visual checks can't count", "err", err)
+		e.Err = err.Error()
+		return e
+	}
+	e.Store = store
+	slog.Info("receipt evidence store", "dir", envOrDefault("RECEIPT_DIR", receipts.DefaultDir), "max_bytes", e.MaxBytes,
+		"retention_days", int(e.Retention.Hours()/24))
+	return e
 }
 
 // artifactRetention is how long an artifact lives after its last version
