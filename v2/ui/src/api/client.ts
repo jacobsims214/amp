@@ -4,7 +4,7 @@ import type {
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
-  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, GitHubCredentialInfo, GitHubCredentialChange, Run, Usage, UpstreamDecision, DecisionDoc, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
+  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, GitHubCredentialInfo, GitHubCredentialChange, Run, Usage, UpstreamDecision, DecisionAsk, DecisionDoc, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
   ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork, MyWorkCounts, PeopleWaiting,
 } from '../types'
 import { auditQuery, auditVerifyUrl, type AuditScope } from '../lib/audit'
@@ -331,6 +331,13 @@ export const api = {
   /** A ticket's decision doc with every version and its options (404 without one). */
   getTaskDecision: (taskId: number) =>
     get<DecisionDoc>(`/tasks/${taskId}/decision`),
+  /** A person's edit of a decision doc: its markdown and options as one new
+   *  version, made on base_version (409 when the doc changed meanwhile). */
+  saveDecisionDoc: (taskId: number, body: { base_version: number; content: string; ask: DecisionAsk }) =>
+    put<DecisionDoc>(`/tasks/${taskId}/decision/doc`, body),
+  /** Record decision: freezes the version, completes the ticket, and posts the decision. */
+  recordDecision: (taskId: number, body: { version: number; chosen_option: number | null; decision_text: string }) =>
+    post<DecisionDoc>(`/tasks/${taskId}/decision/record`, body),
   /** Answer an agent's flag (a ticket blocked with a reason): posts the
    *  answer as a comment and puts the ticket back to ready (or waiting). */
   answerFlag: (taskId: number, answer: string) =>

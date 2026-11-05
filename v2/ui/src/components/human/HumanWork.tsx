@@ -7,9 +7,10 @@
  * Everything here comes from the ticket and the project's plan as the API
  * already returns them; dependents are worked out client-side from each
  * ticket's dependency_ids. A judgment ticket with a decision doc shows the
- * DecisionCard (question, options, the doc, Decided means, Mark done) in
- * place of the brief's checklist and Mark done…; it reloads when the doc
- * changes (decision.updated).
+ * DecisionCard (question, options, the doc with its provenance, Decided
+ * means, Edit doc, Record decision) in place of the brief's checklist and
+ * Mark done…; it reloads when the doc changes (decision.updated, and after
+ * the card's own edit or record).
  */
 import { useCallback, useEffect, useState } from 'react'
 import { AlertTriangle, ArrowRight, Pencil, Square, SquareCheck, UserRound } from 'lucide-react'
@@ -68,9 +69,12 @@ export function HumanWork({ task, meId, people, plan, canPlan, onEdit, ticketHre
   const [doc, setDoc] = useState<DecisionDoc | null>(null)
   const loadDoc = useCallback(() => {
     if (!judgment) return
-    api.getTaskDecisions(task.id).then(r => setDoc(r.own)).catch(() => {})
+    // The doc with its versions, for provenance; 404 when it has none.
+    api.getTaskDecision(task.id).then(d => setDoc(d?.artifact_id ? d : null)).catch(() => {})
   }, [judgment, task.id])
   useEffect(() => { loadDoc() }, [loadDoc])
+  // The card's own edit returns the doc with its versions; a record doesn't.
+  const docChanged = useCallback((d: DecisionDoc) => { if (d.versions) setDoc(d); else loadDoc() }, [loadDoc])
   useSSE(task.project_id, e => {
     if (e.type === 'decision.updated' && (e.payload as { task_id?: number } | undefined)?.task_id === task.id) loadDoc()
   })
@@ -155,7 +159,7 @@ export function HumanWork({ task, meId, people, plan, canPlan, onEdit, ticketHre
       )}
 
       {doc
-        ? <DecisionCard task={task} doc={doc} canAct={mine} ownerName={owner?.name} onChanged={onChanged} />
+        ? <DecisionCard task={task} doc={doc} canAct={mine} ownerName={owner?.name} onChanged={onChanged} onDocChanged={docChanged} />
         : <HumanActions task={task} kind="do" canAct={mine} ownerName={owner?.name} onChanged={t => { if (t) onChanged(t) }} />}
     </div>
   )

@@ -321,6 +321,10 @@ func TestHuman_DecisionReachesDependents(t *testing.T) {
 		m := c.(map[string]any)
 		ids[m["ref"].(string)] = int(m["id"].(float64))
 	}
+	// j stands for a judgment ticket without a doc (J3: made before decision
+	// docs, or by a person in the UI), whose owner writes the decision when
+	// marking it done. A ticket with a doc is recorded on it (decisions_test.go).
+	execSQL(t, `DELETE FROM artifacts WHERE id IN (SELECT artifact_id FROM decision_docs WHERE task_id = $1)`, ids["j"])
 	done := func(who string, id int, body map[string]any) (int, map[string]any) {
 		return ra.do(t, who, http.MethodPost, fmt.Sprintf("/api/tasks/%d/complete", id), body)
 	}

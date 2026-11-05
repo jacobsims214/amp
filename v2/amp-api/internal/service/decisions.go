@@ -2,12 +2,14 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
+	"github.com/simstech/amp-api/internal/repository"
 )
 
 // Decision docs (docs/specs/human-decision-docs.md §2, §3): a judgment
@@ -26,7 +28,13 @@ const (
 	decisionReviewRefusal     = "Decision docs are approved and kept by Record decision: %s"
 	decisionRecordedRefusal   = "This decision is recorded and can't change: %s"
 	decisionOptionsRefusal    = "This ticket's options are in its decision doc; the owner edits them in AMP: %s"
-	askOnlyJudgment           = "ask only goes with a judgment ticket (performer \"human\", human_reason \"judgment\")"
+	decisionMarkDoneRefusal   = "Record the decision on its doc: %s"
+	decisionRecordingRefusal  = "This decision is already being recorded: %s"
+	// DecisionStaleRefusal and DecisionCapRefusal are PUT doc's 409s (§3
+	// Editing); the card shows them and keeps the draft.
+	DecisionStaleRefusal = "The doc changed in another tab. Reload to see it"
+	DecisionCapRefusal   = "This doc has 100 versions; record the decision or start a new judgment ticket"
+	askOnlyJudgment      = "ask only goes with a judgment ticket (performer \"human\", human_reason \"judgment\")"
 )
 
 // UpstreamDecisions returns what people decided on the ticket's direct
@@ -332,4 +340,211 @@ func (s *Service) refuseAgentDecision(ctx context.Context, p authz.Principal, ta
 	refusal := authz.Forbidden(decisionPersonOnlyRefusal, s.TaskURL(t.ProjectID, taskID))
 	s.auditTaskDenied(ctx, p, "task.human.complete", t, refusal, map[string]any{"via_agent": viaAgent, "decision_doc": doc.ArtifactID})
 	return refusal
+}
+
+// SaveDecisionDocRequest is a person's edit of a decision doc (PUT
+// /api/tasks/:id/decision/doc): the version it was made on, and the doc's
+// markdown and options, which become one new version.
+type SaveDecisionDocRequest struct {
+	BaseVersion int                 `json:"base_version"`
+	Content     string              `json:"content"`
+	Ask         *domain.DecisionAsk `json:"ask"`
+}
+
+// decisionTask loads a ticket for a decision write: the caller must be able
+// to work it (as for Mark done) and be a person in the web UI (D17). The
+// ticket must have a decision doc.
+func (s *Service) decisionTask(ctx context.Context, p authz.Principal, taskID int, what string) (*domain.Task, *domain.DecisionDoc, string, error) {
+	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskWork)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	link := s.TaskURL(t.ProjectID, taskID)
+	if err := authz.RequireUI(p, fmt.Sprintf(what, taskID), link); err != nil {
+		s.auditTaskDenied(ctx, p, "decision.write", t, err, nil)
+		return nil, nil, "", err
+	}
+	doc, err := s.Repo.GetDecisionDoc(ctx, taskID)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	if doc == nil {
+		return nil, nil, "", authz.NotFound("ticket %d has no decision doc", taskID)
+	}
+	return t, doc, link, nil
+}
+
+// SaveDecisionDoc writes a person's edit of a ticket's decision doc: its
+// markdown and options as one new version (author person), made on
+// base_version. It refuses a recorded (or claimed) doc, invalid options, a
+// stale base and a doc at 100 versions. It returns the doc with its versions.
+func (s *Service) SaveDecisionDoc(ctx context.Context, p authz.Principal, taskID int, req SaveDecisionDocRequest) (*domain.DecisionDoc, error) {
+	t, doc, link, err := s.decisionTask(ctx, p, taskID, "Editing ticket %d's decision doc")
+	if err != nil {
+		return nil, err
+	}
+	if doc.Claimed() {
+		return nil, &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionRecordedRefusal, link)}
+	}
+	if req.Ask == nil {
+		return nil, authz.BadRequest("ask is missing: the doc's question and options")
+	}
+	ask := (&domain.Ask{Question: req.Ask.Question, Options: req.Ask.Options, Recommended: req.Ask.Recommended}).Stored()
+	if err := ask.Validate(); err != nil {
+		return nil, authz.BadRequest("%s", err.Error())
+	}
+	content := []byte(req.Content)
+	if strings.TrimSpace(req.Content) == "" {
+		return nil, authz.BadRequest("the doc's text is empty")
+	}
+	if len(content) > domain.MaxArtifactBytes {
+		return nil, authz.BadRequest("the doc is %d bytes; the limit is %d (10 MB)", len(content), domain.MaxArtifactBytes)
+	}
+	version, err := s.Repo.SaveDecisionVersion(ctx, taskID, req.BaseVersion, content, "text/markdown; charset=utf-8", "Edited in AMP", ask, p.UserRef())
+	switch {
+	case errors.Is(err, repository.ErrDecisionRecorded):
+		return nil, &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionRecordedRefusal, link)}
+	case errors.Is(err, repository.ErrDecisionStale):
+		return nil, &authz.Error{Status: 409, Msg: DecisionStaleRefusal}
+	case errors.Is(err, repository.ErrDecisionVersionCap):
+		return nil, &authz.Error{Status: 409, Msg: DecisionCapRefusal}
+	case errors.Is(err, repository.ErrNoDecisionDoc):
+		return nil, authz.NotFound("ticket %d has no decision doc", taskID)
+	case err != nil:
+		return nil, err
+	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "decision.edit", ProjectID: intRef(t.ProjectID), TargetType: "task", TargetID: idStr(taskID),
+		TargetName: t.Name, Summary: fmt.Sprintf("edited ticket %d's decision doc (artifact #%d v%d)", taskID, doc.ArtifactID, version),
+		Details: map[string]any{"artifact_id": doc.ArtifactID, "version": version, "base_version": req.BaseVersion}})
+	return s.decisionDocFor(ctx, t, true)
+}
+
+// RecordDecisionRequest is Record decision (POST
+// /api/tasks/:id/decision/record): the version decided on, the chosen
+// option's index in that version's options (nil: something else), and the
+// decided text.
+type RecordDecisionRequest struct {
+	Version      int    `json:"version"`
+	ChosenOption *int   `json:"chosen_option"`
+	DecisionText string `json:"decision_text"`
+}
+
+// RecordDecision records a person's decision on a ticket's doc (§3 Record
+// decision) and freezes the version decided on, its markdown and options:
+//
+//  1. who may act (as Mark done, in the web UI only), non-empty text, the
+//     option in range of that version's options, and that the ticket can be
+//     completed now (not blocked, its dependencies done);
+//  2. the claim, under the edit lock (Repo.ClaimDecisionRecord): from here
+//     no doc write succeeds and dependents read the claimed values;
+//  3. the ticket's completion, with one run and one "Decision by" comment
+//     attributed to the decider (finishHumanTask, guarded by
+//     decision_docs.run_id in one transaction);
+//  4. the doc approved at that version and kept, and decided_at set.
+//
+// If step 3 is refused (the ticket can't be completed, a 4xx), the claim is
+// released and the doc is editable again. Any other failure keeps the claim:
+// once it is a minute old a retry finishes with the stored values, whatever
+// it sent. On an error, the returned doc is non-nil exactly when a claim
+// stands, so the caller can tell open drawers.
+func (s *Service) RecordDecision(ctx context.Context, p authz.Principal, taskID int, req RecordDecisionRequest) (*domain.DecisionDoc, error) {
+	if err := s.refuseAgentDecision(ctx, p, taskID, false); err != nil {
+		return nil, err
+	}
+	t, doc, link, err := s.decisionTask(ctx, p, taskID, "Recording ticket %d's decision")
+	if err != nil {
+		return nil, err
+	}
+	text := strings.TrimSpace(req.DecisionText)
+	if text == "" && !doc.Claimed() {
+		return nil, authz.BadRequest("a decision ticket needs your decision: say what you decided")
+	}
+	if doc.DecidedAt != nil {
+		return nil, &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionRecordedRefusal, link)}
+	}
+	notCurrent := func() error {
+		return authz.BadRequest("v%d isn't the doc's current version (v%d); reload it and record again", req.Version, doc.CurrentVersion)
+	}
+	if !doc.Claimed() {
+		if t.State == domain.TaskStateCompleted {
+			return nil, &authz.Error{Status: 409, Msg: fmt.Sprintf("ticket %d is already done; its decision is in its comments: %s", taskID, link)}
+		}
+		if err := s.refuseIncompletable(ctx, t, link); err != nil {
+			return nil, err
+		}
+		v, err := s.Repo.GetArtifactVersion(ctx, doc.ArtifactID, req.Version)
+		if err != nil || req.Version != doc.CurrentVersion {
+			return nil, notCurrent()
+		}
+		if o := req.ChosenOption; o != nil && (v.DecisionAsk == nil || *o < 0 || *o >= len(v.DecisionAsk.Options)) {
+			n := 0
+			if v.DecisionAsk != nil {
+				n = len(v.DecisionAsk.Options)
+			}
+			return nil, authz.BadRequest("chosen_option %d is not one of v%d's %d options; send null for something else", *o, req.Version, n)
+		}
+	}
+	rec, retried, err := s.Repo.ClaimDecisionRecord(ctx, taskID, req.Version, req.ChosenOption, text, p.UserRef())
+	switch {
+	case errors.Is(err, repository.ErrDecisionRecorded):
+		return nil, &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionRecordedRefusal, link)}
+	case errors.Is(err, repository.ErrDecisionBeingRecorded):
+		return nil, &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionRecordingRefusal, link)}
+	case errors.Is(err, repository.ErrDecisionNotCurrent):
+		return nil, notCurrent()
+	case errors.Is(err, repository.ErrNoDecisionDoc):
+		return nil, authz.NotFound("ticket %d has no decision doc", taskID)
+	case err != nil:
+		return nil, err
+	}
+	// The note is built from the stored record, so a retry records what was
+	// claimed: "<option label> — <text>\n<doc link vN>".
+	version := *rec.DecidedVersion
+	note := rec.DecisionText
+	if rec.ChosenOption != nil {
+		if v, err := s.Repo.GetArtifactVersion(ctx, rec.ArtifactID, version); err == nil && v.DecisionAsk != nil {
+			if i := *rec.ChosenOption; i >= 0 && i < len(v.DecisionAsk.Options) {
+				note = v.DecisionAsk.Options[i].Label + " — " + note
+			}
+		}
+	}
+	note += "\n" + s.decisionDocVersionURL(rec.ArtifactID, version)
+	if _, _, err := s.finishHumanTask(ctx, p, t, HumanDone{Note: note}, &decisionFinish{decider: rec.DecidedBy}); err != nil {
+		if st := authz.StatusOf(err, 500); st >= 400 && st < 500 {
+			// The ticket can't be completed: nothing waits on a record that
+			// won't finish, so the claim goes and the doc is editable again.
+			if cur, gerr := s.Repo.GetTask(ctx, taskID); gerr == nil && cur.State != domain.TaskStateCompleted {
+				if rerr := s.Repo.ReleaseDecisionClaim(ctx, taskID); rerr == nil {
+					return nil, err
+				}
+			}
+		}
+		return rec, fmt.Errorf("recording didn't finish (%w); retry in a minute", err)
+	}
+	if err := s.Repo.FinishDecisionRecord(ctx, taskID, rec.DecidedBy); err != nil {
+		return rec, fmt.Errorf("recording didn't finish (%w); retry in a minute", err)
+	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "decision.record", ProjectID: intRef(t.ProjectID), TargetType: "task", TargetID: idStr(taskID),
+		TargetName: t.Name, Summary: fmt.Sprintf("recorded ticket %d's decision on artifact #%d v%d", taskID, rec.ArtifactID, version),
+		Details: map[string]any{"artifact_id": rec.ArtifactID, "version": version, "chosen_option": rec.ChosenOption, "retried": retried}})
+	return s.decisionDocFor(ctx, t, false)
+}
+
+// refuseIncompletable refuses (409) recording a decision on a ticket that
+// can't be completed now: one still waiting on its dependencies, or blocked.
+// Checked before the claim, so a refused record leaves nothing behind.
+func (s *Service) refuseIncompletable(ctx context.Context, t *domain.Task, link string) error {
+	var open []string
+	for _, id := range t.DependencyIDs {
+		if dep, err := s.Repo.GetTask(ctx, id); err == nil && dep.State != domain.TaskStateCompleted {
+			open = append(open, fmt.Sprintf("#%d", id))
+		}
+	}
+	if len(open) > 0 {
+		return &authz.Error{Status: 409, Msg: fmt.Sprintf("ticket %d is waiting on %s; record its decision once they're done: %s", t.ID, strings.Join(open, " "), link)}
+	}
+	if t.State == domain.TaskStateBlocked {
+		return &authz.Error{Status: 409, Msg: fmt.Sprintf("ticket %d is blocked; record its decision once it's unblocked: %s", t.ID, link)}
+	}
+	return nil
 }

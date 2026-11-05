@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -64,7 +65,9 @@ func (s *Service) StartHumanTask(ctx context.Context, p authz.Principal, taskID 
 // as a run (agent_id "human"): their note, a link, and the hours they spent.
 // A human ticket is the person's own gate (a merge, a deploy, a sign-off),
 // so only the person marks it done, in the web UI; an agent recording it
-// for them (viaAgent, over MCP) is refused with the ticket's link.
+// for them (viaAgent, over MCP) is refused with the ticket's link. A
+// judgment ticket with a decision doc is refused too: RecordDecision
+// finishes it.
 func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, taskID int, done HumanDone, viaAgent bool) (*domain.Task, *domain.Run, error) {
 	if err := s.refuseAgentDecision(ctx, p, taskID, viaAgent); err != nil {
 		return nil, nil, err
@@ -84,6 +87,35 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 		s.auditTaskDenied(ctx, p, "task.human.complete", t, err, map[string]any{"via_agent": viaAgent})
 		return nil, nil, err
 	}
+	// A ticket with a decision doc is finished by Record decision, which
+	// freezes the version its dependents receive; Mark done would skip that.
+	doc, err := s.Repo.GetDecisionDoc(ctx, taskID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if doc != nil {
+		return nil, nil, &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionMarkDoneRefusal, s.TaskURL(t.ProjectID, taskID))}
+	}
+	return s.finishHumanTask(ctx, p, t, done, nil)
+}
+
+// decisionFinish is what Record decision passes to finishHumanTask: who
+// decided (the stored decided_by), to whom the run and the comment are
+// attributed even when someone else finishes a stalled record.
+type decisionFinish struct {
+	decider *int
+}
+
+// finishHumanTask completes a person's human ticket and records their run
+// and the note's comment. Its callers have checked who may act. For Record
+// decision (rec), the run is written and decision_docs.run_id set in one
+// transaction, only while run_id is unset (Repo.AddDecisionRun), and the
+// comment is posted only by the call that wrote the run: a retry of a record
+// that stopped part way completes the ticket again (a no-op) without a second
+// run or comment. Its actor refusals come back as 409s (the ticket can't be
+// completed), which RecordDecision tells apart from transient failures.
+func (s *Service) finishHumanTask(ctx context.Context, p authz.Principal, t *domain.Task, done HumanDone, rec *decisionFinish) (*domain.Task, *domain.Run, error) {
+	taskID := t.ID
 	if h := done.HoursWorked; h != nil && (*h < 0 || *h > 1000) {
 		return nil, nil, authz.BadRequest("hours_worked must be between 0 and 1000")
 	}
@@ -92,6 +124,11 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 	if decision && note == "" {
 		return nil, nil, authz.BadRequest("a decision ticket needs your decision: say what you decided")
 	}
+	if rec != nil && s.DecisionCompleteFault != nil {
+		if err := s.DecisionCompleteFault(taskID); err != nil {
+			return nil, nil, err
+		}
+	}
 	pid, err := s.Registry.Get(t.ProjectID)
 	if err != nil {
 		return nil, nil, err
@@ -99,14 +136,39 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 	replyCh := make(chan actor.ReplyComplete, 1)
 	s.Registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: taskID, By: p.UserRef(), ByName: p.Label(), InUI: p.InUI(), ReplyCh: replyCh})
 	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
+		if rec != nil && !errors.Is(reply.Err, actor.ErrNoReply) {
+			return nil, nil, &authz.Error{Status: 409, Msg: reply.Err.Error()}
+		}
 		return nil, nil, reply.Err
 	}
-	run, err := s.recordRun(ctx, p, t, domain.Run{
+	runIn := domain.Run{
 		AgentID: domain.HumanAgentID, Outcome: domain.RunCompleted,
 		PRURL: strings.TrimSpace(done.PRURL), Note: note, HoursWorked: done.HoursWorked,
-	})
-	if err != nil {
-		return nil, nil, err
+	}
+	var run domain.Run
+	name := ""
+	if rec != nil {
+		if s.DecisionRunFault != nil {
+			if err := s.DecisionRunFault(taskID); err != nil {
+				return nil, nil, err
+			}
+		}
+		runIn.TaskID, runIn.ProjectID, runIn.UserID = t.ID, t.ProjectID, rec.decider
+		var wrote bool
+		if run, wrote, err = s.Repo.AddDecisionRun(ctx, taskID, runIn); err != nil {
+			return nil, nil, err
+		}
+		if !wrote {
+			// Another attempt wrote the run and posts the comment.
+			updated, err := s.Repo.GetTask(ctx, taskID)
+			return updated, nil, err
+		}
+		name = s.userNameOr(ctx, rec.decider, p)
+	} else {
+		if run, err = s.recordRun(ctx, p, t, runIn); err != nil {
+			return nil, nil, err
+		}
+		name = s.personName(ctx, p)
 	}
 	// A person's ticket is their gate (a merge, a deploy, a sign-off): who
 	// marked it done, and from where, belongs in the audit log.
@@ -167,7 +229,7 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 		if decision {
 			verb = "Decision"
 		}
-		s.comment(t.ProjectID, taskID, p, fmt.Sprintf("%s by %s: %s", verb, s.personName(ctx, p), note))
+		s.comment(t.ProjectID, taskID, p, fmt.Sprintf("%s by %s: %s", verb, name, note))
 	}
 	updated, err := s.Repo.GetTask(ctx, taskID)
 	if err != nil {
@@ -183,8 +245,14 @@ func isDecisionReason(reason string) bool { return reason == "judgment" || reaso
 // personName is how a person is named in a comment: their display name, else
 // their email.
 func (s *Service) personName(ctx context.Context, p authz.Principal) string {
-	if p.HasUser() {
-		if u, err := s.Repo.GetUserByID(ctx, p.UserID); err == nil && u != nil {
+	return s.userNameOr(ctx, p.UserRef(), p)
+}
+
+// userNameOr is how user id is named in a comment: their display name, else
+// their email; p's label when id is nil or unknown.
+func (s *Service) userNameOr(ctx context.Context, id *int, p authz.Principal) string {
+	if id != nil {
+		if u, err := s.Repo.GetUserByID(ctx, *id); err == nil && u != nil {
 			if u.DisplayName != "" {
 				return u.DisplayName
 			}

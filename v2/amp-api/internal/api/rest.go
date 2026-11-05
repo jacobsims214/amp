@@ -1509,16 +1509,57 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 	case "decision":
 		// GET: the ticket's decision doc: the current version's options and
 		// markdown, and every version with its options. 404 without one.
-		if r.Method != http.MethodGet || len(parts) != 2 {
-			http.Error(w, "GET required", 405)
-			return
+		// PUT /decision/doc {base_version, content, ask}: a person's edit,
+		// one new version. POST /decision/record {version, chosen_option,
+		// decision_text}: Record decision. Both are the web UI's only.
+		switch {
+		case r.Method == http.MethodGet && len(parts) == 2:
+			doc, err := h.svc.GetDecision(r.Context(), pr, taskID)
+			if err != nil {
+				fail(w, err, 500)
+				return
+			}
+			jsonOK(w, doc)
+		case r.Method == http.MethodPut && len(parts) == 3 && parts[2] == "doc":
+			var req service.SaveDecisionDocRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				jsonErr(w, err, 400)
+				return
+			}
+			doc, err := h.svc.SaveDecisionDoc(r.Context(), pr, taskID, req)
+			if err != nil {
+				fail(w, err, 500)
+				return
+			}
+			h.publishDecision(task.ProjectID, taskID, doc.CurrentVersion)
+			h.publishDecisionArtifact(r, doc.ArtifactID)
+			jsonOK(w, doc)
+		case r.Method == http.MethodPost && len(parts) == 3 && parts[2] == "record":
+			var req service.RecordDecisionRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				jsonErr(w, err, 400)
+				return
+			}
+			doc, err := h.svc.RecordDecision(r.Context(), pr, taskID, req)
+			if err != nil {
+				if doc != nil && doc.DecidedVersion != nil {
+					// The record claimed and then stopped: dependents already
+					// read the claim, and open drawers should show the retry.
+					h.publishDecision(task.ProjectID, taskID, *doc.DecidedVersion)
+				}
+				fail(w, err, 500)
+				return
+			}
+			version := doc.CurrentVersion
+			if doc.DecidedVersion != nil {
+				version = *doc.DecidedVersion
+			}
+			h.publishDecision(task.ProjectID, taskID, version)
+			h.publishDecisionArtifact(r, doc.ArtifactID)
+			jsonOK(w, doc)
+		default:
+			http.Error(w, "method not allowed", 405)
 		}
-		doc, err := h.svc.GetDecision(r.Context(), pr, taskID)
-		if err != nil {
-			fail(w, err, 500)
-			return
-		}
-		jsonOK(w, doc)
 
 	case "runs":
 		if r.Method == http.MethodPost {
@@ -1824,6 +1865,14 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 func (h *RestHandler) publishDecision(projectID, taskID, version int) {
 	h.hub.Publish(domain.Event{Type: domain.EventDecisionUpdated, ProjectID: projectID,
 		Payload: map[string]any{"task_id": taskID, "version": version}, At: time.Now()})
+}
+
+// publishDecisionArtifact tells an open artifact page its decision doc
+// changed (a new version, or approved by Record decision).
+func (h *RestHandler) publishDecisionArtifact(r *http.Request, artifactID int) {
+	if a, err := h.repo.GetArtifact(r.Context(), artifactID); err == nil {
+		h.publishArtifactEvent(a)
+	}
 }
 
 func taskActionFor(method, sub string) authz.TaskAction {

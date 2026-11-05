@@ -150,11 +150,28 @@ on them.
   why. AMP drafts the ticket's decision doc from it (a markdown artifact, kept, never expiring).
   The ticket panel shows it as a card: the **Question**, the **Options** with the recommended one
   marked **Recommended** (nothing is chosen for you), **Something else**, the doc's context,
-  trade-offs and reasoning, and **Decided means** (the acceptance criteria). Pick an option (or
-  **Accept recommendation**), write **Your decision** and click **Mark done**: the note is
-  "<option> — <your decision>", posted and passed on as above. The doc changes only in AMP: an
-  agent can't publish to it, approve or unkeep it, or mark the ticket done. A judgment ticket you
-  make yourself in the web UI has no doc; you write your decision when you mark it done.
+  trade-offs and reasoning, and **Decided means** (the acceptance criteria).
+  - **Who wrote what.** The agent's lines and options have a coloured rule on the left and an
+    "Agent" tag when you hover; the lines and options you changed have no mark.
+  - **Edit doc** opens the doc's markdown (with a preview) and the option editor: 2 to 4 options,
+    each with a label and what it costs, and which one is recommended. **Save** writes both as one
+    new version. If the doc changed in another tab meanwhile, your draft stays and AMP says "The
+    doc changed in another tab. Reload to see it". A doc keeps at most 100 versions.
+  - **Record decision.** Pick an option (or **Accept recommendation**, or **Something else**),
+    write **Your decision** and click **Record decision**. AMP freezes the version you decided on
+    (its text and its options), approves and keeps it, marks the ticket done and posts "Decision
+    by <name>: <option> — <your decision>" with a link to that version. The tickets that wait on
+    it receive the option as it reads on that version, your text and the version number. Mark
+    done isn't offered on a ticket with a doc. If recording stops part way, the card says
+    "Recording didn't finish" after a minute; **Retry** finishes it with what you sent.
+  - **After recording** the card reads "Decided by <name> · vN · <date>" and the doc is
+    read-only. There is no reopening: to change your mind, plan a new judgment ticket that depends
+    on this one and says what it supersedes.
+
+  The doc changes only in AMP, and only its owner changes it, in the web UI: an agent can't
+  publish to it, edit it, approve or unkeep it, or record the decision (it is told "Only a person
+  records a decision, in AMP: <link>"). A judgment ticket you make yourself in the web UI has no
+  doc; you write your decision when you mark it done.
 - **It's never flagged as quiet.** People work in days, not the minutes an agent takes. It shows as
   **stale** after two days with no activity.
 
@@ -226,7 +243,7 @@ recorded by github") and no run is recorded for its owner.
     instructions**, names who to ask, and offers **Edit** to whoever can change the plan;
   - **Unblocks N**: the open tickets that depend on it, each a link, or **Nothing waits on this**;
   - for its owner, **Start** and **Mark done…**; on a judgment ticket with a decision doc, the
-    decision card in place of the checklist and Mark done….
+    decision card (Edit doc, Record decision) in place of the checklist and Mark done….
 - **Artifacts:** the **Decisions** filter lists recorded decision docs.
 
   The rules (agents never pick it up or mark it done) are in the heading's tooltip.

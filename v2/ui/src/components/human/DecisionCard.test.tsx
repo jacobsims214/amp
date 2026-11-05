@@ -1,8 +1,10 @@
 // DecisionCard (docs/specs/human-decision-docs.md §5): the recommended badge,
-// Accept recommendation, Something else, Mark done's note, and Decided means.
+// Accept recommendation, Something else, Decided means, Record decision, Edit
+// doc (a 409 keeps the draft), provenance marks, and the read-only state.
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, useState } from 'react'
 import { DecisionCard } from './DecisionCard'
 import type { DecisionDoc, Task } from '../../types'
 
@@ -28,9 +30,18 @@ const doc: DecisionDoc = {
   decided_version: null, chosen_option: null, decided_by: null, recording_started_at: null, decided_at: null,
 }
 
-const { done } = vi.hoisted(() => ({ done: vi.fn() }))
-vi.mock('../../api/client', () => ({ api: { completeHumanTask: done, startHumanTask: vi.fn() } }))
-beforeEach(() => { done.mockReset(); done.mockResolvedValue(task({ state: 'completed' })) })
+const { done, save, getTask, getDoc } = vi.hoisted(() => ({ done: vi.fn(), save: vi.fn(), getTask: vi.fn(), getDoc: vi.fn() }))
+vi.mock('../../api/client', () => ({ api: { recordDecision: done, saveDecisionDoc: save, getTask, getTaskDecision: getDoc, startHumanTask: vi.fn() } }))
+beforeEach(() => {
+  done.mockReset(); save.mockReset(); getTask.mockReset(); getDoc.mockReset()
+  done.mockResolvedValue({ ...doc, decided_version: 2, chosen_option: 1, decided_at: '2026-11-04T12:00:00Z' })
+  getTask.mockResolvedValue(task({ state: 'completed' }))
+})
+
+const recorded: DecisionDoc = {
+  ...doc, decided_version: 2, chosen_option: 1, decision_text: 'Go with B; keep trial at 14 days', decided_by: 9,
+  decided_by_name: 'Jacob', recording_started_at: '2026-11-04T12:00:00Z', decided_at: '2026-11-04T12:00:05Z',
+}
 
 describe('DecisionCard', () => {
   it('shows the question and options, with the badge on the recommended one and nothing chosen', () => {
@@ -57,44 +68,158 @@ describe('DecisionCard', () => {
     await userEvent.click(screen.getByRole('button', { name: /accept recommendation/i }))
     expect(screen.getAllByRole('radio')[1]).toBeChecked()
     expect(screen.getByLabelText('Your decision')).toHaveValue('B: Activation rate (40%, floor 30%)')
-    expect(done).not.toHaveBeenCalled() // the person still clicks Mark done
+    expect(done).not.toHaveBeenCalled() // the person still clicks Record decision
   })
 
-  it('Mark done sends "<option label> — <decision text>"', async () => {
-    const onChanged = vi.fn()
-    render(<DecisionCard task={task()} doc={doc} canAct onChanged={onChanged} />)
+  it('Record decision sends the current version, the chosen option and the text', async () => {
+    const onChanged = vi.fn(), onDocChanged = vi.fn()
+    render(<DecisionCard task={task()} doc={doc} canAct onChanged={onChanged} onDocChanged={onDocChanged} />)
+    expect(screen.queryByRole('button', { name: /mark done/i })).toBeNull()
     await userEvent.click(screen.getAllByRole('radio')[1])
     await userEvent.type(screen.getByLabelText('Your decision'), 'Go with B; keep trial at 14 days')
-    await userEvent.click(screen.getByRole('button', { name: /mark done/i }))
-    await waitFor(() => expect(onChanged).toHaveBeenCalled())
-    expect(done).toHaveBeenCalledWith(34, { note: 'B: Activation rate (40%, floor 30%) — Go with B; keep trial at 14 days' })
+    await userEvent.click(screen.getByRole('button', { name: /record decision/i }))
+    await waitFor(() => expect(onChanged).toHaveBeenCalledWith(expect.objectContaining({ state: 'completed' })))
+    expect(done).toHaveBeenCalledWith(34, { version: 2, chosen_option: 1, decision_text: 'Go with B; keep trial at 14 days' })
+    expect(onDocChanged).toHaveBeenCalledWith(expect.objectContaining({ decided_version: 2 }))
   })
 
-  it('Something else sends the decision text alone', async () => {
+  it('Something else records no option, the text alone', async () => {
     const onChanged = vi.fn()
     render(<DecisionCard task={task()} doc={doc} canAct onChanged={onChanged} />)
     await userEvent.click(screen.getByRole('radio', { name: 'Something else' }))
     await userEvent.type(screen.getByLabelText('Your decision'), 'Retention, but measured weekly')
-    await userEvent.click(screen.getByRole('button', { name: /mark done/i }))
+    await userEvent.click(screen.getByRole('button', { name: /record decision/i }))
     await waitFor(() => expect(onChanged).toHaveBeenCalled())
-    expect(done).toHaveBeenCalledWith(34, { note: 'Retention, but measured weekly' })
+    expect(done).toHaveBeenCalledWith(34, { version: 2, chosen_option: null, decision_text: 'Retention, but measured weekly' })
   })
 
-  it('needs an option and the decision text before Mark done', async () => {
+  it('needs an option and the decision text before Record decision', async () => {
     render(<DecisionCard task={task()} doc={doc} canAct />)
     await userEvent.type(screen.getByLabelText('Your decision'), 'B')
-    await userEvent.click(screen.getByRole('button', { name: /mark done/i }))
+    await userEvent.click(screen.getByRole('button', { name: /record decision/i }))
     expect(screen.getByRole('alert')).toHaveTextContent('Pick an option, or Something else')
     await userEvent.click(screen.getAllByRole('radio')[0])
     await userEvent.clear(screen.getByLabelText('Your decision'))
-    await userEvent.click(screen.getByRole('button', { name: /mark done/i }))
+    await userEvent.click(screen.getByRole('button', { name: /record decision/i }))
     expect(screen.getByRole('alert')).toHaveTextContent('Write what you decided')
     expect(done).not.toHaveBeenCalled()
   })
 
+  it('Edit doc saves the markdown and the options as one version on the current base', async () => {
+    const onDocChanged = vi.fn()
+    save.mockResolvedValue({ ...doc, current_version: 3 })
+    render(<DecisionCard task={task()} doc={doc} canAct onDocChanged={onDocChanged} />)
+    await userEvent.click(screen.getByRole('button', { name: /edit doc/i }))
+    const label = screen.getByLabelText('Option 2 label')
+    await userEvent.clear(label)
+    await userEvent.type(label, 'B: Activation rate (45%, floor 30%)')
+    await userEvent.type(screen.getByLabelText('Doc text'), 'Trial stays at 14 days.')
+    await userEvent.click(screen.getByRole('button', { name: /^save$/i }))
+    await waitFor(() => expect(onDocChanged).toHaveBeenCalled())
+    const [id, body] = save.mock.calls[0]
+    expect(id).toBe(34)
+    expect(body.base_version).toBe(2)
+    expect(body.content).toBe(doc.text + 'Trial stays at 14 days.')
+    expect(body.ask.options[1]).toEqual({ label: 'B: Activation rate (45%, floor 30%)', consequence: 'Needs the onboarding event (#41)' })
+    expect(body.ask.recommended).toBe(1)
+    expect(screen.queryByTestId('decision-editor')).toBeNull()
+  })
+
+  it('a 409 on save keeps the draft and says the doc changed', async () => {
+    save.mockRejectedValue(Object.assign(new Error('The doc changed in another tab. Reload to see it'), { status: 409 }))
+    render(<DecisionCard task={task()} doc={doc} canAct />)
+    await userEvent.click(screen.getByRole('button', { name: /edit doc/i }))
+    await userEvent.type(screen.getByLabelText('Doc text'), 'My careful edit.')
+    await userEvent.click(screen.getByRole('button', { name: /^save$/i }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('The doc changed in another tab. Reload to see it')
+    expect(screen.getByLabelText('Doc text')).toHaveValue(doc.text + 'My careful edit.')
+  })
+
+  it('the option editor keeps 2 to 4 options and checks them before saving', async () => {
+    render(<DecisionCard task={task()} doc={doc} canAct />)
+    await userEvent.click(screen.getByRole('button', { name: /edit doc/i }))
+    await userEvent.click(screen.getByRole('button', { name: /add option/i }))
+    expect(screen.getAllByTestId('option-row')).toHaveLength(4)
+    expect(screen.queryByRole('button', { name: /add option/i })).toBeNull()
+    await userEvent.click(screen.getByRole('button', { name: /^save$/i }))
+    expect(screen.getByRole('alert')).toHaveTextContent('Option 4 needs a label')
+    await userEvent.click(screen.getByRole('button', { name: 'Remove option 4' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Remove option 3' }))
+    expect(screen.getByRole('button', { name: 'Remove option 2' })).toBeDisabled()
+    expect(save).not.toHaveBeenCalled()
+  })
+
+  it('marks the agent\'s lines and options, not the owner\'s', () => {
+    const opts = doc.ask!
+    const v1 = { version: 1, author_kind: 'agent' as const, text: 'Agent context.\n\nAgent reason.', ask: opts, created_by: 1, created_at: '' }
+    const v2 = {
+      version: 2, author_kind: 'person' as const, text: 'Agent context.\n\nOwner addition.', created_by: 9, created_at: '',
+      ask: { ...opts, options: opts.options.map((o, i) => i === 1 ? { ...o, label: 'B: tighter' } : o) },
+    }
+    render(<DecisionCard task={task()} doc={{ ...doc, text: v2.text, ask: v2.ask, author_kind: 'person', versions: [v1, v2] }} canAct />)
+    const runs = screen.getAllByTestId('doc-run')
+    expect(runs.map(r => [r.dataset.author, r.textContent?.replace(/Agent$/, '').trim()])).toEqual([['agent', 'Agent context.'], ['person', 'Owner addition.']])
+    expect(runs[0]).toHaveAttribute('title', 'Agent')
+    expect(screen.getAllByTestId('option').map(o => o.dataset.author)).toEqual(['agent', 'person', 'agent'])
+  })
+
+  it('is read-only after the decision is recorded', () => {
+    render(<DecisionCard task={task({ state: 'completed' })} doc={recorded} canAct />)
+    expect(screen.getByTestId('decision-recorded')).toHaveTextContent('Decided by Jacob · v2')
+    expect(screen.getByTestId('decision-recorded')).toHaveTextContent('Go with B; keep trial at 14 days')
+    expect(screen.queryByRole('button', { name: /edit doc/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /record decision/i })).toBeNull()
+    expect(screen.queryByLabelText('Your decision')).toBeNull()
+    for (const r of screen.getAllByRole('radio')) expect(r).toBeDisabled()
+    expect(screen.getAllByRole('radio')[1]).toBeChecked()
+  })
+
+  it('a record that did not finish is retried with the stored values once its claim is a minute old', async () => {
+    const claimed = { ...recorded, decided_at: null, recording_started_at: '2026-11-04T12:00:00Z' }
+    const { unmount } = render(<DecisionCard task={task()} doc={claimed} canAct now={() => Date.parse('2026-11-04T12:00:30Z')} />)
+    expect(screen.getByTestId('decision-recording')).toHaveTextContent('Being recorded')
+    expect(screen.queryByRole('button', { name: /retry/i })).toBeNull()
+    unmount()
+    render(<DecisionCard task={task()} doc={claimed} canAct now={() => Date.parse('2026-11-04T12:02:00Z')} />)
+    expect(screen.getByTestId('decision-recording')).toHaveTextContent("Recording didn't finish.")
+    await userEvent.click(screen.getByRole('button', { name: /retry/i }))
+    expect(done).toHaveBeenCalledWith(34, { version: 2, chosen_option: 1, decision_text: 'Go with B; keep trial at 14 days' })
+  })
+
+  describe('a record that stops after its claim', () => {
+    beforeEach(() => { vi.useFakeTimers({ shouldAdvanceTime: true }) })
+    afterEach(() => { vi.useRealTimers() })
+
+    it('reloads into "Being recorded", then offers Retry once the claim is a minute old', async () => {
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+      done.mockRejectedValueOnce(Object.assign(new Error("recording didn't finish (disk on fire); retry in a minute"), { status: 500 }))
+      getDoc.mockImplementation(async () => ({
+        ...doc, decided_version: 2, chosen_option: 1, decision_text: 'Go with B', decided_by: 9,
+        recording_started_at: new Date(Date.now()).toISOString(), decided_at: null,
+      }))
+      function Harness() {
+        const [d, setD] = useState(doc)
+        return <DecisionCard task={task()} doc={d} canAct onDocChanged={setD} />
+      }
+      render(<Harness />)
+      await user.click(screen.getAllByRole('radio')[1])
+      await user.type(screen.getByLabelText('Your decision'), 'Go with B')
+      await user.click(screen.getByRole('button', { name: /record decision/i }))
+      expect(await screen.findByTestId('decision-recording')).toHaveTextContent('Being recorded')
+      expect(screen.queryByLabelText('Your decision')).toBeNull()
+      expect(screen.queryByRole('button', { name: /retry/i })).toBeNull()
+      await act(async () => { vi.advanceTimersByTime(61_000) })
+      expect(screen.getByTestId('decision-recording')).toHaveTextContent("Recording didn't finish.")
+      done.mockResolvedValueOnce({ ...doc, decided_version: 2, chosen_option: 1, decided_at: new Date().toISOString() })
+      await user.click(screen.getByRole('button', { name: /retry/i }))
+      expect(done).toHaveBeenLastCalledWith(34, { version: 2, chosen_option: 1, decision_text: 'Go with B' })
+    })
+  })
+
   it('is read-only for someone else, and says who decides', () => {
     render(<DecisionCard task={task()} doc={doc} canAct={false} ownerName="Jacob" />)
-    expect(screen.queryByRole('button', { name: /mark done/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /record decision/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /edit doc/i })).toBeNull()
     for (const r of screen.getAllByRole('radio')) expect(r).toBeDisabled()
     expect(screen.getByText('Only Jacob decides this.')).toBeInTheDocument()
   })

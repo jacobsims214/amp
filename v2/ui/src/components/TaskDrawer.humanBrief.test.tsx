@@ -42,6 +42,7 @@ const server = setupServer(
   http.get('*/api/tasks/:id/runs', () => HttpResponse.json({ runs: [], usage: { runs: 0 } })),
   http.get('*/api/projects/2/artifacts', () => HttpResponse.json({ artifacts: [] })),
   http.get('*/api/tasks/:id/decisions', () => HttpResponse.json({ upstream, own: null })),
+  http.get('*/api/tasks/:id/decision', () => HttpResponse.json({ error: 'ticket has no decision doc' }, { status: 404 })),
   http.get('*/api/*', () => HttpResponse.json({})),
 )
 class FakeEventSource { onmessage = null; onerror = null; addEventListener() {} removeEventListener() {} close() {} }
