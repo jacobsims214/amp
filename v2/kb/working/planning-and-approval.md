@@ -16,6 +16,12 @@ Your manager agent turns what you ask for into epics, stories and tickets:
    approval link (`approve_url` from `amp_check_plan`, which opens your My work tab), and stops
    until you've approved them in the web UI.
 
+You can also plan by hand on the **Board**: **+ Epic** in the header (on an empty board,
+**Create your first epic**), then **+ Story** on an epic and **+ Task** on a story. An epic with
+no stories and a story with no tickets show those buttons in full; once they have some, the
+same action is the **+** icon on the row, next to **⋯** (edit or delete), and both say what
+they do on hover.
+
 Good tickets:
 - **One thing each.** If it needs "and" to describe it, split it.
 - **Say the outcome, not the code.** Exact values that matter (a path, a config key) are fine; a
