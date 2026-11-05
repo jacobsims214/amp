@@ -6,6 +6,7 @@ import type {
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
   Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, GitHubCredentialInfo, GitHubCredentialChange, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
   ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork, MyWorkCounts, PeopleWaiting,
+  ReceiptsMode, ReceiptMinLevel, ReceiptSummary, ReceiptView, TaskReceipt,
 } from '../types'
 import { auditQuery, auditVerifyUrl, type AuditScope } from '../lib/audit'
 
@@ -91,7 +92,7 @@ const userRef = (user: string | number) => String(user)
 export const api = {
   listProjects: () => get<{ projects: Project[] }>('/projects').then(r => r.projects),
   getProject: (id: number) => get<{ project: Project }>(`/projects/${id}`).then(r => r.project),
-  updateProjectSettings: (id: number, settings: { name?: string; description?: string; open_reassign?: boolean; require_plan_approval?: boolean; require_merge?: boolean; not_started_flag_minutes?: number; not_started_return_minutes?: number; metadata?: Record<string, string | number | boolean | null> }) =>
+  updateProjectSettings: (id: number, settings: { name?: string; description?: string; open_reassign?: boolean; require_plan_approval?: boolean; require_merge?: boolean; not_started_flag_minutes?: number; not_started_return_minutes?: number; receipts_mode?: '' | ReceiptsMode; receipts_min_level?: ReceiptMinLevel; metadata?: Record<string, string | number | boolean | null> }) =>
     patch<{ project: Project }>(`/projects/${id}`, settings).then(r => r.project),
   createProject: (req: CreateProjectRequest) => post<Project>('/projects', req),
   archiveProject: (id: number) => post<Project>(`/projects/${id}/archive`),
@@ -316,8 +317,22 @@ export const api = {
    *  timeout; this is the earlier, knowing version. */
   returnTask: (taskId: number, reason: string) =>
     post<{ task: Task }>(`/tasks/${taskId}/return`, { reason }).then(r => r.task),
+  /** Completes an agent ticket; where the project requires a receipt, a
+   *  completion below its minimum comes back held (with why) instead. */
   completeTask: (taskId: number) =>
-    post(`/tasks/${taskId}/complete`),
+    post<{ task_id: number; state: string; held?: boolean; reason?: string }>(`/tasks/${taskId}/complete`),
+
+  // Verification receipts (#126)
+  getTaskReceipt: (taskId: number) => get<TaskReceipt>(`/tasks/${taskId}/receipt`),
+  listTaskReceipts: (taskId: number) =>
+    get<{ receipts: ReceiptView[] | null }>(`/tasks/${taskId}/receipts`).then(r => r.receipts ?? []),
+  /** A person accepts the ticket's latest receipt (a held ticket completes). */
+  acceptReceipt: (taskId: number, note?: string) => post<ReceiptView>(`/tasks/${taskId}/receipt/accept`, { note: note ?? '' }),
+  /** A person rejects it, with a note (a held ticket goes back to ready). */
+  rejectReceipt: (taskId: number, note: string) => post<ReceiptView>(`/tasks/${taskId}/receipt/reject`, { note }),
+  receiptSummary: (projectId: number) => get<ReceiptSummary>(`/projects/${projectId}/receipts/summary`),
+  setOrgReceiptsMode: (orgId: number, mode: ReceiptsMode) =>
+    put<{ mode: ReceiptsMode; org: Org }>(`/orgs/${orgId}/receipts`, { mode }).then(r => r.org),
   /** A person starts their own human ticket. */
   startHumanTask: (taskId: number) =>
     post<{ task: Task }>(`/tasks/${taskId}/start`).then(r => r.task),

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sort"
 	"strings"
@@ -128,6 +129,9 @@ func (s *Service) CreateTask(ctx context.Context, p authz.Principal, req domain.
 	req.EpicID = story.EpicID
 	if strings.TrimSpace(req.Name) == "" {
 		return nil, nil, authz.BadRequest("name is required")
+	}
+	if err := s.GuardReceiptsCreate(ctx, p, "story", story.ID, req.Metadata); err != nil {
+		return nil, nil, err
 	}
 	if req.DependencyIDs, err = s.ValidateDependencies(ctx, req.ProjectID, 0, req.DependencyIDs); err != nil {
 		return nil, nil, err
@@ -281,6 +285,9 @@ func (s *Service) MoveTask(ctx context.Context, p authz.Principal, taskID, story
 	if story.ID == t.StoryID {
 		return t, nil
 	}
+	if err := s.GuardReceiptsMoveTask(ctx, p, t, story); err != nil {
+		return nil, err
+	}
 	pid, err := s.Registry.Get(t.ProjectID)
 	if err != nil {
 		return nil, err
@@ -303,6 +310,9 @@ func (s *Service) MoveStory(ctx context.Context, p authz.Principal, storyID, epi
 	}
 	if epic.ID == story.EpicID {
 		return story, nil
+	}
+	if err := s.GuardReceiptsMoveStory(ctx, p, story, epic); err != nil {
+		return nil, err
 	}
 	pid, err := s.Registry.Get(story.ProjectID)
 	if err != nil {
@@ -1217,6 +1227,10 @@ func (s *Service) deleteTickets(ctx context.Context, p authz.Principal, projectI
 	}
 	s.Registry.System().Root.Send(pid, msg)
 	actor.Await(ctx, replyCh)
+	// Deleted tickets wait on nobody (#126).
+	if err := s.Repo.ClearTasksHeld(ctx, ids); err != nil {
+		slog.Warn("clear held receipts on delete", "task_ids", ids, "err", err)
+	}
 	s.ReconcileDependents(ctx, projectID, dependents, ids)
 	var kept []int
 	gone := map[int]bool{}

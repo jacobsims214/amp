@@ -25,6 +25,7 @@ import { useProjectPeople } from '../hooks/useProjectPeople'
 import { ProjectNav } from '../components/ProjectNav'
 import { TaskDrawer } from '../components/TaskDrawer'
 import { Panel, Readouts } from '../components/ui/PageHeader'
+import { useReceiptSummary } from '../hooks/useReceiptSummary'
 import { StateBar, StateDot } from '../components/ui/StateTag'
 import { Avatar } from '../components/ui/Avatar'
 import { PriorityMark } from '../components/ui/PriorityMark'
@@ -264,6 +265,12 @@ export function Mission() {
     return () => { clearTimeout(t); stop?.() }
   }, [tasks, loadWaiting])
   const mergeNeeded = useMemo(() => tasks.filter(needsMerge).length, [tasks])
+  // Verification receipts (#126): completed agent tickets whose receipt is
+  // unverified. Held ones are in "Waiting on you" (the server's verify kind).
+  const receipts = useReceiptSummary(pid)
+  const unverified = useMemo(() => tasks.filter(t => t.state === 'completed' && !isHuman(t) &&
+    receipts.byTask.get(t.id)?.status === 'unverified').length, [tasks, receipts.byTask])
+  const receiptsOn = !!receipts.summary && receipts.summary.mode !== 'off'
   const mine = useMemo(() => ticketsWaitingOn(waiting.find(p => p.user_id === me?.user_id)), [waiting, me?.user_id])
   const waitingPeople = useMemo(() => panelOrder(waiting, me?.user_id), [waiting, me?.user_id])
   const flying = useMemo(() => tasks.filter(t => t.state === 'in_progress')
@@ -316,7 +323,9 @@ export function Mission() {
           { label: 'Merge needed', value: mergeNeeded, color: mergeNeeded ? 'var(--teal)' : undefined,
             sub: yours ? `${yours.merge} yours` : mergeNeeded ? 'dependents wait on them' : 'none' },
           { label: 'Done', value: <>{counts.done}<span className="text-[13px] text-ink-3">/{tasks.length}</span></>,
-            sub: tasks.length ? `${Math.round(counts.done / tasks.length * 100)}% of the plan` : 'no tickets yet' },
+            sub: receiptsOn || unverified
+              ? `${unverified} unverified`
+              : tasks.length ? `${Math.round(counts.done / tasks.length * 100)}% of the plan` : 'no tickets yet' },
         ]} />
 
         <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1fr)_340px]">

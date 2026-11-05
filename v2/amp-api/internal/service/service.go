@@ -58,6 +58,10 @@ type Service struct {
 	// a rule that names someone stays the honest unknown arm; see
 	// MergeAlertPersonSource.
 	MergeAlertPerson MergeAlertPersonSource
+	// Notify, when set, publishes the events the service makes itself
+	// (receipt.updated, #126): the REST and MCP handlers point it at their
+	// hub. nil drops them.
+	Notify func(domain.Event)
 }
 
 func New(repo *repository.Repo, registry *actor.Registry, kbSvc *kb.Service) *Service {
@@ -498,6 +502,10 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 		return nil, reply.Err
 	}
+	// A new dispatch is a new attempt: no earlier hold still waits (#126).
+	if err := s.Repo.ClearTaskHeld(ctx, taskID); err != nil {
+		slog.Warn("clear held receipts on dispatch", "task_id", taskID, "err", err)
+	}
 	return s.Repo.GetTask(ctx, taskID)
 }
 
@@ -530,6 +538,9 @@ func (s *Service) ReturnTask(ctx context.Context, p authz.Principal, taskID int,
 	reply := actor.Await(ctx, replyCh)
 	if reply.Err != nil {
 		return nil, &authz.Error{Status: 409, Msg: reply.Err.Error()}
+	}
+	if err := s.Repo.ClearTaskHeld(ctx, taskID); err != nil {
+		slog.Warn("clear held receipts on return", "task_id", taskID, "err", err)
 	}
 	details := map[string]any{"reason": reason, "automatic": system}
 	if d := strings.TrimSpace(dispatchID); d != "" {
@@ -577,7 +588,8 @@ func planApprovalGate(proj *domain.Project, lookupErr error, t *domain.Task, pla
 // needs project owner access. Callers publish project.updated.
 func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectID int, u domain.ProjectSettings) (*domain.Project, error) {
 	if u.Name == nil && u.Description == nil && u.OpenReassign == nil && u.RequirePlanApproval == nil && u.RequireMerge == nil &&
-		u.NotStartedFlagMinutes == nil && u.NotStartedReturnMinutes == nil && u.Metadata == nil {
+		u.NotStartedFlagMinutes == nil && u.NotStartedReturnMinutes == nil && u.Metadata == nil &&
+		u.ReceiptsMode == nil && u.ReceiptsMinLevel == nil {
 		return nil, authz.BadRequest("nothing to change: pass name, description, open_reassign, require_plan_approval, require_merge, " +
 			"not_started_flag_minutes, not_started_return_minutes, or metadata")
 	}
@@ -592,6 +604,17 @@ func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectI
 		u.Name = &name
 	}
 	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Owner); err != nil {
+		return nil, err
+	}
+	// The verification receipts setting is a person's, in the web UI (#126,
+	// D9), and so is weakening it through the project's metadata (D11).
+	if err := s.checkReceiptsSettings(p, projectID, &u); err != nil {
+		s.auditDenied(ctx, p, "project.settings", domain.AuditEntry{ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
+			Summary: "refused changing the receipts setting for " + p.Label(), Details: map[string]any{"receipts_mode": u.ReceiptsMode,
+				"receipts_min_level": u.ReceiptsMinLevel}}, err)
+		return nil, err
+	}
+	if err := s.GuardReceiptsUpdate(ctx, p, "project", projectID, u.Metadata); err != nil {
 		return nil, err
 	}
 	// Turning plan approval off lets agents start work nobody approved, so
@@ -610,6 +633,7 @@ func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectI
 		e := domain.AuditEntry{Action: "project.settings", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
 			TargetName: proj.Name, Summary: "changed project settings", Details: map[string]any{"name": u.Name, "description_changed": u.Description != nil,
 				"open_reassign": u.OpenReassign, "require_plan_approval": u.RequirePlanApproval, "require_merge": u.RequireMerge,
+				"receipts_mode": u.ReceiptsMode, "receipts_min_level": u.ReceiptsMinLevel,
 				"metadata": u.Metadata, "channel": p.Channel},
 			After: projectSettingsOf(proj)}
 		if prevErr == nil {
@@ -757,7 +781,8 @@ func projectSettingsOf(p *domain.Project) map[string]any {
 		return nil
 	}
 	m := map[string]any{"name": p.Name, "description_length": len(p.Description), "open_reassign": p.OpenReassign,
-		"require_plan_approval": p.RequirePlanApproval, "require_merge": p.RequireMerge}
+		"require_plan_approval": p.RequirePlanApproval, "require_merge": p.RequireMerge,
+		"receipts_mode": p.ReceiptsMode, "receipts_min_level": p.ReceiptsMinLevel}
 	if len(p.Metadata) > 0 {
 		md := make(map[string]any, len(p.Metadata))
 		for k, v := range p.Metadata {

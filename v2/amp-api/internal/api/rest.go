@@ -45,6 +45,8 @@ import (
 //	POST /api/tasks/:id/dispatch
 //	POST /api/tasks/:id/start      (a person starts their human ticket)
 //	POST /api/tasks/:id/complete
+//	GET  /api/tasks/:id/receipt, /receipts; POST /api/tasks/:id/receipt/accept|reject (receipts.go)
+//	GET  /api/projects/:id/receipts/summary (receipts.go)
 //	POST /api/tasks/:id/start_at
 //	GET  /api/events              ← SSE stream (only events for projects you can see)
 //
@@ -77,7 +79,11 @@ type RestHandler struct {
 }
 
 func NewRestHandler(registry *actor.Registry, repo *repository.Repo, h *hub.Hub, kbSvc *kb.Service) *RestHandler {
-	return &RestHandler{registry: registry, repo: repo, hub: h, kb: kbSvc, svc: service.New(repo, registry, kbSvc)}
+	svc := service.New(repo, registry, kbSvc)
+	if h != nil {
+		svc.Notify = h.Publish
+	}
+	return &RestHandler{registry: registry, repo: repo, hub: h, kb: kbSvc, svc: svc}
 }
 
 // principal resolves the caller, writing the error response if it can't.
@@ -639,6 +645,10 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch parts[1] {
+	case "receipts":
+		h.projectReceiptSummary(w, r, pr, projectID, parts)
+		return
+
 	case "day-reports":
 		// GET ?date=YYYY-MM-DD&tz=…: everyone on the project and the report
 		// they saved for the day, narrowed to this project (the standup sheet).
@@ -1029,6 +1039,10 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			}
 			req.ProjectID = projectID
 			req.CreatedBy = pr.UserRef()
+			if err := h.svc.GuardReceiptsCreate(r.Context(), pr, "project", projectID, req.Metadata); err != nil {
+				fail(w, err, 400)
+				return
+			}
 			// Route through ProjectActor so EpicActor is spawned.
 			pid, err := h.registry.Get(projectID)
 			if err != nil {
@@ -1162,6 +1176,10 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			req.EpicID = epicID
+			if err := h.svc.GuardReceiptsUpdate(r.Context(), pr, "epic", epicID, req.Metadata); err != nil {
+				fail(w, err, 400)
+				return
+			}
 			if err := h.sendUpdate(epic.ProjectID, &actor.MsgUpdateEpic{Req: req, ReplyCh: make(chan actor.ReplySimple, 1)}); err != nil {
 				jsonErr(w, err, 400)
 				return
@@ -1216,6 +1234,10 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 			req.EpicID = epicID
 			req.ProjectID = epic.ProjectID
 			req.CreatedBy = pr.UserRef()
+			if err := h.svc.GuardReceiptsCreate(r.Context(), pr, "epic", epicID, req.Metadata); err != nil {
+				fail(w, err, 400)
+				return
+			}
 			// Route through ProjectActor → EpicActor so StoryActor is spawned.
 			pid, err := h.registry.Get(epic.ProjectID)
 			if err != nil {
@@ -1308,6 +1330,10 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.StoryID = storyID
+		if err := h.svc.GuardReceiptsUpdate(r.Context(), pr, "story", storyID, req.Metadata); err != nil {
+			fail(w, err, 400)
+			return
+		}
 		if err := h.sendUpdate(story.ProjectID, &actor.MsgUpdateStory{Req: req, ReplyCh: make(chan actor.ReplySimple, 1)}); err != nil {
 			jsonErr(w, err, 400)
 			return
@@ -1440,6 +1466,10 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch parts[1] {
+	case "receipt", "receipts":
+		h.taskReceipt(w, r, pr, taskID, parts)
+		return
+
 	case "merge":
 		// POST /tasks/{id}/merge {merge_commit?}: Mark merged (recorded once;
 		// a repeat returns the first record). POST /tasks/{id}/merge/not-needed:
@@ -1595,8 +1625,15 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		}
 		// A person in the web UI completes any ticket they can work; other
 		// callers (API tokens, MCP-audience tokens) only dispatched work.
-		if _, err := h.svc.CompleteTask(r.Context(), pr, taskID); err != nil {
+		t, closed, err := h.svc.CompleteTaskReceipt(r.Context(), pr, taskID)
+		if err != nil {
 			fail(w, err, 400)
+			return
+		}
+		if closed.Held {
+			// The project requires a verification receipt and this one is
+			// below its minimum: held for a person, who can Accept it now.
+			jsonOK(w, map[string]interface{}{"task_id": taskID, "state": t.State, "held": true, "reason": closed.HoldReason})
 			return
 		}
 		jsonOK(w, map[string]interface{}{"task_id": taskID, "state": "completed"})

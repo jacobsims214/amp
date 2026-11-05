@@ -22,7 +22,7 @@ import { displayState } from '../lib/ticketState'
 import { ConfirmDeleteModal } from './ConfirmDeleteModal'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
 import { activityActor, canPlanTask, canTakeOverTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
-import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata, HumanReason, Run } from '../types'
+import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata, HumanReason, Run, TaskReceipt } from '../types'
 import { DependencyPicker } from './DependencyPicker'
 import { MetadataEditor } from './MetadataEditor'
 import { metadataPatch } from '../lib/metadata'
@@ -30,6 +30,7 @@ import { Markdown } from './ui/Markdown'
 import { RunsPanel } from './RunsPanel'
 import { CompletionReceipt } from './receipt/CompletionReceipt'
 import { latestRunWith } from '../lib/receipt'
+import { useSSE } from '../hooks/useSSE'
 
 interface Props {
   task: Task | null
@@ -168,6 +169,23 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
     return () => { live = false }
   }, [task?.id, task?.state, task?.merge_state]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // The ticket's verification receipt (#126), for the receipt and the
+  // header's "Requires receipt". Reread on its state, and on receipt.updated.
+  const [receiptFor, setReceiptFor] = useState<{ taskId: number; data: TaskReceipt | null } | null>(null)
+  const [receiptTick, setReceiptTick] = useState(0)
+  const agentTicket = !!task && !isHuman(task)
+  useEffect(() => {
+    if (!task || !agentTicket) return
+    const id = task.id
+    let live = true
+    api.getTaskReceipt(id).then(r => { if (live) setReceiptFor({ taskId: id, data: r }) })
+      .catch(() => { if (live) setReceiptFor(prev => prev?.taskId === id ? prev : { taskId: id, data: null }) })
+    return () => { live = false }
+  }, [task?.id, task?.state, agentTicket, receiptTick]) // eslint-disable-line react-hooks/exhaustive-deps
+  useSSE(task?.project_id ?? null, e => {
+    if (e.type === 'receipt.updated' && (e.payload as { task_id?: number } | undefined)?.task_id === task?.id) setReceiptTick(n => n + 1)
+  })
+
   useEffect(() => {
     if (!task) return
     const id = task.id
@@ -240,6 +258,8 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   const canPlan = canPlanTask(task, meId, myAccess)
   const history = log?.taskId === task.id ? log : null
   const runs = runsFor?.taskId === task.id ? runsFor.runs : null
+  const receipt = receiptFor?.taskId === task.id ? receiptFor.data : undefined
+  const requiresReceipt = !isHuman(task) && receipt?.settings?.mode === 'require'
   // A completed agent ticket shows its Done and merge lines in the receipt.
   const agentReceipt = task.state === 'completed' && !isHuman(task)
   const view = focusView(location.pathname)
@@ -396,6 +416,13 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
               <span>{mergeStatusText(task)}</span>
             </div>
           )}
+          {requiresReceipt && (
+            <div className="flex items-center gap-1.5 text-xs text-warning-ink" data-testid="requires-receipt"
+              title="This project requires a verification receipt: below its minimum, a completion waits for a person to accept it">
+              <ShieldCheck size={11} aria-hidden="true" />
+              <span>Requires receipt</span>
+            </div>
+          )}
           <MergeGateNote task={task} runs={runs} />
         </div>
 
@@ -441,7 +468,9 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
         )}
 
         {/* Receipt v0: who did it, where the code is, how it was checked */}
-        <CompletionReceipt key={`receipt-${task.id}`} task={task} runs={runs} comments={history?.comments ?? null} />
+        <CompletionReceipt key={`receipt-${task.id}`} task={task} runs={runs} comments={history?.comments ?? null}
+          receipt={receipt} canWork={canWork}
+          onChanged={() => { setReceiptTick(n => n + 1); onRefresh?.() }} />
 
         {/* Mockups, diagrams and documents published to this ticket */}
         <TicketArtifacts projectId={task.project_id} taskId={task.id} />

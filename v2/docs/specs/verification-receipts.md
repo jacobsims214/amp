@@ -267,7 +267,9 @@ Tools go in `amp-api/internal/mcp/receipts.go`, registered in `server.go` and li
   7. returns `receipt.updated` for the caller to publish (the service has no hub).
 
   A person's Done in the UI on a Require ticket below the minimum is held the same way, with
-  Accept right there. No MCP tool writes `role=human` checks: Accept and Reject are REST only, for
+  Accept right there. Held means `in_progress` with no dispatch: under Require, a below-minimum
+  completion of a ticket that isn't in progress (a Done on a ready ticket, a closeout of one) is
+  refused (409) instead. No MCP tool writes `role=human` checks: Accept and Reject are REST only, for
   `p.InUI()`, as in artifact review.
 
 `checks[]` item: `{criterion_ref, kind: command|test|ci|visual|manual, verdict:

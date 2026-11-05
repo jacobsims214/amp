@@ -15,7 +15,7 @@ import { GitHubHookPanel } from '../components/GitHubHookPanel'
 import { GitHubCredentialPanel } from '../components/GitHubCredentialPanel'
 import { AuditLogPanel } from '../components/AuditLogPanel'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
-import type { KBSource, Metadata, Org, Project, ProjectAccess } from '../types'
+import type { KBSource, Metadata, Org, Project, ProjectAccess, ReceiptsMode } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
 import { LastApproved } from '../components/LastApproved'
 import { useProjectPeople } from '../hooks/useProjectPeople'
@@ -112,7 +112,7 @@ export function ProjectSettings() {
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-[200px_minmax(0,1fr)] gap-6 px-7 py-6 items-start">
         <nav className="hidden lg:grid gap-0.5 sticky top-6" aria-label="Settings sections">
           <span className="amp-label px-2.5 pb-2">Settings</span>
-          {['General', 'Plan approval', 'Merges', 'Dispatch watchdog', 'Metadata', 'Team access', 'Knowledge bases', 'Trash', ...(canManage ? ['GitHub token', 'GitHub merge webhook', 'Webhooks', 'Audit log', 'Danger zone'] : [])].map(t => (
+          {['General', 'Plan approval', 'Merges', 'Verification receipts', 'Dispatch watchdog', 'Metadata', 'Team access', 'Knowledge bases', 'Trash', ...(canManage ? ['GitHub token', 'GitHub merge webhook', 'Webhooks', 'Audit log', 'Danger zone'] : [])].map(t => (
             <a key={t} href={`#${slug(t)}`} className="px-2.5 py-1.5 text-[13px] text-ink-2 hover:text-ink hover:bg-surface-3">{t}</a>
           ))}
         </nav>
@@ -204,6 +204,12 @@ export function ProjectSettings() {
                     ? <>On. Mark merged, or Not needed, on a waiting ticket releases the tickets after it.</>
                     : <>Off: dependents start as soon as a ticket is done, merged or not. Turning it back on holds the tickets waiting on unmerged work again.</>}
                 </p>
+              </Section>
+
+              <Section title="Verification receipts"
+                description="A receipt records how an agent checked its work and whether a person accepted it. Off: nothing is recorded or stored. Inform: receipts are shown, nothing waits. Require: tickets wait for a receipt or your Accept.">
+                <ReceiptsSetting project={project} org={org} pid={pid} canManage={canManage}
+                  onSaved={setProject} onError={setError} />
               </Section>
 
               <Section title="Dispatch watchdog"
@@ -391,6 +397,96 @@ function WatchdogMinutes({ project, pid, canManage, onSaved, onError }: {
         <div className="flex items-center gap-3">
           <button type="button" onClick={save} disabled={bad || !dirty || saving} className="amp-btn amp-btn-primary">
             {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}Save watchdog
+          </button>
+          {saved && !dirty && <span className="text-xs text-success-ink">Saved</span>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+const MODE_LABEL: Record<ReceiptsMode, string> = { off: 'Off', inform: 'Inform', require: 'Require' }
+
+/**
+ * The project's verification receipts setting (#126): use the org's default
+ * (which it names), Off, Inform or Require, and Require's minimum level.
+ * Before saving Require it says how many agent tickets completed in the last
+ * 7 days would have been held. Read-only for anyone but project owners and
+ * org admins; the server refuses everyone else, agents included.
+ */
+export function ReceiptsSetting({ project, org, pid, canManage, onSaved, onError }: {
+  project: Project; org: Org | null; pid: number; canManage: boolean
+  onSaved: (p: Project) => void; onError: (m: string | null) => void
+}) {
+  const current = project.receipts_mode ?? ''
+  const [choice, setChoice] = useState<'' | ReceiptsMode>(current)
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+  const [wouldHold, setWouldHold] = useState<number | null>(null)
+  useEffect(() => { setChoice(current) }, [current])
+  const orgMode: ReceiptsMode = org?.receipts_mode ?? 'off'
+  const effective: ReceiptsMode = choice === '' ? orgMode : choice
+  const becomesRequire = effective === 'require' && (current === '' ? orgMode : current) !== 'require'
+  useEffect(() => {
+    if (!becomesRequire) return
+    let live = true
+    api.receiptSummary(pid).then(s => { if (live) setWouldHold(s.would_hold_last_7_days) }).catch(() => {})
+    return () => { live = false }
+  }, [becomesRequire, pid])
+  const dirty = choice !== current
+
+  const save = async () => {
+    if (!dirty) return
+    setSaving(true); onError(null); setSaved(false)
+    try {
+      onSaved(await api.updateProjectSettings(pid, { receipts_mode: choice }))
+      setSaved(true)
+    } catch (e) {
+      onError(e instanceof Error ? e.message : 'Could not change the setting')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const options: { value: '' | ReceiptsMode; label: string }[] = [
+    { value: '', label: `Use org default (${MODE_LABEL[orgMode]})` },
+    { value: 'off', label: 'Off' },
+    { value: 'inform', label: 'Inform' },
+    { value: 'require', label: 'Require' },
+  ]
+  return (
+    <div className="grid gap-3" data-testid="receipts-setting">
+      <fieldset className="m-0 p-0 border-0 grid gap-1.5" disabled={!canManage}>
+        <legend className={labelCls}>Receipts</legend>
+        {options.map(o => (
+          <label key={o.value || 'org'} className="flex items-center gap-2.5 text-[13px] text-ink cursor-pointer select-none">
+            <input type="radio" name={`receipts-${pid}`} className="accent-[var(--ink)]" value={o.value}
+              checked={choice === o.value} onChange={() => { setChoice(o.value); setSaved(false) }} />
+            {o.label}
+          </label>
+        ))}
+      </fieldset>
+      {effective === 'require' && (
+        <div>
+          <label htmlFor={`receipts-min-${pid}`} className={labelCls}>Minimum level</label>
+          <select id={`receipts-min-${pid}`} className={inputCls} disabled value={project.receipts_min_level ?? 'self_checked'} onChange={() => {}}>
+            <option value="self_checked">Self-checked</option>
+            <option value="independently_verified">Independently verified (arrives with the verifier)</option>
+          </select>
+          <p className="m-0 mt-1 text-[12px] text-ink-2">A person's Accept always meets it.</p>
+        </div>
+      )}
+      {becomesRequire && dirty && wouldHold != null && (
+        <p role="status" data-testid="receipts-require-warning" className="m-0 text-[12px] text-warning-ink leading-relaxed">
+          {wouldHold === 0
+            ? 'No agent ticket completed in the last 7 days would have been held.'
+            : `${wouldHold} agent ticket${wouldHold === 1 ? '' : 's'} completed in the last 7 days would have been held for you. Held tickets show in My work, and Accept clears them.`}
+        </p>
+      )}
+      {canManage && (
+        <div className="flex items-center gap-3">
+          <button type="button" onClick={save} disabled={!dirty || saving} className="amp-btn amp-btn-primary">
+            {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}Save receipts setting
           </button>
           {saved && !dirty && <span className="text-xs text-success-ink">Saved</span>}
         </div>

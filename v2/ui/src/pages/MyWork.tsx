@@ -30,17 +30,18 @@ const ymd = (d: Date) => d.toLocaleDateString('en-CA', { timeZone: TZ })
 /** How many projects with nothing for you are listed before "N more". */
 const CLEAR_SHOWN = 8
 
-/** The five kinds, in display order. Color is always next to its label. */
+/** The six kinds, in display order. Color is always next to its label. */
 const KINDS: { kind: WaitKind; label: string; color: string; unit: (n: number) => string }[] = [
   { kind: 'approve', label: 'Approve', color: 'var(--violet)', unit: n => (n === 1 ? 'plan' : 'plans') },
   { kind: 'answer', label: 'Answer', color: 'var(--st-flag)', unit: n => (n === 1 ? 'question' : 'questions') },
+  { kind: 'verify', label: 'Verify', color: 'var(--warning)', unit: () => "couldn't verify" },
   { kind: 'merge', label: 'Merge', color: 'var(--teal)', unit: n => (n === 1 ? 'PR' : 'PRs') },
   { kind: 'start', label: 'Start', color: 'var(--warning)', unit: () => 'not started' },
   { kind: 'do', label: 'Do', color: 'var(--ink)', unit: n => (n === 1 ? 'your ticket' : 'your tickets') },
 ]
 const kindOf = (k: string) => KINDS.find(x => x.kind === k)
 
-const ZERO: WaitCounts = { waiting: 0, approve: 0, answer: 0, merge: 0, start: 0, do: 0, coming_up: 0 }
+const ZERO: WaitCounts = { waiting: 0, approve: 0, answer: 0, verify: 0, merge: 0, start: 0, do: 0, coming_up: 0 }
 
 function ago(iso?: string | null): string {
   if (!iso) return ''
@@ -80,6 +81,8 @@ function describe(it: WaitItem): { title: string; sub: string } {
         sub: `Epic ${it.epic_id} · planned ${ago(it.since)} ago` }
     case 'answer':
       return { title: `#${it.task_id} ${it.name}`, sub: `${needs} · waiting ${ago(it.since)}` }
+    case 'verify':
+      return { title: `#${it.task_id} Couldn't verify: ${it.name}`, sub: `${needs} · held ${ago(it.since)}` }
     case 'merge': {
       const pr = prNumber(it.pr_url)
       return { title: `#${it.task_id} ${pr ? `Merge ${pr}: ` : 'Merge: '}${it.name}`,
@@ -283,7 +286,7 @@ export function MyWork() {
           </SkeletonRegion>
         )}
         {work && !authLoading && !error && !noWork && <>
-          <div className="amp-panel amp-panel-top grid grid-cols-3 md:grid-cols-7" aria-label="Waiting on you, across your projects">
+          <div className="amp-panel amp-panel-top grid grid-cols-3 md:grid-cols-8" aria-label="Waiting on you, across your projects">
             <div className="col-span-3 md:col-span-1 px-4 py-3 grid gap-1.5 border-b md:border-b-0 border-line"
               style={counts.waiting ? { background: 'var(--st-flag)', color: '#fff' } : undefined}>
               <span className="amp-label" style={counts.waiting ? { color: '#fff' } : undefined}>Waiting on you</span>
@@ -293,13 +296,13 @@ export function MyWork() {
               </span>
             </div>
             {KINDS.map((k, i) => (
-              <div key={k.kind} className={`px-4 py-3 grid gap-1.5 border-line ${i % 3 ? 'border-l' : ''} md:border-l ${i < 3 ? 'border-b md:border-b-0' : ''} ${counts[k.kind] ? '' : 'opacity-60'}`}>
+              <div key={k.kind} className={`px-4 py-3 grid gap-1.5 border-line ${i % 3 ? 'border-l' : ''} md:border-l ${i < 6 ? 'border-b md:border-b-0' : ''} ${counts[k.kind] ? '' : 'opacity-60'}`}>
                 <KindMark kind={k.kind} />
-                <span className="amp-num text-[26px] leading-none text-ink">{counts[k.kind]}</span>
-                {counts[k.kind] > 0 && <span className="text-[11.5px] text-ink-2">{k.unit(counts[k.kind])}</span>}
+                <span className="amp-num text-[26px] leading-none text-ink">{counts[k.kind] ?? 0}</span>
+                {(counts[k.kind] ?? 0) > 0 && <span className="text-[11.5px] text-ink-2">{k.unit(counts[k.kind] ?? 0)}</span>}
               </div>
             ))}
-            <div className="col-span-2 md:col-span-1 px-4 py-3 grid gap-1.5 border-l border-line">
+            <div className="col-span-3 md:col-span-1 px-4 py-3 grid gap-1.5 md:border-l border-line">
               <span className="amp-label">Your agents</span>
               <span className="amp-num text-[26px] leading-none" style={{ color: 'var(--st-prog)' }}>{agentsTotal}</span>
               <span className="text-[11.5px] text-ink-2">in progress</span>

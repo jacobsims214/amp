@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { agoText, isCloseout, latestRunWith, parseSelfCheck } from './receipt'
-import type { Comment, Run } from '../types'
+import { agoText, isCloseout, latestRunWith, parseSelfCheck, STATUS_LABEL, STATUS_TONE, summarizeChecks, verificationText } from './receipt'
+import type { Comment, ReceiptCheck, Run } from '../types'
 
 const c = (id: number, body: string, created_at = `2026-11-01T10:0${id}:00Z`): Comment => ({ id, task_id: 1, body, author: 'a', created_at })
 const run = (over: Partial<Run>): Run => ({ id: 1, task_id: 1, project_id: 1, outcome: 'completed', created_at: '2026-11-01T10:00:00Z', ...over })
@@ -78,5 +78,26 @@ describe('isCloseout / agoText', () => {
     expect(agoText('2026-11-04T10:00:00Z', now)).toBe('2h ago')
     expect(agoText('2026-11-04T11:59:50Z', now)).toBe('just now')
     expect(agoText('2026-11-01T12:00:00Z', now)).toBe('3d ago')
+  })
+})
+
+describe('summarizeChecks (#126)', () => {
+  const c = (id: number, role: ReceiptCheck['role'], verdict: ReceiptCheck['verdict'], at = '2026-11-04T10:00:00Z'): ReceiptCheck =>
+    ({ id, receipt_id: 1, role, kind: role === 'worker' ? 'test' : 'verdict', verdict, criterion_ref: '', checked_by: 'x', created_at: at })
+  it('counts the worker checks and groups by role', () => {
+    const s = summarizeChecks([c(1, 'worker', 'pass'), c(2, 'worker', 'cant_tell'), c(3, 'worker', 'fail'), c(4, 'human', 'pass')])
+    expect([s.pass, s.fail, s.cantTell, s.total]).toEqual([1, 1, 1, 3])
+    expect(s.byRole.human).toHaveLength(1)
+    expect(s.rejection).toBeUndefined()
+  })
+  it('a later Reject is the rejection; a later Accept clears it', () => {
+    expect(summarizeChecks([c(1, 'human', 'pass'), c(2, 'human', 'fail', '2026-11-04T11:00:00Z')]).rejection?.id).toBe(2)
+    expect(summarizeChecks([c(1, 'human', 'fail'), c(2, 'human', 'pass', '2026-11-04T11:00:00Z')]).rejection).toBeUndefined()
+  })
+  it('labels and tones every status', () => {
+    expect(STATUS_LABEL.human_accepted).toBe('Accepted')
+    expect(STATUS_TONE.unverified).toBe('var(--ink-3)')
+    expect(STATUS_TONE.self_checked).toBe('var(--st-prog)')
+    expect(verificationText({ status: 'unverified', held: true, has_media: false })).toBe("Couldn't verify, needs you")
   })
 })

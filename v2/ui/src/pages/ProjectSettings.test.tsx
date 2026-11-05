@@ -24,6 +24,7 @@ vi.mock('../api/client', () => ({
       if (name === 'getGitHubHook') return Promise.resolve({ configured: false, url: '/api/hooks/github/3', deliveries: [], encrypted: true })
       if (name === 'getGitHubCredential') return state.credential(args[0] as number)
       if (name === 'updateProjectSettings') return state.update(args[0] as number, args[1] as Partial<Project>)
+      if (name === 'receiptSummary') return Promise.resolve({ mode: 'off', min_level: 'self_checked', project_mode: '', org_mode: 'off', tasks: [], would_hold_last_7_days: 4 })
       return Promise.reject(new Error(`not mocked: ${String(name)}`))
     },
   }),
@@ -207,5 +208,40 @@ describe('ProjectSettings dispatch watchdog', () => {
     expect(flag).toBeDisabled()
     expect(screen.getByLabelText(/return it to ready after/i)).toBeDisabled()
     expect(screen.queryByRole('button', { name: /save watchdog/i })).toBeNull()
+  })
+})
+
+describe('ProjectSettings verification receipts (#126)', () => {
+  it('starts on the org default (Off) and saves Inform for a project owner', async () => {
+    state.update.mockImplementation((_id, s) => Promise.resolve({ ...project, ...s }))
+    const user = userEvent.setup()
+    renderAs('owner')
+    const orgDefault = await screen.findByRole('radio', { name: 'Use org default (Off)' })
+    await vi.waitFor(() => expect(orgDefault).toBeEnabled())
+    expect(orgDefault).toBeChecked()
+    expect(screen.getByText(/Off: nothing is recorded or stored\. Inform: receipts are shown, nothing waits\. Require: tickets wait for a receipt or your Accept\./)).toBeInTheDocument()
+    await user.click(screen.getByRole('radio', { name: 'Inform' }))
+    await user.click(screen.getByRole('button', { name: /save receipts setting/i }))
+    expect(state.update).toHaveBeenLastCalledWith(3, { receipts_mode: 'inform' })
+  })
+
+  it('warns how many recent tickets Require would have held, before saving it', async () => {
+    const user = userEvent.setup()
+    renderAs('owner')
+    const require = await screen.findByRole('radio', { name: 'Require' })
+    await vi.waitFor(() => expect(require).toBeEnabled())
+    expect(screen.queryByTestId('receipts-require-warning')).toBeNull()
+    await user.click(require)
+    expect(await screen.findByTestId('receipts-require-warning')).toHaveTextContent('4 agent tickets completed in the last 7 days would have been held')
+    expect(screen.getByLabelText('Minimum level')).toHaveValue('self_checked')
+    expect(state.update).not.toHaveBeenCalled()
+  })
+
+  it('is read-only for a lead', async () => {
+    renderAs('lead')
+    const radios = await screen.findAllByRole('radio')
+    await vi.waitFor(() => expect(screen.getByText(/Only project owners and org admins can change these settings/)).toBeInTheDocument())
+    for (const r of radios) expect(r).toBeDisabled()
+    expect(screen.queryByRole('button', { name: /save receipts setting/i })).toBeNull()
   })
 })

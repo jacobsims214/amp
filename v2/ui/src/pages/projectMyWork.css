@@ -1,8 +1,8 @@
 /* The project's My work tab (artifact #23, "Project › My work"). Tokens from index.css; layout only. */
-.pmw { --k-approve: var(--violet); --k-answer: var(--st-flag); --k-merge: var(--teal); --k-start: var(--warning); --k-do: var(--ink); }
+.pmw { --k-approve: var(--violet); --k-answer: var(--st-flag); --k-verify: var(--warning); --k-merge: var(--teal); --k-start: var(--warning); --k-do: var(--ink); }
 
 /* readouts: Waiting on you, the four kinds, then Coming up / Cleared today */
-.pmw-ro { display: grid; grid-template-columns: 1.4fr repeat(5, minmax(0, 1fr)) 1fr; }
+.pmw-ro { display: grid; grid-template-columns: 1.4fr repeat(6, minmax(0, 1fr)) 1fr; }
 .pmw-ro .ro { padding: 12px 16px; display: grid; gap: 6px; align-content: start; border-left: 1px solid var(--line); min-width: 0; }
 .pmw-ro .ro:first-child { border-left: 0; }
 .pmw-ro .v { font-family: var(--font-data); font-size: 26px; line-height: 1; color: var(--ink); }
@@ -17,6 +17,7 @@
 .pmw-kind i { width: 8px; height: 8px; border-radius: 1px; display: inline-block; flex-shrink: 0; }
 .pmw-kind.k-approve i { background: var(--k-approve); }
 .pmw-kind.k-answer i { background: var(--k-answer); }
+.pmw-kind.k-verify i { background: var(--k-verify); }
 .pmw-kind.k-merge i { background: var(--k-merge); }
 .pmw-kind.k-start i { background: var(--k-start); }
 .pmw-kind.k-do i { background: var(--k-do); }
@@ -29,6 +30,7 @@
 .pmw-item::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; }
 .pmw-item.k-approve::before { background: var(--k-approve); }
 .pmw-item.k-answer::before { background: var(--k-answer); }
+.pmw-item.k-verify::before { background: var(--k-verify); }
 .pmw-item.k-merge::before { background: var(--k-merge); }
 .pmw-item.k-start::before { background: var(--k-start); }
 .pmw-item.k-do::before { background: var(--k-do); }
@@ -87,7 +89,7 @@ a.pmw-row:hover { background: var(--surface-2); }
   .pmw-layout { grid-template-columns: minmax(0, 1fr); }
   .pmw-ro { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .pmw-ro .ro:first-child { grid-column: 1 / -1; }
-  .pmw-ro .ro:nth-child(2), .pmw-ro .ro:nth-child(5) { border-left: 0; }
+  .pmw-ro .ro:nth-child(2), .pmw-ro .ro:nth-child(5), .pmw-ro .ro:nth-child(8) { border-left: 0; }
   .pmw-ro .ro:nth-child(n+2) { border-top: 1px solid var(--line); }
   .pmw-ro .v { font-size: 22px; }
   .pmw-item { padding: 14px 14px 14px 17px; }

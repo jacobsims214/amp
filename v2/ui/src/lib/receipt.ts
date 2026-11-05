@@ -1,4 +1,4 @@
-import type { Comment, Run } from '../types'
+import type { Comment, ReceiptCheck, ReceiptSummaryRow, Run, VerificationStatus } from '../types'
 
 /** One criterion from a worker's "Work complete." comment. */
 export interface SelfCheckItem { criterion: string; ok: boolean; why: string }
@@ -58,4 +58,61 @@ export function agoText(iso: string, now = Date.now()): string {
   if (hrs > 0) return `${hrs}h ago`
   if (mins > 0) return `${mins}m ago`
   return 'just now'
+}
+
+/** A verification status in words (#126). */
+export const STATUS_LABEL: Record<VerificationStatus, string> = {
+  unverified: 'Unverified',
+  self_checked: 'Self-checked',
+  independently_verified: 'Independently verified',
+  human_accepted: 'Accepted',
+}
+
+/** A status's color: ink-3 for unverified, in-progress blue for self-checked, teal for verified, success for accepted. */
+export const STATUS_TONE: Record<VerificationStatus, string> = {
+  unverified: 'var(--ink-3)',
+  self_checked: 'var(--st-prog)',
+  independently_verified: 'var(--teal)',
+  human_accepted: 'var(--success-ink)',
+}
+
+export interface CheckSummary {
+  /** the worker's checks: passed, failed, couldn't tell, and in all */
+  pass: number
+  fail: number
+  cantTell: number
+  total: number
+  /** the latest human verdict when it is a Reject */
+  rejection?: ReceiptCheck
+  /** checks by role, oldest first */
+  byRole: { worker: ReceiptCheck[]; verifier: ReceiptCheck[]; human: ReceiptCheck[] }
+}
+
+const newer = (a: ReceiptCheck, b: ReceiptCheck) => {
+  const ta = Date.parse(a.created_at) || 0
+  const tb = Date.parse(b.created_at) || 0
+  return ta > tb || (ta === tb && a.id > b.id)
+}
+
+/** Counts a receipt's checks for the receipt's "Self-checked 2/2" line. */
+export function summarizeChecks(checks: ReceiptCheck[]): CheckSummary {
+  const out: CheckSummary = { pass: 0, fail: 0, cantTell: 0, total: 0, byRole: { worker: [], verifier: [], human: [] } }
+  let human: ReceiptCheck | undefined
+  for (const c of checks) {
+    out.byRole[c.role]?.push(c)
+    if (c.role === 'human' && c.kind === 'verdict' && (!human || newer(c, human))) human = c
+    if (c.role !== 'worker') continue
+    out.total++
+    if (c.verdict === 'pass') out.pass++
+    else if (c.verdict === 'fail') out.fail++
+    else out.cantTell++
+  }
+  if (human?.verdict === 'fail') out.rejection = human
+  return out
+}
+
+/** The words a verification badge reads as, for a card's aria-label. */
+export function verificationText(r: Pick<ReceiptSummaryRow, 'status' | 'held' | 'has_media'>): string {
+  if (r.held) return "Couldn't verify, needs you"
+  return STATUS_LABEL[r.status] + (r.has_media ? ', with media' : '')
 }

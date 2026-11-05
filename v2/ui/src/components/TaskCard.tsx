@@ -1,6 +1,6 @@
 import { Calendar, GitBranch, GitMerge, UserRound } from 'lucide-react'
 import { isHuman, reasonLabel } from '../lib/human'
-import type { Task } from '../types'
+import type { ReceiptSummaryRow, Task } from '../types'
 import type { Person } from '../lib/people'
 import { displayState, STATE_LABEL, STATE_VAR } from '../lib/ticketState'
 import { mergeBadge, mergeWait } from '../lib/merge'
@@ -9,6 +9,8 @@ import { NotStartedTag, ReturnedTag } from './DispatchTags'
 import { PriorityMark } from './ui/PriorityMark'
 import { Avatar } from './ui/Avatar'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
+import { VerificationBadge } from './receipt/VerificationBadge'
+import { verificationText } from '../lib/receipt'
 
 interface Props {
   task: Task
@@ -19,6 +21,8 @@ interface Props {
   owner?: Person | null
   /** the project's not_started_flag_minutes: past it the amber badge is filled (0 = flag off) */
   notStartedFlagMinutes?: number
+  /** the ticket's latest verification receipt (#126), from the project summary; none = no badge */
+  receipt?: ReceiptSummaryRow
 }
 
 function formatStart(iso: string): string {
@@ -30,19 +34,21 @@ function formatStart(iso: string): string {
  *  and priority, the agent on it (or the planned profile, or a Person tag for
  *  a ticket its owner does), and its owner.
  *  A question shows the question itself. */
-export function TaskCard({ task, onClick, dimmed = false, owner = null, notStartedFlagMinutes }: Props) {
+export function TaskCard({ task, onClick, dimmed = false, owner = null, notStartedFlagMinutes, receipt }: Props) {
   const state = displayState(task)
   const startAt = state === 'sched' ? (task.start_at ?? task.block_reason?.replace('scheduled:', '')) : null
   const waitingOn = task.blocked_by_ids?.length ?? 0
   const merge = mergeBadge(task)
   const mergeWaiting = state === 'wait' ? mergeWait(task) : null
   const returned = returnedLine(task)
+  // A completed agent ticket's status, or a held one's "needs you" (#126).
+  const badge = receipt && !isHuman(task) && (task.state === 'completed' || receipt.held) ? receipt : null
 
   return (
     <button
       type="button"
       onClick={onClick}
-      aria-label={`Ticket ${task.id}: ${task.name}, ${STATE_LABEL[state]}${merge ? ` · ${merge.label}` : ''}`}
+      aria-label={`Ticket ${task.id}: ${task.name}, ${STATE_LABEL[state]}${merge ? ` · ${merge.label}` : ''}${badge ? ` · ${verificationText(badge)}` : ''}`}
       className={`w-full text-left bg-surface border border-line hover:border-ink cursor-pointer transition-colors grid gap-1.5 ${dimmed ? 'opacity-35' : ''}`}
       style={{ padding: '8px 10px 9px 12px', boxShadow: `inset 3px 0 0 ${STATE_VAR[state]}`, borderRadius: 'var(--radius)' }}
     >
@@ -92,6 +98,7 @@ export function TaskCard({ task, onClick, dimmed = false, owner = null, notStart
           <span className="amp-num text-[11px] text-ink-3 truncate" title={`Planned agent profile: ${task.assigned_to}`}>{task.assigned_to}</span>
         ) : <span />}
         <span className="ml-auto flex items-center gap-2 flex-shrink-0">
+          {badge && <VerificationBadge receipt={badge} />}
           {waitingOn > 0 && (
             <span className="inline-flex items-center gap-1 amp-num text-[11px] text-ink-3" title={`Waiting on #${task.blocked_by_ids!.join(', #')}`}>
               <GitBranch size={11} />{waitingOn}
