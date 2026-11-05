@@ -24,6 +24,7 @@ import { remoteAvailable, useRemote } from '../remote/remote-context'
 import { projectLink } from '../lib/projectLink'
 import { isNoUserError, noMyWorkReason } from '../lib/myWorkAccess'
 import { MyWorkLoadError, MyWorkUnavailable } from '../components/human/MyWorkUnavailable'
+import { GetStarted } from '../components/GetStarted'
 
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone
 const ymd = (d: Date) => d.toLocaleDateString('en-CA', { timeZone: TZ })
@@ -269,6 +270,8 @@ export function MyWork() {
       <PageHeader crumb="Overview" title="My work"
         meta="A summary across your projects. Each row opens the item in that project's My work." />
       <div className="p-4 sm:p-7 sm:pt-5 grid gap-4">
+        {/* No AMP user (sign-in off): the checklist still guides a first run (#128). */}
+        {noWork === 'local-dev' && <GetStarted who="local-dev" />}
         {noWork && <MyWorkUnavailable reason={noWork} email={me?.email} />}
         {!noWork && error && <MyWorkLoadError error={error} onRetry={() => { setError(null); loadWork() }} />}
         {firstLoad && (
@@ -317,7 +320,9 @@ export function MyWork() {
                     Showing {cards.length} of {work.projects_total} projects with something for you.
                   </p>
                 )}
-              </> : (
+              </> : <>
+                {/* Where the queue will be: the first-run checklist until its steps are done (#128). */}
+                <GetStarted who={me?.user_id != null ? String(me.user_id) : 'local-dev'} />
                 <div className="amp-panel px-7 py-9 grid gap-2.5">
                   {done24 > 0
                     ? <span className="amp-label" style={{ color: 'var(--success-ink)' }}>All clear</span>
@@ -330,7 +335,7 @@ export function MyWork() {
                   </p>
                   <div className="flex gap-3.5 flex-wrap mt-1.5">{KINDS.map(k => <KindMark key={k.kind} kind={k.kind} />)}</div>
                 </div>
-              )}
+              </>}
 
               {(comingOnly.length > 0 || clear.length > 0) && <>
                 <SectionRule>{waitingCards.length ? 'Nothing waiting on you' : 'Your projects'}</SectionRule>
@@ -401,7 +406,7 @@ export function MyWork() {
               </Panel>
 
               <p className="m-0 px-0.5 text-[12px] leading-normal text-ink-3">
-                Nothing on this page is a button. To act, open the project: the item opens focused, with its action.
+                Nothing here acts on a ticket. To act, open the project: the item opens focused, with its action.
               </p>
             </aside>
           </div>

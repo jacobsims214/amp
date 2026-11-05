@@ -1,10 +1,12 @@
 import { PageHeader } from '../components/ui/PageHeader'
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { Loader2, Clock, Layers, Archive, RotateCcw, ChevronDown, ChevronUp, Download, Upload, Plus } from 'lucide-react'
 import { api } from '../api/client'
 import { useSSE } from '../hooks/useSSE'
-import { CrudModal, inputCls, labelCls } from '../components/CrudModal'
+import { CrudModal, FieldError, inputCls, labelCls } from '../components/CrudModal'
+import { CODE_MAX, cleanCode, suggestCode } from '../lib/projectCode'
+import { ManagerAgent } from '../components/ManagerAgent'
 import { ProjectHomeFields, type ProjectHome } from '../components/ProjectHomeFields'
 import type { Org, Project, SSEEvent } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
@@ -47,18 +49,35 @@ export function Projects() {
 
   // Orgs the caller can place projects in (global admins see all).
   const [orgs, setOrgs] = useState<Org[]>([])
+  // /projects?new=1 (the Get started checklist's link) opens New project once the orgs are in.
+  const [params, setParams] = useSearchParams()
+  const [orgsLoaded, setOrgsLoaded] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
   const [createForm, setCreateForm] = useState({ name: '', code: '', description: '' })
   const [createHome, setCreateHome] = useState<ProjectHome>(NO_HOME)
   const [creating, setCreating] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
+  // Inline, per field, cleared as you type (#128).
+  const [fieldErrors, setFieldErrors] = useState<{ name?: string; code?: string }>({})
+  // The code follows the name until you type one yourself.
+  const [codeTyped, setCodeTyped] = useState(false)
   const [importModalOpen, setImportModalOpen] = useState(false)
   const [importHome, setImportHome] = useState<ProjectHome>(NO_HOME)
   const importHomeRef = useRef<ProjectHome>(NO_HOME)
 
   useEffect(() => {
-    api.listOrgs().then(setOrgs).catch(() => setOrgs([]))
+    api.listOrgs().then(setOrgs).catch(() => setOrgs([])).finally(() => setOrgsLoaded(true))
   }, [])
+
+  // ?new opens the dialog as the New project button does, with the same default home.
+  const wantsNew = orgsLoaded && params.has('new')
+  useEffect(() => {
+    if (!wantsNew) return
+    openCreate()
+    setParams(p => { const n = new URLSearchParams(p); n.delete('new'); return n }, { replace: true })
+    // openCreate reads orgs, which have loaded once wantsNew is true
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wantsNew])
 
   const defaultHome = (): ProjectHome => ({ orgId: orgs.length > 1 ? orgs[0].id : null, teamId: null })
 
@@ -66,12 +85,19 @@ export function Projects() {
     setCreateForm({ name: '', code: '', description: '' })
     setCreateHome(defaultHome())
     setCreateError(null)
+    setFieldErrors({})
+    setCodeTyped(false)
     setCreateOpen(true)
   }
 
   const handleCreate = async () => {
-    if (!createForm.name.trim() || !createForm.code.trim()) {
-      setCreateError('Name and code are required')
+    const missing = {
+      ...(!createForm.name.trim() ? { name: 'Give the project a name.' } : {}),
+      ...(!createForm.code.trim() ? { code: 'Give it a code: letters A-Z and digits.' } : {}),
+    }
+    setFieldErrors(missing)
+    if (missing.name || missing.code) {
+      document.getElementById(missing.name ? 'new-project-name' : 'new-project-code')?.focus()
       return
     }
     setCreating(true)
@@ -210,17 +236,11 @@ export function Projects() {
             >
               <Layers size={26} className="text-line-str" />
             </div>
-            <div className="text-center">
-              <p className="text-base font-semibold text-ink">No projects yet</p>
-              <p className="text-sm text-ink-2 mt-2 max-w-xs leading-relaxed">
-                Ask the{' '}
-                <code
-                  className="text-link font-mono text-xs px-1.5 py-0.5 rounded-md"
-                  style={{ background: 'color-mix(in srgb, var(--link) 10%, transparent)' }}
-                >
-                  amp-manager
-                </code>
-                {' '}to create a project — it will appear here instantly.
+            <div className="text-center grid justify-items-center gap-3">
+              <p className="m-0 text-base font-semibold text-ink">No projects yet</p>
+              <button onClick={openCreate} className="amp-btn amp-btn-primary"><Plus size={12} />Create your first project</button>
+              <p className="m-0 text-sm text-ink-2 max-w-xs leading-relaxed">
+                Or describe what you want to your <ManagerAgent /> and it creates the project. It appears here at once.
               </p>
             </div>
           </div>
@@ -306,12 +326,26 @@ export function Projects() {
       {createOpen && (
         <CrudModal title="New Project" onClose={() => setCreateOpen(false)} onSave={handleCreate} saving={creating} saveLabel="Create">
           <div className="space-y-4">
-            <div><label className={labelCls}>Name *</label>
-              <input autoFocus value={createForm.name} onChange={e => setCreateForm(f => ({ ...f, name: e.target.value }))} className={inputCls} placeholder="Project name" /></div>
-            <div><label className={labelCls}>Code *</label>
-              <input value={createForm.code} onChange={e => setCreateForm(f => ({ ...f, code: e.target.value.toUpperCase() }))} className={`${inputCls} font-mono`} placeholder="e.g. AMP" maxLength={12} /></div>
-            <div><label className={labelCls}>Description</label>
-              <textarea value={createForm.description} onChange={e => setCreateForm(f => ({ ...f, description: e.target.value }))} rows={3} className={`${inputCls} resize-none`} placeholder="Optional description" /></div>
+            <div><label htmlFor="new-project-name" className={labelCls}>Name *</label>
+              <input id="new-project-name" autoFocus value={createForm.name}
+                onChange={e => {
+                  const name = e.target.value
+                  setCreateForm(f => ({ ...f, name, code: codeTyped ? f.code : suggestCode(name) }))
+                  setFieldErrors(fe => ({ ...fe, name: undefined, ...(codeTyped ? {} : { code: undefined }) }))
+                }}
+                aria-invalid={!!fieldErrors.name} aria-describedby={fieldErrors.name ? 'new-project-name-error' : undefined}
+                className={inputCls} placeholder="Project name" />
+              <FieldError id="new-project-name-error">{fieldErrors.name}</FieldError></div>
+            <div><label htmlFor="new-project-code" className={labelCls}>Code *</label>
+              <input id="new-project-code" value={createForm.code}
+                onChange={e => { setCodeTyped(true); setCreateForm(f => ({ ...f, code: cleanCode(e.target.value) })); setFieldErrors(fe => ({ ...fe, code: undefined })) }}
+                aria-invalid={!!fieldErrors.code} aria-describedby={fieldErrors.code ? 'new-project-code-error' : 'new-project-code-hint'}
+                className={`${inputCls} font-mono`} placeholder="e.g. AMP" maxLength={CODE_MAX} />
+              {fieldErrors.code
+                ? <FieldError id="new-project-code-error">{fieldErrors.code}</FieldError>
+                : <p id="new-project-code-hint" className="text-[11px] text-ink-3 mt-1.5">Letters A-Z and digits, up to {CODE_MAX}.{codeTyped ? '' : ' Suggested from the name.'}</p>}</div>
+            <div><label htmlFor="new-project-description" className={labelCls}>Description</label>
+              <textarea id="new-project-description" value={createForm.description} onChange={e => setCreateForm(f => ({ ...f, description: e.target.value }))} rows={3} className={`${inputCls} resize-none`} placeholder="Optional description" /></div>
             <ProjectHomeFields orgs={orgs} value={createHome} onChange={setCreateHome} />
             {createError && <p className="text-xs text-danger-ink">{createError}</p>}
           </div>

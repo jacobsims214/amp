@@ -209,8 +209,10 @@ func (s *Server) ServerOptions() []server.ServerOption {
 	hooks := &server.Hooks{}
 	hooks.AddAfterListTools(func(ctx context.Context, _ any, _ *mcpgo.ListToolsRequest, res *mcpgo.ListToolsResult) {
 		res.Tools = s.listFilter(ctx, res.Tools)
+		s.noteContact(ctx)
 	})
 	return []server.ServerOption{
+		server.WithToolHandlerMiddleware(s.contactMiddleware()),
 		server.WithToolHandlerMiddleware(Middleware()),
 		server.WithToolHandlerMiddleware(s.deniedMiddleware()),
 		server.WithHooks(hooks),
@@ -224,4 +226,23 @@ func humanReasonList() string {
 		parts = append(parts, "'"+r+"' ("+domain.HumanReasonText[r]+")")
 	}
 	return "One of " + strings.Join(parts, ", ")
+}
+
+// contactMiddleware records that the caller's agent reached AMP (the Get
+// started checklist's first step, #128) on every tool call; the service
+// writes it at most once a minute per caller.
+func (s *Server) contactMiddleware() server.ToolHandlerMiddleware {
+	return func(next server.ToolHandlerFunc) server.ToolHandlerFunc {
+		return func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+			s.noteContact(ctx)
+			return next(ctx, req)
+		}
+	}
+}
+
+// noteContact records an agent contact for the caller, when there is one.
+func (s *Server) noteContact(ctx context.Context) {
+	if p, err := authz.FromContext(ctx); err == nil {
+		s.svc.NoteAgentContact(ctx, p)
+	}
 }

@@ -81,6 +81,7 @@ export function AppShell() {
 
   return (
     <div className="relative flex h-screen overflow-hidden bg-bg">
+      <a href="#main-content" className="amp-skip-link">Skip to main content</a>
       {navOpen && <div className="fixed inset-0 z-30 bg-[var(--scrim)] md:hidden" onClick={() => setNavOpen(false)} aria-hidden="true" />}
       <aside id="main-nav" className={`w-[232px] flex-shrink-0 flex-col bg-surface-2 border-r border-line overflow-y-auto fixed inset-y-0 left-0 z-40 md:static md:z-auto md:flex ${navOpen ? 'flex' : 'hidden'}`} aria-label="Main"
         onClick={e => { if ((e.target as HTMLElement).closest('a')) setNavOpen(false) }}>
@@ -169,7 +170,7 @@ export function AppShell() {
         )}
       </aside>
 
-      <main className="relative flex-1 min-w-0 h-full overflow-auto">
+      <main id="main-content" tabIndex={-1} className="relative flex-1 min-w-0 h-full overflow-auto">
         <div className="md:hidden sticky top-0 z-20 flex items-center gap-2 h-11 px-2 bg-surface border-b border-line">
           <button type="button" className="p-2 text-ink" onClick={() => setNavOpen(true)} aria-label="Open menu" aria-expanded={navOpen} aria-controls="main-nav"><Menu size={18} /></button>
           <span className="text-[15px] font-bold tracking-[0.16em] text-ink">AMP</span>

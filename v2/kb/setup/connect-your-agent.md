@@ -14,6 +14,31 @@ acts as you. There are two ways in:
 - **Any other harness that speaks MCP** (Claude Code, opencode and others) with an AMP token:
   sections 1 and 2 below.
 
+## The manager agent
+
+The **manager agent** is the agent you talk to. It turns what you ask for into a plan on the AMP
+board (epics, stories and tickets with dependencies), waits for you to approve it, then runs
+each ticket with a worker agent. It never edits code itself. In AMP Harness, the plugins and
+these docs it is named `amp-manager`; the web UI calls it your manager agent. Setting it up is
+connecting your harness, below: AMP Harness has it built in, and the Claude Code and opencode
+plugins install it.
+
+## Get started in the web UI
+
+On a fresh AMP, **My work** shows a **Get started** checklist where your queue will be:
+
+1. **Connect an agent.** The MCP address to point your harness at, with a copy button. Checked
+   the first time an agent reaches AMP's MCP endpoint as you (or as an agent account you
+   manage), or once one of your API tokens has been used.
+2. **Create or describe a project.** **Create a project** opens New project; or describe what
+   you want to your manager agent and it creates it. Checked once you can see a project.
+3. **Review and approve the agent's plan.** Checked once you have approved a ticket in a plan
+   (with sign-in off: once any plan in an active project has been approved).
+
+Each step is read from AMP itself, so it stays checked once done, on any device. The checklist
+goes away when all three are done; **Hide** hides it in this browser. It shows when sign-in is
+off, too.
+
 ## AMP Harness (the default)
 
 One binary for macOS and Linux. Install it, then run setup in your project folder:
