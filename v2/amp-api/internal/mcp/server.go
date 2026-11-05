@@ -2070,6 +2070,10 @@ func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*
 	if err := s.checkProjectNotArchived(context.Background(), task.ProjectID); err != nil {
 		return nil, err
 	}
+	// A held ticket waits for a person; a question doesn't release it (#126).
+	if err := s.svc.RefuseIfHeld(rctx, caller(rctx).p, task, "task.block"); err != nil {
+		return nil, err
+	}
 	replyCh := make(chan ReplySimple, 1)
 	pid, err := s.registry.Get(task.ProjectID)
 	if err != nil {

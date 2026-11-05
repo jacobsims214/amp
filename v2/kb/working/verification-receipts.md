@@ -57,15 +57,17 @@ card. It is a **Verify** item in "Waiting on you" (My work and its counts) for t
 or for the project's owners when it has none. The tickets that depend on it keep waiting. A ticket
 that isn't in progress can't be held: below the minimum, its completion is refused.
 
-While it waits, nothing completes it off the web UI: its worker calling `amp_complete_task` again
-(even with passing checks), a closeout, `amp_set_task_state(completed)` or a REST call with an API
-token all get a 409 that points to the ticket. Rework goes through Reject and a new dispatch.
+While it waits, agents can't touch it: off the web UI, completing it (its worker calling
+`amp_complete_task` again, even with passing checks, or a closeout), moving it to any other state
+(back to ready included), blocking it with a question, returning it or deleting it all get a 409
+that points to the ticket. Only a person releases it: they Accept or Reject it in the web UI, and
+the next dispatch reworks a rejected one.
 
 The minimum level in v1 is **Self-checked** only; Independently verified arrives with the
 verifier, and setting it is refused until then.
 
-A hold lasts only while the ticket waits: moving it back to ready, dispatching it again, deleting
-it or completing it another way ends the hold.
+A hold lasts only while the ticket waits: a person moving it back in the web UI (to ready, say),
+deleting it there or marking it done ends the hold.
 
 - **Accept** completes it. A PR on it still waits on its merge, as usual.
 - **Reject** needs a note. The ticket goes back to ready with the note as a comment, for the next

@@ -1201,6 +1201,10 @@ func (s *Service) deleteTickets(ctx context.Context, p authz.Principal, projectI
 	if err := s.guardDeletedHumanGates(ctx, p, projectID, ids); err != nil {
 		return nil, err
 	}
+	// Off the web UI, a held ticket isn't deleted: it waits for a person (#126).
+	if err := s.refuseIfAnyHeld(ctx, p, ids, "task.delete"); err != nil {
+		return nil, err
+	}
 	dependents, err := s.Repo.Dependents(ctx, ids)
 	if err != nil {
 		return nil, err

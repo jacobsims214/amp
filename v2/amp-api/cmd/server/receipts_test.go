@@ -142,14 +142,14 @@ func TestReceipts_Inform(t *testing.T) {
 	wantErr(t, alice.callExpectError(t, "amp_open_receipt", map[string]any{"task_id": float64(a), "dispatch_id": "stale"}), "current dispatch")
 	out := alice.call(t, "amp_complete_task", map[string]any{"task_id": float64(a), "dispatch_id": da, "receipt_id": float64(rid),
 		"checks": []any{passCheck("1"), map[string]any{"criterion_ref": "2", "kind": "visual", "verdict": "cant_tell", "note": "no screenshot"}},
-		"branch": "feat/a", "commit": "abc1234def", "base_branch": "main", "tree_sha": "tree123"})
+		"branch": "feat/a", "commit": "abc1234def", "base_branch": "main", "tree_sha": "abcdef0123456789"})
 	if out["state"] != "completed" || out["receipt_status"] != "self_checked" {
 		t.Fatalf("complete: %v", out)
 	}
 	got := getReceipt(t, ra, "bob", a)
 	rc := got["receipt"].(map[string]any)
 	if got["status"] != "self_checked" || got["held"] != false || intField(t, rc, "id") != rid || rc["state"] != "final" ||
-		rc["branch"] != "feat/a" || rc["commit_sha"] != "abc1234def" || rc["base_branch"] != "main" || rc["tree_sha"] != "tree123" ||
+		rc["branch"] != "feat/a" || rc["commit_sha"] != "abc1234def" || rc["base_branch"] != "main" || rc["tree_sha"] != "abcdef0123456789" ||
 		rc["summary"] != "did it" || rc["mode"] != "inform" || rc["run_id"] == nil {
 		t.Fatalf("receipt: %v", got)
 	}
@@ -470,12 +470,14 @@ func TestReceipts_StaleHoldIsCleared(t *testing.T) {
 	if out := alice.call(t, "amp_complete_task", map[string]any{"task_id": float64(x), "dispatch_id": dx}); out["held"] != true {
 		t.Fatalf("not held: %v", out)
 	}
-	// A "change" to the state it already has keeps the hold.
-	alice.call(t, "amp_set_task_state", map[string]any{"task_id": float64(x), "state": "in_progress"})
+	// A person moving it in the web UI (an agent can't, see
+	// TestReceipts_HeldTicketCantBeMovedOffUI): a "change" to the state it
+	// already has keeps the hold, a move to ready ends it.
+	uiSetState(t, w, w.alice, x, domain.TaskStateInProgress)
 	if got := getReceipt(t, ra, "alice", x); got["held"] != true {
 		t.Fatalf("a no-op state change cleared the hold: %v", got)
 	}
-	alice.call(t, "amp_set_task_state", map[string]any{"task_id": float64(x), "state": "backlog"})
+	uiSetState(t, w, w.alice, x, domain.TaskStateBacklog)
 	if got := getReceipt(t, ra, "alice", x); got["held"] != false {
 		t.Fatalf("held after a move to ready: %v", got)
 	}
@@ -716,6 +718,9 @@ func opened(t *testing.T, s *mcpStack, storyID int, name string) (taskID int, di
 	t.Helper()
 	taskID = mkIn(t, s, storyID, name)
 	dispatch = dispatchClaims(t, s, taskID)
+	// A ticket a test leaves dispatched and unstarted would be returned by
+	// a later run's watchdog test (it sweeps every project): mark it started.
+	t.Cleanup(func() { execSQL(t, `UPDATE tasks SET started_at = COALESCE(started_at, NOW()) WHERE id = $1`, taskID) })
 	receiptID = intField(t, s.call(t, "amp_open_receipt", map[string]any{"task_id": float64(taskID), "dispatch_id": dispatch}), "receipt_id")
 	if receiptID == 0 {
 		t.Fatal("open receipt returned 0")
@@ -1340,7 +1345,7 @@ func TestReceipts_HeldTicketWaitsForAPerson(t *testing.T) {
 	}
 	pass := []any{passCheck("1")}
 	wantErr(t, alice.callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(x), "checks": pass}), "is held", "web UI")
-	wantErr(t, alice.callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(x), "dispatch_id": dx, "checks": pass}), "")
+	wantErr(t, alice.callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(x), "dispatch_id": dx, "checks": pass}), "is held")
 	wantErr(t, w.as(w.orgadmin).callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(x), "checks": pass,
 		"closeout_reason": "looks done"}), "is held")
 	wantErr(t, alice.callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(x), "closeout_reason": "stuck"}), "is held")
@@ -1397,5 +1402,97 @@ func TestReceipts_OrgMoveCantWeaken(t *testing.T) {
 	root.call(t, "amp_manage_project_teams", move(w.other.ID))
 	if p, _ := w.s.repo.GetProject(context.Background(), w.s.projectID); p.OrgID == nil || *p.OrgID != w.other.ID {
 		t.Fatalf("move into another Require org: %v", p.OrgID)
+	}
+}
+
+// Strictly held: off the web UI an agent can't move a held ticket to any
+// other state (back to ready included), block, return or delete it; it
+// stays held. A person moving it back in the web UI ends the hold.
+func TestReceipts_HeldTicketCantBeMovedOffUI(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	alice := w.as(w.alice)
+	setReceiptsMode(t, ra, w.s.projectID, "require")
+	x := mkIn(t, alice, w.s.storyID, "held")
+	dx := dispatchClaims(t, alice, x)
+	if out := alice.call(t, "amp_complete_task", map[string]any{"task_id": float64(x), "dispatch_id": dx}); out["held"] != true {
+		t.Fatalf("not held: %v", out)
+	}
+	id := float64(x)
+	wantErr(t, alice.callExpectError(t, "amp_set_task_state", map[string]any{"task_id": id, "state": "backlog"}), "is held")
+	wantErr(t, alice.callExpectError(t, "amp_set_task_state", map[string]any{"task_id": id, "state": "blocked", "reason": "stuck"}), "is held")
+	wantErr(t, alice.callExpectError(t, "amp_block_task", map[string]any{"task_id": id, "reason": "should I?"}), "is held")
+	wantErr(t, alice.callExpectError(t, "amp_return_task", map[string]any{"task_id": id, "reason": "worker died", "dispatch_id": dx}), "is held")
+	wantErr(t, alice.callExpectError(t, "amp_delete_task", map[string]any{"task_id": id}), "is held")
+	wantErr(t, w.as(w.root).callExpectError(t, "amp_delete_story", map[string]any{"story_id": float64(w.s.storyID)}), "is held")
+	if code, out := ra.doVia(t, auth.ChannelToken, "alice", http.MethodPost, fmt.Sprintf("/api/tasks/%d/return", x),
+		map[string]any{"reason": "back to ready"}); code != 409 {
+		t.Fatalf("REST return with a token: %d %v", code, out)
+	}
+	if st := taskState(t, alice, x); st != domain.TaskStateInProgress {
+		t.Fatalf("held ticket moved to %s", st)
+	}
+	if got := getReceipt(t, ra, "alice", x); got["held"] != true {
+		t.Fatalf("hold lost: %v", got)
+	}
+	// Nor does the not-started watchdog return it, however long it waits.
+	execSQL(t, `UPDATE tasks SET dispatched_at = NOW() - INTERVAL '2 hours', started_at = NULL WHERE id = $1`, x)
+	if _, err := service.New(w.s.repo, w.s.reg, nil).SweepNotStarted(context.Background(), allowAll); err != nil {
+		t.Fatal(err)
+	}
+	if st := taskState(t, alice, x); st != domain.TaskStateInProgress || getReceipt(t, ra, "alice", x)["held"] != true {
+		t.Fatalf("the watchdog released a held ticket: %s", st)
+	}
+	// The refusals are audited.
+	entries, err := w.s.repo.ListAudit(context.Background(), domain.AuditFilter{ProjectID: w.s.projectID, Action: "task.state.denied"})
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("no audit for the refused move: %v %v", entries, err)
+	}
+	// Other in-progress tickets move as before.
+	other := mkIn(t, alice, w.s.storyID, "not held")
+	dispatchClaims(t, alice, other)
+	alice.call(t, "amp_set_task_state", map[string]any{"task_id": float64(other), "state": "backlog"})
+	// A person in the web UI moves it back; that ends the hold.
+	uiSetState(t, w, w.alice, x, domain.TaskStateBacklog)
+	if st := taskState(t, alice, x); st != domain.TaskStateBacklog {
+		t.Fatalf("UI move: %s", st)
+	}
+	if got := getReceipt(t, ra, "alice", x); got["held"] != false {
+		t.Fatalf("hold after the UI move: %v", got)
+	}
+}
+
+// A receipt-level tree_sha that isn't a full tree id is refused.
+func TestReceipts_CompletionTreeSHAValidated(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	alice := w.as(w.alice)
+	setReceiptsMode(t, ra, w.s.projectID, "inform")
+	x := mkIn(t, alice, w.s.storyID, "short tree")
+	dx := dispatchClaims(t, alice, x)
+	wantErr(t, alice.callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(x), "dispatch_id": dx,
+		"tree_sha": "abc1234", "checks": []any{passCheck("1")}}), "12 to 64 hex digits")
+	if st := taskState(t, alice, x); st != domain.TaskStateInProgress {
+		t.Fatalf("refused completion left it %s", st)
+	}
+}
+
+// uiSetState sets a ticket's state as a person in the web UI would (the
+// service's SetTaskState with a web UI principal; the board has no REST
+// route for an arbitrary state).
+func uiSetState(t *testing.T, w *rbacWorld, who *auth.Identity, id int, state domain.TaskState) {
+	t.Helper()
+	ident := *who
+	ident.Listener, ident.Channel = "rest", auth.ChannelUI
+	ctx := auth.WithIdentity(context.Background(), &ident)
+	p, err := authz.FromContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.InUI() {
+		t.Fatal("not a web UI principal")
+	}
+	if _, err := service.New(w.s.repo, w.s.reg, nil).SetTaskState(ctx, p, id, state, ""); err != nil {
+		t.Fatalf("UI state %s: %v", state, err)
 	}
 }

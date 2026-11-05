@@ -161,6 +161,9 @@ func optFilesChanged(args map[string]interface{}) ([]domain.FileChange, error) {
 // receiptFromArgs reads amp_complete_task's receipt arguments.
 func receiptFromArgs(args map[string]interface{}, dispatchID string) (*service.ReceiptIn, error) {
 	in := &service.ReceiptIn{DispatchID: dispatchID, TreeSHA: strings.TrimSpace(optStr(args, "tree_sha", ""))}
+	if in.TreeSHA != "" && !receipts.ValidTreeSHA(in.TreeSHA) {
+		return nil, authz.BadRequest("tree_sha must be the full git tree id (12 to 64 hex digits): git rev-parse HEAD^{tree}")
+	}
 	if v, ok := args["receipt_id"].(float64); ok && v > 0 {
 		in.ReceiptID = int64(v)
 	}

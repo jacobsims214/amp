@@ -285,6 +285,11 @@ func (s *Service) SetTaskStateHeld(ctx context.Context, p authz.Principal, taskI
 	if state == domain.TaskStateBlocked && strings.HasPrefix(strings.TrimSpace(reason), "scheduled:") {
 		return nil, false, authz.BadRequest("ticket %d: a block reason can't start with \"scheduled:\"; schedule a ticket with amp_set_task_start_at", taskID)
 	}
+	// A held ticket waits for a person: off the web UI it isn't moved at all,
+	// back to ready and to completed included (#126).
+	if err := s.RefuseIfHeld(ctx, p, t, "task.state"); err != nil {
+		return nil, false, err
+	}
 	requireStarted, err := s.offUIStateGate(ctx, p, t, state, reason, dispatchID)
 	if err != nil {
 		s.auditTaskDenied(ctx, p, "task.state", t, err, map[string]any{"to": string(state)})

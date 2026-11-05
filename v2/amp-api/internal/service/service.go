@@ -529,6 +529,13 @@ func (s *Service) ReturnTask(ctx context.Context, p authz.Principal, taskID int,
 	if err != nil {
 		return nil, err
 	}
+	// A held ticket isn't returned off the web UI: it waits for a person
+	// (#126). The watchdog never sees one: it has no dispatch.
+	if !system {
+		if err := s.RefuseIfHeld(ctx, p, t, "task.return"); err != nil {
+			return nil, err
+		}
+	}
 	byName := p.Label()
 	if system {
 		byName = "system"

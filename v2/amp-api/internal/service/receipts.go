@@ -187,17 +187,10 @@ func (s *Service) prepareReceipt(ctx context.Context, p authz.Principal, t *doma
 	}
 	// A held ticket waits for a person (D10): off the web UI nothing
 	// completes it, not its worker trying again with new checks, nor a
-	// closeout. Rework goes through a new dispatch, which ends the hold.
-	if !p.InUI() && t.State == domain.TaskStateInProgress && t.DispatchID == "" {
-		rc, err := s.latestFinal(ctx, t.ID)
-		if err != nil && authz.StatusOf(err, 0) != 404 {
-			return nil, &authz.Error{Status: 503, Msg: fmt.Sprintf("ticket %d: couldn't read its receipt (%v); nothing changed, try again", t.ID, err)}
-		}
-		if err == nil && liveHeld(*rc, t.State, t.DispatchID) {
-			return nil, &authz.Error{Status: 409, Msg: fmt.Sprintf("ticket %d is held: its verification receipt couldn't be verified and it "+
-				"waits for a person to Accept (which completes it) or Reject it in the AMP web UI: %s. Don't complete it again; "+
-				"rework needs a new dispatch.", t.ID, s.TaskURL(t.ProjectID, t.ID))}
-		}
+	// closeout. A person Rejects it in the web UI, and the next dispatch
+	// reworks it.
+	if err := s.RefuseIfHeld(ctx, p, t, "task.complete"); err != nil {
+		return nil, err
 	}
 	rs, err := s.effectiveReceiptsStrict(ctx, t)
 	if err != nil {
@@ -271,6 +264,54 @@ func (s *Service) downgradeVisual(ctx context.Context, plan *receiptPlan) {
 		}
 	}
 	plan.in.Checks = domain.DowngradeVisualChecks(plan.in.Checks, ev, tree, s.storeErr())
+}
+
+// RefuseIfHeld refuses, off the web UI, any change to ticket t while it is
+// live-held (#126): completing, moving it to another state, blocking,
+// returning or deleting it. "Couldn't verify, needs you" means a person
+// acts (Accept or Reject in the web UI); an agent never releases the hold
+// itself. Other tickets, and the web UI, are unaffected. A receipt that
+// can't be read refuses too (503, nothing changed); a ticket with no
+// receipt isn't held. The refusal is audited as a denial of action.
+func (s *Service) RefuseIfHeld(ctx context.Context, p authz.Principal, t *domain.Task, action string) error {
+	if p.InUI() || t.State != domain.TaskStateInProgress || t.DispatchID != "" {
+		return nil
+	}
+	rc, err := s.latestFinal(ctx, t.ID)
+	var refusal error
+	switch {
+	case err != nil && authz.StatusOf(err, 0) == 404:
+		return nil
+	case err != nil:
+		refusal = &authz.Error{Status: 503, Msg: fmt.Sprintf("ticket %d: couldn't read its verification receipt (%v); nothing changed, try again", t.ID, err)}
+	case !liveHeld(*rc, t.State, t.DispatchID):
+		return nil
+	default:
+		refusal = &authz.Error{Status: 409, Msg: fmt.Sprintf("ticket %d is held: its verification receipt couldn't be verified, and it waits "+
+			"for a person in the AMP web UI: %s. A person Accepts it (which completes it) or Rejects it, and the next dispatch "+
+			"reworks it. Don't complete, move or delete it yourself.", t.ID, s.TaskURL(t.ProjectID, t.ID))}
+	}
+	s.auditTaskDenied(ctx, p, action, t, refusal, map[string]any{"held": true})
+	return refusal
+}
+
+// refuseIfAnyHeld is RefuseIfHeld for several tickets (a delete).
+func (s *Service) refuseIfAnyHeld(ctx context.Context, p authz.Principal, ids []int, action string) error {
+	if p.InUI() {
+		return nil
+	}
+	for _, id := range ids {
+		t, err := s.Repo.GetTask(ctx, id)
+		if err != nil {
+			// Fail closed: the ids come from the set being deleted, so a
+			// read error here is transient, not a ticket that's already gone.
+			return &authz.Error{Status: 503, Msg: fmt.Sprintf("ticket %d: couldn't read it to check for a verification hold (%v); nothing changed, try again", id, err)}
+		}
+		if err := s.RefuseIfHeld(ctx, p, t, action); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // holdReason says why a receipt is below its minimum, in a person's words.
@@ -771,7 +812,13 @@ func (s *Service) releaseHeld(ctx context.Context, p authz.Principal, t *domain.
 		}
 		s.comment(t.ProjectID, t.ID, p, "Receipt rejected: "+note)
 	}
-	return s.Repo.ClearTaskHeld(ctx, t.ID)
+	// The ticket has moved: a hold left behind is harmless (a completed or
+	// ready ticket is never live-held), so failing to clear it is only
+	// logged, and the verdict that moved it stays.
+	if err := s.Repo.ClearTaskHeld(ctx, t.ID); err != nil {
+		slog.Warn("receipt verdict: clear the hold after the move", "task_id", t.ID, "err", err)
+	}
+	return nil
 }
 
 // KeepReceipts keeps every receipt of a ticket whose merge was just
@@ -1253,8 +1300,13 @@ func (s *Service) guardReceiptsOrgMove(ctx context.Context, p authz.Principal, p
 	}
 	before, after := settings(from), settings(to)
 	if weakens(before, after) {
-		return authz.UIOnly(fmt.Sprintf("Moving project %d to org %d, which weakens its verification receipts setting (from %s to %s),",
+		err := authz.UIOnly(fmt.Sprintf("Moving project %d to org %d, which weakens its verification receipts setting (from %s to %s),",
 			proj.ID, orgID, describeReceipts(before), describeReceipts(after)), s.SettingsURL(proj.ID))
+		s.auditDenied(ctx, p, "project.org", domain.AuditEntry{ProjectID: intRef(proj.ID), TargetType: "project", TargetID: idStr(proj.ID),
+			TargetName: proj.Name, Summary: fmt.Sprintf("refused moving project %d to org %d by %s: it weakens its verification receipts setting",
+				proj.ID, orgID, p.Label()), Details: map[string]any{"from_org_id": proj.OrgID, "to_org_id": orgID,
+				"before": describeReceipts(before), "after": describeReceipts(after)}}, err)
+		return err
 	}
 	return nil
 }

@@ -431,6 +431,11 @@ func (s *Service) completeTask(ctx context.Context, p authz.Principal, taskID in
 	if t.IsHuman() {
 		return nil, Closeout{}, authz.BadRequest("ticket %d is a person's ticket; they mark it done in AMP: %s", taskID, s.TaskURL(t.ProjectID, taskID))
 	}
+	// A held ticket waits for a person (#126): refused before any other
+	// check, so the refusal says so whoever calls and with whatever dispatch.
+	if err := s.RefuseIfHeld(ctx, p, t, "task.complete"); err != nil {
+		return nil, Closeout{}, err
+	}
 	if err := s.checkAgentCompletion(ctx, p, t, complete.DispatchID); err != nil {
 		s.auditTaskDenied(ctx, p, "task.complete", t, err, nil)
 		return nil, Closeout{}, err
