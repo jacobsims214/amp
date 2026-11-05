@@ -83,6 +83,14 @@ The server links people to tickets this way (`TaskURL` in amp-api, and the
 | `sel` | Graph | ticket id; selected node with its chain lit | none | push to select, replace to clear |
 | `chain` | Graph | `1`: show only the selected node's chain | off | replace |
 | `open` | Trace | `<task id>[,<task id>…]`: expanded stories | none | push |
+| `doc` | Library (KB) | doc path: the open doc | none (the list) | push |
+| `q` | Library (KB) | search text, run on load | empty | replace |
+| `tag` | Library (KB) | tag: filters the list | all tags | push |
+| `range` | Report | `1d`, `7d`, `30d`, `all` | `7d` | replace |
+| `range` | Portfolio | `7d`, `30d`, `90d`, `365d` | `30d` | push |
+| `user` | Day reports | user id: whose reports | you | push |
+| `day` | Day reports | `YYYY-MM-DD`: the day your report is built for | today | replace |
+| `open` | Day reports | `YYYY-MM-DD`: the saved report that's expanded, or `none` | the newest | replace |
 | `v` | Artifact | version number | latest | replace |
 | `org` | Portfolio | org id | last viewed, else your first | replace |
 | `launch` | any page (debug) | `full` or `short`: forces the launch animation | by timing | read only |
@@ -104,6 +112,7 @@ means choosing that person (or Everyone) in the owner filter first.
 ## Not in the URL (yet)
 
 - Board collapsed epics and stories, and Graph expanded stories: arrangement,
-  not selection. They stay per-view state for now.
+  not selection. They stay per-view state for now. So do Portfolio's
+  split and hidden columns (per-browser preferences).
 - Graph search box, zoom and pan, and the "What changed" panel.
 - Modals (plan check, epic and story edit, team access) are not addressable.
