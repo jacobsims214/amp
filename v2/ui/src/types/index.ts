@@ -477,6 +477,12 @@ export interface Me {
   teams?: { id: number; name: string; org_id: number; role: string }[]
   kind?: UserKind
   via_token?: boolean
+  /**
+   * Sign-in is off on this AMP (no OIDC_ISSUER_URL): every request is the
+   * Local Dev user, an AMP admin provisioned at startup (#124). Absent on
+   * older APIs and with sign-in on.
+   */
+  local_dev?: boolean
   /** Feature flags for this caller. Absent on older APIs (treat as unavailable). */
   capabilities?: {
     remote_control?: { available: boolean; org_ids?: number[]; reason?: string | null }

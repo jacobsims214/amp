@@ -143,6 +143,18 @@ func main() {
 		slog.Error("failed to initialize auth verifier", "err", err)
 		os.Exit(1)
 	}
+	// With auth off, the local-dev identity is a real AMP user, an admin of
+	// the Default org (#124). With auth on, that user is never created, and
+	// one left by an auth-off boot is deactivated (ProvisionLocalDev).
+	if u, err := verifier.ProvisionLocalDev(ctx); err != nil {
+		if verifier.Enabled() {
+			slog.Error("auth on: deactivating the Local Dev user failed", "err", err)
+		} else {
+			slog.Error("auth off: provisioning the Local Dev user failed; My work, tokens and agent accounts won't work", "err", err)
+		}
+	} else if u != nil {
+		slog.Info("auth off: every request is the Local Dev user, an AMP admin", "user_id", u.ID, "email", u.Email)
+	}
 
 	// ---- 2. SSE hub ----
 	sseHub := hub.New()

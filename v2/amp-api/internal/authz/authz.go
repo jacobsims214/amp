@@ -88,7 +88,7 @@ func StatusOf(err error, fallback int) int {
 
 // Principal is who is making a request.
 type Principal struct {
-	UserID int // 0 for the local-dev user (auth disabled)
+	UserID int // 0 for the local-dev user (auth disabled) until it's provisioned
 	Email  string
 	Super  bool // global admin, or local dev
 	// Agent is set for agent accounts (see domain.UserKindAgent).
@@ -145,7 +145,12 @@ func UIOnly(what, link string) error {
 		"Stop and ask your person to do it there.", what, link)
 }
 
-// HasUser reports whether the principal is a real AMP user (not local dev).
+// LocalDev reports whether p is the identity every request has when auth
+// is off. Since #124 it's also a real AMP user (HasUser) once provisioned.
+func (p Principal) LocalDev() bool { return p.AuthMethod == auth.AuthLocalDev }
+
+// HasUser reports whether the principal is a real AMP user (the local-dev
+// identity is one once startup has provisioned it).
 func (p Principal) HasUser() bool { return p.UserID != 0 }
 
 // UserRef returns a pointer to the user ID for attribution columns, nil for local dev.
@@ -167,7 +172,15 @@ func FromContext(ctx context.Context) (Principal, error) {
 	}
 	req, _ := reqctx.FromContext(ctx)
 	if ident.LocalDev {
-		return Principal{Super: true, Email: ident.Email, Channel: ident.Channel, AuthMethod: ident.AuthMethod, Req: req}, nil
+		// Auth is off: a global admin. Once startup has provisioned it
+		// (auth.Verifier.ProvisionLocalDev, #124) it is also a real AMP
+		// user, so everything that needs one (My work, tokens, agent
+		// accounts) works; before that, or if that failed, it has none.
+		p := Principal{Super: true, Email: ident.Email, Channel: ident.Channel, AuthMethod: ident.AuthMethod, Req: req}
+		if ident.User != nil {
+			p.UserID = ident.User.ID
+		}
+		return p, nil
 	}
 	if ident.User == nil {
 		return Principal{}, Forbidden("this token has no AMP user (missing email claim); sign in again")
@@ -474,7 +487,8 @@ func (c *Checker) ParseTaskView(ctx context.Context, p Principal, s string) (Tas
 // "mine" is: tickets I own, plus unassigned tickets I created, plus
 // unassigned tickets with no creator — rows from before attribution
 // existed, which would otherwise vanish from every default board.
-// Local dev has no user, so "mine" shows everything.
+// me == 0 (no AMP user: local dev before it's provisioned, #124) shows
+// everything.
 func (v TaskView) Includes(t *domain.Task, me int) bool {
 	switch v.Mode {
 	case "any":

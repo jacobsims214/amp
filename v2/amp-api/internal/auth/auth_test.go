@@ -12,6 +12,7 @@ import (
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
+	"github.com/simstech/amp-api/internal/domain"
 )
 
 const testIssuer = "https://amp.example.test/dex"
@@ -360,5 +361,21 @@ func TestSessionSurvivesRefresh(t *testing.T) {
 	}
 	if DexSessionID("", 1, "n", t0) != "" {
 		t.Fatal("session id without a subject")
+	}
+}
+
+// RequireRole's 403 says what's missing, never a bare "forbidden" (#124).
+func TestRequireRole_SaysWhatIsMissing(t *testing.T) {
+	h := RequireRole(domain.RoleAdmin, func(w http.ResponseWriter, r *http.Request) { t.Fatal("handler ran") })
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/users", nil)
+	req = req.WithContext(WithIdentity(req.Context(), &Identity{Subject: "s", User: &domain.User{ID: 1, Roles: []string{domain.RoleMember}}}))
+	h(rec, req)
+	var body struct{ Error string }
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || rec.Code != 403 {
+		t.Fatalf("%d %s (%v)", rec.Code, rec.Body, err)
+	}
+	if strings.EqualFold(strings.TrimSpace(body.Error), "forbidden") || !strings.Contains(body.Error, "admin") {
+		t.Fatalf("403 body = %q", body.Error)
 	}
 }

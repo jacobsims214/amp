@@ -160,7 +160,8 @@ func (h *RestHandler) register(mux *deniedMux) {
 // ---- /api/me ----
 // Returns the caller's identity as resolved by the auth middleware.
 // Always 200 — when auth is disabled (local dev) this returns the
-// anonymous "local-dev" identity so the UI doesn't need special-casing.
+// "local-dev" identity (an AMP admin user once provisioned, #124) with
+// local_dev: true, so the UI doesn't need special-casing.
 func (h *RestHandler) me(w http.ResponseWriter, r *http.Request) {
 	ident, ok := auth.FromContext(r.Context())
 	if !ok {
@@ -206,7 +207,10 @@ func (h *RestHandler) me(w http.ResponseWriter, r *http.Request) {
 		resp["teams"] = teams
 	}
 	if ident.LocalDev {
+		// Auth is off: the Local Dev user, an admin (provisioned at
+		// startup, #124). local_dev lets the UI say sign-in is off.
 		resp["roles"] = []string{domain.RoleAdmin}
+		resp["local_dev"] = true
 	}
 	// What this AMP and the caller's orgs let the UI offer (additive: an old
 	// UI ignores it; a UI talking to an old API treats it as unavailable).

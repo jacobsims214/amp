@@ -145,7 +145,7 @@ function NoWaitingStrip({ projectId, reason }: { projectId: number; reason: NoMy
     <div className="amp-panel flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-3" role="status">
       <span className="amp-label inline-flex items-center gap-1.5" style={{ color: 'var(--warning-ink)' }}><UserX size={14} aria-hidden="true" />Waiting on you: not counted</span>
       <span className="text-[13px] text-ink-2">
-        {reason === 'local-dev' ? 'Sign-in is off on this AMP, so nothing can wait on you.' : 'You are not signed in as an AMP user.'} The Board has every ticket.
+        {reason === 'local-dev' ? "Sign-in is off on this AMP and its Local Dev user isn't set up, so nothing can wait on you." : 'You are not signed in as an AMP user.'} The Board has every ticket.
       </span>
       <span className="ml-auto flex gap-4">
         <Link to={projectLink(projectId, 'board')} className="amp-label inline-flex items-center gap-1" style={{ color: 'var(--link)' }}>Board<ChevronRight size={14} aria-hidden="true" /></Link>
