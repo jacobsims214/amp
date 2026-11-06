@@ -46,7 +46,17 @@ Good tickets:
   - `coupled_gate`: one ticket joins different people's work, so neither can finish alone.
   - `metadata_drift`: an epic is missing metadata keys its siblings carry (often a near-miss
     key like `jira_key` where the others say `jira_epic`).
+  - `awaiting_approval`: in a project that requires plan approval, tickets nobody has approved
+    yet, by ID. A person approves them in My work (`approve_url`); agents can't, so it is a
+    warning for the person, not NO-GO, and not something the planner fixes. While any wait, the
+    summary never says "No problems found".
+  - `no_context` as a warning: AMP has no KB configured, or couldn't read it. A KB AMP can't
+    read is never a GO.
 - **GO** otherwise.
+
+Flight plan and the Board's **Check plan** list every issue the check returns, including the
+ones without a row of their own (`awaiting_approval`, `human_without_owner`, the merge-step
+warnings).
 
 It also lists `human_gates`: each open human ticket and how many tickets wait on it.
 

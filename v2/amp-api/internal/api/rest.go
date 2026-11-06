@@ -1602,17 +1602,22 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, map[string]interface{}{"task_id": taskID, "state": "completed"})
 
 	case "unblock":
-		// POST {answer}: answer an agent's flag (a ticket blocked with a
-		// reason) and put the ticket back to ready.
+		// POST {answer, option?, option_label?}: answer an agent's flag (a
+		// ticket blocked with a reason) and put the ticket back to ready.
+		// option (0-based) chooses one of the question's options (#130), with
+		// option_label the label that was shown (409 if the question changed
+		// since); answer is then a note added to it.
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", 405)
 			return
 		}
 		var body struct {
-			Answer string `json:"answer"`
+			Answer      string `json:"answer"`
+			Option      *int   `json:"option"`
+			OptionLabel string `json:"option_label"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		t, err := h.svc.AnswerQuestion(r.Context(), pr, taskID, body.Answer)
+		t, err := h.svc.AnswerWithOption(r.Context(), pr, taskID, body.Answer, body.Option, body.OptionLabel)
 		if err != nil {
 			fail(w, err, 400)
 			return

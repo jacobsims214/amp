@@ -94,6 +94,11 @@ describe('suggestAnswers', () => {
       expect(suggestAnswers(q).some(c => /^(should|shall|do|does|can|is|are)\b/i.test(c))).toBe(false)
     }
   })
+  it('reads the options after a colon, and never glues an open question\'s stem to an option (#130)', () => {
+    expect(suggestAnswers('Which CRM should the lead import write to: HubSpot or Pipedrive?')).toEqual(['HubSpot', 'Pipedrive'])
+    expect(suggestAnswers('Which CRM should the lead import write to, HubSpot or Pipedrive?')).toEqual([])
+    expect(suggestAnswers('What should it do, retry or fail?')).toEqual([])
+  })
   it('suggests nothing for an open question', () => {
     expect(suggestAnswers('Which provider do you want?')).toEqual([])
     expect(suggestAnswers('Ship it.')).toEqual([])

@@ -10,15 +10,18 @@ interface Props {
   epicOptions: { id: number; name: string }[]
   /** project members selectable in the owner filter */
   memberOptions: { id: number; name: string }[]
-  counts: { backlog: number; in_progress: number; completed: number; blocked: number; total: number }
+  counts: { backlog: number; in_progress: number; completed: number; question: number; waiting: number; total: number }
 }
 
+// A person's question (red) and waiting on other tickets (grey) are separate
+// filters (#129): one needs someone now, the other clears by itself.
 const STATE_OPTIONS = [
   { value: '', label: 'All' },
   { value: 'backlog',     label: 'Ready',        dot: 'bg-st-ready' },
   { value: 'in_progress', label: 'In progress',  dot: 'bg-st-prog' },
   { value: 'completed',   label: 'Done',         dot: 'bg-st-done' },
-  { value: 'blocked',     label: 'Waiting & questions', dot: 'bg-st-flag' },
+  { value: 'question',    label: 'Needs a person', dot: 'bg-st-flag', hint: 'An agent asked a question: someone has to answer it' },
+  { value: 'waiting',     label: 'Waiting on other tickets', dot: 'bg-st-wait', hint: 'Waiting on dependencies (or a merge); becomes Ready by itself' },
 ] as const
 
 export function FilterBar({ filter, onChange, epicOptions, memberOptions, counts }: Props) {
@@ -55,6 +58,7 @@ export function FilterBar({ filter, onChange, epicOptions, memberOptions, counts
               key={opt.value}
               onClick={() => onChange({ ...filter, state: opt.value as FilterState['state'] })}
               aria-pressed={isActive}
+              title={'hint' in opt ? opt.hint : undefined}
               className={`flex items-center gap-1.5 px-3 py-1  text-xs font-medium transition-all cursor-pointer ${
                 isActive
                   ? 'bg-ink text-on-ink'

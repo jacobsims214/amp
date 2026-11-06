@@ -1,0 +1,11 @@
+-- Structured agent questions (#130). amp_block_task may give the person
+-- options to choose from and the one it recommends, beside its question
+-- (block_reason). They live exactly as long as the question: set by the
+-- block, cleared by any state change after it (the answer included).
+--
+-- {options: [{label, consequence}], recommended: <index> | null}. The option
+-- shape is the human-decisions spec's AskOption (docs/specs/human-decision-docs.md),
+-- so a decision card and an agent's question read the same.
+--
+-- Additive: NULL is a question without options, which behaves as before.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS block_question JSONB;

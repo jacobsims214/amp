@@ -6,9 +6,12 @@ import { displayState, STATE_LABEL, STATE_VAR } from '../lib/ticketState'
 import { mergeBadge, mergeWait } from '../lib/merge'
 import { returnedHint, returnedLine } from '../lib/dispatchState'
 import { NotStartedTag, ReturnedTag } from './DispatchTags'
+import { ApprovalTag } from './ApprovalTag'
+import { questionOptions } from '../lib/answers'
 import { PriorityMark } from './ui/PriorityMark'
 import { Avatar } from './ui/Avatar'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
+import { stripMarkdown } from '../lib/stripMarkdown'
 
 interface Props {
   task: Task
@@ -19,6 +22,8 @@ interface Props {
   owner?: Person | null
   /** the project's not_started_flag_minutes: past it the amber badge is filled (0 = flag off) */
   notStartedFlagMinutes?: number
+  /** the project's require_plan_approval: only then does an unapproved ready ticket say Needs approval */
+  requireApproval?: boolean
 }
 
 function formatStart(iso: string): string {
@@ -30,13 +35,14 @@ function formatStart(iso: string): string {
  *  and priority, the agent on it (or the planned profile, or a Person tag for
  *  a ticket its owner does), and its owner.
  *  A question shows the question itself. */
-export function TaskCard({ task, onClick, dimmed = false, owner = null, notStartedFlagMinutes }: Props) {
+export function TaskCard({ task, onClick, dimmed = false, owner = null, notStartedFlagMinutes, requireApproval = false }: Props) {
   const state = displayState(task)
   const startAt = state === 'sched' ? (task.start_at ?? task.block_reason?.replace('scheduled:', '')) : null
   const waitingOn = task.blocked_by_ids?.length ?? 0
   const merge = mergeBadge(task)
   const mergeWaiting = state === 'wait' ? mergeWait(task) : null
   const returned = returnedLine(task)
+  const options = state === 'flag' ? questionOptions(task) : null
 
   return (
     <button
@@ -51,6 +57,7 @@ export function TaskCard({ task, onClick, dimmed = false, owner = null, notStart
         <PriorityMark priority={task.priority} />
         <NotStartedTag task={task} flagMinutes={notStartedFlagMinutes} compact />
         <ReturnedTag task={task} compact />
+        <ApprovalTag task={task} requireApproval={requireApproval} compact />
         {state === 'flag' && (
           <span className="ml-auto font-label text-[10px] font-semibold uppercase tracking-[0.1em] px-1.5 py-[3px] bg-st-flag text-white">Question</span>
         )}
@@ -65,7 +72,18 @@ export function TaskCard({ task, onClick, dimmed = false, owner = null, notStart
       <span className="text-[13px] font-medium text-ink leading-snug line-clamp-2">{task.name}</span>
 
       {state === 'flag' && task.block_reason && (
-        <span className="text-[12px] leading-snug text-danger-ink line-clamp-3">{task.block_reason}</span>
+        <span className="text-[12px] leading-snug text-danger-ink line-clamp-3">{stripMarkdown(task.block_reason)}</span>
+      )}
+      {/* The agent's options (#130), the recommended one marked: answered in the drawer or My work. */}
+      {options && (
+        <span className="flex flex-wrap gap-1" data-testid="card-options">
+          {options.options.map((o, i) => (
+            <span key={i} className={`text-[10.5px] leading-tight px-1.5 py-[3px] border ${i === options.recommended ? 'border-success text-success-ink font-semibold' : 'border-line text-ink-2'}`}
+              style={{ borderRadius: 'var(--radius)' }} title={i === options.recommended ? 'Recommended by the agent' : undefined}>
+              {o.label}{i === options.recommended && <span className="sr-only"> (recommended)</span>}
+            </span>
+          ))}
+        </span>
       )}
       {returned && (
         <span className="text-[11.5px] leading-snug text-ink-2 line-clamp-2" title={returnedHint(task.returned_reason)}>{returned}</span>

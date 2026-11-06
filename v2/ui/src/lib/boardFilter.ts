@@ -1,8 +1,18 @@
 import type { OwnerFilter } from './people'
+import type { Task } from '../types'
+import { displayState } from './ticketState'
+
+/**
+ * The Board's status filters. A blocked ticket is one of two different waits
+ * (#129): 'question' waits on a person (an agent's question, red) and
+ * 'waiting' on other tickets (dependencies or a merge, grey). They're
+ * separate filters, so one question isn't lost among dependency waits.
+ */
+export type BoardStatus = 'backlog' | 'in_progress' | 'completed' | 'question' | 'waiting'
 
 export interface FilterState {
   query: string
-  state: '' | 'backlog' | 'in_progress' | 'completed' | 'blocked'
+  state: '' | BoardStatus
   epicId: number | null
   /** whose tickets to show; defaults to 'mine' */
   owner: OwnerFilter
@@ -19,8 +29,8 @@ export const DEFAULT_FILTER: FilterState = { query: '', state: '', epicId: null,
 export const BOARD_FILTER_KEYS = ['status', 'q', 'epic', 'owner'] as const
 export type BoardFilterKey = (typeof BOARD_FILTER_KEYS)[number]
 
-const STATUS_SLUGS: Record<Exclude<FilterState['state'], ''>, string> = {
-  backlog: 'ready', in_progress: 'in_progress', completed: 'done', blocked: 'waiting',
+const STATUS_SLUGS: Record<BoardStatus, string> = {
+  backlog: 'ready', in_progress: 'in_progress', completed: 'done', question: 'question', waiting: 'waiting',
 }
 const STATUS_BY_SLUG = Object.fromEntries(
   Object.entries(STATUS_SLUGS).map(([state, slug]) => [slug, state]),
@@ -51,5 +61,17 @@ export function serializeBoardFilter(f: FilterState): Record<BoardFilterKey, str
     q: f.query || null,
     epic: f.epicId != null ? String(f.epicId) : null,
     owner: f.owner === DEFAULT_FILTER.owner ? null : f.owner === 'everyone' ? 'all' : String(f.owner),
+  }
+}
+
+/** Which status filter a ticket falls under; null for a scheduled one (it has its own column, no filter). */
+export function boardStatus(t: Pick<Task, 'state'> & Partial<Pick<Task, 'block_reason' | 'blocked_by_ids'>>): BoardStatus | null {
+  switch (displayState(t)) {
+    case 'flag': return 'question'
+    case 'wait': return 'waiting'
+    case 'sched': return null
+    case 'ready': return 'backlog'
+    case 'prog': return 'in_progress'
+    case 'done': return 'completed'
   }
 }
