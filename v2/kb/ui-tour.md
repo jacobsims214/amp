@@ -20,8 +20,14 @@ tags: [ui, onboarding, navigation]
   you strip say so and show no counts: use the project's Board, which has every ticket, or ask an
   admin for an invite and sign in again. When My work fails to load it shows the error and **Try again**,
   never zeros.
-- **Projects** — every project you can see. A project with something waiting on you shows the
-  count.
+- **Projects** — every project you can see, as a tree: one group per org (projects with no org
+  sit under **No org**), each project expanding to its views (Mission, My work, Board, Flight
+  plan, Graph, Reports, Artifacts, Library, Settings). Click a chevron or press Enter on it to
+  open or close an org or a project; the project you are in stays open. There is no cap on the
+  list, and a filter box appears once you have six or more. Hover (or tab to) a row for **Pin**
+  and **Move up / down**: pinned projects sit in a Pinned group at the top. Your pins, order and
+  what you collapsed are remembered in this browser. A project or org with something waiting on
+  you shows the count, also while collapsed.
 - **Day reports** — your saved end-of-day reports and your completed tickets.
 - **Trace** — paste a commit sha, branch or PR URL and get back the tickets, plan, comments and
   runs that produced it (`visibility/traceability.md`).

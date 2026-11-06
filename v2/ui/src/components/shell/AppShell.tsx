@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation, useMatch } from 'react-router-dom'
 import {
-  Activity, BookOpen, Home, Inbox, Menu, MonitorSmartphone, Radar, X, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, GitCommitHorizontal, GraduationCap, KeyRound, LogOut, PieChart, LayoutGrid, Settings, Shapes, ShieldCheck, ScrollText,
+  Home, Menu, MonitorSmartphone, X, Building2, CalendarDays, FolderKanban, GitCommitHorizontal, GraduationCap, KeyRound, LogOut, PieChart, ShieldCheck, ScrollText,
 } from 'lucide-react'
 import { api } from '../../api/client'
 import { useAuth } from '../../hooks/useAuth'
@@ -9,43 +9,13 @@ import { remoteAvailable, useRemote } from '../../remote/remote-context'
 import type { Project } from '../../types'
 import { refreshWaitCounts, useWaitCounts } from '../../lib/waitCounts'
 import { Avatar } from '../ui/Avatar'
-import { viewLink, type ProjectView } from '../../lib/projectLink'
+import { badged, navCls } from './nav'
+import { Badge } from './Badge'
+import { ProjectTree } from './ProjectTree'
 
 // The frame around every page: one sidebar to get anywhere, the page beside
-// it. The current project's views sit under it in the sidebar, so nothing
+// it. Projects are a tree (org > project > views) in the sidebar, so nothing
 // needs a back button.
-
-const PROJECT_VIEWS: { view: ProjectView; label: string; icon: React.ReactNode; badge?: boolean }[] = [
-  { view: 'mission', label: 'Mission', icon: <Radar size={14} /> },
-  { view: 'my-work', label: 'My work', icon: <Inbox size={14} />, badge: true },
-  { view: 'board', label: 'Board', icon: <LayoutGrid size={14} /> },
-  { view: 'plan', label: 'Flight plan', icon: <Rows3 size={14} /> },
-  { view: 'dag', label: 'Graph', icon: <GitBranch size={14} /> },
-  { view: 'report', label: 'Reports', icon: <Activity size={14} /> },
-  { view: 'artifacts', label: 'Artifacts', icon: <Shapes size={14} /> },
-  { view: 'kb', label: 'Library', icon: <BookOpen size={14} /> },
-  { view: 'settings', label: 'Settings', icon: <Settings size={14} /> },
-]
-
-function navCls({ isActive }: { isActive: boolean }) {
-  return [
-    'group flex items-center gap-2.5 h-8 px-2.5 text-[13.5px] transition-colors',
-    isActive
-      ? 'bg-surface text-ink font-semibold shadow-[inset_3px_0_0_var(--accent),0_0_0_1px_var(--line)]'
-      : 'text-ink-2 hover:bg-surface-3 hover:text-ink',
-  ].join(' ')
-}
-
-/** A "waiting on you" count: white on the accent, read as "N waiting on you". */
-function Badge({ n }: { n?: number }) {
-  if (!n) return null
-  return <span className="ml-auto amp-num text-[11px] leading-none text-white bg-accent px-[5px] py-[2px] shrink-0" aria-hidden="true">{n}</span>
-}
-
-/** The accessible name of a link with a Badge: "My work, 6 waiting on you". */
-function badged(label: string, n?: number) {
-  return n ? `${label}, ${n} waiting on you` : undefined
-}
 
 function Group({ children }: { children: React.ReactNode }) {
   return <div className="amp-label px-2.5 pt-5 pb-2">{children}</div>
@@ -76,8 +46,6 @@ export function AppShell() {
   // The role people know themselves by: org owner or admin, else member.
   const orgRole = (me?.orgs ?? []).find(o => o.my_role === 'owner') ?? (me?.orgs ?? []).find(o => o.my_role === 'admin')
   const orgRoleLabel = orgRole ? `${orgRole.my_role}, ${orgRole.name}` : 'member'
-  const current = projects.find(p => String(p.id) === currentId)
-  const others = projects.filter(p => String(p.id) !== currentId).slice(0, 8)
 
   return (
     <div className="relative flex h-screen overflow-hidden bg-bg">
@@ -105,34 +73,7 @@ export function AppShell() {
           {(me?.orgs?.length ?? 0) > 0 && <NavLink to="/portfolio" className={navCls}><PieChart size={14} />Portfolio</NavLink>}
           {me?.user_id != null && <NavLink to="/access" className={navCls}><KeyRound size={14} />Agents & tokens</NavLink>}
 
-          {current && (
-            <>
-              <Group>Project</Group>
-              <div className="flex items-center gap-2 px-2.5 pb-1.5">
-                <span className="text-[13.5px] font-semibold text-ink truncate" title={current.name}>{current.name}</span>
-                {current.code.length <= 8 && <span className="amp-num text-[10.5px] text-ink-3 border border-line px-1 py-px ml-auto shrink-0">{current.code}</span>}
-              </div>
-              {PROJECT_VIEWS.map(v => (
-                <NavLink key={v.label} to={viewLink(currentId!, v.view, location.search)} className={p => `${navCls(p)} pl-5`} aria-label={v.badge ? badged(v.label, waitIn(currentId!)) : undefined}>
-                  {v.icon}{v.label}{v.badge && <Badge n={waitIn(currentId!)} />}
-                </NavLink>
-              ))}
-            </>
-          )}
-
-          {others.length > 0 && (
-            <>
-              <Group>{current ? 'Other projects' : 'Projects'}</Group>
-              {others.map(p => (
-                <NavLink key={p.id} to={`/project/${p.id}`} className={navCls} title={p.name} aria-label={badged(p.name, waitIn(p.id))}>
-                  <span className="truncate">{p.name}</span>
-                  {/* Something waiting beats the code; long slugs crowd the name out of a narrow sidebar. */}
-                  {waitIn(p.id) ? <Badge n={waitIn(p.id)} />
-                    : p.code.length <= 8 && <span className="amp-num text-[10.5px] text-ink-3 ml-auto shrink-0">{p.code}</span>}
-                </NavLink>
-              ))}
-            </>
-          )}
+          <ProjectTree projects={projects} orgs={me?.orgs ?? []} currentId={currentId} search={location.search} waitIn={waitIn} />
 
           {(isAdmin || orgAdmin) && (
             <>
