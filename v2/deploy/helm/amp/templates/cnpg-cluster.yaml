@@ -14,12 +14,62 @@ spec:
     {{- if .Values.cnpg.storage.storageClassName }}
     storageClass: {{ .Values.cnpg.storage.storageClassName }}
     {{- end }}
+  {{- if .Values.cnpg.recovery.enabled }}
+  {{- $r := .Values.cnpg.recovery }}
+  {{- $b := .Values.cnpg.backup }}
+  {{- if not $b.enabled }}{{ fail "cnpg.recovery.enabled needs cnpg.backup.enabled (it reuses the endpoint and credentials, and the restored cluster must archive to a fresh path)" }}{{ end }}
+  {{- if not $r.sourcePath }}{{ fail "cnpg.recovery.enabled needs cnpg.recovery.sourcePath (the old cnpg.backup.destinationPath)" }}{{ end }}
+  {{- $src := default "amp-postgres" $r.sourceServerName }}
+  {{- if and (eq $r.sourcePath $b.destinationPath) (eq $src .Values.cnpg.clusterName) }}{{ fail "cnpg.backup.destinationPath must differ from cnpg.recovery.sourcePath: CNPG refuses to archive into a path that holds another timeline's WALs" }}{{ end }}
+  # Restore from an existing object store (#145). database/owner keep the app
+  # role and its <cluster>-app Secret as amp/amp, not CNPG's app/app.
+  bootstrap:
+    recovery:
+      source: restore-source
+      database: {{ .Values.cnpg.appDatabase }}
+      owner: {{ .Values.cnpg.appOwner }}
+      {{- if $r.targetTime }}
+      recoveryTarget:
+        targetTime: {{ $r.targetTime | quote }}
+      {{- end }}
+  externalClusters:
+    - name: restore-source
+      barmanObjectStore:
+        destinationPath: {{ $r.sourcePath | quote }}
+        serverName: {{ $src | quote }}
+        {{- if $b.endpointURL }}
+        endpointURL: {{ $b.endpointURL | quote }}
+        {{- end }}
+        s3Credentials:
+          accessKeyId: { name: {{ $b.existingSecret }}, key: {{ $b.accessKeyIdKey }} }
+          secretAccessKey: { name: {{ $b.existingSecret }}, key: {{ $b.secretAccessKeyKey }} }
+  {{- else }}
   bootstrap:
     initdb:
       database: {{ .Values.cnpg.appDatabase }}
       owner: {{ .Values.cnpg.appOwner }}
+  {{- end }}
   monitoring:
     enablePodMonitor: false
+  {{- if .Values.cnpg.backup.enabled }}
+  {{- $b := .Values.cnpg.backup }}
+  {{- if not $b.destinationPath }}{{ fail "cnpg.backup.enabled needs cnpg.backup.destinationPath (s3://bucket/path)" }}{{ end }}
+  {{- if not $b.existingSecret }}{{ fail "cnpg.backup.enabled needs cnpg.backup.existingSecret (a Secret with the S3 access keys)" }}{{ end }}
+  backup:
+    retentionPolicy: {{ $b.retentionPolicy | quote }}
+    barmanObjectStore:
+      destinationPath: {{ $b.destinationPath | quote }}
+      {{- if $b.endpointURL }}
+      endpointURL: {{ $b.endpointURL | quote }}
+      {{- end }}
+      s3Credentials:
+        accessKeyId: { name: {{ $b.existingSecret }}, key: {{ $b.accessKeyIdKey }} }
+        secretAccessKey: { name: {{ $b.existingSecret }}, key: {{ $b.secretAccessKeyKey }} }
+      wal:
+        compression: gzip
+      data:
+        compression: gzip
+  {{- end }}
   {{- if .Values.relay.enabled }}
   # amp-relay's own login role (#2392). CloudNativePG creates it and keeps its
   # password in step with the Secret; amp-api (which owns the tables) grants
@@ -42,6 +92,21 @@ spec:
         passwordSecret:
           name: {{ include "amp.relayDbSecret" . }}
   {{- end }}
+{{- if .Values.cnpg.backup.enabled }}
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: {{ .Values.cnpg.clusterName }}-daily
+  namespace: {{ .Values.global.namespace }}
+spec:
+  schedule: {{ .Values.cnpg.backup.schedule | quote }}
+  immediate: {{ .Values.cnpg.backup.immediate }}
+  backupOwnerReference: self
+  method: barmanObjectStore
+  cluster:
+    name: {{ .Values.cnpg.clusterName }}
+{{- end }}
 ---
 # Dex gets its own database in the same cluster, owned by the same app role —
 # this is a small, single-tenant-trust stack so one role owning two databases
