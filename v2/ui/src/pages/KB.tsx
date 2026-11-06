@@ -11,6 +11,7 @@ import { PageHeader } from '../components/ui/PageHeader'
 import { ProjectNav } from '../components/ProjectNav'
 import type { KBDoc, KBDocSummary, KBInfo, KBRef, KBScope, KBSearchResult, KBSource, KBTagCount } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
+import { useSearchParam } from '../hooks/useSearchParam'
 
 // What each kind of KB is for; shown on team and org KB pages and in the editor.
 const SCOPE_PURPOSE: Record<KBScope, string> = {
@@ -25,6 +26,48 @@ type View = 'browse' | 'doc' | 'editor'
 // Tags are labels, not states: one quiet style for all of them.
 const TAG_STYLE = { bg: 'var(--surface)', text: 'var(--ink-2)', ring: 'var(--line-str)' }
 const tagColor = () => TAG_STYLE
+
+const shortDate = (ts: number) => new Date(ts * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+
+// "5m ago" for recent times, a date for older ones (unix seconds).
+function relTime(ts: number) {
+  const date = new Date(ts * 1000)
+  const diffMs = Date.now() - date.getTime()
+  const diffMins = Math.floor(diffMs / 60000)
+  const diffHours = Math.floor(diffMs / 3600000)
+  const diffDays = Math.floor(diffMs / 86400000)
+  if (diffMins < 1) return 'just now'
+  if (diffMins < 60) return `${diffMins}m ago`
+  if (diffHours < 24) return `${diffHours}h ago`
+  if (diffDays < 7) return `${diffDays}d ago`
+  return shortDate(ts)
+}
+
+// Agent reads of a doc, for curating the KB (#159). Only stored KBs track
+// them, so docs without created_at (the AMP guide) show nothing.
+function lastReadText(doc: Pick<KBDocSummary, 'created_at' | 'last_read_at' | 'last_read_by'>) {
+  if (!doc.created_at) return null
+  if (!doc.last_read_at) return 'Not read by an agent yet'
+  return `Last read by ${doc.last_read_by || 'an agent'} ${relTime(doc.last_read_at)}`
+}
+
+// Browse sort orders (?sort=). Least read and stale help find docs to prune.
+type DocSort = 'updated' | 'least-read' | 'stale'
+const DOC_SORTS: { value: DocSort; label: string }[] = [
+  { value: 'updated', label: 'Recently updated' },
+  { value: 'least-read', label: 'Least read' },
+  { value: 'stale', label: 'Stale (oldest update)' },
+]
+function sortDocs(docs: KBDocSummary[], sort: DocSort): KBDocSummary[] {
+  if (sort === 'updated') return docs
+  const out = [...docs]
+  if (sort === 'least-read') {
+    out.sort((a, b) => (a.read_count ?? 0) - (b.read_count ?? 0) || (a.last_read_at ?? 0) - (b.last_read_at ?? 0))
+  } else {
+    out.sort((a, b) => a.updated_at - b.updated_at)
+  }
+  return out
+}
 
 function readingTime(content: string) {
   const words = content.trim().split(/\s+/).length
@@ -63,6 +106,9 @@ export function KB() {
   const tagFilter = params.get('tag')
   const [searchQuery, setSearchQuery] = useState(() => params.get('q') ?? '')
   const [showAllTags, setShowAllTags] = useState(false)
+  const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth)
+  // The matched chunk of the search hit the open doc came from (in memory only, not in the URL).
+  const [matched, setMatched] = useState<{ path: string; text: string } | null>(null)
   const [searchResults, setSearchResults] = useState<KBSearchResult[]>([])
   const [searching, setSearching] = useState(false)
   const [loading, setLoading] = useState(true)
@@ -138,10 +184,23 @@ export function KB() {
     return () => clearTimeout(t)
   }, [searchQuery, kbRef])
 
-  const openDoc = (path: string) => {
+  const openDoc = (path: string, hit?: KBSearchResult) => {
     setActionError(null)
     setSearchQuery('') // close search results
-    patchParams({ doc: path, q: null }) // pushes a history entry; the ?doc effect loads it
+    setMatched(hit?.chunk_text ? { path, text: hit.chunk_text } : null)
+    // pushes a history entry; the ?doc effect loads it
+    patchParams({ doc: path, q: null })
+  }
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault()
+    const startX = e.clientX, startW = sidebarWidth
+    let w = startW
+    const move = (ev: MouseEvent) => { w = clampSidebar(startW + ev.clientX - startX); setSidebarWidth(w) }
+    const up = () => {
+      window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up)
+      try { localStorage.setItem(SIDEBAR_KEY, String(w)) } catch { /* private mode */ }
+    }
+    window.addEventListener('mousemove', move); window.addEventListener('mouseup', up)
   }
 
   const openEditor = (doc?: KBDoc | null) => {
@@ -249,7 +308,7 @@ export function KB() {
       <div className="flex flex-1 overflow-hidden">
         {/* ── Sidebar ────────────────────────────────────────────────── */}
         <aside className="flex flex-col flex-shrink-0 overflow-hidden"
-          style={{ width: 248, borderRight: '1px solid var(--line)', background: 'var(--surface)' }}>
+          style={{ width: sidebarWidth, position: 'relative', borderRight: '1px solid var(--line)', background: 'var(--surface)' }}>
 
           {/* Search */}
           <div className="px-3 pt-3 pb-2 flex-shrink-0">
@@ -358,13 +417,15 @@ export function KB() {
                 onToggleDir={(dir) => setExpandedDirs(prev => {
                   const s = new Set(prev); if (s.has(dir)) s.delete(dir); else s.add(dir); return s
                 })}
-                onSelectDoc={openDoc}
+                onSelectDoc={path => openDoc(path)}
                 selectedPath={selectedDoc?.path}
               />
             )}
           </div>
 
           {pid != null && <OtherKBs projectId={pid} />}
+          <div role="separator" aria-orientation="vertical" aria-label="Resize sidebar" onMouseDown={startResize}
+            className="absolute top-0 right-0 h-full cursor-col-resize hover:bg-line-str" style={{ width: 4 }} />
         </aside>
 
         {/* ── Main content ───────────────────────────────────────────── */}
@@ -383,11 +444,12 @@ export function KB() {
                   </p>
                 </div>
               )}
-              <BrowseView docs={docs} loading={loading} tagFilter={tagFilter} onOpen={openDoc} onNew={canWrite ? () => openEditor(null) : undefined} />
+              <BrowseView docs={docs} loading={loading} tagFilter={tagFilter} onOpen={path => openDoc(path)} onNew={canWrite ? () => openEditor(null) : undefined} />
             </>
           )}
           {view === 'doc' && selectedDoc && (
-            <DocView doc={selectedDoc} canWrite={canWrite} onEdit={() => openEditor(selectedDoc)} onDelete={() => deleteDoc(selectedDoc.path)} onTagClick={tag => setTagFilter(tag)} kbRef={kbRef} setSelectedDoc={setSelectedDoc} />
+            <DocView key={selectedDoc.path} doc={selectedDoc} canWrite={canWrite} onEdit={() => openEditor(selectedDoc)} onDelete={() => deleteDoc(selectedDoc.path)} onTagClick={tag => setTagFilter(tag)} kbRef={kbRef} setSelectedDoc={setSelectedDoc}
+              matchedChunk={matched?.path === selectedDoc.path ? matched.text : null} />
           )}
           {view === 'editor' && (
             <EditorView
@@ -548,8 +610,14 @@ function TreeNode({ node, depth, expanded, onToggleDir, onSelectDoc, selectedPat
 /* ── Search results (in sidebar) ─────────────────────────────────────────── */
 function SearchResultsList({ query, results, searching, onSelect, selectedPath }: {
   query: string; results: KBSearchResult[]; searching: boolean
-  onSelect: (path: string) => void; selectedPath?: string
+  onSelect: (path: string, hit: KBSearchResult) => void; selectedPath?: string
 }) {
+  const [shown, setShown] = useState<Set<string>>(() => new Set())
+  const toggle = (key: string) => setShown(prev => {
+    const next = new Set(prev)
+    if (!next.delete(key)) next.add(key)
+    return next
+  })
   if (searching) return (
     <div className="flex justify-center py-6">
       <Loader2 size={14} className="animate-spin text-primary" />
@@ -564,8 +632,12 @@ function SearchResultsList({ query, results, searching, onSelect, selectedPath }
     <div className="space-y-1">
       {results.map((r, i) => {
         const isSelected = selectedPath === r.path
+        const key = `${r.path}#${i}`
+        const showPassage = shown.has(key)
+        const hasPassage = !!r.chunk_text
         return (
-          <button key={i} onClick={() => onSelect(r.path)}
+          <div key={key}>
+          <button onClick={() => onSelect(r.path, r)}
             className="w-full text-left px-2 py-2 rounded-lg transition-all cursor-pointer"
             style={{
               background: isSelected ? 'color-mix(in srgb, var(--link) 12%, transparent)' : 'transparent',
@@ -599,6 +671,24 @@ function SearchResultsList({ query, results, searching, onSelect, selectedPath }
               </div>
             )}
           </button>
+          {hasPassage && (
+            <button onClick={() => toggle(key)} aria-expanded={showPassage}
+              className="ml-6 mt-0.5 text-[10px] text-link cursor-pointer hover:underline">
+              {showPassage ? 'Hide passage' : 'Show passage'}
+            </button>
+          )}
+          {showPassage && (
+            <div className="ml-6 mt-1 mb-1 rounded p-2" style={{ background: 'var(--surface)', border: '1px solid var(--line-sub)' }}>
+              <p className="text-[10px] text-ink-3 mb-1">
+                Score {r.score.toFixed(2)}
+                {r.vector_score !== undefined && <> · semantic {r.vector_score.toFixed(2)}</>}
+                {r.chunk_index !== undefined && <> · chunk {r.chunk_index}</>}
+                {' · '}agents see only the short excerpt above
+              </p>
+              <p aria-label="Matched passage" className="text-xs text-ink-2 leading-relaxed whitespace-pre-wrap overflow-y-auto" style={{ maxHeight: 256 }}>{r.chunk_text}</p>
+            </div>
+          )}
+          </div>
         )
       })}
     </div>
@@ -610,6 +700,11 @@ function BrowseView({ docs, loading, tagFilter, onOpen, onNew }: {
   docs: KBDocSummary[]; loading: boolean; tagFilter: string | null
   onOpen: (path: string) => void; onNew?: () => void
 }) {
+  const [sortParam, setSort] = useSearchParam('sort', 'updated')
+  const sort: DocSort = DOC_SORTS.some(o => o.value === sortParam) ? sortParam as DocSort : 'updated'
+  const sorted = useMemo(() => sortDocs(docs, sort), [docs, sort])
+  // Read stats exist only for stored KBs; the AMP guide has none to sort by.
+  const tracked = docs.some(d => d.created_at)
   if (loading) return (
     <div className="flex justify-center py-20">
       <BandLoader label="Loading the library" />
@@ -645,9 +740,17 @@ function BrowseView({ docs, loading, tagFilter, onOpen, onNew }: {
           </h2>
           <p className="text-sm text-ink-3 mt-0.5">{docs.length} doc{docs.length !== 1 ? 's' : ''}</p>
         </div>
+        {tracked && (
+          <label className="flex items-center gap-2 text-xs text-ink-3">
+            Sort
+            <select value={sort} onChange={e => setSort(e.target.value)} aria-label="Sort documents" className="amp-input !w-auto !py-1.5 text-[12.5px]">
+              {DOC_SORTS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </label>
+        )}
       </div>
       <div className="grid gap-2.5">
-        {docs.map(doc => (
+        {sorted.map(doc => (
           <DocListItem key={doc.id} doc={doc} onOpen={() => onOpen(doc.path)} />
         ))}
       </div>
@@ -684,6 +787,11 @@ function DocListItem({ doc, onOpen }: { doc: KBDocSummary; onOpen: () => void })
           <span className="text-[10px] text-ink-3 font-mono flex-shrink-0 mt-0.5">{doc.author}</span>
         </div>
         <p className="text-xs text-ink-3 font-mono mt-0.5 truncate">{doc.path}</p>
+        {doc.created_at ? (
+          <p className="text-[11px] text-ink-3 mt-1">
+            Updated {relTime(doc.updated_at)} · {doc.read_count ? `${doc.read_count} agent read${doc.read_count !== 1 ? 's' : ''}, last ${relTime(doc.last_read_at ?? 0)}` : 'never read by an agent'}
+          </p>
+        ) : null}
         {doc.tags.length > 0 && (
           <div className="flex gap-1 mt-2 flex-wrap">
             {doc.tags.map(t => {
@@ -702,15 +810,53 @@ function DocListItem({ doc, onOpen }: { doc: KBDocSummary; onOpen: () => void })
   )
 }
 
+const SIDEBAR_KEY = 'amp.kb.sidebarWidth'
+const clampSidebar = (w: number) => Math.min(640, Math.max(200, w))
+function readSidebarWidth(): number {
+  try { const n = Number(localStorage.getItem(SIDEBAR_KEY)); return n > 0 ? clampSidebar(n) : 320 } catch { return 320 }
+}
+
+const norm = (t: string) => t.replace(/\s+/g, ' ').trim()
+/** Chunks are raw markdown; rendered text has no syntax, so strip it before comparing. */
+const stripMd = (t: string) => norm(t
+  .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
+  .replace(/^\s{0,3}(#{1,6}|>|[-*+]|\d+[.)])\s+/gm, '')
+  .replace(/[*`|]/g, '')
+  .replace(/(^|[^\w])_+|_+(?=[^\w]|$)/g, '$1')) // '_' only at word edges, so snake_case survives
+const MIN_BLOCK = 12
+/** Marks the rendered blocks whose text lies in the matched chunk and scrolls to the first. */
+function highlightChunk(root: HTMLElement, chunk: string) {
+  const hay = stripMd(chunk)
+  root.querySelectorAll('[data-chunk-hit]').forEach(el => { el.removeAttribute('data-chunk-hit'); (el as HTMLElement).style.background = '' })
+  let first: Element | null = null
+  root.querySelectorAll('p, li, h1, h2, h3, h4, h5, h6, pre, blockquote, td, th').forEach(el => {
+    if (el.querySelector('p, li, pre, blockquote, ul, ol')) return // only leaf blocks
+    const t = norm(el.textContent ?? '')
+    if (!t || !(t.length >= MIN_BLOCK ? hay.includes(t) : hay === t)) return
+    el.setAttribute('data-chunk-hit', '')
+    ;(el as HTMLElement).style.background = 'color-mix(in srgb, var(--warning) 18%, transparent)'
+    first ??= el
+  })
+  ;(first as Element | null)?.scrollIntoView?.({ block: 'center' })
+}
+
 /* ── Doc viewer ───────────────────────────────────────────────────────────── */
-function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelectedDoc }: {
+function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelectedDoc, matchedChunk }: {
+  matchedChunk?: string | null
   doc: KBDoc; canWrite: boolean; onEdit: () => void; onDelete: () => void; onTagClick: (tag: string) => void
   kbRef: KBRef; setSelectedDoc: (doc: KBDoc | null) => void
 }) {
   const pathParts = doc.path.split('/')
   const rt = readingTime(doc.content)
-  const date = doc.updated_at > 0 ? new Date(doc.updated_at * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : null
-  const [annExpanded, setAnnExpanded] = useState(true)
+  const date = doc.updated_at > 0 ? shortDate(doc.updated_at) : null
+  const lastRead = lastReadText(doc)
+  const [annExpanded, setAnnExpanded] = useState((doc.annotations?.length ?? 0) > 0) // empty panel starts collapsed so the text leads
+  const contentRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!contentRef.current) return
+    if (matchedChunk) highlightChunk(contentRef.current, matchedChunk)
+    else contentRef.current.querySelectorAll('[data-chunk-hit]').forEach(el => { el.removeAttribute('data-chunk-hit'); (el as HTMLElement).style.background = '' })
+  }, [matchedChunk, doc.path, doc.content])
   const [annText, setAnnText] = useState('')
   const [annSaving, setAnnSaving] = useState(false)
   const [annError, setAnnError] = useState<string | null>(null)
@@ -744,20 +890,6 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
     }
   }
 
-  const formatDate = (timestamp: number) => {
-    const date = new Date(timestamp * 1000)
-    const now = new Date()
-    const diffMs = now.getTime() - date.getTime()
-    const diffMins = Math.floor(diffMs / 60000)
-    const diffHours = Math.floor(diffMs / 3600000)
-    const diffDays = Math.floor(diffMs / 86400000)
-    
-    if (diffMins < 1) return 'just now'
-    if (diffMins < 60) return `${diffMins}m ago`
-    if (diffHours < 24) return `${diffHours}h ago`
-    if (diffDays < 7) return `${diffDays}d ago`
-    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
-  }
 
   return (
     <div className="p-8 max-w-3xl mx-auto">
@@ -780,9 +912,21 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
               <Clock size={10} />
               {rt}
             </span>
-            {date && <span className="text-xs text-ink-3">{date}</span>}
+            {doc.created_at ? <span className="text-xs text-ink-3">Created {shortDate(doc.created_at)}</span> : null}
+            {date && <span className="text-xs text-ink-3">{doc.created_at ? `Updated ${date}` : date}</span>}
             {doc.author && <span className="text-xs text-ink-3">by {doc.author}</span>}
+            {!kbRef.global && (doc.annotations?.length ?? 0) > 0 && (
+              <a href="#annotations" onClick={e => { e.preventDefault(); setAnnExpanded(true); document.getElementById('annotations')?.scrollIntoView?.({ block: 'start' }) }}
+                className="text-xs flex items-center gap-1 text-link">
+                <MessageSquare size={10} />{doc.annotations!.length} annotation{doc.annotations!.length !== 1 ? 's' : ''}
+              </a>
+            )}
           </div>
+          {lastRead && (
+            <p className="text-xs text-ink-3 mt-1.5" title={doc.read_count ? `${doc.read_count} agent read${doc.read_count !== 1 ? 's' : ''} counted` : undefined}>
+              {lastRead}
+            </p>
+          )}
         </div>
         {canWrite && <div className="flex items-center gap-2 flex-shrink-0">
           <button onClick={onEdit} className="amp-btn amp-btn-sm">
@@ -822,16 +966,8 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
         </div>
       )}
 
-      {/* Divider */}
-      <div className="border-t border-line-sub mb-6" />
-
-      {/* Markdown content */}
-      <div className="prose-amp">
-        <Markdown>{doc.content}</Markdown>
-      </div>
-
       {/* Annotations Panel (none on the AMP guide: it changes through the repo) */}
-      {!kbRef.global && <div className="mt-8 pt-6 border-t border-line-sub">
+      {!kbRef.global && <div id="annotations" className="mb-6 pb-4 border-b border-line-sub">
         <button
           onClick={() => setAnnExpanded(!annExpanded)}
           className="flex items-center gap-2 text-xs font-semibold text-ink-2 hover:text-ink transition-colors mb-4"
@@ -848,13 +984,13 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
           <div className="space-y-4">
             {/* Annotation List */}
             {doc.annotations && doc.annotations.length > 0 ? (
-              <div className="space-y-3">
+              <div className="space-y-3 overflow-y-auto" style={{ maxHeight: 288 }}>
                 {doc.annotations.map((ann, idx) => (
                   <div key={idx} className="p-3 rounded-lg text-xs" style={{ background: 'color-mix(in srgb, var(--ink) 3%, transparent)', border: '1px solid var(--line)' }}>
                     <div className="flex items-center justify-between mb-2">
                       <div className="flex items-center gap-2">
                         <span className="font-semibold text-ink">{ann.author}</span>
-                        <span className="text-ink-3">{formatDate(ann.created_at)}</span>
+                        <span className="text-ink-3">{relTime(ann.created_at)}</span>
                       </div>
                       <div className="flex items-center gap-2">
                         <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
@@ -880,7 +1016,7 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
                     <p className={`leading-relaxed whitespace-pre-wrap ${ann.is_resolved ? 'text-ink-3' : 'text-ink-2'}`}>{ann.text}</p>
                     {ann.is_resolved && ann.resolved_by && (
                       <p className="text-[10px] text-ink-3 mt-1.5">
-                        Resolved by {ann.resolved_by}{ann.resolved_at ? ` · ${formatDate(ann.resolved_at)}` : ''}
+                        Resolved by {ann.resolved_by}{ann.resolved_at ? ` · ${relTime(ann.resolved_at)}` : ''}
                       </p>
                     )}
                   </div>
@@ -934,6 +1070,15 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
           </div>
         )}
       </div>}
+
+      {/* Divider */}
+      <div className="border-t border-line-sub mb-6" />
+
+      {/* Markdown content */}
+      <div className="prose-amp" ref={contentRef}>
+        <Markdown>{doc.content}</Markdown>
+      </div>
+
     </div>
   )
 }

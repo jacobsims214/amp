@@ -1,6 +1,12 @@
 package mcp
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/simstech/amp-api/internal/kb"
+)
 
 func TestKBSearchLimit(t *testing.T) {
 	tests := []struct {
@@ -23,5 +29,18 @@ func TestKBSearchLimit(t *testing.T) {
 				t.Errorf("kbSearchLimit(%v) = %d, want %d", tt.args, got, tt.want)
 			}
 		})
+	}
+}
+
+// amp_kb_search returns the excerpt only; the whole chunk is Library-only.
+func TestDropChunkText(t *testing.T) {
+	res := []kb.SearchResult{{Excerpt: "short", ChunkText: "short and the rest", ChunkIndex: 2}}
+	dropChunkText(res)
+	if res[0].ChunkText != "" || res[0].Excerpt != "short" || res[0].ChunkIndex != 2 {
+		t.Errorf("got %+v", res[0])
+	}
+	b, _ := json.Marshal(res[0])
+	if strings.Contains(string(b), "chunk_text") {
+		t.Errorf("chunk_text leaked into MCP JSON: %s", b)
 	}
 }

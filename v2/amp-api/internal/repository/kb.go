@@ -71,6 +71,12 @@ type KBDocument struct {
 	UpdatedAt   time.Time
 	DeletedAt   *time.Time
 	DeletedBy   *string
+	// Agent reads (migration 051): the last time an agent read the doc, who
+	// it was, and how many throttled reads have been counted. nil/0 for a
+	// doc no agent has read. See RecordKBReads.
+	LastReadAt *time.Time
+	LastReadBy *string
+	ReadCount  int64
 }
 
 // KBDocWrite is a create-or-update of one doc.
@@ -90,11 +96,12 @@ type KBDocWrite struct {
 }
 
 const kbDocCols = `id, scope_kind, scope_id, path, title, tags, author, reason, content,
-	annotations, version, created_at, updated_at, deleted_at, deleted_by`
+	annotations, version, created_at, updated_at, deleted_at, deleted_by, last_read_at, last_read_by, read_count`
 
 func scanKBDocument(row pgx.Row, d *KBDocument) error {
 	return row.Scan(&d.ID, &d.ScopeKind, &d.ScopeID, &d.Path, &d.Title, &d.Tags, &d.Author, &d.Reason, &d.Content,
-		&d.Annotations, &d.Version, &d.CreatedAt, &d.UpdatedAt, &d.DeletedAt, &d.DeletedBy)
+		&d.Annotations, &d.Version, &d.CreatedAt, &d.UpdatedAt, &d.DeletedAt, &d.DeletedBy,
+		&d.LastReadAt, &d.LastReadBy, &d.ReadCount)
 }
 
 func kbTags(tags []string) []string {
@@ -255,6 +262,40 @@ func (r *Repo) ListKBDocuments(ctx context.Context, scope KBScope, limit, offset
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// RecordKBReads records that by (an agent) read the live docs at paths: it
+// sets last_read_at and last_read_by and adds one to read_count. It is
+// throttled per (doc, reader) in kb_doc_reads so search stays cheap: a doc
+// this reader's read was counted less than throttle ago is left alone, even
+// if other readers read it in between, so repeated reads cost no row write
+// and count once per reader per window. Paths that don't exist or are
+// deleted are ignored. It returns how many docs were written.
+func (r *Repo) RecordKBReads(ctx context.Context, scope KBScope, paths []string, by string, throttle time.Duration) (int64, error) {
+	if err := scope.validate(); err != nil {
+		return 0, err
+	}
+	if len(paths) == 0 || by == "" {
+		return 0, nil
+	}
+	tag, err := r.db.Exec(ctx, `WITH docs AS (
+			SELECT id FROM kb_documents
+			WHERE scope_kind = $1 AND scope_id = $2 AND path = ANY($3) AND deleted_at IS NULL
+		), counted AS (
+			INSERT INTO kb_doc_reads (document_id, reader, last_at)
+			SELECT id, $4, NOW() FROM docs
+			ON CONFLICT (document_id, reader) DO UPDATE SET last_at = EXCLUDED.last_at
+			WHERE kb_doc_reads.last_at <= NOW() - make_interval(secs => $5)
+			RETURNING document_id
+		)
+		UPDATE kb_documents d
+		SET last_read_at = NOW(), last_read_by = $4, read_count = d.read_count + 1
+		FROM counted WHERE d.id = counted.document_id`,
+		scope.Kind, scope.ID, paths, by, throttle.Seconds())
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 // CountKBDocuments counts a KB's live docs.

@@ -93,3 +93,82 @@ describe('Library URL state', () => {
     expect(url()).toBe('/project/3/kb?tag=tag2')
   })
 })
+
+describe('Library search hits', () => {
+  const hit = (chunk: string) => ({
+    path: 'docs/a.md', title: 'Title of docs/a.md', tags: [], excerpt: chunk.slice(0, 120), chunk_text: chunk,
+    author: 'a', updated_at: 1, score: 0.8, vector_score: 0.71, chunk_index: 3, annotation_count: 2, latest_annotation: 'needs a rewrite',
+  })
+
+  it('shows the whole matched passage, score and chunk index on demand', async () => {
+    const user = userEvent.setup()
+    const chunk = 'Approval flow. ' + 'details '.repeat(40) + 'FINAL-WORDS'
+    kb.kbSearch.mockResolvedValue([hit(chunk)])
+    renderAt('/project/3/kb?q=approval')
+    expect(await screen.findByText(/2 annotations/)).toBeInTheDocument()
+    expect(screen.getByText(/needs a rewrite/)).toBeInTheDocument()
+    expect(screen.queryByText(/FINAL-WORDS/)).toBeNull()
+    await user.click(screen.getByRole('button', { name: 'Show passage' }))
+    expect(screen.getByLabelText('Matched passage')).toHaveTextContent('FINAL-WORDS')
+    expect(screen.getByText(/Score 0\.80 · semantic 0\.71 · chunk 3/)).toBeInTheDocument()
+    expect(screen.getByText(/agents see only the short excerpt/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Hide passage' }))
+    expect(screen.queryByLabelText('Matched passage')).toBeNull()
+  })
+
+  it('offers no toggle when the hit carries no chunk text', async () => {
+    kb.kbSearch.mockResolvedValue([{ ...hit('short chunk'), chunk_text: undefined }])
+    renderAt('/project/3/kb?q=approval')
+    await screen.findByText(/2 annotations/)
+    expect(screen.queryByRole('button', { name: 'Show passage' })).toBeNull()
+  })
+})
+
+describe('Library open-at-match, sidebar and annotations', () => {
+  it('opening a hit highlights the matched block and keeps it through re-renders', async () => {
+    const user = userEvent.setup()
+    kb.kbGet.mockResolvedValue({ ...doc('docs/a.md'), content: 'First para.\n\nThe **matched** sentence lives [here](http://x.test).\n\nLast para.' })
+    kb.kbSearch.mockResolvedValue([{
+      path: 'docs/a.md', title: 'Title of docs/a.md', tags: [], excerpt: 'unique-excerpt', chunk_text: 'The **matched** sentence lives [here](http://x.test).',
+      author: 'a', updated_at: 1, score: 0.8, chunk_index: 2,
+    }])
+    renderAt('/project/3/kb?q=matched')
+    await user.click(await screen.findByText('unique-excerpt'))
+    const hit = (await screen.findByText('matched')).closest('p')!
+    expect(url()).toBe('/project/3/kb?doc=docs%2Fa.md')
+    await vi.waitFor(() => expect(hit).toHaveAttribute('data-chunk-hit'))
+    expect(screen.getByText('First para.')).not.toHaveAttribute('data-chunk-hit')
+    await user.click(screen.getByRole('button', { name: /Annotations/ }))
+    await user.type(screen.getByPlaceholderText(/annotation|note|add/i), 'x') // re-renders DocView
+    expect(hit).toBeInTheDocument()
+    expect(hit).toHaveAttribute('data-chunk-hit')
+  })
+
+  it('highlights paragraphs with markup next to punctuation and snake_case', async () => {
+    const user = userEvent.setup()
+    const chunk = '**Note**: call `amp_kb_search`) with my_var_name and *a*.'
+    kb.kbGet.mockImplementation(async (_r: unknown, path: string) => ({ ...doc(path), content: path === 'docs/a.md' ? `Intro line here.\n\n${chunk}` : `Other intro.\n\n${chunk}` }))
+    kb.kbSearch.mockResolvedValue([{ path: 'docs/a.md', title: 'Title of docs/a.md', tags: [], excerpt: 'unique-excerpt', chunk_text: chunk, author: 'a', updated_at: 1, score: 0.8, chunk_index: 1 }])
+    renderAt('/project/3/kb?q=note')
+    await user.click(await screen.findByText('unique-excerpt'))
+    const hit = (await screen.findByText('Note')).closest('p')!
+    await vi.waitFor(() => expect(hit).toHaveAttribute('data-chunk-hit'))
+    expect(hit.style.background).not.toBe('')
+  })
+
+  it('shows an annotation count in the doc header and the panel above the text', async () => {
+    const ann = { author: 'sam', text: 'fix this', created_at: 1, is_resolved: false }
+    kb.kbGet.mockResolvedValue({ ...doc('docs/a.md'), annotations: [ann, { ...ann, text: 'and this' }] })
+    renderAt('/project/3/kb?doc=docs%2Fa.md')
+    expect(await screen.findByRole('link', { name: /2 annotations/ })).toBeInTheDocument()
+    expect(screen.getByText('fix this')).toBeInTheDocument()
+  })
+
+  it('restores the saved sidebar width and clamps it', async () => {
+    localStorage.setItem('amp.kb.sidebarWidth', '9999')
+    renderAt('/project/3/kb')
+    const handle = await screen.findByRole('separator', { name: 'Resize sidebar' })
+    expect(handle.parentElement).toHaveStyle({ width: '640px' })
+    localStorage.removeItem('amp.kb.sidebarWidth')
+  })
+})

@@ -848,7 +848,9 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_kb_list",
 		"List the documents in a knowledge base (project KB unless scope says otherwise), most recently updated first, "+
 			"without content. Optionally filter by tag. Returns one page: the newest 250 by default. total is how many docs "+
-			"the listing has (with the tag, if given); next_offset is present when more remain: pass it as offset for the next page.",
+			"the listing has (with the tag, if given); next_offset is present when more remain: pass it as offset for the next page. "+
+			"Each doc carries created_at, updated_at and, once an agent has read it, last_read_at, last_read_by and read_count: "+
+			"use them to find stale or unread docs when curating a KB.",
 		kbArgs(props{
 			"tag":    str("Optional. Filter to documents with this tag."),
 			"limit":  num(fmt.Sprintf("Optional. Docs per page (default %d, max %d).", kbListDefault, kbListMax)),
@@ -2760,7 +2762,31 @@ func (s *Server) kbSearch(ctx context.Context, args map[string]interface{}) (*mc
 	if err != nil {
 		return nil, err
 	}
+	dropChunkText(results)
+	paths := make([]string, 0, len(results))
+	for _, r := range results {
+		paths = append(paths, r.Path)
+	}
+	s.recordKBReads(ctx, k.Scope, paths)
 	return jsonResult(map[string]interface{}{"kb": k, "results": results, "count": len(results)})
+}
+
+// recordKBReads notes an agent's read of KB docs for the Library's "last read
+// by" (#159). It never fails the tool: a missed count is better than a
+// failed read.
+func (s *Server) recordKBReads(ctx context.Context, sc kb.Scope, paths []string) {
+	if err := s.kb.RecordReads(ctx, sc, paths, authorOf(ctx, nil)); err != nil {
+		slog.Default().Warn("record kb reads", "kb", sc.String(), "err", err)
+	}
+}
+
+// dropChunkText keeps amp_kb_search to the short excerpt: agents read the full
+// doc with amp_kb_get. The Library's REST search keeps chunk_text and labels it
+// as more than the agent sees.
+func dropChunkText(results []kb.SearchResult) {
+	for i := range results {
+		results[i].ChunkText = ""
+	}
 }
 
 // kbSearchDefaultLimit and kbSearchMaxLimit are amp_kb_search's documented
@@ -2799,6 +2825,8 @@ func (s *Server) kbGet(ctx context.Context, args map[string]interface{}) (*mcpgo
 	if err != nil {
 		return nil, err
 	}
+	// The doc returned shows the reads before this one.
+	s.recordKBReads(ctx, k.Scope, []string{doc.Path})
 	return jsonResult(doc)
 }
 
