@@ -42,3 +42,5 @@ jobs:
         run: python3 v2/deploy/helm/test_client_ip_chart.py --envoy-validate --envoy-run
       - name: receipt evidence store (local PVC / bundled SeaweedFS / external S3, #126 #144) template tests
         run: python3 v2/deploy/helm/test_receipts_store_chart.py
+      - name: CNPG backups (barmanObjectStore + ScheduledBackup, #145) template tests
+        run: python3 v2/deploy/helm/test_cnpg_backup_chart.py

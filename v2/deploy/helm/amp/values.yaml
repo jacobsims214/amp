@@ -483,6 +483,29 @@ cnpg:
   appDatabase: amp
   appOwner: amp
   postgresVersion: "16"
+  # Continuous backup (WAL archive + scheduled base backups) to an
+  # S3-compatible store through CNPG's barmanObjectStore (#145). Off by
+  # default; see kb/operations/backup-and-disaster-recovery.md.
+  backup:
+    enabled: false
+    destinationPath: ""     # s3://bucket/path (required when enabled)
+    endpointURL: ""         # S3 gateway, e.g. SeaweedFS (empty = AWS S3)
+    # A Secret you create out-of-band holding the access keys (required).
+    existingSecret: ""
+    accessKeyIdKey: ACCESS_KEY_ID
+    secretAccessKeyKey: SECRET_ACCESS_KEY
+    retentionPolicy: 30d
+    # Six-field CNPG cron (seconds first). Daily at 03:00.
+    schedule: "0 0 3 * * *"
+    immediate: true         # also take a base backup when the schedule is created
+  # Bootstrap this cluster from an earlier backup instead of an empty database
+  # (disaster recovery). Needs backup.enabled, with backup.destinationPath
+  # changed to a fresh path. See the restore runbook.
+  recovery:
+    enabled: false
+    sourcePath: ""          # the OLD backup.destinationPath
+    sourceServerName: amp-postgres   # the OLD cluster's name (its barman server name)
+    targetTime: ""          # e.g. "2026-11-04 14:30:00+00"; empty = latest WAL
 
 # Backs the asynq indexing queue — amp-api enqueues KB indexing jobs here
 # instead of writing to Typesense inline, so a burst of writes gets smoothed
