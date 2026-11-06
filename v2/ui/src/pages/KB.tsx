@@ -11,6 +11,7 @@ import { PageHeader } from '../components/ui/PageHeader'
 import { ProjectNav } from '../components/ProjectNav'
 import type { KBDoc, KBDocSummary, KBInfo, KBRef, KBScope, KBSearchResult, KBSource, KBTagCount } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
+import { useSearchParam } from '../hooks/useSearchParam'
 
 // What each kind of KB is for; shown on team and org KB pages and in the editor.
 const SCOPE_PURPOSE: Record<KBScope, string> = {
@@ -92,6 +93,15 @@ export function KB() {
   }, [kbRef, tagFilter])
 
   useEffect(() => { loadDocs() }, [loadDocs])
+
+  // /guide?doc=<path> (and the same on any KB) opens that doc, so other pages can link to a how-to.
+  const [docParam] = useSearchParam('doc')
+  useEffect(() => {
+    if (!docParam) return
+    let live = true
+    api.kbGet(kbRef, docParam).then(d => { if (live) { setSelectedDoc(d); setView('doc') } }).catch(() => {})
+    return () => { live = false }
+  }, [docParam, kbRef])
 
   // Debounced search
   useEffect(() => {

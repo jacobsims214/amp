@@ -1,9 +1,12 @@
 // Project settings: the require_merge toggle, who sees the GitHub merge webhook
 // (AMP #2485), and who sees the GitHub token form (AMP #3161).
+import { existsSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { SECTION_GUIDE } from '../lib/settingsGuide'
 import type { Project, ProjectAccess } from '../types'
 
 const project: Project = { id: 3, name: 'P', code: 'P', description: '', state: 'active', created_at: '', updated_at: '', require_merge: true }
@@ -216,5 +219,28 @@ describe('ProjectSettings dispatch watchdog', () => {
     expect(flag).toBeDisabled()
     expect(screen.getByLabelText(/return it to ready after/i)).toBeDisabled()
     expect(screen.queryByRole('button', { name: /save watchdog/i })).toBeNull()
+  })
+})
+
+describe('ProjectSettings "How it works" links', () => {
+  it('links every section to a guide doc that ships in v2/kb', async () => {
+    renderAs('owner')
+    await screen.findByRole('heading', { name: 'Dispatch watchdog' })
+    const links = screen.getAllByRole('link', { name: /^How .* works$/ })
+    // Owners see all eleven documented sections.
+    expect(links).toHaveLength(Object.keys(SECTION_GUIDE).length)
+    for (const a of links) {
+      const href = a.getAttribute('href')!
+      expect(href).toMatch(/^\/guide\?doc=/)
+      const doc = decodeURIComponent(href.slice('/guide?doc='.length))
+      expect(existsSync(resolve(process.cwd(), '../kb', doc)), `${doc} should exist in v2/kb`).toBe(true)
+    }
+  })
+
+  it('shows a non-owner only the links for the sections they can see', async () => {
+    renderAs('member')
+    await screen.findByRole('heading', { name: 'Dispatch watchdog' })
+    expect(screen.queryByRole('link', { name: 'How Webhooks works' })).toBeNull()
+    expect(screen.getByRole('link', { name: 'How Metadata works' })).toHaveAttribute('href', '/guide?doc=admin/project-settings.md')
   })
 })
