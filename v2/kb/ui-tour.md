@@ -10,7 +10,10 @@ tags: [ui, onboarding, navigation]
 - **My work** — your home page: a summary of what waits on you across every project (Approve,
   Answer, Merge, Start, Do), one card per project, plus your agents at work and what finished
   lately. It only informs: each row opens that project's My work with the item in focus. Its
-  badge is your total waiting.
+  badge is your total waiting. The find box at the top (press `/`) narrows the cards to the rows whose
+  ticket number, title or project name match (Escape clears it); it is kept in the address as `?q=`,
+  and the counts stay the full totals. It searches only the rows listed, and says when some were left
+  out. The project's My work tab has the same box for that project's items.
   My work is one person's list, so it needs a signed-in AMP user. When sign-in is off (local
   development, no `OIDC_ISSUER_URL`) or your sign-in has no AMP user (not invited, email domain
   not allowed, or email not verified), My work, the project's My work tab and Mission's Waiting on
