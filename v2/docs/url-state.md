@@ -57,6 +57,8 @@ and serialize pair (`lib/boardFilter.ts`) and apply it with
 | `sel` | Graph | ticket id; selected node with its chain lit | none | push to select, replace to clear |
 | `chain` | Graph | `1`: show only the selected node's chain | off | replace |
 | `open` | Trace | `<task id>[,<task id>…]`: expanded stories | none | push |
+| `status`, `kind`, `expiry` | Artifacts | status as on Board but `in_review`, `changes_requested`, `approved`; kind `html`, `svg`, `image`, `markdown`, `pdf`, `text`; expiry `soon` (within 7 days) or `kept` | all | replace |
+| `q` | Artifacts | text matched against title, ticket ref and ticket name | empty | replace |
 | `v` | Artifact | version number | latest | replace |
 | `org` | Portfolio | org id | last viewed, else your first | replace |
 | `launch` | any page (debug) | `full` or `short`: forces the launch animation | by timing | read only |
