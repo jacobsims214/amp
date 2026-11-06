@@ -52,7 +52,7 @@ and serialize pair (`lib/boardFilter.ts`) and apply it with
 | `epic` | Board, Graph | epic id | all epics | push |
 | `owner` | Board | `mine`, `unowned`, `all`, `<user id>` | `mine` | push |
 | `owner` | Graph | `mine` | everyone | replace |
-| `done` | Board | `show` (done epics are hidden by default) | `hide` | replace |
+| `done` | Board, Flight plan | `show` (done epics are hidden by default) | `hide` | replace |
 | `done` | Graph | `hide` | `show` | replace |
 | `sel` | Graph | ticket id; selected node with its chain lit | none | push to select, replace to clear |
 | `chain` | Graph | `1`: show only the selected node's chain | off | replace |
