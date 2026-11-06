@@ -66,7 +66,10 @@ copy the address bar to share exactly what you see.
 - **Library** — the project's knowledge base, plus links to the team and org KBs and this guide.
   The search box matches titles and doc text, not just titles. Each hit shows a short excerpt (what
   agents get from `amp_kb_search`) and any annotation summary; "Show passage" opens the whole matched
-  chunk with its score and chunk number.
+  chunk with its score and chunk number (the box scrolls rather than growing). Opening a hit
+  scrolls to and highlights the matched passage in the doc (this is not in the address bar, so a copied link opens the doc without it). Drag the sidebar's right
+  edge to widen it; the width is remembered in the browser. A doc with annotations shows a count
+  link beside its details and lists them in a panel above the text (the list scrolls past a few).
 - **Settings** — general (including which org the project is in), plan approval, merges (whether
   dependents wait for merges), metadata, team access, knowledge bases, trash (restore deleted
   tickets), and for owners the GitHub token and the GitHub merge webhook, then webhooks, the audit

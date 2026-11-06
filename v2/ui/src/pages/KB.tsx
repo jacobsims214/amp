@@ -106,6 +106,9 @@ export function KB() {
   const tagFilter = params.get('tag')
   const [searchQuery, setSearchQuery] = useState(() => params.get('q') ?? '')
   const [showAllTags, setShowAllTags] = useState(false)
+  const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth)
+  // The matched chunk of the search hit the open doc came from (in memory only, not in the URL).
+  const [matched, setMatched] = useState<{ path: string; text: string } | null>(null)
   const [searchResults, setSearchResults] = useState<KBSearchResult[]>([])
   const [searching, setSearching] = useState(false)
   const [loading, setLoading] = useState(true)
@@ -181,10 +184,23 @@ export function KB() {
     return () => clearTimeout(t)
   }, [searchQuery, kbRef])
 
-  const openDoc = (path: string) => {
+  const openDoc = (path: string, hit?: KBSearchResult) => {
     setActionError(null)
     setSearchQuery('') // close search results
-    patchParams({ doc: path, q: null }) // pushes a history entry; the ?doc effect loads it
+    setMatched(hit?.chunk_text ? { path, text: hit.chunk_text } : null)
+    // pushes a history entry; the ?doc effect loads it
+    patchParams({ doc: path, q: null })
+  }
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault()
+    const startX = e.clientX, startW = sidebarWidth
+    let w = startW
+    const move = (ev: MouseEvent) => { w = clampSidebar(startW + ev.clientX - startX); setSidebarWidth(w) }
+    const up = () => {
+      window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up)
+      try { localStorage.setItem(SIDEBAR_KEY, String(w)) } catch { /* private mode */ }
+    }
+    window.addEventListener('mousemove', move); window.addEventListener('mouseup', up)
   }
 
   const openEditor = (doc?: KBDoc | null) => {
@@ -292,7 +308,7 @@ export function KB() {
       <div className="flex flex-1 overflow-hidden">
         {/* ── Sidebar ────────────────────────────────────────────────── */}
         <aside className="flex flex-col flex-shrink-0 overflow-hidden"
-          style={{ width: 248, borderRight: '1px solid var(--line)', background: 'var(--surface)' }}>
+          style={{ width: sidebarWidth, position: 'relative', borderRight: '1px solid var(--line)', background: 'var(--surface)' }}>
 
           {/* Search */}
           <div className="px-3 pt-3 pb-2 flex-shrink-0">
@@ -401,13 +417,15 @@ export function KB() {
                 onToggleDir={(dir) => setExpandedDirs(prev => {
                   const s = new Set(prev); if (s.has(dir)) s.delete(dir); else s.add(dir); return s
                 })}
-                onSelectDoc={openDoc}
+                onSelectDoc={path => openDoc(path)}
                 selectedPath={selectedDoc?.path}
               />
             )}
           </div>
 
           {pid != null && <OtherKBs projectId={pid} />}
+          <div role="separator" aria-orientation="vertical" aria-label="Resize sidebar" onMouseDown={startResize}
+            className="absolute top-0 right-0 h-full cursor-col-resize hover:bg-line-str" style={{ width: 4 }} />
         </aside>
 
         {/* ── Main content ───────────────────────────────────────────── */}
@@ -426,11 +444,12 @@ export function KB() {
                   </p>
                 </div>
               )}
-              <BrowseView docs={docs} loading={loading} tagFilter={tagFilter} onOpen={openDoc} onNew={canWrite ? () => openEditor(null) : undefined} />
+              <BrowseView docs={docs} loading={loading} tagFilter={tagFilter} onOpen={path => openDoc(path)} onNew={canWrite ? () => openEditor(null) : undefined} />
             </>
           )}
           {view === 'doc' && selectedDoc && (
-            <DocView doc={selectedDoc} canWrite={canWrite} onEdit={() => openEditor(selectedDoc)} onDelete={() => deleteDoc(selectedDoc.path)} onTagClick={tag => setTagFilter(tag)} kbRef={kbRef} setSelectedDoc={setSelectedDoc} />
+            <DocView key={selectedDoc.path} doc={selectedDoc} canWrite={canWrite} onEdit={() => openEditor(selectedDoc)} onDelete={() => deleteDoc(selectedDoc.path)} onTagClick={tag => setTagFilter(tag)} kbRef={kbRef} setSelectedDoc={setSelectedDoc}
+              matchedChunk={matched?.path === selectedDoc.path ? matched.text : null} />
           )}
           {view === 'editor' && (
             <EditorView
@@ -591,7 +610,7 @@ function TreeNode({ node, depth, expanded, onToggleDir, onSelectDoc, selectedPat
 /* ── Search results (in sidebar) ─────────────────────────────────────────── */
 function SearchResultsList({ query, results, searching, onSelect, selectedPath }: {
   query: string; results: KBSearchResult[]; searching: boolean
-  onSelect: (path: string) => void; selectedPath?: string
+  onSelect: (path: string, hit: KBSearchResult) => void; selectedPath?: string
 }) {
   const [shown, setShown] = useState<Set<string>>(() => new Set())
   const toggle = (key: string) => setShown(prev => {
@@ -618,7 +637,7 @@ function SearchResultsList({ query, results, searching, onSelect, selectedPath }
         const hasPassage = !!r.chunk_text
         return (
           <div key={key}>
-          <button onClick={() => onSelect(r.path)}
+          <button onClick={() => onSelect(r.path, r)}
             className="w-full text-left px-2 py-2 rounded-lg transition-all cursor-pointer"
             style={{
               background: isSelected ? 'color-mix(in srgb, var(--link) 12%, transparent)' : 'transparent',
@@ -666,7 +685,7 @@ function SearchResultsList({ query, results, searching, onSelect, selectedPath }
                 {r.chunk_index !== undefined && <> · chunk {r.chunk_index}</>}
                 {' · '}agents see only the short excerpt above
               </p>
-              <p aria-label="Matched passage" className="text-xs text-ink-2 leading-relaxed whitespace-pre-wrap">{r.chunk_text}</p>
+              <p aria-label="Matched passage" className="text-xs text-ink-2 leading-relaxed whitespace-pre-wrap overflow-y-auto" style={{ maxHeight: 256 }}>{r.chunk_text}</p>
             </div>
           )}
           </div>
@@ -791,8 +810,39 @@ function DocListItem({ doc, onOpen }: { doc: KBDocSummary; onOpen: () => void })
   )
 }
 
+const SIDEBAR_KEY = 'amp.kb.sidebarWidth'
+const clampSidebar = (w: number) => Math.min(640, Math.max(200, w))
+function readSidebarWidth(): number {
+  try { const n = Number(localStorage.getItem(SIDEBAR_KEY)); return n > 0 ? clampSidebar(n) : 320 } catch { return 320 }
+}
+
+const norm = (t: string) => t.replace(/\s+/g, ' ').trim()
+/** Chunks are raw markdown; rendered text has no syntax, so strip it before comparing. */
+const stripMd = (t: string) => norm(t
+  .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
+  .replace(/^\s{0,3}(#{1,6}|>|[-*+]|\d+[.)])\s+/gm, '')
+  .replace(/[*`|]/g, '')
+  .replace(/(^|[^\w])_+|_+(?=[^\w]|$)/g, '$1')) // '_' only at word edges, so snake_case survives
+const MIN_BLOCK = 12
+/** Marks the rendered blocks whose text lies in the matched chunk and scrolls to the first. */
+function highlightChunk(root: HTMLElement, chunk: string) {
+  const hay = stripMd(chunk)
+  root.querySelectorAll('[data-chunk-hit]').forEach(el => { el.removeAttribute('data-chunk-hit'); (el as HTMLElement).style.background = '' })
+  let first: Element | null = null
+  root.querySelectorAll('p, li, h1, h2, h3, h4, h5, h6, pre, blockquote, td, th').forEach(el => {
+    if (el.querySelector('p, li, pre, blockquote, ul, ol')) return // only leaf blocks
+    const t = norm(el.textContent ?? '')
+    if (!t || !(t.length >= MIN_BLOCK ? hay.includes(t) : hay === t)) return
+    el.setAttribute('data-chunk-hit', '')
+    ;(el as HTMLElement).style.background = 'color-mix(in srgb, var(--warning) 18%, transparent)'
+    first ??= el
+  })
+  ;(first as Element | null)?.scrollIntoView?.({ block: 'center' })
+}
+
 /* ── Doc viewer ───────────────────────────────────────────────────────────── */
-function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelectedDoc }: {
+function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelectedDoc, matchedChunk }: {
+  matchedChunk?: string | null
   doc: KBDoc; canWrite: boolean; onEdit: () => void; onDelete: () => void; onTagClick: (tag: string) => void
   kbRef: KBRef; setSelectedDoc: (doc: KBDoc | null) => void
 }) {
@@ -800,7 +850,13 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
   const rt = readingTime(doc.content)
   const date = doc.updated_at > 0 ? shortDate(doc.updated_at) : null
   const lastRead = lastReadText(doc)
-  const [annExpanded, setAnnExpanded] = useState(true)
+  const [annExpanded, setAnnExpanded] = useState((doc.annotations?.length ?? 0) > 0) // empty panel starts collapsed so the text leads
+  const contentRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!contentRef.current) return
+    if (matchedChunk) highlightChunk(contentRef.current, matchedChunk)
+    else contentRef.current.querySelectorAll('[data-chunk-hit]').forEach(el => { el.removeAttribute('data-chunk-hit'); (el as HTMLElement).style.background = '' })
+  }, [matchedChunk, doc.path, doc.content])
   const [annText, setAnnText] = useState('')
   const [annSaving, setAnnSaving] = useState(false)
   const [annError, setAnnError] = useState<string | null>(null)
@@ -859,6 +915,12 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
             {doc.created_at ? <span className="text-xs text-ink-3">Created {shortDate(doc.created_at)}</span> : null}
             {date && <span className="text-xs text-ink-3">{doc.created_at ? `Updated ${date}` : date}</span>}
             {doc.author && <span className="text-xs text-ink-3">by {doc.author}</span>}
+            {!kbRef.global && (doc.annotations?.length ?? 0) > 0 && (
+              <a href="#annotations" onClick={e => { e.preventDefault(); setAnnExpanded(true); document.getElementById('annotations')?.scrollIntoView?.({ block: 'start' }) }}
+                className="text-xs flex items-center gap-1 text-link">
+                <MessageSquare size={10} />{doc.annotations!.length} annotation{doc.annotations!.length !== 1 ? 's' : ''}
+              </a>
+            )}
           </div>
           {lastRead && (
             <p className="text-xs text-ink-3 mt-1.5" title={doc.read_count ? `${doc.read_count} agent read${doc.read_count !== 1 ? 's' : ''} counted` : undefined}>
@@ -904,16 +966,8 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
         </div>
       )}
 
-      {/* Divider */}
-      <div className="border-t border-line-sub mb-6" />
-
-      {/* Markdown content */}
-      <div className="prose-amp">
-        <Markdown>{doc.content}</Markdown>
-      </div>
-
       {/* Annotations Panel (none on the AMP guide: it changes through the repo) */}
-      {!kbRef.global && <div className="mt-8 pt-6 border-t border-line-sub">
+      {!kbRef.global && <div id="annotations" className="mb-6 pb-4 border-b border-line-sub">
         <button
           onClick={() => setAnnExpanded(!annExpanded)}
           className="flex items-center gap-2 text-xs font-semibold text-ink-2 hover:text-ink transition-colors mb-4"
@@ -930,7 +984,7 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
           <div className="space-y-4">
             {/* Annotation List */}
             {doc.annotations && doc.annotations.length > 0 ? (
-              <div className="space-y-3">
+              <div className="space-y-3 overflow-y-auto" style={{ maxHeight: 288 }}>
                 {doc.annotations.map((ann, idx) => (
                   <div key={idx} className="p-3 rounded-lg text-xs" style={{ background: 'color-mix(in srgb, var(--ink) 3%, transparent)', border: '1px solid var(--line)' }}>
                     <div className="flex items-center justify-between mb-2">
@@ -1016,6 +1070,15 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
           </div>
         )}
       </div>}
+
+      {/* Divider */}
+      <div className="border-t border-line-sub mb-6" />
+
+      {/* Markdown content */}
+      <div className="prose-amp" ref={contentRef}>
+        <Markdown>{doc.content}</Markdown>
+      </div>
+
     </div>
   )
 }

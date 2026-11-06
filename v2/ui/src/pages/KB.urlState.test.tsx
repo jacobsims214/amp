@@ -123,3 +123,52 @@ describe('Library search hits', () => {
     expect(screen.queryByRole('button', { name: 'Show passage' })).toBeNull()
   })
 })
+
+describe('Library open-at-match, sidebar and annotations', () => {
+  it('opening a hit highlights the matched block and keeps it through re-renders', async () => {
+    const user = userEvent.setup()
+    kb.kbGet.mockResolvedValue({ ...doc('docs/a.md'), content: 'First para.\n\nThe **matched** sentence lives [here](http://x.test).\n\nLast para.' })
+    kb.kbSearch.mockResolvedValue([{
+      path: 'docs/a.md', title: 'Title of docs/a.md', tags: [], excerpt: 'unique-excerpt', chunk_text: 'The **matched** sentence lives [here](http://x.test).',
+      author: 'a', updated_at: 1, score: 0.8, chunk_index: 2,
+    }])
+    renderAt('/project/3/kb?q=matched')
+    await user.click(await screen.findByText('unique-excerpt'))
+    const hit = (await screen.findByText('matched')).closest('p')!
+    expect(url()).toBe('/project/3/kb?doc=docs%2Fa.md')
+    await vi.waitFor(() => expect(hit).toHaveAttribute('data-chunk-hit'))
+    expect(screen.getByText('First para.')).not.toHaveAttribute('data-chunk-hit')
+    await user.click(screen.getByRole('button', { name: /Annotations/ }))
+    await user.type(screen.getByPlaceholderText(/annotation|note|add/i), 'x') // re-renders DocView
+    expect(hit).toBeInTheDocument()
+    expect(hit).toHaveAttribute('data-chunk-hit')
+  })
+
+  it('highlights paragraphs with markup next to punctuation and snake_case', async () => {
+    const user = userEvent.setup()
+    const chunk = '**Note**: call `amp_kb_search`) with my_var_name and *a*.'
+    kb.kbGet.mockImplementation(async (_r: unknown, path: string) => ({ ...doc(path), content: path === 'docs/a.md' ? `Intro line here.\n\n${chunk}` : `Other intro.\n\n${chunk}` }))
+    kb.kbSearch.mockResolvedValue([{ path: 'docs/a.md', title: 'Title of docs/a.md', tags: [], excerpt: 'unique-excerpt', chunk_text: chunk, author: 'a', updated_at: 1, score: 0.8, chunk_index: 1 }])
+    renderAt('/project/3/kb?q=note')
+    await user.click(await screen.findByText('unique-excerpt'))
+    const hit = (await screen.findByText('Note')).closest('p')!
+    await vi.waitFor(() => expect(hit).toHaveAttribute('data-chunk-hit'))
+    expect(hit.style.background).not.toBe('')
+  })
+
+  it('shows an annotation count in the doc header and the panel above the text', async () => {
+    const ann = { author: 'sam', text: 'fix this', created_at: 1, is_resolved: false }
+    kb.kbGet.mockResolvedValue({ ...doc('docs/a.md'), annotations: [ann, { ...ann, text: 'and this' }] })
+    renderAt('/project/3/kb?doc=docs%2Fa.md')
+    expect(await screen.findByRole('link', { name: /2 annotations/ })).toBeInTheDocument()
+    expect(screen.getByText('fix this')).toBeInTheDocument()
+  })
+
+  it('restores the saved sidebar width and clamps it', async () => {
+    localStorage.setItem('amp.kb.sidebarWidth', '9999')
+    renderAt('/project/3/kb')
+    const handle = await screen.findByRole('separator', { name: 'Resize sidebar' })
+    expect(handle.parentElement).toHaveStyle({ width: '640px' })
+    localStorage.removeItem('amp.kb.sidebarWidth')
+  })
+})
