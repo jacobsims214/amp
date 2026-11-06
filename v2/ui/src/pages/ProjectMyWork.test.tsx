@@ -243,6 +243,47 @@ describe('My work tab: ?focus=', () => {
   })
 })
 
+describe('My work tab: find box', () => {
+  it('?q= narrows the items and Coming up, keeps the readouts, and the box is on the page', async () => {
+    at('/project/2/my-work?q=2473')
+    const list = await screen.findByRole('region', { name: 'Waiting on you' })
+    const kinds = Array.from(list.querySelectorAll('[data-item-key]')).map(e => e.getAttribute('data-item-key'))
+    expect(kinds).toEqual(['task:2473'])
+    expect(screen.getByRole('searchbox', { name: 'Find in My work' })).toHaveValue('2473')
+    expect(within(screen.getByRole('group', { name: 'Waiting on you in AMP v2' })).getByText('Waiting on you').nextSibling).toHaveTextContent('5')
+    const coming = screen.getByRole('region', { name: 'Coming up' })
+    expect(within(coming).getByText('1 · not counted yet')).toBeInTheDocument()
+    expect(within(coming).getByText('No coming-up tickets match.')).toBeInTheDocument()
+  })
+
+  it('typing writes ?q=; a title matches; Clear and Escape bring everything back', async () => {
+    const user = userEvent.setup()
+    at('/project/2/my-work')
+    const box = await screen.findByRole('searchbox', { name: 'Find in My work' })
+    await user.type(box, 'harness')
+    expect(where()).toBe('/project/2/my-work?q=harness')
+    const coming = screen.getByRole('region', { name: 'Coming up' })
+    expect(within(coming).getByText('M5-TAG: tag harness v0.5.0')).toBeInTheDocument()
+    expect(screen.getByText('No matches')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Clear' }))
+    expect(where()).toBe('/project/2/my-work')
+    expect(box).toHaveFocus()
+    await user.type(box, 'zzzz')
+    await user.keyboard('{Escape}')
+    expect(box).toHaveValue('')
+    expect(screen.getAllByRole('article').length).toBeGreaterThan(1)
+  })
+
+  it('"/" focuses the box', async () => {
+    const user = userEvent.setup()
+    at('/project/2/my-work')
+    const box = await screen.findByRole('searchbox', { name: 'Find in My work' })
+    await user.keyboard('/')
+    expect(box).toHaveFocus()
+    expect(box).toHaveValue('')
+  })
+})
+
 describe('landing rule', () => {
   it('opens My work when something waits on you in the project', async () => {
     at('/project/2')

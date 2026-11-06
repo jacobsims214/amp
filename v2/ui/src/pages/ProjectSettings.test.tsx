@@ -1,9 +1,12 @@
 // Project settings: the require_merge toggle, who sees the GitHub merge webhook
 // (AMP #2485), and who sees the GitHub token form (AMP #3161).
+import { existsSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { SECTION_GUIDE } from '../lib/settingsGuide'
 import type { Project, ProjectAccess } from '../types'
 
 const project: Project = { id: 3, name: 'P', code: 'P', description: '', state: 'active', created_at: '', updated_at: '', require_merge: true }
@@ -42,6 +45,16 @@ function renderAs(access: ProjectAccess) {
   )
 }
 
+// Replace an input's text in ONE step (select-all + type), then wait for the
+// controlled input to hold exactly that text. clear-then-type raced a
+// re-render on a loaded CI runner: the cleared '' was reverted to '10' and
+// the typed '5' appended to it, saving 105.
+async function replaceText(user: ReturnType<typeof userEvent.setup>, el: HTMLElement, text: string) {
+  const input = el as HTMLInputElement
+  await user.type(input, text, { initialSelectionStart: 0, initialSelectionEnd: input.value.length })
+  await vi.waitFor(() => expect(input).toHaveValue(text))
+}
+
 beforeEach(() => {
   state.update.mockReset()
   state.credential.mockReset()
@@ -59,12 +72,12 @@ describe('ProjectSettings require_merge', () => {
     expect(toggle).toBeChecked()
 
     await user.click(toggle)
-    expect(state.update).toHaveBeenLastCalledWith(3, { require_merge: false })
+    await vi.waitFor(() => expect(state.update).toHaveBeenLastCalledWith(3, { require_merge: false }))
     expect(await screen.findByText(/dependents start as soon as a ticket is done/i)).toBeInTheDocument()
     expect(toggle).not.toBeChecked()
 
     await user.click(toggle)
-    expect(state.update).toHaveBeenLastCalledWith(3, { require_merge: true })
+    await vi.waitFor(() => expect(state.update).toHaveBeenLastCalledWith(3, { require_merge: true }))
     await vi.waitFor(() => expect(toggle).toBeChecked())
   })
 
@@ -160,10 +173,10 @@ describe('ProjectSettings dispatch watchdog', () => {
     await vi.waitFor(() => expect(flag).toBeEnabled())
     expect(save).toBeDisabled() // nothing changed yet
 
-    await user.clear(flag)
-    await user.type(flag, '5')
+    await replaceText(user, flag, '5')
+    await vi.waitFor(() => expect(save).toBeEnabled())
     await user.click(save)
-    expect(state.update).toHaveBeenLastCalledWith(3, { not_started_flag_minutes: 5, not_started_return_minutes: 30 })
+    await vi.waitFor(() => expect(state.update).toHaveBeenLastCalledWith(3, { not_started_flag_minutes: 5, not_started_return_minutes: 30 }))
     await vi.waitFor(() => expect(screen.getByText('Saved')).toBeInTheDocument())
   })
 
@@ -173,13 +186,14 @@ describe('ProjectSettings dispatch watchdog', () => {
     renderAs('owner')
     const ret = await screen.findByLabelText(/return it to ready after/i)
     await vi.waitFor(() => expect(ret).toBeEnabled())
-    await user.clear(ret)
-    await user.type(ret, '0')
+    await replaceText(user, ret, '0')
     // The hint renders after the input's state update; wait for it rather than racing it on a busy CI runner.
     expect(await screen.findByText('Off: this never happens.')).toBeInTheDocument()
     expect(await screen.findByText(/automatic return is off/i)).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: /save watchdog/i }))
-    expect(state.update).toHaveBeenLastCalledWith(3, { not_started_flag_minutes: 10, not_started_return_minutes: 0 })
+    const saveBtn = screen.getByRole('button', { name: /save watchdog/i })
+    await vi.waitFor(() => expect(saveBtn).toBeEnabled())
+    await user.click(saveBtn)
+    await vi.waitFor(() => expect(state.update).toHaveBeenLastCalledWith(3, { not_started_flag_minutes: 10, not_started_return_minutes: 0 }))
   })
 
   it('refuses text that is not a whole number of minutes, and never sends it', async () => {
@@ -187,8 +201,7 @@ describe('ProjectSettings dispatch watchdog', () => {
     renderAs('owner')
     const flag = await screen.findByLabelText(/flag it for its owner after/i)
     await vi.waitFor(() => expect(flag).toBeEnabled())
-    await user.clear(flag)
-    await user.type(flag, '1.5')
+    await replaceText(user, flag, '1.5')
     expect(screen.getAllByRole('alert').map(e => e.textContent).join(' ')).toMatch(/whole number of minutes, 0 \(off\) to 1440/i)
     expect(screen.getByRole('button', { name: /save watchdog/i })).toBeDisabled()
     expect(state.update).not.toHaveBeenCalled()
@@ -199,8 +212,7 @@ describe('ProjectSettings dispatch watchdog', () => {
     renderAs('owner')
     const flag = await screen.findByLabelText(/flag it for its owner after/i)
     await vi.waitFor(() => expect(flag).toBeEnabled())
-    await user.clear(flag)
-    await user.type(flag, '40')
+    await replaceText(user, flag, '40')
     expect(screen.getByText(/never reaches the flag first/i)).toBeInTheDocument()
   })
 
@@ -251,5 +263,28 @@ describe('ProjectSettings verification receipts (#126)', () => {
     await vi.waitFor(() => expect(screen.getByText(/Only project owners and org admins can change these settings/)).toBeInTheDocument())
     for (const r of radios) expect(r).toBeDisabled()
     expect(screen.queryByRole('button', { name: /save receipts setting/i })).toBeNull()
+  })
+})
+
+describe('ProjectSettings "How it works" links', () => {
+  it('links every section to a guide doc that ships in v2/kb', async () => {
+    renderAs('owner')
+    await screen.findByRole('heading', { name: 'Dispatch watchdog' })
+    const links = screen.getAllByRole('link', { name: /^How .* works$/ })
+    // Owners see all eleven documented sections.
+    expect(links).toHaveLength(Object.keys(SECTION_GUIDE).length)
+    for (const a of links) {
+      const href = a.getAttribute('href')!
+      expect(href).toMatch(/^\/guide\?doc=/)
+      const doc = decodeURIComponent(href.slice('/guide?doc='.length))
+      expect(existsSync(resolve(process.cwd(), '../kb', doc)), `${doc} should exist in v2/kb`).toBe(true)
+    }
+  })
+
+  it('shows a non-owner only the links for the sections they can see', async () => {
+    renderAs('member')
+    await screen.findByRole('heading', { name: 'Dispatch watchdog' })
+    expect(screen.queryByRole('link', { name: 'How Webhooks works' })).toBeNull()
+    expect(screen.getByRole('link', { name: 'How Metadata works' })).toHaveAttribute('href', '/guide?doc=admin/project-settings.md')
   })
 })

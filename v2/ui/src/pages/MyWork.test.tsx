@@ -67,11 +67,11 @@ beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }))
 afterEach(() => { payload = busy })
 afterAll(() => server.close())
 
-function renderMyWork(me: Me = { subject: 's', email: 'jo@example.com', name: 'Jo', roles: [], user_id: 7 }) {
+function renderMyWork(me: Me = { subject: 's', email: 'jo@example.com', name: 'Jo', roles: [], user_id: 7 }, url = '/') {
   return render(
     <AuthContext.Provider value={{ me, loading: false, error: null, isAdmin: false }}>
       <RemoteProvider deps={{ transport: httpTransport, crypto: unpairedCrypto, mock: false }}>
-        <MemoryRouter><MyWork /></MemoryRouter>
+        <MemoryRouter initialEntries={[url]}><MyWork /></MemoryRouter>
       </RemoteProvider>
     </AuthContext.Provider>,
   )
@@ -292,5 +292,85 @@ describe('top-level My work: no zeros when there is nothing to count', () => {
     await userEvent.click(within(alert).getByRole('button', { name: 'Try again' }))
     expect(await screen.findByLabelText('Waiting on you, across your projects')).toBeInTheDocument()
     expect(screen.queryByRole('alert')).toBeNull()
+  })
+})
+
+describe('find box (#155)', () => {
+  const me: Me = { subject: 's', email: 'jo@example.com', name: 'Jo', roles: [], user_id: 7 }
+
+  it('?q= narrows rows across projects by title, ticket ref or project, and keeps the counts', async () => {
+    renderMyWork(me, '/?q=vendor')
+    await screen.findByRole('heading', { name: 'Core API' })
+    expect(screen.queryByRole('heading', { name: 'AMP v2' })).toBeNull()
+    const core = screen.getByRole('article', { name: /Core API/ })
+    expect(within(core).getAllByRole('listitem')).toHaveLength(1)
+    expect(within(core).getByText('#1903 Call the vendor')).toBeInTheDocument()
+    const ro = screen.getByLabelText('Waiting on you, across your projects')
+    expect(ro.textContent).toMatch(/Waiting on you8/)
+    expect(ro.textContent).toMatch(/in 2 of 13 projects/)
+  })
+
+  it('typing filters and writes ?q=; a ticket number matches; a project name keeps all its rows', async () => {
+    const user = userEvent.setup()
+    renderMyWork()
+    await screen.findByRole('heading', { name: 'AMP v2' })
+    const box = screen.getByRole('searchbox', { name: 'Find in My work' })
+    await user.type(box, '2473')
+    expect(screen.getByText('#2473 Review the mockup')).toBeInTheDocument()
+    expect(screen.queryByText('#2470 My Work questions')).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Core API' })).toBeNull()
+    await user.clear(box)
+    await user.type(box, 'core api')
+    expect(within(screen.getByRole('article', { name: /Core API/ })).getAllByRole('listitem')).toHaveLength(2)
+    expect(screen.queryByRole('heading', { name: 'AMP v2' })).toBeNull()
+  })
+
+  it('says so when nothing matches; Clear removes ?q= and brings the rows back', async () => {
+    const user = userEvent.setup()
+    renderMyWork(me, '/?q=zzzz')
+    expect(await screen.findByText('No matches')).toBeInTheDocument()
+    expect(screen.queryByRole('article')).toBeNull()
+    expect(screen.getByLabelText('Waiting on you, across your projects').textContent).toMatch(/in 2 of 13 projects/)
+    await user.click(screen.getByRole('button', { name: 'Clear' }))
+    expect(screen.queryByText('No matches')).toBeNull()
+    expect(screen.getByRole('searchbox', { name: 'Find in My work' })).toHaveValue('')
+    expect(screen.getByRole('searchbox', { name: 'Find in My work' })).toHaveFocus()
+    expect(screen.getByRole('heading', { name: 'AMP v2' })).toBeInTheDocument()
+  })
+
+  it('Escape clears the box and brings the rows back', async () => {
+    const user = userEvent.setup()
+    renderMyWork(me, '/?q=vendor')
+    const box = await screen.findByRole('searchbox', { name: 'Find in My work' })
+    expect(box).toHaveValue('vendor')
+    await user.click(box)
+    await user.keyboard('{Escape}')
+    expect(box).toHaveValue('')
+    expect(screen.getByRole('heading', { name: 'AMP v2' })).toBeInTheDocument()
+  })
+
+  it('a match only in projects with nothing waiting never shows the all-clear state', async () => {
+    renderMyWork(me, '/?q=home')
+    await screen.findByText(/No waiting items match/)
+    expect(screen.queryByText(/Nothing waits on you/)).toBeNull()
+    expect(screen.getByText('No matches')).toBeInTheDocument()
+    expect(screen.getByText(/No waiting items match/)).toBeInTheDocument()
+    expect(screen.getByLabelText('Waiting on you, across your projects').textContent).toMatch(/Waiting on you8/)
+  })
+
+  it('says some rows were not searched, and keeps each card\'s "more" link', async () => {
+    renderMyWork(me, '/?q=mockup')
+    await screen.findByText('#2473 Review the mockup')
+    expect(screen.getByText(/Only the rows listed here are searched\. 2 more items in the cards are not searched/)).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: '+2 more in AMP v2 ›' })).toBeInTheDocument()
+  })
+
+  it('"/" focuses the box, but not while typing in it', async () => {
+    const user = userEvent.setup()
+    renderMyWork()
+    const box = await screen.findByRole('searchbox', { name: 'Find in My work' })
+    await user.keyboard('/')
+    expect(box).toHaveFocus()
+    expect(box).toHaveValue('')
   })
 })

@@ -265,7 +265,38 @@ func (r *Repo) ListProjects(ctx context.Context) ([]domain.Project, error) {
 	if err != nil {
 		return nil, err
 	}
-	return collect(rows, scanProject)
+	return r.withOrgNames(ctx, rows)
+}
+
+// withOrgNames collects project rows and fills in each project's OrgName.
+func (r *Repo) withOrgNames(ctx context.Context, rows pgx.Rows) ([]domain.Project, error) {
+	ps, err := collect(rows, scanProject)
+	if err != nil || len(ps) == 0 {
+		return ps, err
+	}
+	orows, err := r.db.Query(ctx, `SELECT id, name FROM orgs`)
+	if err != nil {
+		return nil, err
+	}
+	defer orows.Close()
+	names := map[int]string{}
+	for orows.Next() {
+		var id int
+		var name string
+		if err := orows.Scan(&id, &name); err != nil {
+			return nil, err
+		}
+		names[id] = name
+	}
+	if err := orows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range ps {
+		if ps[i].OrgID != nil {
+			ps[i].OrgName = names[*ps[i].OrgID]
+		}
+	}
+	return ps, nil
 }
 
 func (r *Repo) ArchiveProject(ctx context.Context, id int) (*domain.Project, error) {
@@ -403,7 +434,7 @@ func (r *Repo) ListArchivedProjects(ctx context.Context) ([]domain.Project, erro
 	if err != nil {
 		return nil, err
 	}
-	return collect(rows, scanProject)
+	return r.withOrgNames(ctx, rows)
 }
 
 // ---- Epics ----

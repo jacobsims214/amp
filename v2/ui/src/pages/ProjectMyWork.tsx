@@ -30,6 +30,8 @@ import { ApproveView, type AlsoAwaiting } from '../components/approve/ApproveVie
 import { HumanActions } from '../components/human/HumanActions'
 import { useApproveParam } from '../hooks/useApproveParam'
 import { useFocusParam } from '../hooks/useFocusParam'
+import { ticketMatches, useFind } from '../hooks/useFind'
+import { FindBox, NoMatches } from '../components/ui/FindBox'
 import { useSSE } from '../hooks/useSSE'
 import { personName } from '../lib/people'
 import { ago } from '../lib/approval'
@@ -254,6 +256,12 @@ function Body({ data, items, name, pid, focusId, setFocus, onReview, onChanged, 
   const counts = data.counts
   const done = data.done_today ?? []
   const coming = data.coming_up ?? []
+  // The find box narrows the lists, not the readouts: those stay the server's.
+  const find = useFind()
+  const { q } = find
+  const hit = (it: ProjectWaitItem) => !q || ticketMatches(q, [it.task_id, ...(it.task_ids ?? [])], it.name)
+  const shownItems = items.filter(hit)
+  const shownComing = coming.filter(hit)
   const state: 'busy' | 'empty' | 'done' = counts.waiting > 0 || items.length > 0 ? 'busy' : done.length > 0 ? 'done' : 'empty'
 
   // ?focus=: the item (or Coming up row) that contains the ticket.
@@ -297,6 +305,8 @@ function Body({ data, items, name, pid, focusId, setFocus, onReview, onChanged, 
         </div>
       )}
 
+      {(items.length > 0 || coming.length > 0) && <FindBox find={find} label="Find in My work" placeholder="Find a ticket  ( / )" />}
+
       <div className="pmw-layout">
         <section aria-label={state === 'busy' ? `Waiting on ${who}` : state === 'done' ? 'Cleared today' : `Nothing waits on ${who}`} className="grid gap-2 min-w-0">
           {state === 'busy' && <>
@@ -304,11 +314,12 @@ function Body({ data, items, name, pid, focusId, setFocus, onReview, onChanged, 
               <span className="amp-label whitespace-nowrap">Waiting on {readOnly ? 'them' : 'you'} · oldest first within each kind</span>
               <span className="flex-1 h-px bg-line" />
             </div>
-            {items.map((it, i) => (
+            {q && shownItems.length === 0 && items.length > 0 && <NoMatches find={find} what="waiting items" />}
+            {shownItems.map((it, i) => (
               <ItemCard key={it.key} it={it} pid={pid} all={items} readOnly={readOnly}
                 focused={focusItem?.key === it.key} onDismiss={() => setFocus(null)}
                 onReview={onReview} onChanged={onChanged}
-                note={it.kind === 'merge' && items[i + 1]?.kind !== 'merge' ? <MergeNote /> : null} />
+                note={it.kind === 'merge' && shownItems[i + 1]?.kind !== 'merge' ? <MergeNote /> : null} />
             ))}
           </>}
           {state === 'empty' && <ClearPanel name={name} readOnly={readOnly} />}
@@ -316,7 +327,7 @@ function Body({ data, items, name, pid, focusId, setFocus, onReview, onChanged, 
         </section>
 
         <aside aria-label="Context" className="pmw-side min-w-0">
-          <ComingUp items={coming} pid={pid} focusKey={focusComing?.key ?? null} />
+          <ComingUp items={shownComing} total={coming.length} pid={pid} focusKey={focusComing?.key ?? null} />
           <Agents pid={pid} a={data.agents} />
           {state === 'busy' && done.length > 0 && (
             <section className="amp-panel" aria-label="Done today">
@@ -489,15 +500,15 @@ function DoneList({ done }: { done: DoneItem[] }) {
   )
 }
 
-function ComingUp({ items, pid, focusKey }: { items: ProjectWaitItem[]; pid: number; focusKey: string | null }) {
+function ComingUp({ items, total, pid, focusKey }: { items: ProjectWaitItem[]; total: number; pid: number; focusKey: string | null }) {
   return (
     <section className="amp-panel" aria-label="Coming up">
       <div className="flex items-center gap-2.5 px-4 py-3 border-b border-line">
         <span className="amp-label">Coming up</span>
-        <span className="ml-auto amp-num text-[11px] text-ink-3">{items.length ? `${items.length} · not counted yet` : '0'}</span>
+        <span className="ml-auto amp-num text-[11px] text-ink-3">{total ? `${total} · not counted yet` : '0'}</span>
       </div>
       {items.length === 0
-        ? <p className="m-0 px-4 py-3.5 text-[13px] text-ink-2">None of your tickets are waiting on other work.</p>
+        ? <p className="m-0 px-4 py-3.5 text-[13px] text-ink-2">{total ? 'No coming-up tickets match.' : 'None of your tickets are waiting on other work.'}</p>
         : (
           <ul className="pmw-list">
             {items.map(it => (

@@ -20,6 +20,17 @@ import { BandLoader } from '../components/brand/BandLoader'
 import { LastApproved } from '../components/LastApproved'
 import { useProjectPeople } from '../hooks/useProjectPeople'
 import { projectLink } from '../lib/projectLink'
+import { SECTION_GUIDE } from '../lib/settingsGuide'
+
+/** A small worked example, collapsed until asked for. */
+function Example({ children }: { children: React.ReactNode }) {
+  return (
+    <details className="mt-3 text-[12px] text-ink-2">
+      <summary className="cursor-pointer select-none text-ink">Example</summary>
+      <div className="mt-1.5 leading-relaxed">{children}</div>
+    </details>
+  )
+}
 
 const slug = (t: string) => t.toLowerCase().replace(/[^a-z]+/g, '-')
 
@@ -28,7 +39,13 @@ function Section({ title, description, danger, children }: { title: string; desc
   return (
     <section id={slug(title)} className={`bg-surface border scroll-mt-6 ${danger ? 'border-danger' : 'border-line'}`}>
       <div className="px-5 pt-4 pb-3 border-b border-line">
-        <h2 className="m-0 text-[15px] font-semibold" style={{ color: danger ? 'var(--danger-ink)' : 'var(--ink)' }}>{title}</h2>
+        <div className="flex items-baseline justify-between gap-3">
+          <h2 className="m-0 text-[15px] font-semibold" style={{ color: danger ? 'var(--danger-ink)' : 'var(--ink)' }}>{title}</h2>
+          {SECTION_GUIDE[title] && (
+            <Link to={`/guide?doc=${SECTION_GUIDE[title]}`} className="text-[12px] text-ink underline underline-offset-2 whitespace-nowrap"
+              aria-label={`How ${title} works`}>How it works →</Link>
+          )}
+        </div>
         {description && <p className="m-0 mt-1 text-[12.5px] text-ink-2 leading-relaxed max-w-[68ch]">{description}</p>}
       </div>
       <div className="px-5 py-4">{children}</div>
@@ -216,6 +233,10 @@ export function ProjectSettings() {
                 description="A ticket is dispatched before its worker starts it. A dispatched ticket no worker starts is flagged for its owner after the first timeout, and returned to ready after the second: the manager then dispatches it again, or asks you. 0 turns either off. A ticket a worker has started is never returned this way.">
                 <WatchdogMinutes project={project} pid={pid} canManage={canManage}
                   onSaved={setProject} onError={setError} />
+                <Example>
+                  Flag after 10, return after 30: a ticket dispatched at 09:00 that no worker claims shows “Dispatched · not started” from 09:10
+                  and is back in ready at 09:30. A worker claims a ticket with <code className="text-ink">amp_claim_task</code>.
+                </Example>
               </Section>
 
               <Section title="Metadata"
@@ -232,6 +253,10 @@ export function ProjectSettings() {
                     {metaSaved && !metaPatch && <span className="text-xs text-success-ink">Saved</span>}
                   </div>
                 )}
+                <Example>
+                  <code className="text-ink">repo = github.com/org/repo</code>, <code className="text-ink">jira_board = PLAT</code>,{' '}
+                  <code className="text-ink">capitalizable = yes</code>. A ticket with its own <code className="text-ink">jira_board</code> overrides the project's.
+                </Example>
               </Section>
 
               <Section title="Team access" description="Teams reach the project through these links. Owner teams manage the project; member teams work in it.">
@@ -290,6 +315,10 @@ export function ProjectSettings() {
                 <Section title="Webhooks"
                   description="Send this project's ticket changes to another service or a Slack channel. Org admins can also add webhooks for every project in the org.">
                   <WebhooksPanel projectId={pid} canManage={canManage} />
+                  <Example>
+                    Pick the Slack format and paste a Slack incoming-webhook URL: AMP posts <code className="text-ink">{'{"text": "…"}'}</code> for each event you pick.
+                    The JSON format signs each POST with <code className="text-ink">X-AMP-Signature</code>.
+                  </Example>
                 </Section>
               )}
 
