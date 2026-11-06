@@ -76,6 +76,11 @@ type Project struct {
 	// NotStartedReturnMinutes. 0 turns either off; both default on (10, 30).
 	NotStartedFlagMinutes   int `json:"not_started_flag_minutes"`
 	NotStartedReturnMinutes int `json:"not_started_return_minutes"`
+	// Verification receipts (#126): ReceiptsMode is "" (use the org's) or
+	// off / inform / require; ReceiptsMinLevel is what a Require ticket
+	// must reach before it completes (v1: self_checked).
+	ReceiptsMode     string `json:"receipts_mode"`
+	ReceiptsMinLevel string `json:"receipts_min_level"`
 	// Metadata is free-form key/value data for integrations (see Metadata).
 	Metadata  Metadata  `json:"metadata"`
 	CreatedAt time.Time `json:"created_at"`
@@ -104,6 +109,11 @@ type ProjectSettings struct {
 	// watchdog's timeouts (AMP #2801); 0 disables each.
 	NotStartedFlagMinutes   *int `json:"not_started_flag_minutes"`
 	NotStartedReturnMinutes *int `json:"not_started_return_minutes"`
+	// ReceiptsMode ("" = the org's, off, inform, require) and
+	// ReceiptsMinLevel: the verification receipts setting (#126). Only a
+	// person in the web UI changes either.
+	ReceiptsMode     *string `json:"receipts_mode"`
+	ReceiptsMinLevel *string `json:"receipts_min_level"`
 	// Metadata sets keys; null removes one (see MetadataPatch).
 	Metadata MetadataPatch `json:"metadata,omitempty"`
 }
@@ -593,6 +603,11 @@ const (
 	EventEpicUpdated       EventType = "epic.updated"
 	EventStoryUpdated      EventType = "story.updated"
 	EventArtifactUpdated   EventType = "artifact.updated"
+	// EventReceiptUpdated: a verification receipt changed (#126); payload
+	// {task_id, receipt_id, status, held}, or {task_id, receipt_id,
+	// evidence_key} when an evidence upload finished (the status and hold
+	// aren't re-derived by an upload, so they are left out).
+	EventReceiptUpdated EventType = "receipt.updated"
 )
 
 // AllEventTypes lists every event the hub publishes.
@@ -602,7 +617,7 @@ var AllEventTypes = []EventType{
 	EventStoryCreated, EventStoryStateChanged, EventStoryUpdated,
 	EventTaskCreated, EventTaskUpdated, EventTaskDispatched, EventTaskCompleted,
 	EventTaskBlocked, EventTaskUnblocked, EventTaskAssigned, EventCommentAdded,
-	EventArtifactUpdated,
+	EventArtifactUpdated, EventReceiptUpdated,
 }
 
 type Event struct {
@@ -856,6 +871,9 @@ type Org struct {
 	Slug      string    `json:"slug"`
 	CreatedBy *int      `json:"created_by"`
 	CreatedAt time.Time `json:"created_at"`
+	// ReceiptsMode is the org's default verification receipts mode (#126):
+	// off (the default), inform or require.
+	ReceiptsMode string `json:"receipts_mode"`
 	// MyRole is the caller's role in the org ("" when not a member, e.g. a
 	// global admin browsing). Filled by list endpoints only.
 	MyRole string `json:"my_role,omitempty"`

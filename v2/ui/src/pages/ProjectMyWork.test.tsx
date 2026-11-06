@@ -13,7 +13,7 @@ import { ProjectNav } from '../components/ProjectNav'
 import { fixedTab, landingPath, landingTab } from '../lib/landing'
 import { resetWaitCounts } from '../lib/waitCounts'
 import { alertMergeItem, doItem, linkedMergeItem, legacyMergeItem, mergeItem, myWork, task } from '../test/myWorkFixture'
-import type { Me, MyWorkCounts, ProjectMyWork as Data, Task } from '../types'
+import type { Me, MyWorkCounts, ProjectMyWork as Data, ProjectWaitItem, Task } from '../types'
 
 let data: Data = myWork('busy')
 let counts: MyWorkCounts = { counts: { waiting: 5, approve: 1, answer: 1, merge: 1, start: 1, do: 1, coming_up: 1 }, projects: { 2: { waiting: 5, approve: 1, answer: 1, merge: 1, start: 1, do: 1, coming_up: 1 } } }
@@ -588,5 +588,22 @@ describe('My work tab: what each item needs from you', () => {
     const card = document.querySelector('[data-item-key="task:2481"]') as HTMLElement
     expect(within(card).getByText('No instructions: open the ticket')).toBeInTheDocument()
     expect(card.querySelector('details')).toBeNull()
+  })
+})
+
+describe('My work tab: held receipts (#126)', () => {
+  it('shows a verify item from the server, with why and a link to Accept or Reject on the ticket', async () => {
+    const held: ProjectWaitItem = {
+      project_id: 2, project_code: 'AMPV2', project_name: 'AMP v2', kind: 'verify', key: 'task:77', task_id: 77, task_ids: [77],
+      name: 'Settings page', since: new Date(Date.now() - 3_600_000).toISOString(), state: 'in_progress', agent_id: 'amp-worker',
+      hold_reason: 'no checks were recorded', task: task(77, { state: 'in_progress', agent_id: 'amp-worker' }),
+    }
+    data = myWork('empty')
+    data.items.verify = [held]
+    data.counts = { ...data.counts, verify: 1, waiting: 1 }
+    at('/project/2/my-work')
+    const card = await screen.findByRole('article', { name: /Verify: #77 Settings page/ })
+    expect(card).toHaveTextContent("Couldn't verify #77: no checks were recorded. Accept or reject it on the ticket")
+    expect(within(card).getByRole('link', { name: 'Open #77 to accept or reject' })).toHaveAttribute('href', '/project/2/board?focus=77')
   })
 })

@@ -15,9 +15,18 @@ tags: [ui, onboarding, navigation]
   and the counts stay the full totals. It searches only the rows listed, and says when some were left
   out. The project's My work tab has the same box for that project's items.
   My work is one person's list, so it needs a signed-in AMP user. When sign-in is off (local
-  development, no `OIDC_ISSUER_URL`) or your sign-in has no AMP user (not invited, email domain
-  not allowed, or email not verified), My work, the project's My work tab and Mission's Waiting on
-  you strip say so and show no counts: use the project's Board, which has every ticket, or ask an
+  development, no `OIDC_ISSUER_URL`), amp-api makes the identity every request has, **Local Dev**
+  (`local-dev@amp.local`), a real AMP user at startup: a global admin, admin of the Default org and
+  lead of its Everyone team. So My work, approvals, People & agents and Agents & tokens work
+  locally, and what an agent plans over MCP (as Local Dev too) waits on you there. With sign-in
+  off AMP doesn't check tokens, so agents connect without one. If the same database later runs
+  with sign-in on, amp-api deactivates Local Dev at startup: nobody can sign in as it (its email
+  and subject are reserved) and its tokens stop working. Agent accounts Local Dev made, and their
+  tokens, stay active; startup logs how many, so review them in People & agents. In local mode
+  the Board's default Mine view is Local Dev's tickets; on a database other people used, pick
+  Everyone to see theirs. If that user couldn't be set up (see amp-api's startup log), or your sign-in
+  has no AMP user (not invited, email domain not allowed, or email not verified), My work, the
+  project's My work tab and Mission's Waiting on you strip say so and show no counts: use the project's Board, which has every ticket, or ask an
   admin for an invite and sign in again. When My work fails to load it shows the error and **Try again**,
   never zeros.
 - **Projects** — every project you can see, as a tree: one group per org (projects with no org

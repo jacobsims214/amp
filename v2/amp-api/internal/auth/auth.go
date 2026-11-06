@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,6 +22,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -64,11 +66,52 @@ type Identity struct {
 	// across refreshes when the token has auth_time or a nonce
 	// (DexSessionID). Never the token.
 	SessionID string
+	// ProvisionRefusal is why JIT provisioning left User nil on a valid
+	// Dex token (empty when it didn't refuse), so a refusal can say why.
+	ProvisionRefusal ProvisionRefusal
 
 	// provisioned is what JIT provisioning changed on this request (a new
 	// account, accepted invites), reported to OnEvent once the identity is
 	// complete.
 	provisioned *repository.Provisioned
+}
+
+// ProvisionRefusal is why a sign-in got no AMP user (Identity.ProvisionRefusal).
+type ProvisionRefusal string
+
+const (
+	// RefusalUnverifiedEmail: the IdP marked the email unverified
+	// (email_verified false), so it is never provisioned or linked.
+	RefusalUnverifiedEmail ProvisionRefusal = "unverified_email"
+	// RefusalDomainNotAllowed: the email's domain may not sign up and it
+	// has no invite.
+	RefusalDomainNotAllowed ProvisionRefusal = "domain_not_allowed"
+	// RefusalNoEmail: the token has no email claim.
+	RefusalNoEmail ProvisionRefusal = "no_email"
+	// RefusalReservedIdentity: the subject or email is the Local Dev
+	// user's, which is reserved for AMP with sign-in off (#124).
+	RefusalReservedIdentity ProvisionRefusal = "reserved_identity"
+)
+
+// Message says, in plain words, why sign-in left the caller with no AMP
+// account and who can fix it ("" for no refusal). It names nobody and
+// carries nothing from the token.
+func (r ProvisionRefusal) Message() string {
+	switch r {
+	case RefusalUnverifiedEmail:
+		return "Your identity provider reports your email as unverified, so AMP did not create your account; " +
+			"ask your IdP admin to verify it."
+	case RefusalDomainNotAllowed:
+		return "Your email's domain isn't allowed to sign up to AMP and you have no invite, so AMP did not create your account; " +
+			"ask an AMP admin to invite you."
+	case RefusalNoEmail:
+		return "Your identity provider didn't send an email address, so AMP has no account for you; " +
+			"ask your IdP admin to include the email claim, then sign in again."
+	case RefusalReservedIdentity:
+		return "Your sign-in uses the Local Dev identity (local-dev@amp.local), which is reserved for AMP with sign-in off, " +
+			"so AMP did not create your account; sign in with another account."
+	}
+	return ""
 }
 
 // Events the verifier reports for the audit log (Verifier.OnEvent). The
@@ -165,6 +208,12 @@ type Verifier struct {
 	// lookupOnly: see Config.LookupOnly.
 	lookupOnly bool
 
+	// localUser is the AMP user behind the local-dev identity when auth is
+	// off, once ProvisionLocalDev has run (#124); nil before, or if it
+	// failed (the identity then has no AMP user, as before). A pointer to
+	// shared storage, so the WithAudiences copies see it too.
+	localUser *atomic.Pointer[domain.User]
+
 	// OnEvent, when set, receives authentication events for the audit log
 	// (sign-ins, refused sign-ups, new accounts and accepted invites, API
 	// token use and failures). It runs on the request path and must be
@@ -215,7 +264,8 @@ func NewVerifier(ctx context.Context, cfg Config) (*Verifier, error) {
 
 	if cfg.IssuerURL == "" {
 		slog.Warn("auth disabled: OIDC_ISSUER_URL not set — all requests treated as anonymous local-dev user")
-		return &Verifier{enabled: false, repo: cfg.Repo, bootstrapAdmins: admins, uiClientID: strings.TrimSpace(cfg.UIClientID)}, nil
+		return &Verifier{enabled: false, repo: cfg.Repo, bootstrapAdmins: admins, uiClientID: strings.TrimSpace(cfg.UIClientID),
+			localUser: new(atomic.Pointer[domain.User])}, nil
 	}
 
 	discoveryURL := cfg.DiscoveryURL
@@ -235,6 +285,54 @@ func NewVerifier(ctx context.Context, cfg Config) (*Verifier, error) {
 	v := &Verifier{inner: verifier, enabled: true, repo: cfg.Repo, bootstrapAdmins: admins, uiClientID: strings.TrimSpace(cfg.UIClientID),
 		lookupOnly: cfg.LookupOnly}
 	return v, nil
+}
+
+// The identity every request has when auth is off.
+const (
+	LocalDevSubject = repository.LocalDevSubject
+	LocalDevEmail   = repository.LocalDevEmail
+	LocalDevName    = "Local Dev"
+)
+
+// Enabled reports whether auth is on (OIDC_ISSUER_URL is set).
+func (v *Verifier) Enabled() bool { return v.enabled }
+
+// ProvisionLocalDev runs once at startup (#124). With auth off it makes the
+// local-dev identity a real AMP user, an admin of the Default org, so My
+// work, approvals, People & agents and tokens work for it, and returns it.
+// With auth on it never creates that user: it deactivates the one an
+// auth-off boot left behind (if any), so neither a sign-in nor one of its
+// tokens can act as it, and returns nil. Idempotent either way.
+func (v *Verifier) ProvisionLocalDev(ctx context.Context) (*domain.User, error) {
+	if v.enabled {
+		if v.repo == nil || v.lookupOnly {
+			return nil, nil
+		}
+		exists, agents, err := v.repo.DisableLocalDevUser(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			slog.Info("auth on: the Local Dev user (made while auth was off) is deactivated")
+		}
+		if agents > 0 {
+			slog.Warn("auth on: agent accounts made by the Local Dev user while auth was off are still active, and so are their tokens; "+
+				"review them in People & agents and deactivate any you don't want", "agents", agents)
+		}
+		return nil, nil
+	}
+	if v.localUser == nil {
+		return nil, nil
+	}
+	if v.repo == nil {
+		return nil, errors.New("provision local dev user: no repository")
+	}
+	u, err := v.repo.ProvisionLocalDevUser(ctx, LocalDevSubject, LocalDevEmail, LocalDevName)
+	if err != nil {
+		return nil, err
+	}
+	v.localUser.Store(u)
+	return u, nil
 }
 
 // WithAudiences returns a copy of v that only accepts tokens whose aud
@@ -276,7 +374,14 @@ func (v *Verifier) verifyAudience(audience []string) bool {
 func (v *Verifier) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !v.enabled {
-			ident := &Identity{Subject: "local-dev", Email: "local-dev@amp.local", Name: "Local Dev", LocalDev: true, Listener: v.label}
+			ident := &Identity{Subject: LocalDevSubject, Email: LocalDevEmail, Name: LocalDevName, LocalDev: true, Listener: v.label}
+			if v.localUser != nil {
+				if u := v.localUser.Load(); u != nil {
+					cp := *u
+					cp.Roles = slices.Clone(u.Roles)
+					ident.User = &cp
+				}
+			}
 			ident.Channel = v.channelOf(ident)
 			ident.AuthMethod = AuthLocalDev
 			r = r.WithContext(context.WithValue(r.Context(), identityCtxKey, ident))
@@ -390,9 +495,17 @@ func (v *Verifier) identityFromJWT(w http.ResponseWriter, r *http.Request, rawTo
 		slog.Warn("JIT user provisioning refused: email not verified", "subject", claims.Subject, "email", claims.Email)
 		v.emit(r.Context(), Event{Kind: EventSignupRefused, Subject: claims.Subject, Email: claims.Email,
 			Reason: "email not verified: an unverified email is never provisioned or linked to an AMP user"})
+		ident.ProvisionRefusal = RefusalUnverifiedEmail
 		return ident
 	}
 	if v.lookupOnly {
+		if claims.Subject == LocalDevSubject || strings.EqualFold(strings.TrimSpace(claims.Email), LocalDevEmail) {
+			// Reserved for auth-off mode (#124): never the Local Dev user,
+			// even if an auth-off boot left it active.
+			slog.Warn("token refused (lookup only): the Local Dev identity is reserved for auth-off mode", "listener", v.label, "subject", claims.Subject)
+			ident.ProvisionRefusal = RefusalReservedIdentity
+			return ident
+		}
 		u, err := v.repo.GetUserBySubject(r.Context(), claims.Subject)
 		if err != nil {
 			// Not yet an AMP user here (or the lookup failed): no user on the
@@ -416,10 +529,17 @@ func (v *Verifier) identityFromJWT(w http.ResponseWriter, r *http.Request, rawTo
 			"user_agent", r.UserAgent(),
 			"request_uri", r.RequestURI,
 		)
+		ident.ProvisionRefusal = RefusalNoEmail
+	case errors.Is(err, repository.ErrReservedIdentity):
+		slog.Warn("JIT user provisioning refused: the Local Dev identity is reserved for auth-off mode", "subject", claims.Subject, "email", claims.Email)
+		v.emit(r.Context(), Event{Kind: EventSignupRefused, Subject: claims.Subject, Email: claims.Email,
+			Reason: "the Local Dev identity (local-dev@amp.local) is reserved for AMP with sign-in off; sign in with another account"})
+		ident.ProvisionRefusal = RefusalReservedIdentity
 	case errors.Is(err, repository.ErrSignupNotAllowed):
 		slog.Warn("JIT user provisioning refused: email domain not allowed", "subject", claims.Subject, "email", claims.Email)
 		v.emit(r.Context(), Event{Kind: EventSignupRefused, Subject: claims.Subject, Email: claims.Email,
 			Reason: "sign-ups are limited to allowed email domains, and this email has no invite"})
+		ident.ProvisionRefusal = RefusalDomainNotAllowed
 	case err != nil:
 		slog.Error("JIT user provisioning failed",
 			"err", err,
@@ -461,6 +581,15 @@ func (v *Verifier) identityFromAPIToken(w http.ResponseWriter, r *http.Request, 
 				Reason: "invalid, expired, or revoked API token"})
 		}
 		v.writeUnauthorized(w, "invalid, expired, or revoked API token")
+		return nil
+	}
+	if u.Subject == LocalDevSubject && u.Kind != domain.UserKindAgent {
+		// A token the Local Dev user made while auth was off (#124): that
+		// user is an admin nobody signs in as, so with auth on its tokens
+		// are refused rather than acting as it.
+		v.emit(r.Context(), Event{Kind: EventTokenFail, TokenPrefix: rawToken[:min(len(rawToken), tokenPrefixLen)],
+			Reason: "token of the Local Dev user, made while sign-in was off"})
+		v.writeUnauthorized(w, "this token belongs to the Local Dev user, made while sign-in was off; it can't be used with sign-in on")
 		return nil
 	}
 	return &Identity{Subject: u.Subject, Email: u.Email, Name: u.DisplayName, User: u, APIToken: true, TokenID: tokenID}
@@ -602,14 +731,41 @@ func (i *Identity) HasRole(role string) bool {
 }
 
 // RequireRole wraps a handler, returning 403 unless the caller has the given role.
-// Must run after Middleware.
+// The 403 is {"error": "..."} naming the role and who the caller is signed
+// in as. Must run after Middleware.
 func RequireRole(role string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ident, ok := FromContext(r.Context())
 		if !ok || !ident.HasRole(role) {
-			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+			// A sentence that names what's missing and who the caller is,
+			// never a bare "forbidden" (#124, #69).
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": roleRefusal(role, ident)})
 			return
 		}
 		next(w, r)
 	}
+}
+
+// roleRefusal is RequireRole's message: the role needed, the caller's own
+// email (the AMP user's, else the token's email claim), and who can fix
+// it. Nothing else from the token, and nobody else's details.
+func roleRefusal(role string, ident *Identity) string {
+	need := fmt.Sprintf("this needs the AMP %s role", role)
+	switch {
+	case ident != nil && ident.User != nil && ident.User.Email != "":
+		return fmt.Sprintf("%s, which your account (%s) doesn't have; ask an AMP admin to grant it", need, ident.User.Email)
+	case ident != nil && ident.User != nil:
+		return need + ", which your account doesn't have; ask an AMP admin to grant it"
+	case ident != nil && ident.LocalDev:
+		// Sign-in is off and startup couldn't make the Local Dev user.
+		return need + ", and the Local Dev user couldn't be set up at startup (see amp-api's log); restart amp-api once that's fixed"
+	case ident != nil && ident.ProvisionRefusal != "":
+		return need + ". " + ident.ProvisionRefusal.Message()
+	case ident != nil && ident.Email != "":
+		return fmt.Sprintf("%s, and you're signed in as %s, who has no AMP account; ask an AMP admin to invite you, then sign in again", need, ident.Email)
+	}
+	return need + ", and this request isn't signed in as anyone AMP knows; sign in, then ask an AMP admin to grant it"
 }

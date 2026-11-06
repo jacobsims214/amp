@@ -19,6 +19,10 @@ COPY --from=builder /app/amp-api .
 # The AMP guide (global KB), synced into Typesense on startup.
 COPY kb/ /app/kb/
 RUN chown amp:amp /app/amp-api
+# Verification receipt evidence (#126, RECEIPT_DIR): a volume (compose) or a
+# ReadWriteMany PVC (Helm) is mounted here, owned by uid 1000. The local dev
+# default, data/receipts under the working directory, also belongs to amp.
+RUN mkdir -p /data/receipts /app/data/receipts && chown -R amp:amp /data/receipts /app/data
 USER 1000
 EXPOSE 8000 3001
 CMD ["./amp-api"]

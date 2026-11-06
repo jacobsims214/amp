@@ -4,6 +4,7 @@ import { useFocusParam } from '../hooks/useFocusParam'
 import { RefreshCw, RotateCw, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users, ListChecks } from 'lucide-react'
 import { useBoardData } from '../hooks/useBoardData'
 import { useSSE } from '../hooks/useSSE'
+import { useReceiptSummary } from '../hooks/useReceiptSummary'
 import { useAuth } from '../hooks/useAuth'
 import { TaskCard } from '../components/TaskCard'
 import { TaskDrawer } from '../components/TaskDrawer'
@@ -18,6 +19,7 @@ import { MetadataEditor } from '../components/MetadataEditor'
 import { DependencyPicker } from '../components/DependencyPicker'
 import { PlanCheckModal } from '../components/PlanCheckModal'
 import { metadataPatch } from '../lib/metadata'
+import { errMsg } from '../lib/adminStyles'
 import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal'
 import { ProjectNav } from '../components/ProjectNav'
 import { OwnerStack } from '../components/OwnerAvatar'
@@ -105,6 +107,8 @@ export function Board() {
   const [notStartedFlagMinutes, setNotStartedFlagMinutes] = useState<number | undefined>(undefined)
   const [teamAccessOpen, setTeamAccessOpen] = useState(false)
   const people = useMemo(() => peopleById(members), [members])
+  // Each ticket's verification receipt status, for the card badges (#126).
+  const receipts = useReceiptSummary(pid)
   // Tickets waiting on approval: a one-line link to My work, where approving happens.
   const approval = usePlanApproval(pid)
   const awaiting = useMemo(() => awaitingApproval(tasks, approval.project), [tasks, approval.project])
@@ -227,7 +231,6 @@ export function Board() {
   const toggleStory = (id: number) =>
     setCollapsedStories(prev => { const s = new Set(prev); if (s.has(id)) s.delete(id); else s.add(id); return s })
 
-  const errMsg = (e: unknown, fallback: string) => e instanceof Error ? e.message : fallback
 
   // Metadata being edited in the epic / story dialog: what it started as,
   // the edited value, and what the item inherits (shown read-only).
@@ -675,6 +678,7 @@ export function Board() {
                                         isScheduled={col.state === 'scheduled'}
                                         owner={lookupPerson(people, task.owner_user_id)}
                                         notStartedFlagMinutes={notStartedFlagMinutes}
+                                        receipt={receipts.byTask.get(task.id)}
                                       />
                                     ))}
                                     {colTasks.length === 0 && <div className="h-8" />}

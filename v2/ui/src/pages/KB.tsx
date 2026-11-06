@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams, useSearchParams } from 'react-router-dom'
 import {
   Plus, Search, FileText, Tag, Trash2, Edit3, Save, X,
   Loader2, ChevronRight, ChevronDown, BookOpen, Eye, Code2, FolderOpen, Folder, Clock, MessageSquare,
@@ -11,7 +11,6 @@ import { PageHeader } from '../components/ui/PageHeader'
 import { ProjectNav } from '../components/ProjectNav'
 import type { KBDoc, KBDocSummary, KBInfo, KBRef, KBScope, KBSearchResult, KBSource, KBTagCount } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
-import { useSearchParam } from '../hooks/useSearchParam'
 
 // What each kind of KB is for; shown on team and org KB pages and in the editor.
 const SCOPE_PURPOSE: Record<KBScope, string> = {
@@ -32,6 +31,9 @@ function readingTime(content: string) {
   const mins = Math.max(1, Math.round(words / 200))
   return `${mins} min read`
 }
+
+// The tag cloud shows this many, the rest sit behind "+N more".
+const TAG_CAP = 12
 
 const inputCls = 'amp-input'
 
@@ -55,11 +57,15 @@ export function KB() {
   const [docs, setDocs] = useState<KBDocSummary[]>([])
   const [tags, setTags] = useState<KBTagCount[]>([])
   const [selectedDoc, setSelectedDoc] = useState<KBDoc | null>(null)
-  const [searchQuery, setSearchQuery] = useState('')
+  // Shareable state lives in the URL: ?doc=<path>, ?q=<search>, ?tag=<tag>.
+  const [params, setParams] = useSearchParams()
+  const docParam = params.get('doc')
+  const tagFilter = params.get('tag')
+  const [searchQuery, setSearchQuery] = useState(() => params.get('q') ?? '')
+  const [showAllTags, setShowAllTags] = useState(false)
   const [searchResults, setSearchResults] = useState<KBSearchResult[]>([])
   const [searching, setSearching] = useState(false)
   const [loading, setLoading] = useState(true)
-  const [tagFilter, setTagFilter] = useState<string | null>(null)
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set(['architecture', 'docs', '']))
 
   // Editor state
@@ -70,6 +76,15 @@ export function KB() {
   const [editReason, setEditReason] = useState('')
   const [saving, setSaving] = useState(false)
   const [editorTab, setEditorTab] = useState<'write' | 'preview'>('write')
+
+  const patchParams = useCallback((patch: Record<string, string | null>, replace = false) => {
+    setParams(prev => {
+      const next = new URLSearchParams(prev)
+      for (const [k, v] of Object.entries(patch)) { if (v) next.set(k, v); else next.delete(k) }
+      return next
+    }, { replace })
+  }, [setParams])
+  const setTagFilter = (tag: string | null) => patchParams({ tag })
 
   useEffect(() => {
     setInfo(null); setLoadError(null); setSelectedDoc(null); setView('browse')
@@ -94,13 +109,21 @@ export function KB() {
 
   useEffect(() => { loadDocs() }, [loadDocs])
 
-  // /guide?doc=<path> (and the same on any KB) opens that doc, so other pages can link to a how-to.
-  const [docParam] = useSearchParam('doc')
+  // Keep ?q in step with the search box (replace, so typing doesn't fill the history).
+  const updateSearch = (q: string) => { setSearchQuery(q); patchParams({ q: q.trim() ? q : null }, true) }
+
+  // ?doc is the source of truth for the open doc: deep links, reloads and Back all land here.
   useEffect(() => {
-    if (!docParam) return
+    if (!docParam) { setView(v => (v === 'doc' ? 'browse' : v)); return }
+    if (selectedDoc?.path === docParam) { setView(v => (v === 'editor' ? v : 'doc')); return }
     let live = true
-    api.kbGet(kbRef, docParam).then(d => { if (live) { setSelectedDoc(d); setView('doc') } }).catch(() => {})
+    setActionError(null)
+    api.kbGet(kbRef, docParam)
+      .then(d => { if (live) { setSelectedDoc(d); setView('doc') } })
+      .catch(e => { if (live) setActionError(e instanceof Error ? e.message : 'Failed to open the document') })
     return () => { live = false }
+    // selectedDoc is read only to skip a refetch of the doc already shown
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docParam, kbRef])
 
   // Debounced search
@@ -115,15 +138,10 @@ export function KB() {
     return () => clearTimeout(t)
   }, [searchQuery, kbRef])
 
-  const openDoc = async (path: string) => {
+  const openDoc = (path: string) => {
     setActionError(null)
-    try {
-      setSelectedDoc(await api.kbGet(kbRef, path))
-      setView('doc')
-      setSearchQuery('') // close search results
-    } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Failed to open the document')
-    }
+    setSearchQuery('') // close search results
+    patchParams({ doc: path, q: null }) // pushes a history entry; the ?doc effect loads it
   }
 
   const openEditor = (doc?: KBDoc | null) => {
@@ -163,6 +181,7 @@ export function KB() {
         updated_at: Math.floor(Date.now() / 1000),
       }))
       setView('doc')
+      patchParams({ doc: path })
       void (async () => {
         for (let i = 0; i < 10; i++) {
           await new Promise(r => setTimeout(r, 800))
@@ -186,7 +205,7 @@ export function KB() {
     setActionError(null)
     try {
       await api.kbDelete(kbRef, path)
-      setSelectedDoc(null); setView('browse'); loadDocs()
+      setSelectedDoc(null); setView('browse'); patchParams({ doc: null }, true); loadDocs()
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Delete failed')
     }
@@ -240,7 +259,7 @@ export function KB() {
                 type="text"
                 placeholder="Search docs…"
                 value={searchQuery}
-                onChange={e => setSearchQuery(e.target.value)}
+                onChange={e => updateSearch(e.target.value)}
                 className="w-full text-xs rounded-lg pl-8 pr-8 py-2 transition-all focus:outline-none"
                 style={{
                   background: 'var(--bg)',
@@ -253,7 +272,7 @@ export function KB() {
               />
               {searching && <Loader2 size={12} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-primary animate-spin" />}
               {searchQuery && !searching && (
-                <button onClick={() => setSearchQuery('')}
+                <button onClick={() => updateSearch('')}
                   className="absolute right-2.5 top-1/2 -translate-y-1/2 text-ink-3 hover:text-ink cursor-pointer">
                   <X size={11} />
                 </button>
@@ -268,7 +287,7 @@ export function KB() {
                 <Tag size={9} />
                 Tags
               </div>
-              <div className="flex flex-wrap gap-1">
+              <div className="flex flex-wrap gap-1 overflow-y-auto" style={{ maxHeight: 112 }}>
                 <button
                   onClick={() => setTagFilter(null)}
                   className={`text-xs px-2 py-0.5 rounded-md transition-all cursor-pointer font-medium ${
@@ -277,14 +296,15 @@ export function KB() {
                       : 'text-ink-3 hover:text-ink-2'
                   }`}
                 >all</button>
-                {tags.slice(0, 12).map(t => {
+                {(showAllTags ? tags : tags.slice(0, TAG_CAP)).map(t => {
                   const tc = tagColor()
                   const isActive = tagFilter === t.tag
                   return (
                     <button
                       key={t.tag}
                       onClick={() => setTagFilter(tagFilter === t.tag ? null : t.tag)}
-                      className="text-xs px-2 py-0.5 rounded-md transition-all cursor-pointer font-medium flex items-center gap-1"
+                      title={t.tag}
+                      className="text-xs px-2 py-0.5 rounded-md transition-all cursor-pointer font-medium flex items-center gap-1 max-w-full"
                       style={{
                         background: isActive ? tc.bg : 'transparent',
                         color: isActive ? tc.text : 'var(--ink-3)',
@@ -293,11 +313,17 @@ export function KB() {
                       onMouseEnter={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = tc.text }}
                       onMouseLeave={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = 'var(--ink-3)' }}
                     >
-                      {t.tag}
+                      <span className="truncate" style={{ maxWidth: 120 }}>{t.tag}</span>
                       <span style={{ opacity: 0.6 }}>{t.count}</span>
                     </button>
                   )
                 })}
+                {tags.length > TAG_CAP && (
+                  <button
+                    onClick={() => setShowAllTags(v => !v)}
+                    className="text-xs px-2 py-0.5 rounded-md cursor-pointer font-medium text-ink-3 hover:text-ink-2"
+                  >{showAllTags ? 'show fewer' : `+${tags.length - TAG_CAP} more`}</button>
+                )}
               </div>
             </div>
           )}

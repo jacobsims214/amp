@@ -1,17 +1,19 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation, useMatch } from 'react-router-dom'
 import {
-  Home, Menu, MonitorSmartphone, X, Building2, CalendarDays, FolderKanban, GitCommitHorizontal, GraduationCap, KeyRound, LogOut, PieChart, ShieldCheck, ScrollText,
+  Home, Menu, MonitorSmartphone, X, Building2, CalendarDays, FolderKanban, GitCommitHorizontal, GraduationCap, KeyRound, PieChart, ShieldCheck, ScrollText,
 } from 'lucide-react'
 import { api } from '../../api/client'
 import { useAuth } from '../../hooks/useAuth'
 import { remoteAvailable, useRemote } from '../../remote/remote-context'
 import type { Project } from '../../types'
 import { refreshWaitCounts, useWaitCounts } from '../../lib/waitCounts'
-import { Avatar } from '../ui/Avatar'
 import { badged, navCls } from './nav'
 import { Badge } from './Badge'
 import { ProjectTree } from './ProjectTree'
+import { IdentityMenu } from './IdentityMenu'
+import { ThemeToggle } from './ThemeToggle'
+import { useThemeStore } from '../../lib/themeStore'
 
 // The frame around every page: one sidebar to get anywhere, the page beside
 // it. Projects are a tree (org > project > views) in the sidebar, so nothing
@@ -47,19 +49,25 @@ export function AppShell() {
   const orgRole = (me?.orgs ?? []).find(o => o.my_role === 'owner') ?? (me?.orgs ?? []).find(o => o.my_role === 'admin')
   const orgRoleLabel = orgRole ? `${orgRole.my_role}, ${orgRole.name}` : 'member'
 
+  // Initialize theme on first render (applies persisted/system preference).
+  useThemeStore(state => state.init)
+
   return (
     <div className="relative flex h-screen overflow-hidden bg-bg">
       {navOpen && <div className="fixed inset-0 z-30 bg-[var(--scrim)] md:hidden" onClick={() => setNavOpen(false)} aria-hidden="true" />}
       <aside id="main-nav" className={`w-[232px] flex-shrink-0 flex-col bg-surface-2 border-r border-line overflow-y-auto fixed inset-y-0 left-0 z-40 md:static md:z-auto md:flex ${navOpen ? 'flex' : 'hidden'}`} aria-label="Main"
         onClick={e => { if ((e.target as HTMLElement).closest('a')) setNavOpen(false) }}>
         <button type="button" className="md:hidden absolute top-3 right-2 p-1.5 text-ink-3 hover:text-ink" onClick={() => setNavOpen(false)} aria-label="Close menu"><X size={16} /></button>
-        <NavLink to="/" className="flex items-center gap-2.5 px-4 pt-4 pb-3" aria-label="AMP home">
-          {/* Relights on every page change (keyed by path). */}
-          <span key={location.pathname} className="amp-mark amp-ignite" aria-hidden="true">
-            <i className="bg-band-1" /><i className="bg-band-2" /><i className="bg-band-3" /><i className="bg-band-4" />
-          </span>
-          <span className="text-[17px] font-bold tracking-[0.16em] text-ink">AMP</span>
-        </NavLink>
+        <div className="flex items-center justify-between px-4 pt-4 pb-3">
+          <NavLink to="/" className="flex items-center gap-2.5" aria-label="AMP home">
+            {/* Relights on every page change (keyed by path). */}
+            <span key={location.pathname} className="amp-mark amp-ignite" aria-hidden="true">
+              <i className="bg-band-1" /><i className="bg-band-2" /><i className="bg-band-3" /><i className="bg-band-4" />
+            </span>
+            <span className="text-[17px] font-bold tracking-[0.16em] text-ink">AMP</span>
+          </NavLink>
+          <ThemeToggle />
+        </div>
 
         <nav className="flex flex-col px-2 pb-4">
           <Group>Overview</Group>
@@ -92,22 +100,7 @@ export function AppShell() {
           )}
         </nav>
 
-        {me && (
-          <div className="mt-auto flex items-center gap-2.5 px-4 py-3 border-t border-line">
-            <Avatar name={me.name || me.email} kind={me.kind} />
-            <div className="min-w-0 flex-1">
-              <div className="text-[13px] text-ink truncate">{me.name || me.email}</div>
-              <div className="amp-num text-[10.5px] text-ink-3 truncate">{isAdmin ? 'admin' : me.kind === 'agent' ? 'agent' : orgRoleLabel} · {me.email}</div>
-            </div>
-            {/* Signed in through the browser: oauth2-proxy clears the session and sends you to sign in again. */}
-            {me.user_id != null && !me.via_token && (
-              <a href="/oauth2/sign_out?rd=%2F" title="Sign out" aria-label="Sign out"
-                className="shrink-0 p-1.5 text-ink-3 hover:text-ink hover:bg-surface-3 transition-colors">
-                <LogOut size={14} />
-              </a>
-            )}
-          </div>
-        )}
+        {me && <IdentityMenu me={me} roleLabel={isAdmin ? 'admin' : me.kind === 'agent' ? 'agent' : orgRoleLabel} />}
       </aside>
 
       <main className="relative flex-1 min-w-0 h-full overflow-auto">

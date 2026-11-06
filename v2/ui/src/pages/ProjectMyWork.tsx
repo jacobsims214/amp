@@ -47,7 +47,7 @@ import { MyWorkLoadError, MyWorkUnavailable } from '../components/human/MyWorkUn
 import type { DepSummary, DoneItem, Project, ProjectMyWork as Data, ProjectWaitItem, Task, WaitKind } from '../types'
 import './projectMyWork.css'
 
-const KINDS: WaitKind[] = ['approve', 'answer', 'merge', 'start', 'do']
+const KINDS: WaitKind[] = ['approve', 'answer', 'verify', 'merge', 'start', 'do']
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
 /** "3h" from "3h ago"; "just now" stays. */
 const short = (iso?: string) => ago(iso).replace(/ ago$/, '')
@@ -56,6 +56,7 @@ const hm = (iso?: string) => (iso ? new Date(iso).toLocaleTimeString(undefined, 
 const UNIT: Record<WaitKind, (n: number) => string> = {
   approve: n => (n === 1 ? 'plan' : 'plans'),
   answer: n => (n === 1 ? 'question' : 'questions'),
+  verify: () => "couldn't verify",
   merge: n => (n === 1 ? 'PR' : 'PRs'),
   // A ticket of yours dispatched to an agent that no worker has started yet
   // (AMP #2801): its run was never launched, so nothing is happening on it.
@@ -76,6 +77,7 @@ function oldestLabel(it: ProjectWaitItem): string {
   switch (it.kind) {
     case 'approve': return 'the plan approval'
     case 'answer': return `the question on #${it.task_id}`
+    case 'verify': return `the held completion of #${it.task_id}`
     case 'merge': return `the merge of #${it.task_id}`
     case 'start': return `#${it.task_id}, not started`
     default: return `#${it.task_id}`
@@ -286,8 +288,8 @@ function Body({ data, items, name, pid, focusId, setFocus, onReview, onChanged, 
         {KINDS.map(k => (
           <div key={k} className={`ro ${counts[k] ? '' : 'zero'}`}>
             <KindMark kind={k} />
-            <span className="v">{counts[k]}</span>
-            {counts[k] > 0 && <span className="s">{k === 'approve' ? `${UNIT.approve(counts[k])} · ${plural(approveTickets, 'ticket')}` : UNIT[k](counts[k])}</span>}
+            <span className="v">{counts[k] ?? 0}</span>
+            {(counts[k] ?? 0) > 0 && <span className="s">{k === 'approve' ? `${UNIT.approve(counts[k] ?? 0)} · ${plural(approveTickets, 'ticket')}` : UNIT[k](counts[k] ?? 0)}</span>}
           </div>
         ))}
         {state === 'done'
@@ -377,6 +379,7 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
     meta.push(reasonLabel(it.human_reason ?? t?.human_reason))
   }
   if (kind === 'start') meta.push(startItemText(it))
+  if (kind === 'verify') meta.push(`Held ${ago(it.since)}${it.agent_id ? `, finished by ${it.agent_id}` : ''}`)
   return (
     <>
       <article className={frame} data-item-key={it.key} data-focused={focused || undefined} aria-label={`${KIND_LABEL[kind]}: #${it.task_id} ${it.name}`}>
@@ -392,12 +395,14 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
         <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[12.5px] text-ink-2">{meta.map(m => <span key={m}>{m}</span>)}</div>
         {kind === 'do' && t && <Brief task={t} />}
         <div className="mt-3">
-          {t ? <HumanActions task={t} kind={kind} canAct={!readOnly} prUrl={it.pr_url} branch={it.branch}
-            baseBranch={it.base_branch} targetSource={it.target_source}
-            holdingUp={it.holding_up} notWaiting={it.not_waiting} trackedBy={it.tracked_by}
-            alert={it.alert} alertReason={it.alert_reason} rule={it.rule} reviewUrl={it.review_url}
-            defaultBranch={it.default_branch}
-            minutes={it.not_started_minutes} onChanged={() => onChanged()} />
+          {kind === 'verify'
+            ? <Link to={projectLink(pid, 'board', it.task_id)} className="amp-btn amp-btn-sm">Open #{it.task_id} to accept or reject</Link>
+            : t ? <HumanActions task={t} kind={kind} canAct={!readOnly} prUrl={it.pr_url} branch={it.branch}
+              baseBranch={it.base_branch} targetSource={it.target_source}
+              holdingUp={it.holding_up} notWaiting={it.not_waiting} trackedBy={it.tracked_by}
+              alert={it.alert} alertReason={it.alert_reason} rule={it.rule} reviewUrl={it.review_url}
+              defaultBranch={it.default_branch}
+              minutes={it.not_started_minutes} onChanged={() => onChanged()} />
             : <span className="text-[12.5px] text-ink-2">{it.question ?? ''}</span>}
         </div>
       </article>
