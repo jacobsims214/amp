@@ -102,11 +102,10 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 			msg.ReplyCh <- ReplyComplete{Err: fmt.Errorf("task %d not found in story %d", msg.TaskID, a.story.ID)}
 			return
 		}
-		replyCh := make(chan ReplyComplete, 1)
-		fwd := *msg
-		fwd.ReplyCh = replyCh
-		ctx.Send(pid, &fwd)
-		msg.ReplyCh <- <-replyCh
+		// Forwarded, not relayed: the task's reply waits on the ProjectActor's
+		// dependency fan-out, and a story blocked on it can't answer the
+		// ProjectActor's collectAllTasks — the two deadlock the project.
+		ctx.Send(pid, msg)
 
 	case *MsgClaimStart:
 		pid, ok := a.tasks[msg.TaskID]
