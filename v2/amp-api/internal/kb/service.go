@@ -134,6 +134,30 @@ type Doc struct {
 	ChunkText   string       `json:"chunk_text"`  // the searchable portion
 	UpdatedAt   int64        `json:"updated_at"`  // unix timestamp
 	Annotations []Annotation `json:"annotations"`
+	ReadStats
+}
+
+// ReadStats is a stored doc's metadata for curating a KB: when it was
+// created, and when an agent last read it, who, and how many reads have been
+// counted (throttled, see RecordReads). Times are unix seconds; all are
+// absent for a doc only the index has (the global KB, or one not yet
+// backfilled), and the read fields are absent until an agent reads it.
+type ReadStats struct {
+	CreatedAt  int64  `json:"created_at,omitempty"`
+	LastReadAt int64  `json:"last_read_at,omitempty"`
+	LastReadBy string `json:"last_read_by,omitempty"`
+	ReadCount  int64  `json:"read_count"`
+}
+
+func readStatsOf(d *repository.KBDocument) ReadStats {
+	st := ReadStats{CreatedAt: d.CreatedAt.Unix(), ReadCount: d.ReadCount}
+	if d.LastReadAt != nil {
+		st.LastReadAt = d.LastReadAt.Unix()
+	}
+	if d.LastReadBy != nil {
+		st.LastReadBy = *d.LastReadBy
+	}
+	return st
 }
 
 type Annotation = domain.KBAnnotation
@@ -149,6 +173,7 @@ type DocSummary struct {
 	Tags      []string `json:"tags"`
 	Author    string   `json:"author"`
 	UpdatedAt int64    `json:"updated_at"`
+	ReadStats
 }
 
 type SearchResult struct {
@@ -784,7 +809,7 @@ func summarize(sc Scope, docs []*Doc) []DocSummary {
 	for _, d := range docs {
 		out = append(out, DocSummary{
 			ID: d.ID, ProjectID: d.ProjectID, Scope: sc.Kind, ScopeID: sc.ID, Reason: d.Reason,
-			Path: d.Path, Title: d.Title, Tags: d.Tags, Author: d.Author, UpdatedAt: d.UpdatedAt,
+			Path: d.Path, Title: d.Title, Tags: d.Tags, Author: d.Author, UpdatedAt: d.UpdatedAt, ReadStats: d.ReadStats,
 		})
 	}
 	return out
@@ -1902,6 +1927,7 @@ type Store interface {
 	CompleteKBBackfill(ctx context.Context, scope repository.KBScope, docCount int) error
 	FailKBBackfill(ctx context.Context, scope repository.KBScope, msg string) error
 	GetKBBackfill(ctx context.Context, scope repository.KBScope) (*repository.KBBackfill, error)
+	RecordKBReads(ctx context.Context, scope repository.KBScope, paths []string, by string, throttle time.Duration) (int64, error)
 }
 
 var _ Store = (*repository.Repo)(nil)
@@ -1917,6 +1943,30 @@ func (s *Service) stored(sc Scope) bool {
 }
 
 func storeScope(sc Scope) repository.KBScope { return repository.KBScope{Kind: sc.Kind, ID: sc.ID} }
+
+// ReadThrottle is how long a reader's repeat reads of one doc go uncounted
+// after a counted read (RecordReads).
+const ReadThrottle = 10 * time.Minute
+
+// RecordReads notes that by, an agent, read the docs at paths (amp_kb_get
+// returned one, or amp_kb_search returned chunks of them). It is one
+// throttled UPDATE (repository.RecordKBReads). A KB not stored in Postgres
+// (the global KB) records nothing.
+func (s *Service) RecordReads(ctx context.Context, sc Scope, paths []string, by string) error {
+	if !s.stored(sc) || len(paths) == 0 {
+		return nil
+	}
+	uniq := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if !slices.Contains(uniq, p) {
+			uniq = append(uniq, p)
+		}
+	}
+	if _, err := s.store.RecordKBReads(ctx, storeScope(sc), uniq, by, ReadThrottle); err != nil {
+		return fmt.Errorf("record kb reads in %s: %w", collectionName(sc), err)
+	}
+	return nil
+}
 
 // writeStored is WriteDoc for a stored KB: commit to Postgres, then index.
 func (s *Service) writeStored(ctx context.Context, sc Scope, path, title, content, author string, tags []string, reason string, annotations []Annotation) (*DocSummary, error) {
@@ -2651,6 +2701,7 @@ func docFromRow(sc Scope, d *repository.KBDocument) *Doc {
 		ID: docID(sc, d.Path, 0), ProjectID: sc.projectID(), Scope: sc.Kind, ScopeID: sc.ID,
 		Reason: d.Reason, Path: d.Path, Title: d.Title, Content: d.Content, Tags: tags, Author: d.Author,
 		ChunkText: chunkText, UpdatedAt: d.UpdatedAt.Unix(), Annotations: kbAnnotationsOrEmpty(d.Annotations),
+		ReadStats: readStatsOf(d),
 	}
 }
 
@@ -2663,6 +2714,7 @@ func summaryFromRow(sc Scope, d *repository.KBDocument) *DocSummary {
 	return &DocSummary{
 		ID: docID(sc, d.Path, 0), ProjectID: sc.projectID(), Scope: sc.Kind, ScopeID: sc.ID,
 		Reason: d.Reason, Path: d.Path, Title: d.Title, Tags: tags, Author: d.Author, UpdatedAt: d.UpdatedAt.Unix(),
+		ReadStats: readStatsOf(d),
 	}
 }
 

@@ -11,6 +11,7 @@ import { PageHeader } from '../components/ui/PageHeader'
 import { ProjectNav } from '../components/ProjectNav'
 import type { KBDoc, KBDocSummary, KBInfo, KBRef, KBScope, KBSearchResult, KBSource, KBTagCount } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
+import { useSearchParam } from '../hooks/useSearchParam'
 
 // What each kind of KB is for; shown on team and org KB pages and in the editor.
 const SCOPE_PURPOSE: Record<KBScope, string> = {
@@ -25,6 +26,48 @@ type View = 'browse' | 'doc' | 'editor'
 // Tags are labels, not states: one quiet style for all of them.
 const TAG_STYLE = { bg: 'var(--surface)', text: 'var(--ink-2)', ring: 'var(--line-str)' }
 const tagColor = () => TAG_STYLE
+
+const shortDate = (ts: number) => new Date(ts * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+
+// "5m ago" for recent times, a date for older ones (unix seconds).
+function relTime(ts: number) {
+  const date = new Date(ts * 1000)
+  const diffMs = Date.now() - date.getTime()
+  const diffMins = Math.floor(diffMs / 60000)
+  const diffHours = Math.floor(diffMs / 3600000)
+  const diffDays = Math.floor(diffMs / 86400000)
+  if (diffMins < 1) return 'just now'
+  if (diffMins < 60) return `${diffMins}m ago`
+  if (diffHours < 24) return `${diffHours}h ago`
+  if (diffDays < 7) return `${diffDays}d ago`
+  return shortDate(ts)
+}
+
+// Agent reads of a doc, for curating the KB (#159). Only stored KBs track
+// them, so docs without created_at (the AMP guide) show nothing.
+function lastReadText(doc: Pick<KBDocSummary, 'created_at' | 'last_read_at' | 'last_read_by'>) {
+  if (!doc.created_at) return null
+  if (!doc.last_read_at) return 'Not read by an agent yet'
+  return `Last read by ${doc.last_read_by || 'an agent'} ${relTime(doc.last_read_at)}`
+}
+
+// Browse sort orders (?sort=). Least read and stale help find docs to prune.
+type DocSort = 'updated' | 'least-read' | 'stale'
+const DOC_SORTS: { value: DocSort; label: string }[] = [
+  { value: 'updated', label: 'Recently updated' },
+  { value: 'least-read', label: 'Least read' },
+  { value: 'stale', label: 'Stale (oldest update)' },
+]
+function sortDocs(docs: KBDocSummary[], sort: DocSort): KBDocSummary[] {
+  if (sort === 'updated') return docs
+  const out = [...docs]
+  if (sort === 'least-read') {
+    out.sort((a, b) => (a.read_count ?? 0) - (b.read_count ?? 0) || (a.last_read_at ?? 0) - (b.last_read_at ?? 0))
+  } else {
+    out.sort((a, b) => a.updated_at - b.updated_at)
+  }
+  return out
+}
 
 function readingTime(content: string) {
   const words = content.trim().split(/\s+/).length
@@ -638,6 +681,11 @@ function BrowseView({ docs, loading, tagFilter, onOpen, onNew }: {
   docs: KBDocSummary[]; loading: boolean; tagFilter: string | null
   onOpen: (path: string) => void; onNew?: () => void
 }) {
+  const [sortParam, setSort] = useSearchParam('sort', 'updated')
+  const sort: DocSort = DOC_SORTS.some(o => o.value === sortParam) ? sortParam as DocSort : 'updated'
+  const sorted = useMemo(() => sortDocs(docs, sort), [docs, sort])
+  // Read stats exist only for stored KBs; the AMP guide has none to sort by.
+  const tracked = docs.some(d => d.created_at)
   if (loading) return (
     <div className="flex justify-center py-20">
       <BandLoader label="Loading the library" />
@@ -673,9 +721,17 @@ function BrowseView({ docs, loading, tagFilter, onOpen, onNew }: {
           </h2>
           <p className="text-sm text-ink-3 mt-0.5">{docs.length} doc{docs.length !== 1 ? 's' : ''}</p>
         </div>
+        {tracked && (
+          <label className="flex items-center gap-2 text-xs text-ink-3">
+            Sort
+            <select value={sort} onChange={e => setSort(e.target.value)} aria-label="Sort documents" className="amp-input !w-auto !py-1.5 text-[12.5px]">
+              {DOC_SORTS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </label>
+        )}
       </div>
       <div className="grid gap-2.5">
-        {docs.map(doc => (
+        {sorted.map(doc => (
           <DocListItem key={doc.id} doc={doc} onOpen={() => onOpen(doc.path)} />
         ))}
       </div>
@@ -712,6 +768,11 @@ function DocListItem({ doc, onOpen }: { doc: KBDocSummary; onOpen: () => void })
           <span className="text-[10px] text-ink-3 font-mono flex-shrink-0 mt-0.5">{doc.author}</span>
         </div>
         <p className="text-xs text-ink-3 font-mono mt-0.5 truncate">{doc.path}</p>
+        {doc.created_at ? (
+          <p className="text-[11px] text-ink-3 mt-1">
+            Updated {relTime(doc.updated_at)} · {doc.read_count ? `${doc.read_count} agent read${doc.read_count !== 1 ? 's' : ''}, last ${relTime(doc.last_read_at ?? 0)}` : 'never read by an agent'}
+          </p>
+        ) : null}
         {doc.tags.length > 0 && (
           <div className="flex gap-1 mt-2 flex-wrap">
             {doc.tags.map(t => {
@@ -737,7 +798,8 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
 }) {
   const pathParts = doc.path.split('/')
   const rt = readingTime(doc.content)
-  const date = doc.updated_at > 0 ? new Date(doc.updated_at * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : null
+  const date = doc.updated_at > 0 ? shortDate(doc.updated_at) : null
+  const lastRead = lastReadText(doc)
   const [annExpanded, setAnnExpanded] = useState(true)
   const [annText, setAnnText] = useState('')
   const [annSaving, setAnnSaving] = useState(false)
@@ -772,20 +834,6 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
     }
   }
 
-  const formatDate = (timestamp: number) => {
-    const date = new Date(timestamp * 1000)
-    const now = new Date()
-    const diffMs = now.getTime() - date.getTime()
-    const diffMins = Math.floor(diffMs / 60000)
-    const diffHours = Math.floor(diffMs / 3600000)
-    const diffDays = Math.floor(diffMs / 86400000)
-    
-    if (diffMins < 1) return 'just now'
-    if (diffMins < 60) return `${diffMins}m ago`
-    if (diffHours < 24) return `${diffHours}h ago`
-    if (diffDays < 7) return `${diffDays}d ago`
-    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
-  }
 
   return (
     <div className="p-8 max-w-3xl mx-auto">
@@ -808,9 +856,15 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
               <Clock size={10} />
               {rt}
             </span>
-            {date && <span className="text-xs text-ink-3">{date}</span>}
+            {doc.created_at ? <span className="text-xs text-ink-3">Created {shortDate(doc.created_at)}</span> : null}
+            {date && <span className="text-xs text-ink-3">{doc.created_at ? `Updated ${date}` : date}</span>}
             {doc.author && <span className="text-xs text-ink-3">by {doc.author}</span>}
           </div>
+          {lastRead && (
+            <p className="text-xs text-ink-3 mt-1.5" title={doc.read_count ? `${doc.read_count} agent read${doc.read_count !== 1 ? 's' : ''} counted` : undefined}>
+              {lastRead}
+            </p>
+          )}
         </div>
         {canWrite && <div className="flex items-center gap-2 flex-shrink-0">
           <button onClick={onEdit} className="amp-btn amp-btn-sm">
@@ -882,7 +936,7 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
                     <div className="flex items-center justify-between mb-2">
                       <div className="flex items-center gap-2">
                         <span className="font-semibold text-ink">{ann.author}</span>
-                        <span className="text-ink-3">{formatDate(ann.created_at)}</span>
+                        <span className="text-ink-3">{relTime(ann.created_at)}</span>
                       </div>
                       <div className="flex items-center gap-2">
                         <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
@@ -908,7 +962,7 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
                     <p className={`leading-relaxed whitespace-pre-wrap ${ann.is_resolved ? 'text-ink-3' : 'text-ink-2'}`}>{ann.text}</p>
                     {ann.is_resolved && ann.resolved_by && (
                       <p className="text-[10px] text-ink-3 mt-1.5">
-                        Resolved by {ann.resolved_by}{ann.resolved_at ? ` · ${formatDate(ann.resolved_at)}` : ''}
+                        Resolved by {ann.resolved_by}{ann.resolved_at ? ` · ${relTime(ann.resolved_at)}` : ''}
                       </p>
                     )}
                   </div>

@@ -340,6 +340,13 @@ export interface KBDoc {
   chunk_index: number
   chunk_text: string
   updated_at: number
+  /** unix seconds; absent for docs only the search index has (e.g. the AMP guide) */
+  created_at?: number
+  /** when an agent last read the doc (amp_kb_get, or a search hit), unix seconds; absent if never */
+  last_read_at?: number
+  last_read_by?: string
+  /** agent reads counted, at most one per reader per 10 minutes */
+  read_count?: number
   annotations?: KBAnnotation[]
 }
 
@@ -354,6 +361,13 @@ export interface KBDocSummary {
   tags: string[]
   author: string
   updated_at: number
+  /** unix seconds; absent for docs only the search index has (e.g. the AMP guide) */
+  created_at?: number
+  /** when an agent last read the doc (amp_kb_get, or a search hit), unix seconds; absent if never */
+  last_read_at?: number
+  last_read_by?: string
+  /** agent reads counted, at most one per reader per 10 minutes */
+  read_count?: number
 }
 
 export interface KBSearchResult {
