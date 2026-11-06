@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { ChevronUp, KeyRound, LogIn, LogOut } from 'lucide-react'
+import { motion } from 'framer-motion'
 import type { Me } from '../../types'
 import { Avatar } from '../ui/Avatar'
 
@@ -13,7 +14,17 @@ function signInHref(): string {
   return `/oauth2/start?rd=${encodeURIComponent(window.location.pathname + window.location.search)}`
 }
 
-export function IdentityMenu({ me, roleLabel }: { me: Me; roleLabel: string }) {
+export function IdentityMenu({
+  me,
+  roleLabel,
+  collapsed = false,
+  shouldReduceMotion = false,
+}: {
+  me: Me
+  roleLabel: string
+  collapsed?: boolean
+  shouldReduceMotion?: boolean
+}) {
   const [open, setOpen] = useState(false)
   const root = useRef<HTMLDivElement>(null)
   const menuId = useId()
@@ -60,13 +71,22 @@ export function IdentityMenu({ me, roleLabel }: { me: Me; roleLabel: string }) {
       )}
       <button type="button" onClick={() => setOpen(o => !o)} aria-expanded={open} aria-controls={open ? menuId : undefined}
         aria-label={`Account: ${me.name || me.email}`}
-        className="w-full flex items-center gap-2.5 px-4 py-3 text-left bg-transparent border-0 cursor-pointer hover:bg-surface-3">
+        className={`w-full flex items-center text-left bg-transparent border-0 cursor-pointer hover:bg-surface-3 ${collapsed ? 'justify-center px-2 py-3' : 'gap-2.5 px-4 py-3'}`}>
         <Avatar name={me.name || me.email} kind={me.kind} />
-        <span className="min-w-0 flex-1">
-          <span className="block text-[13px] text-ink truncate">{me.name || me.email}</span>
-          <span className="block amp-num text-[10.5px] text-ink-3 truncate">{roleLabel} · {me.email}</span>
-        </span>
-        <ChevronUp size={14} className={`shrink-0 text-ink-3 transition-transform ${open ? '' : 'rotate-180'}`} aria-hidden="true" />
+        {!collapsed && (
+          <span className="min-w-0 flex-1">
+            <span className="block text-[13px] text-ink truncate">{me.name || me.email}</span>
+            <span className="block amp-num text-[10.5px] text-ink-3 truncate">{roleLabel} · {me.email}</span>
+          </span>
+        )}
+        {!collapsed && (
+          <motion.span
+            animate={{ rotate: open ? 0 : 180 }}
+            transition={{ duration: shouldReduceMotion ? 0 : 0.2, ease: [0.4, 0, 0.2, 1] }}
+          >
+            <ChevronUp size={14} className="shrink-0 text-ink-3" aria-hidden="true" />
+          </motion.span>
+        )}
       </button>
     </div>
   )
