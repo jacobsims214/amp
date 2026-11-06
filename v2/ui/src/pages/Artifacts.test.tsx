@@ -47,6 +47,21 @@ describe('Artifacts filters', () => {
     expect(screen.getAllByRole('link', { name: 'v1' }).map(l => l.getAttribute('href'))).toContain('/artifacts/1?v=1')
   })
 
+  it('shows an error when keep fails, then recovers on the next try', async () => {
+    keepSpy.mockClear()
+    keepSpy.mockRejectedValueOnce(new Error('Network down'))
+    renderAt('/project/3/artifacts')
+    await screen.findByText('Login mockup')
+    const card = screen.getByText('Flow diagram').closest('.amp-panel') as HTMLElement
+    const keepBtn = () => within(card).getByRole('button', { name: 'Keep Flow diagram' })
+    await userEvent.click(keepBtn())
+    expect(await within(card).findByRole('alert')).toHaveTextContent('Network down')
+    expect(keepBtn()).toBeEnabled()
+    await userEvent.click(keepBtn())
+    expect(keepSpy).toHaveBeenCalledTimes(2)
+    expect(within(card).queryByRole('alert')).toBeNull()
+  })
+
   it('sorts by ticket and writes it to the URL', async () => {
     renderAt('/project/3/artifacts')
     await screen.findByText('Login mockup')

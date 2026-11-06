@@ -147,10 +147,13 @@ export function Artifacts() {
 
 function ArtifactCard({ a, onKept }: { a: Artifact; onKept: () => void }) {
   const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const soon = expiryBucket(a) === 'soon'
   const keep = async () => {
-    setBusy(true)
-    try { await api.keepArtifact(a.id, true); onKept() } finally { setBusy(false) }
+    setBusy(true); setError(null)
+    try { await api.keepArtifact(a.id, true); onKept() }
+    catch (e) { setError(e instanceof Error ? e.message : "Couldn't keep it — try again") }
+    finally { setBusy(false) }
   }
   const visual = a.kind === 'image' || a.kind === 'svg'
   return (
@@ -177,13 +180,14 @@ function ArtifactCard({ a, onKept }: { a: Artifact; onKept: () => void }) {
             : null}
           {a.created_by_email ? <> · {a.created_by_email}</> : null}
         </span>
-        <span className="text-[11.5px] text-ink-3 flex items-center gap-2">
+        <span className="text-[11.5px] text-ink-3 flex items-center gap-2 flex-wrap">
           {a.keep ? 'Kept' : `Expires ${expiresIn(a.expires_at)}`}
           {soon && (
             <button type="button" onClick={keep} disabled={busy} aria-label={`Keep ${a.title}`}
-              className="text-[11.5px] text-ink underline bg-transparent border-0 p-0 cursor-pointer">Keep</button>
+              className="text-[11.5px] text-ink underline bg-transparent border-0 p-0 cursor-pointer disabled:opacity-50">Keep</button>
           )}
         </span>
+        {error && <span role="alert" className="text-[11.5px] text-danger-ink leading-snug">{error}</span>}
       </div>
     </div>
   )
