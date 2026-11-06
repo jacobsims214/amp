@@ -22,6 +22,7 @@ import { Artifacts } from './pages/Artifacts'
 import { ArtifactView } from './pages/ArtifactView'
 import { Session } from './pages/Session'
 import { Sessions } from './pages/Sessions'
+import { TicketPage } from './pages/TicketPage'
 import { RunRedirect, TicketRedirect } from './pages/TicketRedirect'
 import { RemoteProvider } from './remote/RemoteProvider'
 import { AuthProvider } from './contexts/AuthContext'
@@ -72,6 +73,7 @@ export default function App() {
             <Route path="/project/:projectId/board" element={<Board />} />
             <Route path="/project/:projectId/plan" element={<FlightPlan />} />
             <Route path="/project/:projectId/dag" element={<DAGView />} />
+            <Route path="/project/:projectId/ticket/:ticketId" element={<TicketPage />} />
             <Route path="/project/:projectId/report" element={<Report />} />
             <Route path="/project/:projectId/kb" element={<KB />} />
             <Route path="/project/:projectId/artifacts" element={<Artifacts />} />
