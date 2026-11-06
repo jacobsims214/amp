@@ -1,3 +1,5 @@
+import { friendlyError } from './apiError'
+
 // Class names and helpers shared by the admin screens (see components/admin.tsx).
 
 export const fieldCls = 'amp-input'
@@ -6,4 +8,5 @@ export const primaryBtnCls = 'amp-btn amp-btn-primary'
 export const quietBtnCls = 'amp-btn amp-btn-ghost amp-btn-sm'
 export const dangerBtnCls = 'amp-btn amp-btn-ghost amp-btn-sm hover:!text-danger-ink'
 
-export const errMsg = (e: unknown, fallback: string) => e instanceof Error ? e.message : fallback
+/** A caught error's message for the page; never a bare "forbidden" (lib/apiError). */
+export const errMsg = (e: unknown, fallback: string) => e instanceof Error ? friendlyError(e.message) : fallback

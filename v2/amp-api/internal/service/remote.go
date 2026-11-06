@@ -170,13 +170,13 @@ func RemoteCapabilityFor(cfg RemoteConfig, person bool, enabledOrgIDs []int) dom
 // user signed in through Dex (not an agent account, not an API token, not
 // the auth-less local-dev user).
 func remotePerson(p authz.Principal) bool {
-	return p.HasUser() && !p.Agent && !p.ViaToken
+	return p.HasUser() && !p.Agent && !p.ViaToken && !p.LocalDev()
 }
 
 // RemoteCapability is the caller's capabilities.remote_control.
 func (s *Service) RemoteCapability(ctx context.Context, p authz.Principal) (domain.RemoteCapability, error) {
 	cfg := s.Remote
-	if !p.HasUser() && p.Super { // the local-dev user: auth is off
+	if p.Super && (!p.HasUser() || p.LocalDev()) { // the local-dev user: auth is off
 		cfg.AuthEnabled = false
 	}
 	person := remotePerson(p)

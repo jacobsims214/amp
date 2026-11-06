@@ -26,6 +26,9 @@ import (
 //     per epic, with the tickets and their count.
 //   - answer: a ticket they own, blocked with a question (a block reason
 //     that isn't "scheduled:…").
+//   - verify: an agent ticket whose completion the project's Require
+//     receipts setting holds for a person (#126): "Couldn't verify, needs
+//     you". Its owner's, or with no owner, each project owner's.
 //   - merge: a ticket they own, completed, merge_state needed or abandoned.
 //   - start: a ticket they own, dispatched to an agent, that no worker has
 //     started (in_progress with no started_at: AMP #2801). Their worker was
@@ -41,13 +44,14 @@ import (
 const (
 	WaitApprove = "approve"
 	WaitAnswer  = "answer"
+	WaitVerify  = "verify"
 	WaitMerge   = "merge"
 	WaitStart   = "start"
 	WaitDo      = "do"
 )
 
 // WaitKinds is the display order of the kinds.
-var WaitKinds = []string{WaitApprove, WaitAnswer, WaitMerge, WaitStart, WaitDo}
+var WaitKinds = []string{WaitApprove, WaitAnswer, WaitVerify, WaitMerge, WaitStart, WaitDo}
 
 // WaitCounts counts what waits on a person. Waiting is the sum of the kinds;
 // ComingUp is shown but never part of Waiting.
@@ -55,7 +59,9 @@ type WaitCounts struct {
 	Waiting int `json:"waiting"`
 	Approve int `json:"approve"`
 	Answer  int `json:"answer"`
-	Merge   int `json:"merge"`
+	// Verify: a held completion waiting on the person's Accept or Reject.
+	Verify int `json:"verify"`
+	Merge  int `json:"merge"`
 	// Start: a ticket of theirs dispatched to an agent that no worker has
 	// started (AMP #2801). Nothing is wrong with the ticket; its worker was
 	// never launched.
@@ -70,6 +76,8 @@ func (c *WaitCounts) add(kind string) {
 		c.Approve++
 	case WaitAnswer:
 		c.Answer++
+	case WaitVerify:
+		c.Verify++
 	case WaitMerge:
 		c.Merge++
 	case WaitStart:
@@ -112,6 +120,8 @@ type WaitItem struct {
 	Count    int    `json:"count,omitempty"`
 	// answer
 	Question string `json:"question,omitempty"`
+	// verify: why the receipt is below its minimum
+	HoldReason string `json:"hold_reason,omitempty"`
 	// start: the agent it was dispatched to, and how long it has waited
 	AgentID           string `json:"agent_id,omitempty"`
 	NotStartedMinutes int    `json:"not_started_minutes,omitempty"`
@@ -226,9 +236,28 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 		}
 		return it
 	}
+	// Held tickets nobody owns are each project owner's (#126).
+	ownerOf := map[int]bool{}
+	ownsProject := func(projectID int) bool {
+		if v, ok := ownerOf[projectID]; ok {
+			return v
+		}
+		lvl, err := s.Authz.ProjectLevel(ctx, authz.Principal{UserID: userID}, projectID)
+		ownerOf[projectID] = err == nil && lvl >= authz.Owner
+		return ownerOf[projectID]
+	}
 	for i := range cands {
 		c := &cands[i]
 		t := &c.Task
+		if c.Held {
+			if (t.OwnerUserID != nil && *t.OwnerUserID == userID) || (t.OwnerUserID == nil && ownsProject(t.ProjectID)) {
+				it := single(c, WaitVerify, t.UpdatedAt)
+				it.AgentID = t.AgentID
+				it.HoldReason = s.heldReason(ctx, t)
+				add(it)
+			}
+			continue
+		}
 		awaits := t.State != domain.TaskStateCompleted && !t.Approved()
 		if c.RequirePlanApproval && awaits {
 			if who := t.ApprovalOwner(); who != nil && *who == userID {
@@ -373,7 +402,7 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 		}
 	}
 
-	rank := map[string]int{WaitApprove: 0, WaitAnswer: 1, WaitMerge: 2, WaitStart: 3, WaitDo: 4}
+	rank := map[string]int{WaitApprove: 0, WaitAnswer: 1, WaitVerify: 2, WaitMerge: 3, WaitStart: 4, WaitDo: 5}
 	sort.SliceStable(w.Items, func(i, j int) bool {
 		a, b := w.Items[i], w.Items[j]
 		if rank[a.Kind] != rank[b.Kind] {

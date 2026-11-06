@@ -3,15 +3,17 @@ import { NavLink, Outlet, useLocation, useMatch } from 'react-router-dom'
 import { motion, useReducedMotion } from 'framer-motion'
 import * as Tooltip from '@radix-ui/react-tooltip'
 import {
-  Activity, BookOpen, ChevronLeft, Home, Inbox, Menu, MonitorSmartphone, Radar, X, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, GitCommitHorizontal, GraduationCap, KeyRound, LogOut, PieChart, LayoutGrid, Settings, Shapes, ShieldCheck, ScrollText,
+  Activity, BookOpen, ChevronLeft, Home, Inbox, Menu, MonitorSmartphone, Radar, X, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, GitCommitHorizontal, GraduationCap, KeyRound, PieChart, LayoutGrid, Settings, Shapes, ShieldCheck, ScrollText,
 } from 'lucide-react'
 import { api } from '../../api/client'
 import { useAuth } from '../../hooks/useAuth'
 import { remoteAvailable, useRemote } from '../../remote/remote-context'
 import type { Project } from '../../types'
 import { refreshWaitCounts, useWaitCounts } from '../../lib/waitCounts'
-import { Avatar } from '../ui/Avatar'
+import { IdentityMenu } from './IdentityMenu'
 import { viewLink, type ProjectView } from '../../lib/projectLink'
+import { ThemeToggle } from './ThemeToggle'
+import { useThemeStore } from '../../lib/themeStore'
 
 // The frame around every page: one sidebar to get anywhere, the page beside
 // it. The current project's views sit under it in the sidebar, so nothing
@@ -165,6 +167,9 @@ export function AppShell() {
     width: { duration: shouldReduceMotion ? 0 : 0.25, ease: 'easeInOut' as const },
   }), [shouldReduceMotion])
 
+  // Initialize theme on first render (applies persisted/system preference).
+  useThemeStore(state => state.init)
+
   function toggleCollapsed() {
     const next = !collapsed
     setCollapsed(next)
@@ -186,13 +191,16 @@ export function AppShell() {
           onClick={e => { if ((e.target as HTMLElement).closest('a')) setNavOpen(false) }}
         >
           <button type="button" className="md:hidden absolute top-3 right-2 p-1.5 text-ink-3 hover:text-ink" onClick={() => setNavOpen(false)} aria-label="Close menu"><X size={16} /></button>
-          <NavLink to="/" className={`flex items-center gap-2.5 px-4 pt-4 pb-3 ${collapsed && !navOpen ? 'justify-center' : ''}`} aria-label="AMP home">
+          <div className={`flex items-center px-4 pt-4 pb-3 ${collapsed && !navOpen ? 'justify-center' : 'justify-between'}`}>
+            <NavLink to="/" className="flex items-center gap-2.5" aria-label="AMP home">
             {/* Relights on every page change (keyed by path). */}
             <span key={location.pathname} className="amp-mark amp-ignite" aria-hidden="true">
               <i className="bg-band-1" /><i className="bg-band-2" /><i className="bg-band-3" /><i className="bg-band-4" />
             </span>
             <span className={`text-[17px] font-bold tracking-[0.16em] text-ink ${collapsed && !navOpen ? 'hidden' : ''}`}>AMP</span>
-          </NavLink>
+            </NavLink>
+            {!collapsed && !navOpen && <ThemeToggle />}
+          </div>
 
           <nav className="flex flex-col px-2 pb-4">
             <Group collapsed={collapsed && !navOpen}>Overview</Group>
@@ -288,32 +296,12 @@ export function AppShell() {
           </div>
 
           {me && (
-            <div className={`mt-auto flex items-center gap-2.5 px-4 py-3 border-t border-line ${collapsed && !navOpen ? 'flex-col px-2' : ''}`}>
-              <Avatar name={me.name || me.email} kind={me.kind} />
-              <div className={`min-w-0 flex-1 ${collapsed && !navOpen ? 'hidden' : ''}`}>
-                <div className="text-[13px] text-ink truncate">{me.name || me.email}</div>
-                <div className="amp-num text-[10.5px] text-ink-3 truncate">{isAdmin ? 'admin' : me.kind === 'agent' ? 'agent' : orgRoleLabel} · {me.email}</div>
-              </div>
-              {/* Signed in through the browser: oauth2-proxy clears the session and sends you to sign in again. */}
-              {me.user_id != null && !me.via_token && (
-                <Tooltip.Root>
-                  <Tooltip.Trigger asChild>
-                    <a href="/oauth2/sign_out?rd=%2F" title="Sign out" aria-label="Sign out"
-                      className="shrink-0 p-1.5 text-ink-3 hover:text-ink hover:bg-surface-3 transition-colors rounded-sm">
-                      <motion.span whileHover={shouldReduceMotion ? undefined : { scale: 1.1 }} whileTap={shouldReduceMotion ? undefined : { scale: 0.95 }}>
-                        <LogOut size={14} />
-                      </motion.span>
-                    </a>
-                  </Tooltip.Trigger>
-                  <Tooltip.Portal>
-                    <Tooltip.Content side="top" sideOffset={6} className="z-50 px-2 py-1 bg-ink text-on-ink text-[12px] rounded-sm shadow-[0_2px_8px_rgba(22,24,27,0.16)] select-none">
-                      Sign out
-                      <Tooltip.Arrow className="fill-ink" width={10} height={5} />
-                    </Tooltip.Content>
-                  </Tooltip.Portal>
-                </Tooltip.Root>
-              )}
-            </div>
+            <IdentityMenu
+              me={me}
+              roleLabel={isAdmin ? 'admin' : me.kind === 'agent' ? 'agent' : orgRoleLabel}
+              collapsed={collapsed && !navOpen}
+              shouldReduceMotion={shouldReduceMotion}
+            />
           )}
         </motion.aside>
 

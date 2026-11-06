@@ -21,6 +21,7 @@ import {
   ChevronDown, ChevronRight, Clock, Crosshair, ExternalLink, EyeOff, Eye, Layers, Search, User, X,
 } from 'lucide-react'
 import { api } from '../api/client'
+import { stripMarkdown } from '../lib/stripMarkdown'
 import { useBoardData } from '../hooks/useBoardData'
 import { useAuth } from '../hooks/useAuth'
 import { TaskDrawer } from '../components/TaskDrawer'
@@ -97,7 +98,7 @@ const TicketNode = memo(function TicketNode({ data }: NodeProps<Node<TicketData>
         </div>
         <div className="text-xs font-semibold text-ink leading-snug line-clamp-2">{task.name}</div>
         {task.state === 'blocked' && task.block_reason && (
-          <div className="text-[10px] text-danger-ink truncate" title={task.block_reason}>{task.block_reason}</div>
+          <div className="text-[10px] text-danger-ink truncate" title={stripMarkdown(task.block_reason)}>{stripMarkdown(task.block_reason)}</div>
         )}
       </div>
       <Handle type="source" position={Position.Right} style={hidden} />

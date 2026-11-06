@@ -40,6 +40,9 @@ type mcpStack struct {
 	projectID int
 	epicID    int // default epic for this project (tests can create more)
 	storyID   int // default story under the default epic
+	// tools is the MCP handler, for tests that configure it (a receipt
+	// store, #126).
+	tools *mcp.Server
 	// ident is who tool calls run as; nil means the local-dev user (auth
 	// disabled), which every pre-RBAC test assumes. See as().
 	ident *auth.Identity
@@ -140,7 +143,7 @@ func setupMCP(t *testing.T) *mcpStack {
 	srv := mcpserver.NewMCPServer("amp-api-test", "2.0.0", append([]mcpserver.ServerOption{mcpserver.WithToolCapabilities(false)}, mcpHandler.ServerOptions()...)...)
 	mcpHandler.Register(srv)
 
-	return &mcpStack{srv: srv, mcpSrv: mcpHandler, repo: repo, reg: reg, hub: sseHub, kb: kbSvc, projectID: proj.ID, epicID: epic.ID, storyID: story.ID}
+	return &mcpStack{srv: srv, mcpSrv: mcpHandler, repo: repo, reg: reg, hub: sseHub, kb: kbSvc, projectID: proj.ID, epicID: epic.ID, storyID: story.ID, tools: mcpHandler}
 }
 
 // testKB connects to the Typesense at TEST_TYPESENSE_URL (keyword search

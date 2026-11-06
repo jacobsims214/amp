@@ -4,6 +4,7 @@
  * Org admins only; the API is authoritative. PUT sends only what changed.
  */
 import { RelayError } from './transport'
+import { apiErrorMessage } from '../lib/apiError'
 
 /**
  * `idle_timeout_min` and `max_lifetime_hours` are 0 for "no limit", the default (#2424).
@@ -13,7 +14,7 @@ export interface OrgRemotePolicy { enabled: boolean; idle_timeout_min: number; m
 
 async function failure(res: Response): Promise<RelayError> {
   const body = await res.json().catch(() => ({})) as { error?: string; code?: string }
-  return new RelayError(res.status, body.code ?? `http_${res.status}`, body.error ?? `Request failed (${res.status})`)
+  return new RelayError(res.status, body.code ?? `http_${res.status}`, apiErrorMessage(res.status, body.error, `Request failed (${res.status})`))
 }
 
 export async function getOrgRemotePolicy(orgId: number): Promise<OrgRemotePolicy> {

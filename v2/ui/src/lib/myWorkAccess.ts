@@ -3,8 +3,9 @@
  * list, so it needs an AMP user (KB architecture/waiting-on-you.md). Two ways
  * there isn't one:
  *
- * - `local-dev`: sign-in is off on this AMP (no OIDC_ISSUER_URL), so every
- *   request is the shared "Local Dev" identity and nothing is anyone's.
+ * - `local-dev`: sign-in is off on this AMP (no OIDC_ISSUER_URL) and the
+ *   Local Dev identity has no AMP user. Since #124 amp-api provisions one at
+ *   startup, so this only happens when that failed (or on an older API).
  * - `no-user`: sign-in is on but this session has no AMP user (signed out,
  *   or the session expired).
  *
@@ -29,5 +30,5 @@ export function isNoUserError(message?: string | null): boolean {
  */
 export function noMyWorkReason(me: Me | null | undefined): NoMyWork | null {
   if (!me || me.user_id) return null
-  return me.subject === 'local-dev' ? 'local-dev' : 'no-user'
+  return me.local_dev || me.subject === 'local-dev' ? 'local-dev' : 'no-user'
 }

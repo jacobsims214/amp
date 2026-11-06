@@ -40,3 +40,5 @@ jobs:
         run: python3 v2/deploy/helm/test_inbound_hooks_chart.py --envoy-validate
       - name: client IP template tests (audit log, AMP #2430/#2433/#2469) + envoy validate + spoof tests through a real Envoy
         run: python3 v2/deploy/helm/test_client_ip_chart.py --envoy-validate --envoy-run
+      - name: receipt evidence store (local PVC / bundled SeaweedFS / external S3, #126 #144) template tests
+        run: python3 v2/deploy/helm/test_receipts_store_chart.py

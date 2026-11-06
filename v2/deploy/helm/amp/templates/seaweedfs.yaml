@@ -1,0 +1,233 @@
+{{- if .Values.seaweedfs.enabled }}
+{{- $_ := include "amp.receiptStore" . }}
+{{- $ns := .Values.global.namespace }}
+{{- $secretName := include "amp.seaweedfsSecret" . }}
+{{- $keysChecksum := "" }}
+{{- if not .Values.seaweedfs.existingSecret }}
+{{- /* lookup-or-random, as templates/secrets.yaml (see the note there on
+       ArgoCD: pin global.secretOverrides.seaweedfs* in that case). */}}
+{{- $overrides := .Values.global.secretOverrides | default dict }}
+{{- $existing := lookup "v1" "Secret" $ns $secretName }}
+{{- $access := "" }}
+{{- $secret := "" }}
+{{- $jwt := "" }}
+{{- if $overrides.seaweedfsAccessKey }}
+{{- $access = $overrides.seaweedfsAccessKey }}
+{{- else if $existing }}
+{{- $access = index $existing.data "access-key" | b64dec }}
+{{- else }}
+{{- $access = randAlphaNum 20 }}
+{{- end }}
+{{- if $overrides.seaweedfsSecretKey }}
+{{- $secret = $overrides.seaweedfsSecretKey }}
+{{- else if $existing }}
+{{- $secret = index $existing.data "secret-key" | b64dec }}
+{{- else }}
+{{- $secret = randAlphaNum 40 }}
+{{- end }}
+{{- if $overrides.seaweedfsJwtSigningKey }}
+{{- $jwt = $overrides.seaweedfsJwtSigningKey }}
+{{- else if and $existing (index $existing.data "jwt-signing-key") }}
+{{- $jwt = index $existing.data "jwt-signing-key" | b64dec }}
+{{- else }}
+{{- $jwt = randAlphaNum 64 }}
+{{- end }}
+# The bundled SeaweedFS's S3 key pair (#126, #144): amp-api signs with it,
+# SeaweedFS accepts only it, for the receipts bucket only. jwt-signing-key
+# is SeaweedFS's own (jwt.filer_signing.key): its S3 gRPC admin calls and
+# filer writes need a token signed with it. amp-api never sees it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "seaweedfs" "Release" .Release) | nindent 4 }}
+type: Opaque
+stringData:
+  access-key: {{ $access | quote }}
+  secret-key: {{ $secret | quote }}
+  jwt-signing-key: {{ $jwt | quote }}
+---
+{{- $keysChecksum = printf "%s/%s/%s" $access $secret $jwt | sha256sum }}
+{{- end }}
+# Receipt evidence store (#126, #144): SeaweedFS (Apache-2.0) in one pod
+# (master, volume, filer and the S3 gateway), one replica. Only amp-api talks
+# to it, over the S3 port; browsers get evidence from amp-api.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: amp-seaweedfs
+  namespace: {{ $ns }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "seaweedfs" "Release" .Release) | nindent 4 }}
+spec:
+  serviceName: amp-seaweedfs
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: amp-seaweedfs
+  template:
+    metadata:
+      labels:
+        app: amp-seaweedfs
+      {{- if $keysChecksum }}
+      # The identities file is written at start: a new key pair restarts
+      # SeaweedFS (amp-api picks the new Secret up on its own restart; with
+      # seaweedfs.existingSecret, restart both after rotating).
+      annotations:
+        checksum/s3-keys: {{ $keysChecksum }}
+      {{- end }}
+    spec:
+      securityContext:
+        {{- include "amp.podSecurityContext" (dict "fsGroup" 1000) | nindent 8 }}
+      initContainers:
+        # /data belongs to uid 1000 (the image's seaweed user), as for every
+        # PVC-owning pod in this chart. Top directory only: SeaweedFS
+        # creates everything under it.
+        - name: fix-permissions
+          image: busybox:1.36
+          securityContext:
+            {{- include "amp.chownInitSecurityContext" . | nindent 12 }}
+          command: ["sh", "-c", "chown 1000:1000 /data && chmod 0750 /data"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+        # SeaweedFS reads its S3 identities from a JSON file: written here
+        # from the Secret's key pair, into a memory-backed volume (never
+        # into the pod spec or the PVC). One identity, for the bucket only.
+        - name: s3-config
+          image: busybox:1.36
+          securityContext:
+            {{- include "amp.containerSecurityContext" (dict "runAsUser" 1000) | nindent 12 }}
+          env:
+            - name: ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secretName }}, key: access-key } }
+            - name: SECRET_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secretName }}, key: secret-key } }
+            - name: BUCKET
+              value: {{ .Values.seaweedfs.bucket | quote }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              if [ -z "$ACCESS_KEY" ] || [ -z "$SECRET_KEY" ] || [ -z "$BUCKET" ]; then
+                echo 'the Secret needs non-empty access-key and secret-key, and seaweedfs.bucket must be set' >&2; exit 1
+              fi
+              case "$ACCESS_KEY$SECRET_KEY$BUCKET" in *'"'*|*'\'*) echo 'the key pair and bucket may not contain " or \' >&2; exit 1;; esac
+              umask 077
+              printf '{"identities":[{"name":"amp-api","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin:%s","Read:%s","Write:%s","List:%s","Tagging:%s"]}]}\n' \
+                "$ACCESS_KEY" "$SECRET_KEY" "$BUCKET" "$BUCKET" "$BUCKET" "$BUCKET" "$BUCKET" > /config/s3.json
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      containers:
+        - name: seaweedfs
+          image: {{ .Values.seaweedfs.image }}:{{ .Values.seaweedfs.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "amp.containerSecurityContext" (dict "runAsUser" 1000) | nindent 12 }}
+          # The image's entrypoint adds -dir=/data -volume.max=0
+          # -master.volumeSizeLimitMB=1024. Master, volume and filer (none of
+          # which authenticate) listen on loopback only, where the servers in
+          # this pod find each other; only the S3 gateway is on the pod IP.
+          # It also brings its gRPC port (8333+10000, no flag moves it): its
+          # admin calls (identities, policies, lifecycle deletes) need a
+          # token signed with WEED_JWT_FILER_SIGNING_KEY, from anywhere, and
+          # the NetworkPolicy below admits nobody to it. Iceberg and Lance,
+          # on by default with -s3, are off. No telemetry.
+          env:
+            # jwt.filer_signing.key (SeaweedFS reads WEED_<section>_<key>).
+            # optional: an existingSecret without the key falls back to
+            # SeaweedFS's own rule, admin gRPC from local clients only.
+            - name: WEED_JWT_FILER_SIGNING_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secretName }}, key: jwt-signing-key, optional: true } }
+          args:
+            - server
+            - -ip=127.0.0.1
+            - -ip.bind=127.0.0.1
+            - -s3
+            - -s3.ip.bind=0.0.0.0
+            - -s3.port=8333
+            - -s3.port.iceberg=0
+            - -s3.port.lance=0
+            - -s3.config=/config/s3.json
+            - -master.telemetry=false
+          ports:
+            - name: s3
+              containerPort: 8333
+          readinessProbe:
+            httpGet: { path: /healthz, port: s3 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: s3 }
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /config
+              readOnly: true
+          resources:
+            {{- toYaml .Values.seaweedfs.resources | nindent 12 }}
+      volumes:
+        - name: config
+          emptyDir: { medium: Memory, sizeLimit: 1Mi }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.seaweedfs.storage.storageClassName }}
+        storageClassName: {{ .Values.seaweedfs.storage.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.seaweedfs.storage.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: amp-seaweedfs
+  namespace: {{ $ns }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "seaweedfs" "Release" .Release) | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app: amp-seaweedfs
+  ports:
+    - name: s3
+      port: 8333
+      targetPort: s3
+---
+# Only amp-api may reach SeaweedFS, and only its S3 port: nothing reaches
+# its S3 gRPC port (18333) or anything else. Rendered whatever
+# networkPolicy.enabled says: it selects only this pod, so it can't break
+# anything, and turning the chart's other policies off is no reason to open
+# SeaweedFS. Needs a CNI that enforces NetworkPolicy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: amp-seaweedfs
+  namespace: {{ $ns }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "seaweedfs" "Release" .Release) | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: amp-seaweedfs
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: amp-api
+      ports:
+        - { protocol: TCP, port: 8333 }
+{{- end }}
