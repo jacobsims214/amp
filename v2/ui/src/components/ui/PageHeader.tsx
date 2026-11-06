@@ -37,7 +37,7 @@ export function PageHeader({ crumb, title, meta, actions, tabs, children }: {
               className={({ isActive }) => `font-label text-[12px] font-semibold uppercase tracking-[0.16em] px-3.5 pt-3 pb-2.5 border-b-2 whitespace-nowrap ${
                 isActive ? 'text-ink border-accent' : 'text-ink-3 border-transparent hover:text-ink-2'}`}>
               {t.label}{t.count != null && (
-                <span className={`amp-num ml-1.5 tracking-normal ${t.hot ? 'text-white bg-accent px-[5px] py-px' : 'text-ink-3'}`}>{t.count}</span>
+                <span className={`amp-num ml-1.5 tracking-normal ${t.hot ? 'text-on-accent bg-accent px-[5px] py-px' : 'text-ink-3'}`}>{t.count}</span>
               )}
             </NavLink>
           ))}
@@ -87,9 +87,9 @@ export function Readouts({ items, wrap }: {
       {items.map((it, i) => (
         <div key={it.label} className={`amp-readout px-4 py-3 grid gap-1.5 ${i ? 'border-l border-line' : ''}`}
           style={it.alarm ? { background: 'var(--st-flag)' } : undefined}>
-          <span className="amp-label" style={it.alarm ? { color: '#fff' } : undefined}>{it.label}</span>
-          <span className="amp-num text-[26px] leading-none" style={{ color: it.alarm ? '#fff' : it.color ?? 'var(--ink)' }}>{it.value}</span>
-          {it.sub && <span className="text-[11.5px]" style={{ color: it.alarm ? '#fff' : 'var(--ink-2)' }}>{it.sub}</span>}
+          <span className="amp-label" style={it.alarm ? { color: 'var(--on-accent)' } : undefined}>{it.label}</span>
+          <span className="amp-num text-[26px] leading-none" style={{ color: it.alarm ? 'var(--on-accent)' : it.color ?? 'var(--ink)' }}>{it.value}</span>
+          {it.sub && <span className="text-[11.5px]" style={{ color: it.alarm ? 'var(--on-accent)' : 'var(--ink-2)' }}>{it.sub}</span>}
         </div>
       ))}
     </div>

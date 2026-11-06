@@ -257,7 +257,7 @@ export function Projects() {
           <div className="mt-14">
             <button
               onClick={() => setArchivedExpanded(!archivedExpanded)}
-              className="flex items-center gap-2 text-sm font-semibold text-ink hover:text-white transition-colors mb-5 cursor-pointer"
+              className="flex items-center gap-2 text-sm font-semibold text-ink hover:text-accent transition-colors mb-5 cursor-pointer"
             >
               {archivedExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
               Archived ({archivedProjects.length})

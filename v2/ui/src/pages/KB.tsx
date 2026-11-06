@@ -642,7 +642,7 @@ function DocListItem({ doc, onOpen }: { doc: KBDocSummary; onOpen: () => void })
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-start justify-between gap-3">
-          <h3 className="text-sm font-semibold text-ink group-hover:text-white transition-colors leading-snug">
+          <h3 className="text-sm font-semibold text-ink group-hover:text-accent transition-colors leading-snug">
             {doc.title}
           </h3>
           <span className="text-[10px] text-ink-3 font-mono flex-shrink-0 mt-0.5">{doc.author}</span>

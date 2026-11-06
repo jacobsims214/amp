@@ -285,10 +285,10 @@ export function MyWork() {
         {work && !authLoading && !error && !noWork && <>
           <div className="amp-panel amp-panel-top grid grid-cols-3 md:grid-cols-7" aria-label="Waiting on you, across your projects">
             <div className="col-span-3 md:col-span-1 px-4 py-3 grid gap-1.5 border-b md:border-b-0 border-line"
-              style={counts.waiting ? { background: 'var(--st-flag)', color: '#fff' } : undefined}>
-              <span className="amp-label" style={counts.waiting ? { color: '#fff' } : undefined}>Waiting on you</span>
+              style={counts.waiting ? { background: 'var(--st-flag)', color: 'var(--on-accent)' } : undefined}>
+              <span className="amp-label" style={counts.waiting ? { color: 'var(--on-accent)' } : undefined}>Waiting on you</span>
               <span className="amp-num text-[26px] leading-none" style={counts.waiting ? undefined : { color: 'var(--success-ink)' }}>{counts.waiting}</span>
-              <span className="text-[11.5px]" style={{ color: counts.waiting ? '#fff' : 'var(--ink-2)' }}>
+              <span className="text-[11.5px]" style={{ color: counts.waiting ? 'var(--on-accent)' : 'var(--ink-2)' }}>
                 {counts.waiting ? `in ${waitingCards.length} of ${totalProjects} project${totalProjects === 1 ? '' : 's'}` : `in all ${totalProjects} project${totalProjects === 1 ? '' : 's'}`}
               </span>
             </div>

@@ -22,7 +22,7 @@ const fieldCls =
 const smallSelectCls =
   'bg-bg border border-line rounded-lg px-2 py-1 text-xs text-ink focus:outline-none focus:border-primary cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed'
 const primaryBtnCls =
-  'flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-semibold text-white disabled:opacity-50 cursor-pointer'
+  'flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-semibold text-on-ink bg-primary disabled:opacity-50 cursor-pointer'
 const iconBtnCls = 'text-ink-2 hover:text-danger-ink disabled:opacity-50 cursor-pointer transition-colors'
 
 const errMsg = (e: unknown, fallback: string) => e instanceof Error ? e.message : fallback

@@ -22,6 +22,7 @@
   --ink-2:       #50555C;
   --ink-3:       #8E939A;
   --on-ink:      #FFFFFF;   /* text on black buttons */
+  --on-accent:   #FFFFFF;   /* text on accent, danger, success and warning fills */
 
   /* Action */
   --primary:     #16181B;   /* primary buttons, focus */
@@ -63,6 +64,58 @@
   color-scheme: light;
 }
 
+/* Dark palette. `data-theme` on <html> is always the resolved theme (light or
+   dark): the inline script in index.html sets it before first paint and
+   hooks/useTheme.ts keeps it current. Text pairs are checked against WCAG AA
+   (4.5:1) on --surface and --bg; fills that carry --on-accent text are lighter
+   than in the light theme, so their text flips to near-black. */
+:root[data-theme="dark"] {
+  --bg:          #101215;
+  --surface:     #181B1F;
+  --surface-2:   #14171A;
+  --surface-3:   #23272C;
+  --scrim:       rgba(0, 0, 0, 0.6);
+
+  --line-sub:    #22262B;
+  --line:        #2D3238;
+  --line-str:    #434951;
+
+  --ink:         #ECEDEF;
+  --ink-2:       #A7ADB5;
+  --ink-3:       #868C95;
+  --on-ink:      #101215;
+  --on-accent:   #14110F;
+
+  --primary:     #ECEDEF;
+  --accent:      #EE6A4C;
+  --link:        #6EA2EB;
+
+  --band-1:      #EE6A4C;
+  --band-2:      #F0963F;
+  --band-3:      #EBC34B;
+  --band-4:      #5B93E0;
+
+  --st-ready:    #ECEDEF;
+  --st-prog:     #6EA2EB;
+  --st-wait:     #868C95;
+  --st-flag:     #EE6A4C;
+  --st-sched:    #A58BDB;
+  --st-done:     #ECEDEF;
+
+  --danger:      #EE6A4C;
+  --danger-ink:  #FF8A6E;
+  --success:     #4DB57A;
+  --success-ink: #6CCB95;
+  --warning:     #E0A23A;
+  --warning-ink: #F0B95C;
+  --violet:      #A58BDB;
+  --teal:        #3FB5A7;
+  --pink:        #E070A4;
+  --orange:      #F0963F;
+
+  color-scheme: dark;
+}
+
 /* ─── Tailwind: expose the tokens as utilities (bg-surface, text-ink-2, …) ── */
 @theme inline {
   /* Square corners everywhere; rounded-full (avatars, dots) stays round. */
@@ -90,6 +143,7 @@
   --color-ink-2: var(--ink-2);
   --color-ink-3: var(--ink-3);
   --color-on-ink: var(--on-ink);
+  --color-on-accent: var(--on-accent);
   --color-primary: var(--primary);
   --color-accent: var(--accent);
   --color-link: var(--link);
@@ -174,8 +228,8 @@ body {
 .amp-btn:hover { background: var(--surface-3); }
 .amp-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .amp-btn-primary { background: var(--primary); color: var(--on-ink); border-color: var(--primary); }
-.amp-btn-primary:hover { background: #2C2F33; }
-.amp-btn-accent { background: var(--accent); color: #fff; border-color: var(--accent); }
+.amp-btn-primary:hover { background: color-mix(in srgb, var(--primary) 82%, var(--on-ink)); }
+.amp-btn-accent { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
 .amp-btn-accent:hover { background: var(--danger-ink); }
 .amp-btn-danger { color: var(--danger-ink); border-color: var(--danger); }
 .amp-btn-danger:hover { background: color-mix(in srgb, var(--danger) 8%, var(--surface)); }

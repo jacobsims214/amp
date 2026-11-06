@@ -9,6 +9,7 @@ import { remoteAvailable, useRemote } from '../../remote/remote-context'
 import type { Project } from '../../types'
 import { refreshWaitCounts, useWaitCounts } from '../../lib/waitCounts'
 import { Avatar } from '../ui/Avatar'
+import { ThemeToggle } from './ThemeToggle'
 import { viewLink, type ProjectView } from '../../lib/projectLink'
 
 // The frame around every page: one sidebar to get anywhere, the page beside
@@ -39,7 +40,7 @@ function navCls({ isActive }: { isActive: boolean }) {
 /** A "waiting on you" count: white on the accent, read as "N waiting on you". */
 function Badge({ n }: { n?: number }) {
   if (!n) return null
-  return <span className="ml-auto amp-num text-[11px] leading-none text-white bg-accent px-[5px] py-[2px] shrink-0" aria-hidden="true">{n}</span>
+  return <span className="ml-auto amp-num text-[11px] leading-none text-on-accent bg-accent px-[5px] py-[2px] shrink-0" aria-hidden="true">{n}</span>
 }
 
 /** The accessible name of a link with a Badge: "My work, 6 waiting on you". */
@@ -151,8 +152,9 @@ export function AppShell() {
           )}
         </nav>
 
+        <div className="mt-auto px-4 pt-3 pb-2 border-t border-line"><ThemeToggle /></div>
         {me && (
-          <div className="mt-auto flex items-center gap-2.5 px-4 py-3 border-t border-line">
+          <div className="flex items-center gap-2.5 px-4 py-3">
             <Avatar name={me.name || me.email} kind={me.kind} />
             <div className="min-w-0 flex-1">
               <div className="text-[13px] text-ink truncate">{me.name || me.email}</div>
@@ -174,7 +176,7 @@ export function AppShell() {
           <button type="button" className="p-2 text-ink" onClick={() => setNavOpen(true)} aria-label="Open menu" aria-expanded={navOpen} aria-controls="main-nav"><Menu size={18} /></button>
           <span className="text-[15px] font-bold tracking-[0.16em] text-ink">AMP</span>
           {phoneWaiting > 0 && (
-            <NavLink to={currentId ? `/project/${currentId}/my-work` : '/'} className="ml-auto mr-1 amp-num text-[11px] text-white bg-accent px-1.5 py-0.5">
+            <NavLink to={currentId ? `/project/${currentId}/my-work` : '/'} className="ml-auto mr-1 amp-num text-[11px] text-on-accent bg-accent px-1.5 py-0.5">
               {phoneWaiting} waiting on you</NavLink>
           )}
         </div>

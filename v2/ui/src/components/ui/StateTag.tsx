@@ -25,10 +25,10 @@ export function StateTag({ state, label, title }: { state: DisplayState; label?:
         borderRadius: 'var(--radius)',
         background: flag ? 'var(--st-flag)' : 'var(--surface)',
         borderColor: flag ? 'var(--st-flag)' : 'var(--line)',
-        color: flag ? '#fff' : 'var(--ink)',
+        color: flag ? 'var(--on-accent)' : 'var(--ink)',
       }}
     >
-      {flag ? <i className="inline-block w-2 h-2 bg-white" style={{ borderRadius: 1 }} aria-hidden="true" /> : <StateDot state={state} />}
+      {flag ? <i className="inline-block w-2 h-2 bg-on-accent" style={{ borderRadius: 1 }} aria-hidden="true" /> : <StateDot state={state} />}
       {label ?? STATE_LABEL[state]}
     </span>
   )

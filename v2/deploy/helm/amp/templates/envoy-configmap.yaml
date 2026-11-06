@@ -152,6 +152,12 @@ data:
                                 envoy.filters.http.ext_authz:
                                   "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
                                   disabled: true
+                            - match: { path: "/theme-init.js" }
+                              route: { cluster: ui }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
                             # ---- Everything below requires a browser session via oauth2-proxy ----
                             # The UI's own SSE stream (live board updates) needs the same unbounded
                             # timeout, matched before the general /api prefix below.
@@ -350,6 +356,12 @@ data:
                                   "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
                                   disabled: true
                             - match: { path: "/favicon.svg" }
+                              route: { cluster: ui }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { path: "/theme-init.js" }
                               route: { cluster: ui }
                               typed_per_filter_config:
                                 envoy.filters.http.ext_authz:

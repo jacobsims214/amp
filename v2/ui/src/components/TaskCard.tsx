@@ -52,7 +52,7 @@ export function TaskCard({ task, onClick, dimmed = false, owner = null, notStart
         <NotStartedTag task={task} flagMinutes={notStartedFlagMinutes} compact />
         <ReturnedTag task={task} compact />
         {state === 'flag' && (
-          <span className="ml-auto font-label text-[10px] font-semibold uppercase tracking-[0.1em] px-1.5 py-[3px] bg-st-flag text-white">Question</span>
+          <span className="ml-auto font-label text-[10px] font-semibold uppercase tracking-[0.1em] px-1.5 py-[3px] bg-st-flag text-on-accent">Question</span>
         )}
         {merge && (
           <span className="ml-auto inline-flex items-center gap-1 font-label text-[10px] font-semibold uppercase tracking-[0.1em] px-1.5 py-[2px] border border-teal text-teal"

@@ -94,7 +94,7 @@ function Chip({ t, state, crit, lit, sel, dim, onClick }: {
       className="relative inline-grid place-items-center min-w-[40px] h-[19px] px-[3px] m-[1px] amp-num text-[10px] cursor-pointer transition-opacity"
       style={{
         borderRadius: 'var(--radius)', border: `1px solid ${STATE_VAR[state]}`,
-        color: filled ? '#fff' : state === 'ready' ? 'var(--ink)' : STATE_VAR[state],
+        color: state === 'flag' ? 'var(--on-accent)' : filled ? 'var(--on-ink)' : state === 'ready' ? 'var(--ink)' : STATE_VAR[state],
         background: filled ? STATE_VAR[state] : `color-mix(in srgb, ${STATE_VAR[state]} 9%, var(--surface))`,
         outline: crit ? '1.5px solid var(--accent)' : undefined, outlineOffset: 1,
         boxShadow: sel ? '0 0 0 3px var(--accent)' : undefined,
@@ -320,7 +320,7 @@ export function FlightPlan() {
 function Verdict({ ok, warn, stampDelay }: { ok: boolean; warn?: boolean; stampDelay?: number }) {
   const style = ok ? { border: '1px solid var(--success)', color: 'var(--success-ink)' }
     : warn ? { border: '1px solid var(--warning)', color: 'var(--warning-ink)' }
-      : { background: 'var(--st-flag)', color: '#fff' }
+      : { background: 'var(--st-flag)', color: 'var(--on-accent)' }
   return (
     <span className={`font-label text-[10.5px] font-bold tracking-[0.16em] px-1.5 py-1 self-start leading-none${ok && stampDelay != null ? ' amp-go-stamp' : ''}`}
       style={ok && stampDelay != null ? { ...style, animationDelay: `${stampDelay}ms`, ['--amp-stamp-delay' as string]: `${stampDelay}ms` } : style}>

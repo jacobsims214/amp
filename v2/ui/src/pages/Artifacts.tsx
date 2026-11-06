@@ -64,7 +64,7 @@ function ArtifactCard({ a }: { a: Artifact }) {
   const visual = a.kind === 'image' || a.kind === 'svg'
   return (
     <Link to={`/artifacts/${a.id}`} className="amp-panel no-underline text-ink hover:border-ink-3 flex flex-col overflow-hidden">
-      <div className="relative h-[150px] bg-surface-2 border-b border-line flex items-center justify-center overflow-hidden">
+      <div className={`relative h-[150px] border-b border-line flex items-center justify-center overflow-hidden ${visual ? 'bg-white' : 'bg-surface-2'}`}>
         {visual
           ? <img src={api.artifactContentUrl(a.id, a.current_version)} alt="" className="max-h-full max-w-full object-contain" loading="lazy" />
           : a.kind === 'html'

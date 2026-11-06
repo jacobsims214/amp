@@ -29,6 +29,11 @@ tags: [ui, onboarding, navigation]
   (`setup/connect-your-agent.md`).
 - **Teams & orgs** — membership, roles, teams, and the team and org knowledge bases.
 - **Your name** at the bottom of the sidebar shows your role; the arrow next to it signs you out.
+- **Theme** — above your name, a System / Light / Dark switch. System (the default) follows your
+  operating system's light or dark setting and changes with it; Light and Dark override it. The
+  choice is saved in this browser only (not on your account) and is applied before the page
+  paints, so there is no flash of the wrong theme. Artifact previews stay on a white page,
+  because they show someone else's document as authored.
 
 ## Inside a project
 

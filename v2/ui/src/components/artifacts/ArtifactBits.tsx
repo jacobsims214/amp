@@ -8,8 +8,8 @@ import type { Artifact, ArtifactKind, ArtifactStatus } from '../../types'
 
 const STATUS_STYLE: Record<ArtifactStatus, React.CSSProperties> = {
   in_review: { background: 'var(--surface)', borderColor: 'var(--line)', color: 'var(--ink)' },
-  approved: { background: 'var(--success)', borderColor: 'var(--success)', color: '#fff' },
-  changes_requested: { background: 'var(--st-flag)', borderColor: 'var(--st-flag)', color: '#fff' },
+  approved: { background: 'var(--success)', borderColor: 'var(--success)', color: 'var(--on-accent)' },
+  changes_requested: { background: 'var(--st-flag)', borderColor: 'var(--st-flag)', color: 'var(--on-accent)' },
 }
 
 export function ArtifactStatusTag({ status }: { status: ArtifactStatus }) {

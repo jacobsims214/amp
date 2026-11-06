@@ -54,7 +54,7 @@ export function ConfirmDeleteModal({ title, description, onClose, onConfirm, del
             <button
               onClick={onConfirm}
               disabled={deleting}
-              className="flex items-center gap-1.5 px-4 py-2 bg-danger hover:bg-danger disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer"
+              className="flex items-center gap-1.5 px-4 py-2 bg-danger hover:bg-danger disabled:opacity-50 disabled:cursor-not-allowed text-on-accent text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer"
             >
               {deleting && <Loader2 size={11} className="animate-spin" />}
               Delete

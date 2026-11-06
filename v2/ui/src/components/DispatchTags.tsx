@@ -34,10 +34,10 @@ export function NotStartedTag({ task, minutes, flagMinutes, compact = false }: N
         borderRadius: 'var(--radius)',
         borderColor: 'var(--warning)',
         background: badge.flagged ? 'var(--warning)' : 'transparent',
-        color: badge.flagged ? '#fff' : 'var(--warning-ink)',
+        color: badge.flagged ? 'var(--on-accent)' : 'var(--warning-ink)',
       }}>
       <i className="inline-block w-1.5 h-1.5" aria-hidden="true"
-        style={{ borderRadius: 1, background: badge.flagged ? '#fff' : 'var(--warning)' }} />
+        style={{ borderRadius: 1, background: badge.flagged ? 'var(--on-accent)' : 'var(--warning)' }} />
       {badge.label}{long && !compact ? ` · ${badge.minutes} min` : ''}
     </span>
   )
