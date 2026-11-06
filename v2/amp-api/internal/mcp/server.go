@@ -2760,7 +2760,17 @@ func (s *Server) kbSearch(ctx context.Context, args map[string]interface{}) (*mc
 	if err != nil {
 		return nil, err
 	}
+	dropChunkText(results)
 	return jsonResult(map[string]interface{}{"kb": k, "results": results, "count": len(results)})
+}
+
+// dropChunkText keeps amp_kb_search to the short excerpt: agents read the full
+// doc with amp_kb_get. The Library's REST search keeps chunk_text and labels it
+// as more than the agent sees.
+func dropChunkText(results []kb.SearchResult) {
+	for i := range results {
+		results[i].ChunkText = ""
+	}
 }
 
 // kbSearchDefaultLimit and kbSearchMaxLimit are amp_kb_search's documented

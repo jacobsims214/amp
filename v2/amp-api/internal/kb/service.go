@@ -152,14 +152,19 @@ type DocSummary struct {
 }
 
 type SearchResult struct {
-	Scope     string   `json:"scope"`
-	ScopeID   int      `json:"scope_id"`
-	Path      string   `json:"path"`
-	Title     string   `json:"title"`
-	Tags      []string `json:"tags"`
-	Excerpt   string   `json:"excerpt"` // best-matching chunk_text, trimmed
-	Author    string   `json:"author"`
-	UpdatedAt int64    `json:"updated_at"`
+	Scope   string   `json:"scope"`
+	ScopeID int      `json:"scope_id"`
+	Path    string   `json:"path"`
+	Title   string   `json:"title"`
+	Tags    []string `json:"tags"`
+	Excerpt string   `json:"excerpt"` // best-matching chunk_text, trimmed
+	// ChunkText is the whole matched chunk. Only the REST search the Library
+	// uses fills it; amp_kb_search drops it so agents keep the short excerpt.
+	ChunkText string `json:"chunk_text,omitempty"`
+	// ChunkIndex is the matched chunk's position within the doc.
+	ChunkIndex int    `json:"chunk_index"`
+	Author     string `json:"author"`
+	UpdatedAt  int64  `json:"updated_at"`
 	// Score is the hit's relevance in [0,1], highest first. On a hybrid
 	// search it is Typesense's rank-fusion score (the value results are
 	// ordered by); on a keyword-only collection it is the reciprocal of the
@@ -1010,6 +1015,8 @@ func (s *Service) Search(ctx context.Context, sc Scope, query string, tags []str
 			Title:            doc.Title,
 			Tags:             doc.Tags,
 			Excerpt:          trimExcerpt(doc.ChunkText, 120),
+			ChunkText:        doc.ChunkText,
+			ChunkIndex:       doc.ChunkIndex,
 			Author:           doc.Author,
 			UpdatedAt:        doc.UpdatedAt,
 			Score:            hs.score,

@@ -550,6 +550,12 @@ function SearchResultsList({ query, results, searching, onSelect, selectedPath }
   query: string; results: KBSearchResult[]; searching: boolean
   onSelect: (path: string) => void; selectedPath?: string
 }) {
+  const [shown, setShown] = useState<Set<string>>(() => new Set())
+  const toggle = (key: string) => setShown(prev => {
+    const next = new Set(prev)
+    if (!next.delete(key)) next.add(key)
+    return next
+  })
   if (searching) return (
     <div className="flex justify-center py-6">
       <Loader2 size={14} className="animate-spin text-primary" />
@@ -564,8 +570,12 @@ function SearchResultsList({ query, results, searching, onSelect, selectedPath }
     <div className="space-y-1">
       {results.map((r, i) => {
         const isSelected = selectedPath === r.path
+        const key = `${r.path}#${i}`
+        const showPassage = shown.has(key)
+        const hasPassage = !!r.chunk_text
         return (
-          <button key={i} onClick={() => onSelect(r.path)}
+          <div key={key}>
+          <button onClick={() => onSelect(r.path)}
             className="w-full text-left px-2 py-2 rounded-lg transition-all cursor-pointer"
             style={{
               background: isSelected ? 'color-mix(in srgb, var(--link) 12%, transparent)' : 'transparent',
@@ -599,6 +609,24 @@ function SearchResultsList({ query, results, searching, onSelect, selectedPath }
               </div>
             )}
           </button>
+          {hasPassage && (
+            <button onClick={() => toggle(key)} aria-expanded={showPassage}
+              className="ml-6 mt-0.5 text-[10px] text-link cursor-pointer hover:underline">
+              {showPassage ? 'Hide passage' : 'Show passage'}
+            </button>
+          )}
+          {showPassage && (
+            <div className="ml-6 mt-1 mb-1 rounded p-2" style={{ background: 'var(--surface)', border: '1px solid var(--line-sub)' }}>
+              <p className="text-[10px] text-ink-3 mb-1">
+                Score {r.score.toFixed(2)}
+                {r.vector_score !== undefined && <> · semantic {r.vector_score.toFixed(2)}</>}
+                {r.chunk_index !== undefined && <> · chunk {r.chunk_index}</>}
+                {' · '}agents see only the short excerpt above
+              </p>
+              <p aria-label="Matched passage" className="text-xs text-ink-2 leading-relaxed whitespace-pre-wrap">{r.chunk_text}</p>
+            </div>
+          )}
+          </div>
         )
       })}
     </div>

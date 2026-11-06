@@ -93,3 +93,33 @@ describe('Library URL state', () => {
     expect(url()).toBe('/project/3/kb?tag=tag2')
   })
 })
+
+describe('Library search hits', () => {
+  const hit = (chunk: string) => ({
+    path: 'docs/a.md', title: 'Title of docs/a.md', tags: [], excerpt: chunk.slice(0, 120), chunk_text: chunk,
+    author: 'a', updated_at: 1, score: 0.8, vector_score: 0.71, chunk_index: 3, annotation_count: 2, latest_annotation: 'needs a rewrite',
+  })
+
+  it('shows the whole matched passage, score and chunk index on demand', async () => {
+    const user = userEvent.setup()
+    const chunk = 'Approval flow. ' + 'details '.repeat(40) + 'FINAL-WORDS'
+    kb.kbSearch.mockResolvedValue([hit(chunk)])
+    renderAt('/project/3/kb?q=approval')
+    expect(await screen.findByText(/2 annotations/)).toBeInTheDocument()
+    expect(screen.getByText(/needs a rewrite/)).toBeInTheDocument()
+    expect(screen.queryByText(/FINAL-WORDS/)).toBeNull()
+    await user.click(screen.getByRole('button', { name: 'Show passage' }))
+    expect(screen.getByLabelText('Matched passage')).toHaveTextContent('FINAL-WORDS')
+    expect(screen.getByText(/Score 0\.80 · semantic 0\.71 · chunk 3/)).toBeInTheDocument()
+    expect(screen.getByText(/agents see only the short excerpt/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Hide passage' }))
+    expect(screen.queryByLabelText('Matched passage')).toBeNull()
+  })
+
+  it('offers no toggle when the hit carries no chunk text', async () => {
+    kb.kbSearch.mockResolvedValue([{ ...hit('short chunk'), chunk_text: undefined }])
+    renderAt('/project/3/kb?q=approval')
+    await screen.findByText(/2 annotations/)
+    expect(screen.queryByRole('button', { name: 'Show passage' })).toBeNull()
+  })
+})

@@ -64,6 +64,9 @@ copy the address bar to share exactly what you see.
 - **Artifacts** — mockups, diagrams and other pages agents published for review
   (`working/artifacts.md`).
 - **Library** — the project's knowledge base, plus links to the team and org KBs and this guide.
+  The search box matches titles and doc text, not just titles. Each hit shows a short excerpt (what
+  agents get from `amp_kb_search`) and any annotation summary; "Show passage" opens the whole matched
+  chunk with its score and chunk number.
 - **Settings** — general (including which org the project is in), plan approval, merges (whether
   dependents wait for merges), metadata, team access, knowledge bases, trash (restore deleted
   tickets), and for owners the GitHub token and the GitHub merge webhook, then webhooks, the audit

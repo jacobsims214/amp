@@ -361,6 +361,12 @@ export interface KBSearchResult {
   title: string
   tags: string[]
   excerpt: string
+  /** the whole matched chunk; the excerpt is its first 120 characters */
+  chunk_text?: string
+  /** position of the matched chunk within the doc */
+  chunk_index?: number
+  /** semantic similarity in [0,1]; present when the hit came from the vector half of a hybrid search */
+  vector_score?: number
   author: string
   updated_at: number
   score: number
