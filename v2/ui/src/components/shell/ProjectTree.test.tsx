@@ -34,6 +34,12 @@ describe('ProjectTree', () => {
     expect(within(screen.getByRole('region', { name: 'No org' })).queryByRole('link', { name: /^Shared/ })).toBeNull()
   })
 
+  it('names a non-member org from the project\'s org_name', () => {
+    render(<MemoryRouter><ProjectTree projects={[{ ...mk(2, 'Shared', 9), org_name: 'Initech' }]} orgs={orgs} search="" waitIn={() => undefined} /></MemoryRouter>)
+    expect(within(screen.getByRole('region', { name: 'Initech' })).getByRole('link', { name: /^Shared/ })).toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: 'Org #9' })).toBeNull()
+  })
+
   it('still groups by org_id when me.orgs is empty (auth off)', () => {
     render(<MemoryRouter><ProjectTree projects={[mk(1, 'Alpha', 1), mk(2, 'Beta', 2)]} orgs={[]} search="" waitIn={() => undefined} /></MemoryRouter>)
     expect(screen.getByRole('region', { name: 'Org #1' })).toBeInTheDocument()

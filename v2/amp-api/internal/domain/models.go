@@ -51,8 +51,11 @@ type Project struct {
 	State       ProjectState `json:"state"`
 	// OrgID is the org the project belongs to. Only that org's teams can be
 	// linked to it. Nil only transiently for rows predating orgs.
-	OrgID     *int `json:"org_id"`
-	CreatedBy *int `json:"created_by"`
+	OrgID *int `json:"org_id"`
+	// OrgName is filled on project lists only, so the UI can name the org of a
+	// project the caller can see without belonging to that org.
+	OrgName   string `json:"org_name,omitempty"`
+	CreatedBy *int   `json:"created_by"`
 	// OpenReassign lets any project member take or reassign a ticket that
 	// isn't in progress. Otherwise only its owner or a lead can.
 	OpenReassign bool `json:"open_reassign"`

@@ -45,9 +45,10 @@ export function ProjectTree({ projects, orgs, currentId, search, waitIn }: Props
 
   // Groups: one per org_id among the visible projects, named from the orgs we
   // know (me.orgs only lists memberships, so a shared or admin-visible project's
-  // org falls back to "Org #id"); then projects with no org at all.
+  // org is named by the project's org_name, else "Org #id"); then projects with no org at all.
   const groups = useMemo(() => {
     const names = new Map(orgs.map(o => [o.id, o.name]))
+    for (const p of visible) if (p.org_id != null && p.org_name && !names.has(p.org_id)) names.set(p.org_id, p.org_name)
     const ids: number[] = orgs.map(o => o.id)
     for (const p of visible) if (p.org_id != null && !ids.includes(p.org_id)) ids.push(p.org_id)
     const gs = ids.map(id => ({ key: `org:${id}`, name: names.get(id) ?? `Org #${id}`, items: visible.filter(p => p.org_id === id && !pinnedIds.has(p.id)) }))

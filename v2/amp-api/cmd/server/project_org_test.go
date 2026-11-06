@@ -93,3 +93,28 @@ func TestProjectOrg_TeamLeadLinks(t *testing.T) {
 	w.as(w.orgadmin).call(t, "amp_manage_project_teams", link(w.devs.ID, "owner"))
 	lead.call(t, "amp_manage_project_teams", link(w.ops.ID, "owner"))
 }
+
+// The project list names each project's org, so the UI can label a project in
+// an org the caller isn't a member of (here, root sees both orgs' projects).
+func TestProjectOrg_ListCarriesOrgName(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	p, err := w.s.repo.CreateProject(context.Background(), domain.CreateProjectRequest{Name: "named", Code: fmt.Sprintf("nm-%d", w.other.ID), OrgID: &w.other.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := ra.want(t, 200, "root", http.MethodGet, "/api/projects", nil)
+	found := false
+	for _, x := range out["projects"].([]any) {
+		m := x.(map[string]any)
+		if int(m["id"].(float64)) == p.ID {
+			found = true
+			if m["org_name"] != w.other.Name {
+				t.Fatalf("org_name = %v, want %q", m["org_name"], w.other.Name)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("project missing from list")
+	}
+}
