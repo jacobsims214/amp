@@ -97,8 +97,8 @@ func (s *Service) ResolveProjectHome(ctx context.Context, p authz.Principal, org
 		if err != nil {
 			return home, err
 		}
-		if !p.HasUser() {
-			// Local dev (auth disabled) is one anonymous user: use the
+		if !p.HasUser() || p.LocalDev() {
+			// Local dev (auth disabled) is one global admin: use the
 			// Default org the migration creates, if there's a choice.
 			for _, o := range orgs {
 				if o.Slug == "default" {

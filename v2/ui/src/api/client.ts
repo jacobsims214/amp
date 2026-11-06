@@ -8,6 +8,7 @@ import type {
   ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork, MyWorkCounts, PeopleWaiting,
 } from '../types'
 import { auditQuery, auditVerifyUrl, type AuditScope } from '../lib/audit'
+import { apiErrorMessage } from '../lib/apiError'
 
 const BASE = '/api'
 
@@ -22,7 +23,7 @@ async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`)
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
-    throw new Error(err.error || `GET ${path}: ${res.status}`)
+    throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `GET ${path}: ${res.status}`)), { status: res.status })
   }
   return res.json()
 }
@@ -35,7 +36,7 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw Object.assign(new Error(err.error || `POST ${path}: ${res.status}`), { status: res.status })
+    throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `POST ${path}: ${res.status}`)), { status: res.status })
   }
   return res.json()
 }
@@ -48,7 +49,7 @@ async function patch<T>(path: string, body?: unknown): Promise<T> {
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(err.error || `PATCH ${path}: ${res.status}`)
+    throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `PATCH ${path}: ${res.status}`)), { status: res.status })
   }
   return res.json()
 }
@@ -61,7 +62,7 @@ async function put<T>(path: string, body?: unknown): Promise<T> {
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw Object.assign(new Error(err.error || `PUT ${path}: ${res.status}`), { status: res.status })
+    throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `PUT ${path}: ${res.status}`)), { status: res.status })
   }
   return res.json()
 }
@@ -72,7 +73,7 @@ async function del<T = void>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { method: 'DELETE' })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw Object.assign(new Error(err.error || `DELETE ${path}: ${res.status}`), { status: res.status })
+    throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `DELETE ${path}: ${res.status}`)), { status: res.status })
   }
   return res.json().catch(() => undefined) as Promise<T>
 }
@@ -332,7 +333,10 @@ export const api = {
   // Export
   exportProject: async (projectId: number): Promise<{ blob: Blob; filename: string }> => {
     const res = await fetch(`${BASE}/projects/${projectId}/export`)
-    if (!res.ok) throw new Error(`Export failed: ${res.status}`)
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `Export failed: ${res.status}`)), { status: res.status })
+    }
     
     // Get filename from Content-Disposition header or construct it
     const contentDisposition = res.headers.get('content-disposition')
@@ -493,7 +497,7 @@ async function authadminReq<T>(path: string, method: string, body?: unknown): Pr
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(err.error || `${method} ${path}: ${res.status}`)
+    throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `${method} ${path}: ${res.status}`)), { status: res.status })
   }
   return res.json()
 }

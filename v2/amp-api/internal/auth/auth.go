@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,6 +22,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -165,6 +167,12 @@ type Verifier struct {
 	// lookupOnly: see Config.LookupOnly.
 	lookupOnly bool
 
+	// localUser is the AMP user behind the local-dev identity when auth is
+	// off, once ProvisionLocalDev has run (#124); nil before, or if it
+	// failed (the identity then has no AMP user, as before). A pointer to
+	// shared storage, so the WithAudiences copies see it too.
+	localUser *atomic.Pointer[domain.User]
+
 	// OnEvent, when set, receives authentication events for the audit log
 	// (sign-ins, refused sign-ups, new accounts and accepted invites, API
 	// token use and failures). It runs on the request path and must be
@@ -215,7 +223,8 @@ func NewVerifier(ctx context.Context, cfg Config) (*Verifier, error) {
 
 	if cfg.IssuerURL == "" {
 		slog.Warn("auth disabled: OIDC_ISSUER_URL not set — all requests treated as anonymous local-dev user")
-		return &Verifier{enabled: false, repo: cfg.Repo, bootstrapAdmins: admins, uiClientID: strings.TrimSpace(cfg.UIClientID)}, nil
+		return &Verifier{enabled: false, repo: cfg.Repo, bootstrapAdmins: admins, uiClientID: strings.TrimSpace(cfg.UIClientID),
+			localUser: new(atomic.Pointer[domain.User])}, nil
 	}
 
 	discoveryURL := cfg.DiscoveryURL
@@ -235,6 +244,54 @@ func NewVerifier(ctx context.Context, cfg Config) (*Verifier, error) {
 	v := &Verifier{inner: verifier, enabled: true, repo: cfg.Repo, bootstrapAdmins: admins, uiClientID: strings.TrimSpace(cfg.UIClientID),
 		lookupOnly: cfg.LookupOnly}
 	return v, nil
+}
+
+// The identity every request has when auth is off.
+const (
+	LocalDevSubject = repository.LocalDevSubject
+	LocalDevEmail   = repository.LocalDevEmail
+	LocalDevName    = "Local Dev"
+)
+
+// Enabled reports whether auth is on (OIDC_ISSUER_URL is set).
+func (v *Verifier) Enabled() bool { return v.enabled }
+
+// ProvisionLocalDev runs once at startup (#124). With auth off it makes the
+// local-dev identity a real AMP user, an admin of the Default org, so My
+// work, approvals, People & agents and tokens work for it, and returns it.
+// With auth on it never creates that user: it deactivates the one an
+// auth-off boot left behind (if any), so neither a sign-in nor one of its
+// tokens can act as it, and returns nil. Idempotent either way.
+func (v *Verifier) ProvisionLocalDev(ctx context.Context) (*domain.User, error) {
+	if v.enabled {
+		if v.repo == nil || v.lookupOnly {
+			return nil, nil
+		}
+		exists, agents, err := v.repo.DisableLocalDevUser(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			slog.Info("auth on: the Local Dev user (made while auth was off) is deactivated")
+		}
+		if agents > 0 {
+			slog.Warn("auth on: agent accounts made by the Local Dev user while auth was off are still active, and so are their tokens; "+
+				"review them in People & agents and deactivate any you don't want", "agents", agents)
+		}
+		return nil, nil
+	}
+	if v.localUser == nil {
+		return nil, nil
+	}
+	if v.repo == nil {
+		return nil, errors.New("provision local dev user: no repository")
+	}
+	u, err := v.repo.ProvisionLocalDevUser(ctx, LocalDevSubject, LocalDevEmail, LocalDevName)
+	if err != nil {
+		return nil, err
+	}
+	v.localUser.Store(u)
+	return u, nil
 }
 
 // WithAudiences returns a copy of v that only accepts tokens whose aud
@@ -276,7 +333,14 @@ func (v *Verifier) verifyAudience(audience []string) bool {
 func (v *Verifier) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !v.enabled {
-			ident := &Identity{Subject: "local-dev", Email: "local-dev@amp.local", Name: "Local Dev", LocalDev: true, Listener: v.label}
+			ident := &Identity{Subject: LocalDevSubject, Email: LocalDevEmail, Name: LocalDevName, LocalDev: true, Listener: v.label}
+			if v.localUser != nil {
+				if u := v.localUser.Load(); u != nil {
+					cp := *u
+					cp.Roles = slices.Clone(u.Roles)
+					ident.User = &cp
+				}
+			}
 			ident.Channel = v.channelOf(ident)
 			ident.AuthMethod = AuthLocalDev
 			r = r.WithContext(context.WithValue(r.Context(), identityCtxKey, ident))
@@ -393,6 +457,12 @@ func (v *Verifier) identityFromJWT(w http.ResponseWriter, r *http.Request, rawTo
 		return ident
 	}
 	if v.lookupOnly {
+		if claims.Subject == LocalDevSubject || strings.EqualFold(strings.TrimSpace(claims.Email), LocalDevEmail) {
+			// Reserved for auth-off mode (#124): never the Local Dev user,
+			// even if an auth-off boot left it active.
+			slog.Warn("token refused (lookup only): the Local Dev identity is reserved for auth-off mode", "listener", v.label, "subject", claims.Subject)
+			return ident
+		}
 		u, err := v.repo.GetUserBySubject(r.Context(), claims.Subject)
 		if err != nil {
 			// Not yet an AMP user here (or the lookup failed): no user on the
@@ -416,6 +486,10 @@ func (v *Verifier) identityFromJWT(w http.ResponseWriter, r *http.Request, rawTo
 			"user_agent", r.UserAgent(),
 			"request_uri", r.RequestURI,
 		)
+	case errors.Is(err, repository.ErrReservedIdentity):
+		slog.Warn("JIT user provisioning refused: the Local Dev identity is reserved for auth-off mode", "subject", claims.Subject, "email", claims.Email)
+		v.emit(r.Context(), Event{Kind: EventSignupRefused, Subject: claims.Subject, Email: claims.Email,
+			Reason: "the Local Dev identity (local-dev@amp.local) is reserved for AMP with sign-in off; sign in with another account"})
 	case errors.Is(err, repository.ErrSignupNotAllowed):
 		slog.Warn("JIT user provisioning refused: email domain not allowed", "subject", claims.Subject, "email", claims.Email)
 		v.emit(r.Context(), Event{Kind: EventSignupRefused, Subject: claims.Subject, Email: claims.Email,
@@ -461,6 +535,15 @@ func (v *Verifier) identityFromAPIToken(w http.ResponseWriter, r *http.Request, 
 				Reason: "invalid, expired, or revoked API token"})
 		}
 		v.writeUnauthorized(w, "invalid, expired, or revoked API token")
+		return nil
+	}
+	if u.Subject == LocalDevSubject && u.Kind != domain.UserKindAgent {
+		// A token the Local Dev user made while auth was off (#124): that
+		// user is an admin nobody signs in as, so with auth on its tokens
+		// are refused rather than acting as it.
+		v.emit(r.Context(), Event{Kind: EventTokenFail, TokenPrefix: rawToken[:min(len(rawToken), tokenPrefixLen)],
+			Reason: "token of the Local Dev user, made while sign-in was off"})
+		v.writeUnauthorized(w, "this token belongs to the Local Dev user, made while sign-in was off; it can't be used with sign-in on")
 		return nil
 	}
 	return &Identity{Subject: u.Subject, Email: u.Email, Name: u.DisplayName, User: u, APIToken: true, TokenID: tokenID}
@@ -607,7 +690,11 @@ func RequireRole(role string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ident, ok := FromContext(r.Context())
 		if !ok || !ident.HasRole(role) {
-			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+			// A sentence that names what's missing, never a bare "forbidden" (#124).
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			msg := fmt.Sprintf("this needs the AMP %s role, which your account doesn't have; ask an AMP admin to grant it", role)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 			return
 		}
 		next(w, r)
