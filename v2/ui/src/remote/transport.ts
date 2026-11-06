@@ -8,7 +8,8 @@
  */
 import type { PairMessage } from './protocol'
 import type { CommandEnvelope, RelayFrame, SessionDetail, SessionSummary } from './types'
-import { apiErrorMessage } from '../lib/apiError'
+import { apiErrorMessage, NOT_SIGNED_IN } from '../lib/apiError'
+import { isSessionEnded, markSessionEnded, sessionLost } from '../lib/session'
 
 export class RelayError extends Error {
   status: number
@@ -61,6 +62,8 @@ export const RELAY_DOWN_MESSAGE = "Remote control is unavailable right now (the 
  * audit_unavailable) and keeps its own message.
  */
 async function errorFrom(res: Response): Promise<RelayError> {
+  // The proxy turned this away (#153): the whole app shows "sign in again".
+  if (sessionLost(res)) markSessionEnded()
   const raw = await res.text().catch(() => '')
   let body: { error?: string; code?: string } = {}
   try {
@@ -71,6 +74,11 @@ async function errorFrom(res: Response): Promise<RelayError> {
     return new RelayError(res.status, 'relay_down', RELAY_DOWN_MESSAGE)
   }
   return new RelayError(res.status, body.code ?? `http_${res.status}`, apiErrorMessage(res.status, body.error, `Request failed (${res.status})`))
+}
+
+/** Once the session has ended (#153) no relay call goes out: the app shows "sign in again". */
+function refuseIfEnded() {
+  if (isSessionEnded()) throw new RelayError(401, 'session_ended', NOT_SIGNED_IN)
 }
 
 const enc = encodeURIComponent
@@ -114,6 +122,7 @@ export class SSEParser {
 
 export const httpTransport: RelayTransport = {
   async listSessions() {
+    refuseIfEnded()
     const res = await fetch('/api/sessions', { headers: { Accept: 'application/json' } })
     if (!res.ok) throw await errorFrom(res)
     const body = await res.json() as { sessions?: SessionSummary[] }
@@ -121,6 +130,7 @@ export const httpTransport: RelayTransport = {
   },
 
   async getSession(id) {
+    refuseIfEnded()
     const res = await fetch(`/api/sessions/${enc(id)}`, { headers: { Accept: 'application/json' } })
     if (!res.ok) throw await errorFrom(res)
     return res.json()
@@ -140,6 +150,7 @@ export const httpTransport: RelayTransport = {
     const finish = (err?: RelayError) => { if (!closed) { closed = true; h.onClose(err) } }
     ;(async () => {
       try {
+        refuseIfEnded()
         const res = await fetch(url, { headers: { Accept: 'text/event-stream' }, signal: ctl.signal, cache: 'no-store' })
         if (!res.ok || !res.body) { finish(await errorFrom(res)); return }
         h.onOpen()
@@ -151,14 +162,15 @@ export const httpTransport: RelayTransport = {
           parser.push(value)
         }
         finish()
-      } catch {
-        finish()
+      } catch (e) {
+        finish(e instanceof RelayError ? e : undefined)
       }
     })()
     return () => { closed = true; ctl.abort() }
   },
 
   async postCommand(id, env) {
+    refuseIfEnded()
     const res = await fetch(`/api/sessions/${enc(id)}/commands`, {
       method: 'POST', headers: { 'Content-Type': 'application/json; charset=utf-8' }, body: JSON.stringify(env),
     })
@@ -166,11 +178,13 @@ export const httpTransport: RelayTransport = {
   },
 
   async disconnect(id) {
+    refuseIfEnded()
     const res = await fetch(`/api/sessions/${enc(id)}/disconnect`, { method: 'POST' })
     if (!res.ok) throw await errorFrom(res)
   },
 
   async revokeAll() {
+    refuseIfEnded()
     const res = await fetch('/api/sessions/revoke-all', { method: 'POST' })
     if (!res.ok) throw await errorFrom(res)
     const body = await res.json().catch(() => ({})) as { ended?: number; devices_revoked?: number }
@@ -178,6 +192,7 @@ export const httpTransport: RelayTransport = {
   },
 
   async pair(id, msg) {
+    refuseIfEnded()
     const res = await fetch(`/api/sessions/${enc(id)}/pair`, {
       method: 'POST', headers: { 'Content-Type': 'application/json; charset=utf-8' }, body: JSON.stringify(msg),
     })
