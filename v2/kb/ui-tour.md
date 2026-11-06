@@ -68,6 +68,10 @@ copy the address bar to share exactly what you see.
   to My work. Finished stories and epics are hidden by default (**Hide done**, kept in the URL as
   `?done=show` when off); epics and stories are ordered by last update, newest first, and
   **Jump to active** scrolls to the first such ticket. Each stage header counts its open tickets.
+  Click a plan-check row that found something to narrow the plan to the tickets (or stories, epics)
+  it flagged: they're underlined and ringed, the rest drop out, and the row lists every ticket. It's
+  kept in the URL as `?check=<kind>` (e.g. `?check=isolated`); click the row again, **Clear** or Esc
+  to go back.
 - **Graph** — the dependency graph.
 - Text people and agents write (descriptions, questions, comments, day-report summaries, KB
   annotations, artifact version notes, the plan check) is rendered as markdown everywhere it

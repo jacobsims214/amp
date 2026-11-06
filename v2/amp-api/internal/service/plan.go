@@ -349,6 +349,11 @@ type PlanIssue struct {
 	Severity string `json:"severity,omitempty"`
 	Message  string `json:"message"`
 	TaskIDs  []int  `json:"task_ids,omitempty"`
+	// StoryIDs and EpicIDs name the containers a finding is about when it has
+	// no ticket to point at (an empty story, an epic with drifted metadata),
+	// so the Flight plan can still light the right rows (#156).
+	StoryIDs []int  `json:"story_ids,omitempty"`
+	EpicIDs  []int  `json:"epic_ids,omitempty"`
 	Fix      string `json:"fix,omitempty"`
 }
 
@@ -509,6 +514,7 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 			}
 		}
 		var drift []string
+		var driftEpics []int
 		for _, e := range epics {
 			var missing, odd []string
 			for k := range expected {
@@ -531,11 +537,12 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 				line += " but has " + strings.Join(odd, ", ") + " (only this epic uses that)"
 			}
 			drift = append(drift, line)
+			driftEpics = append(driftEpics, e.ID)
 		}
 		if len(drift) > 0 {
 			sort.Strings(drift)
 			r.Issues = append(r.Issues, PlanIssue{
-				Kind: "metadata_drift", Severity: "warn",
+				Kind: "metadata_drift", Severity: "warn", EpicIDs: driftEpics,
 				Message: "Epics don't carry the same metadata: " + strings.Join(drift, "; ") + ". Reports group by these keys, so this work drops out of those rollups.",
 				Fix:     "Set the missing keys with amp_update_epic metadata (use the same key names the other epics use), and remove a misspelled key by setting it to null.",
 			})
@@ -666,16 +673,19 @@ func planGraph(r *PlanReport, tasks []domain.Task, stories []domain.Story) (stuc
 		storyTasks[t.StoryID]++
 	}
 	var empty []string
+	var emptyIDs []int
 	for _, st := range stories {
 		if storyTasks[st.ID] == 0 {
+			emptyIDs = append(emptyIDs, st.ID)
 			empty = append(empty, fmt.Sprintf("%q (#%d)", st.Name, st.ID))
 		}
 	}
 	if len(empty) > 0 {
 		r.Issues = append(r.Issues, PlanIssue{
-			Kind:    "empty_stories",
-			Message: "Stories with no tickets: " + strings.Join(empty, ", "),
-			Fix:     "Add their tickets, move tickets into them (amp_move_task), or delete them (amp_delete_story).",
+			Kind:     "empty_stories",
+			StoryIDs: emptyIDs,
+			Message:  "Stories with no tickets: " + strings.Join(empty, ", "),
+			Fix:      "Add their tickets, move tickets into them (amp_move_task), or delete them (amp_delete_story).",
 		})
 	}
 

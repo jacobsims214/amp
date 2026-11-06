@@ -211,6 +211,9 @@ export interface PlanIssue {
   kind: 'isolated' | 'wide_start' | 'empty_stories' | 'no_context' | string
   message: string
   task_ids?: number[]
+  /** Containers the finding is about when it has no ticket to point at (empty stories, drifted epics). */
+  story_ids?: number[]
+  epic_ids?: number[]
   fix?: string
   /** 'warn' for advice that doesn't make the plan NO-GO */
   severity?: 'warn'

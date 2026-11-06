@@ -18,6 +18,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { useFocusParam } from '../hooks/useFocusParam'
 import { flagParam, useSearchParamState } from '../hooks/useSearchParamState'
+import { useSearchParam } from '../hooks/useSearchParam'
 import { FocusNotFound } from '../components/FocusNotFound'
 import { useFocusFallback } from '../hooks/useFocusFallback'
 import { Crosshair, GitBranch, Loader2, RefreshCw } from 'lucide-react'
@@ -102,21 +103,22 @@ const ISSUE_TITLE: Record<string, string> = {
   duplicate_merge_step: 'One merge step per PR',
 }
 
-function Chip({ t, state, crit, active, lit, sel, dim, onClick }: {
-  t: Task; state: DisplayState; crit: boolean; active: boolean; lit: boolean; sel: boolean; dim: boolean; onClick: () => void
+function Chip({ t, state, crit, active, lit, sel, dim, flagged, onClick }: {
+  t: Task; state: DisplayState; crit: boolean; active: boolean; lit: boolean; sel: boolean; dim: boolean; flagged?: boolean; onClick: () => void
 }) {
   const filled = state === 'done' || state === 'flag'
   return (
     <button type="button" onClick={onClick} title={`#${t.id} ${t.name} · ${STATE_LABEL[state]}`}
-      aria-label={`Ticket ${t.id}: ${t.name}, ${STATE_LABEL[state]}`} aria-pressed={sel} data-active={active}
+      aria-label={`Ticket ${t.id}: ${t.name}, ${STATE_LABEL[state]}${flagged ? ', flagged by the plan check' : ''}`} aria-pressed={sel} data-active={active} data-check-hit={flagged || undefined}
       className="relative inline-grid place-items-center min-w-[40px] h-[19px] px-[3px] m-[1px] amp-num text-[10px] cursor-pointer transition-opacity"
       style={{
         borderRadius: 'var(--radius)', border: `1px solid ${STATE_VAR[state]}`,
         color: filled ? '#fff' : state === 'ready' ? 'var(--ink)' : STATE_VAR[state],
         background: filled ? STATE_VAR[state] : `color-mix(in srgb, ${STATE_VAR[state]} 9%, var(--surface))`,
         outline: crit ? '1.5px solid var(--accent)' : undefined, outlineOffset: 1,
-        boxShadow: sel ? '0 0 0 3px var(--accent)' : undefined,
-        opacity: dim && !lit && !sel ? 0.16 : 1,
+        boxShadow: sel ? '0 0 0 3px var(--accent)' : flagged ? '0 0 0 2px var(--ink)' : undefined,
+        textDecoration: flagged ? 'underline' : undefined, fontWeight: flagged ? 700 : undefined,
+        opacity: dim && !lit && !sel && !flagged ? 0.16 : 1,
       }}>
       {t.id}
       {t.priority === '3' && <i className="absolute -top-px -right-px w-0 h-0 border-t-[6px] border-l-[6px] border-l-transparent"
@@ -136,6 +138,8 @@ export function FlightPlan() {
   const [focus, setFocus] = useState<number | null>(() => openId)
   const [hideDone, setHideDone] = useSearchParamState('done', HIDE_DONE)
   const [report, setReport] = useState<PlanReport | null>(null)
+  // ?check=<kind> lights the tickets (or stories, epics) one plan-check row is about; it is linkable.
+  const [checkKind, setCheckKind] = useSearchParam('check')
   // Bumped on each check, so the GO stamps replay like a fresh poll.
   const [poll, setPoll] = useState(0)
   const [checking, setChecking] = useState(true)
@@ -164,6 +168,22 @@ export function FlightPlan() {
   const opened = openId != null ? tasks.find(t => t.id === openId) ?? null : null
   const focusMissing = useFocusFallback(pid, 'plan', openId, tasks, loading)
 
+  const checkIssue = checkKind ? (report?.issues ?? []).find(i => i.kind === checkKind) : undefined
+  const checkSel = useMemo(() => checkIssue && (checkIssue.task_ids?.length || checkIssue.story_ids?.length || checkIssue.epic_ids?.length)
+    ? { tasks: new Set(checkIssue.task_ids ?? []), stories: new Set(checkIssue.story_ids ?? []), epics: new Set(checkIssue.epic_ids ?? []) } : null, [checkIssue])
+  // Escape leaves the check view (unless a ticket drawer is open: Escape closes that first).
+  useEffect(() => {
+    if (!checkKind || openId != null) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setCheckKind(null) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [checkKind, openId, setCheckKind])
+  // Bring the first flagged ticket (or story) into view once the grid has it.
+  useEffect(() => {
+    if (!checkSel || loading) return
+    document.querySelector('[data-check-hit="true"]')?.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' })
+  }, [checkSel, loading])
+
   // Most recently updated first, finished work last. Hiding done drops a story or epic with nothing open
   // (including one with no tickets), so what's left is the live plan. The focused ticket's story and epic
   // stay (with their done chips) so a ?focus= link to finished work still lands on it.
@@ -173,17 +193,20 @@ export function FlightPlan() {
     const all = stories.filter(s => s.epic_id === e.id).map(s => {
       const own = tasks.filter(t => t.story_id === s.id)
       const open = own.filter(t => t.state !== 'completed').length
-      return { story: s, own, tasks: own.filter(t => !hideDone || t.state !== 'completed' || t.id === focusTask?.id), total: own.length,
+      const flagged = !!checkSel && (checkSel.stories.has(s.id) || own.some(t => checkSel.tasks.has(t.id)))
+      return { story: s, own, flagged, tasks: own.filter(t => !hideDone || t.state !== 'completed' || t.id === focusTask?.id || !!checkSel?.tasks.has(t.id)), total: own.length,
         open, finished: open === 0, touched: lastTouched(own, s.updated_at), id: s.id }
     })
-    const ss = all.filter(s => !(hideDone && s.open === 0 && s.story.id !== focusTask?.story_id)).sort(byRecent)
+    // A plan check narrows the grid to what it flagged: other stories and epics drop out, finished or not.
+    const ss = (checkSel ? all.filter(s => s.flagged)
+      : all.filter(s => !(hideDone && s.open === 0 && s.story.id !== focusTask?.story_id))).sort(byRecent)
     const total = all.reduce((n, s) => n + s.total, 0)
     const open = all.reduce((n, s) => n + s.open, 0)
-    return { epic: e, stories: ss, total, open, finished: open === 0, id: e.id,
+    return { epic: e, stories: ss, flagged: !!checkSel?.epics.has(e.id), total, open, finished: open === 0, id: e.id,
       touched: Math.max(lastTouched([], e.updated_at), ...all.map(s => s.touched)) }
-  }).filter(r => !(hideDone && r.open === 0 && r.epic.id !== focusTask?.epic_id)).sort(byRecent),
-  [epics, stories, tasks, hideDone, focusTask])
-  const hiddenEpics = hideDone ? epics.length - rows.length : 0
+  }).filter(r => checkSel ? r.flagged || r.stories.length > 0 : !(hideDone && r.open === 0 && r.epic.id !== focusTask?.epic_id)).sort(byRecent),
+  [epics, stories, tasks, hideDone, focusTask, checkSel])
+  const hiddenEpics = hideDone && !checkSel ? epics.length - rows.length : 0
 
   const stageCounts = useMemo(() => {
     const c = Array.from({ length: shape.stages }, () => ({ total: 0, open: 0 }))
@@ -200,19 +223,27 @@ export function FlightPlan() {
   const pollRow = (kind: string, okDetail: string) => {
     const issue: PlanIssue | undefined = issueByKind.get(kind)
     const stamp = Math.max(0, pollOrder.indexOf(kind)) * 90
+    const targets = (issue?.task_ids?.length ?? 0) + (issue?.story_ids?.length ?? 0) + (issue?.epic_ids?.length ?? 0)
+    const selected = !!issue && checkKind === kind && targets > 0
+    const title = ISSUE_TITLE[kind] ?? kind.replace(/_/g, ' ')
     return (
-      <div key={kind} className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 px-4 py-2.5 border-t border-line first:border-t-0" data-check={kind}>
-        <span className="text-[13px] text-ink">{ISSUE_TITLE[kind] ?? kind.replace(/_/g, ' ')}</span>
+      <div key={kind} className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 px-4 py-2.5 border-t border-line first:border-t-0" data-check={kind}
+        style={selected ? { background: 'var(--surface-2)', boxShadow: 'inset 3px 0 0 var(--ink)' } : undefined}>
+        {targets > 0
+          ? <button type="button" aria-pressed={selected} onClick={() => setCheckKind(selected ? null : kind)}
+            title={selected ? 'Back to the whole plan' : 'Show what this check found in the plan'}
+            className="text-[13px] text-ink text-left underline underline-offset-2 cursor-pointer">{title}</button>
+          : <span className="text-[13px] text-ink">{title}</span>}
         <Verdict key={`${poll}-${kind}`} ok={!issue} warn={issue?.severity === 'warn'} stampDelay={stamp} />
         {issue
           ? <div className="col-span-2"><Markdown size="compact" projectId={pid}>{issue.message}</Markdown></div>
           : <span className="col-span-2 text-[11.5px] text-ink-2 leading-snug">{okDetail}</span>}
         {issue?.task_ids && issue.task_ids.length > 0 && (
           <span className="col-span-2 flex flex-wrap gap-1">
-            {issue.task_ids.slice(0, 18).map(id => (
+            {(selected ? issue.task_ids : issue.task_ids.slice(0, 18)).map(id => (
               <button key={id} type="button" onClick={() => setFocus(id)} className="amp-num text-[10.5px] px-1 border border-line hover:border-ink cursor-pointer">#{id}</button>
             ))}
-            {issue.task_ids.length > 18 && <span className="amp-num text-[10.5px] text-ink-3">+{issue.task_ids.length - 18}</span>}
+            {!selected && issue.task_ids.length > 18 && <span className="amp-num text-[10.5px] text-ink-3">+{issue.task_ids.length - 18}</span>}
           </span>
         )}
         {issue?.fix && <span className="col-span-2 text-[11.5px] text-ink-3">{issue.fix}</span>}
@@ -249,6 +280,13 @@ export function FlightPlan() {
 
         <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1fr)_340px]">
           <section className="amp-panel min-w-0 overflow-x-auto" aria-label="Plan by stage">
+            {checkIssue && checkSel && (
+              <div role="status" className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5 border-b border-line bg-surface-2 text-[12.5px] text-ink">
+                <span className="font-semibold">{ISSUE_TITLE[checkIssue.kind] ?? checkIssue.kind.replace(/_/g, ' ')}:</span>
+                <span className="text-ink-2">showing only what this check flagged. Flagged tickets, stories and epics are underlined.</span>
+                <button type="button" className="amp-btn amp-btn-sm ml-auto" onClick={() => setCheckKind(null)}>Clear <span className="text-ink-3">Esc</span></button>
+              </div>
+            )}
             {tasks.length === 0 ? (
               <p className="m-0 px-5 py-8 text-center text-[13.5px] text-ink-2">No tickets yet. When your planner agent files a plan, it shows up here stage by stage.</p>
             ) : (
@@ -265,25 +303,31 @@ export function FlightPlan() {
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.length === 0 && (
+                  {rows.length === 0 && checkSel && (
+                    <tr><td colSpan={shape.stages + 1} className="px-5 py-6 text-center text-[13px] text-ink-2">
+                      Nothing this check flagged is in the loaded plan. <button type="button" className="underline underline-offset-2 cursor-pointer" onClick={() => setCheckKind(null)}>Clear check</button>
+                    </td></tr>
+                  )}
+                  {rows.length === 0 && !checkSel && (
                     <tr><td colSpan={shape.stages + 1} className="px-5 py-6 text-center text-[13px] text-ink-2">
                       Everything here is done. <button type="button" className="underline underline-offset-2 cursor-pointer" onClick={() => setHideDone(false)}>Show done</button>
                     </td></tr>
                   )}
                   {rows.map(r => (
                     <FragmentRows key={r.epic.id} epicName={r.epic.name} epicPriority={r.epic.priority} cols={shape.stages}
-                      count={r.total} open={r.open}>
+                      count={r.total} open={r.open} flagged={r.flagged}>
                       {r.stories.map(s => (
-                        <tr key={s.story.id}>
+                        <tr key={s.story.id} data-check-hit={(s.flagged && !s.tasks.some(t => checkSel?.tasks.has(t.id))) || undefined}>
                           <td className="px-4 py-1.5 border-b border-line align-top">
-                            <span className="block text-[12.5px] text-ink truncate" title={s.story.name}>{s.story.name}</span>
+                            <span className={`block text-[12.5px] text-ink truncate${checkSel?.stories.has(s.story.id) ? ' font-bold underline' : ''}`} title={s.story.name}>
+                              {checkSel?.stories.has(s.story.id) && <span className="sr-only">Flagged by the plan check: </span>}{s.story.name}</span>
                             <span className="block amp-num text-[10px] text-ink-3">{s.total ? `${s.total} ticket${s.total === 1 ? '' : 's'}` : <span className="text-danger-ink">no tickets</span>}</span>
                           </td>
                           {stageCounts.map((_, i) => (
                             <td key={i} className="px-0.5 py-1 border-b border-l border-dashed border-line text-center align-top">
                               {s.tasks.filter(t => shape.depth.get(t.id) === i).map(t => (
                                 <Chip key={t.id} t={t} state={displayState(t)} crit={shape.crit.has(t.id)}
-                                  active={['prog', 'flag'].includes(displayState(t))} lit={!!lit?.all.has(t.id)} sel={focus === t.id} dim={focus != null}
+                                  active={['prog', 'flag'].includes(displayState(t))} lit={!!lit?.all.has(t.id)} sel={focus === t.id} dim={focus != null || !!checkSel} flagged={!!checkSel?.tasks.has(t.id)}
                                   onClick={() => setFocus(f => f === t.id ? null : t.id)} />
                               ))}
                             </td>
@@ -383,16 +427,17 @@ function Verdict({ ok, warn, stampDelay }: { ok: boolean; warn?: boolean; stampD
   )
 }
 
-function FragmentRows({ epicName, epicPriority, count, open, cols, children }: {
-  epicName: string; epicPriority: string; count: number; open: number; cols: number; children: React.ReactNode
+function FragmentRows({ epicName, epicPriority, count, open, cols, flagged, children }: {
+  epicName: string; epicPriority: string; count: number; open: number; cols: number; flagged?: boolean; children: React.ReactNode
 }) {
   return (
     <>
-      <tr className="bg-surface-2">
+      <tr className="bg-surface-2" data-check-hit={flagged || undefined}>
         <td colSpan={cols + 1} className="px-4 py-2 border-b border-line">
           <span className="inline-flex items-center gap-3">
             <span className="amp-bands-v h-[14px]" aria-hidden="true" />
-            <span className="font-label text-[11.5px] font-semibold uppercase tracking-[0.14em] text-ink">{epicName}</span>
+            <span className={`font-label text-[11.5px] font-semibold uppercase tracking-[0.14em] text-ink${flagged ? ' underline' : ''}`}>
+              {flagged && <span className="sr-only">Flagged by the plan check: </span>}{epicName}</span>
             <PriorityMark priority={epicPriority} />
             <span className="amp-num text-[10.5px] text-ink-3">{open < count ? `${open} open of ${count} tickets` : `${count} ${count === 1 ? 'ticket' : 'tickets'}`}</span>
           </span>

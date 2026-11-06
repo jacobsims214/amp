@@ -383,6 +383,14 @@ func TestPlan_CheckPlan(t *testing.T) {
 	if _, ok := kinds["empty_stories"]; !ok || !strings.Contains(fmt.Sprint(report["issues"]), fmt.Sprintf("#%d", empty)) {
 		t.Errorf("expected the empty story: %v", report["issues"])
 	}
+	// The empty-story finding names its story, so the Flight plan can light that row (#156).
+	for _, iss := range report["issues"].([]interface{}) {
+		if m := iss.(map[string]interface{}); m["kind"] == "empty_stories" {
+			if ids, _ := m["story_ids"].([]interface{}); len(ids) != 1 || int(ids[0].(float64)) != empty {
+				t.Errorf("empty_stories story_ids = %v, want [%d]", m["story_ids"], empty)
+			}
+		}
+	}
 	if report["ok"] != false {
 		t.Error("a plan with issues isn't ok")
 	}
@@ -665,6 +673,7 @@ func TestPlan_CheckPlanWarnsOnMetadataDrift(t *testing.T) {
 	s.call(t, "amp_update_epic", map[string]interface{}{"epic_id": float64(s.epicID), "metadata": map[string]interface{}{"capitalizable": true, "jira_epic": "NWC-1"}})
 	epic("catalog", map[string]interface{}{"capitalizable": true, "jira_epic": "NWC-2"})
 	epic("orders", map[string]interface{}{"capitalizable": true, "jira_epic": "NWC-3"})
+	quotes := s.call(t, "amp_create_epic", map[string]interface{}{"project_id": pid, "name": "quotes2", "description": "d", "metadata": map[string]interface{}{"capitalizable": true}})
 	epic("quotes", map[string]interface{}{"capitalizable": true, "jira_key": "NWC-12"})
 
 	report := s.call(t, "amp_check_plan", map[string]interface{}{"project_id": pid})
@@ -679,6 +688,11 @@ func TestPlan_CheckPlanWarnsOnMetadataDrift(t *testing.T) {
 		}
 		if strings.Contains(msg, `"catalog"`) {
 			t.Fatalf("a complete epic is flagged: %v", msg)
+		}
+		// The drifted epics are named by id, so the Flight plan can light them (#156).
+		ids, _ := m["epic_ids"].([]interface{})
+		if len(ids) != 2 || int(ids[0].(float64)) == s.epicID || int(ids[1].(float64)) == s.epicID {
+			t.Fatalf("drift epic_ids = %v (quotes2 %v)", m["epic_ids"], quotes)
 		}
 		return
 	}
