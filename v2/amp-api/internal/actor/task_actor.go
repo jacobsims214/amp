@@ -128,9 +128,10 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 
 	case *MsgCompleteTask:
 		was := a.task.State
-		closeout, err := a.handleComplete(ctx, msg)
+		closeout, fanned, err := a.handleComplete(ctx, msg)
 		changed := err == nil && was != domain.TaskStateCompleted && a.task.State == domain.TaskStateCompleted
-		msg.ReplyCh <- ReplyComplete{Task: ptrTask(a.withBlockedBy()), Closeout: closeout, Changed: changed, Err: err}
+		reply := ReplyComplete{Task: ptrTask(a.withBlockedBy()), Closeout: closeout, Changed: changed, Err: err}
+		replyAfterFan(fanned, func() { msg.ReplyCh <- reply })
 
 	case *MsgClaimStart:
 		started, err := a.handleClaimStart(msg)
@@ -248,7 +249,8 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		a.checkUnblock(ctx)
 
 	case *MsgSetMergeState:
-		msg.ReplyCh <- a.handleSetMergeState(ctx, msg)
+		reply, fanned := a.handleSetMergeState(ctx, msg)
+		replyAfterFan(fanned, func() { msg.ReplyCh <- reply })
 
 	case *MsgScheduledUnblock:
 		// Timer fired — transition task from blocked to backlog
@@ -411,22 +413,22 @@ func (a *TaskActor) handleHold(msg *MsgCompleteTask) error {
 // recorded as a closeout: a caller that isn't the ticket's worker (no
 // dispatch_id, or not the current one), or a ticket no worker ever started
 // (AMP #2801).
-func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (bool, error) {
+func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (bool, <-chan ReplySimple, error) {
 	by := msg.By
 	if a.task.State == domain.TaskStateCompleted {
 		// Idempotent. A repeat is the worker's only if it presents the
 		// dispatch that completed it, which the ticket no longer carries.
-		return !a.task.IsHuman(), nil
+		return !a.task.IsHuman(), nil, nil
 	}
 	if a.task.State != domain.TaskStateInProgress && !msg.CloseoutOK && msg.MergeStepFor == 0 {
 		if msg.RequireStarted {
-			return false, fmt.Errorf("task %d is %s: it was never dispatched, so it can't be completed off the web UI; dispatch it first, "+
+			return false, nil, fmt.Errorf("task %d is %s: it was never dispatched, so it can't be completed off the web UI; dispatch it first, "+
 				"or close it out with closeout_reason if its worker already finished it", a.task.ID, a.task.State)
 		}
 	}
 	if msg.RequireDeps {
 		if err := a.refuseOpenDeps("completed"); err != nil {
-			return false, err
+			return false, nil, err
 		}
 	}
 	// Closeout: the caller isn't the worker that was dispatched. A worker's
@@ -442,7 +444,7 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 	// (AMP #2908).
 	closeout := !msg.InUI && a.task.CompletionIsCloseout(msg.DispatchID, msg.CloseoutReason)
 	if msg.DispatchID != "" && !a.task.CurrentDispatch(msg.DispatchID) && a.task.DispatchID != "" {
-		return false, fmt.Errorf("task %d: dispatch %q is no longer current (the ticket was returned and re-dispatched as %q); "+
+		return false, nil, fmt.Errorf("task %d: dispatch %q is no longer current (the ticket was returned and re-dispatched as %q); "+
 			"re-read the ticket and use the dispatch_id in your prompt, or close it out with closeout_reason if you aren't its worker",
 			a.task.ID, msg.DispatchID, a.task.DispatchID)
 	}
@@ -461,17 +463,17 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 		}
 	}
 	if msg.Hold {
-		return closeout, a.handleHold(msg)
+		return closeout, nil, a.handleHold(msg)
 	}
 	// A done ticket has no current dispatch, in the database too: a reload
 	// mustn't make the old token current again (AMP #2944).
 	if err := a.repo.ClearTaskDispatch(context.Background(), a.task.ID, false); err != nil {
-		return false, fmt.Errorf("db clear dispatch: %w", err)
+		return false, nil, fmt.Errorf("db clear dispatch: %w", err)
 	}
 	// Nor is it returned any more: a returned ticket closed out directly (or
 	// completed in the UI) leaves the returned list and loses its tag (AMP #2947).
 	if err := a.repo.ClearTaskReturn(context.Background(), a.task.ID); err != nil {
-		return false, fmt.Errorf("db clear return: %w", err)
+		return false, nil, fmt.Errorf("db clear return: %w", err)
 	}
 	a.task.ReturnedAt, a.task.ReturnedReason = nil, ""
 	now := time.Now()
@@ -481,7 +483,7 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 	a.task.DispatchID = ""
 
 	if err := a.saveState(domain.TaskStateCompleted, ""); err != nil {
-		return false, fmt.Errorf("db complete: %w", err)
+		return false, nil, fmt.Errorf("db complete: %w", err)
 	}
 	mergeWait := ""
 	if msg.MergeRequired {
@@ -489,7 +491,7 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 		// waiting until the merge is recorded (AMP #2475).
 		yes := true
 		if err := a.repo.SetTaskMerge(context.Background(), a.task.ID, &yes, domain.MergeNeeded, nil, ""); err != nil {
-			return closeout, fmt.Errorf("db merge needed: %w", err)
+			return closeout, nil, fmt.Errorf("db merge needed: %w", err)
 		}
 		a.task.MergeRequired, a.task.MergeState, a.task.MergedAt, a.task.MergeSource = true, domain.MergeNeeded, nil, ""
 		mergeWait = repository.MergeWaitDetail(a.task.ID, domain.MergeNeeded, msg.MergeWhere)
@@ -528,13 +530,15 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 	}
 	a.log.Info("completed", "closeout", closeout)
 
-	// Synchronously ask ProjectActor to fan MsgDepCompleted to ALL epics/stories/tasks.
-	// We WAIT for this to complete before returning, so that any caller who reads
-	// task state after MsgCompleteTask returns will see the unblocked state immediately.
+	// Ask ProjectActor to fan MsgDepCompleted to ALL epics/stories/tasks. The
+	// caller's reply waits for that fan-out (see replyAfterFan), so whoever
+	// reads task state after MsgCompleteTask returns sees the unblocked state
+	// immediately. This actor must not wait for it itself: the ProjectActor
+	// may be mid-request into this very task (collectAllTasks → epic → story
+	// → task), and the two would deadlock the whole project.
 	// With a merge needed the fan-out tells dependents why they still wait.
 	fanReplyCh := make(chan ReplySimple, 1)
 	ctx.Send(a.projectPID, &MsgFanDepCompleted{CompletedTaskID: a.task.ID, MergeWait: mergeWait, ReplyCh: fanReplyCh})
-	<-fanReplyCh
 	if msg.MergeRequired {
 		a.logActivity("system", "merge_needed", "", "", "Done; its work waits on a merge ("+nameOr(msg.MergeWhere, "pushed work")+
 			"), so the tickets that depend on it wait until the merge is recorded")
@@ -542,7 +546,7 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 
 	// Then notify parent StoryActor for state rollup (async is fine for rollup).
 	ctx.Send(a.storyPID, &MsgTaskCompleted{TaskID: a.task.ID})
-	return closeout, nil
+	return closeout, fanReplyCh, nil
 }
 
 // handleClaimStart starts the ticket its worker was dispatched for
@@ -1232,7 +1236,7 @@ func (a *TaskActor) dependsOn(id int) bool {
 // ticket holding its dependents (merged, or not needed) releases them the
 // way completion does; one that starts holding them (a PR reported after
 // completion, an abandoned PR) makes them wait again.
-func (a *TaskActor) handleSetMergeState(ctx actor.Context, msg *MsgSetMergeState) ReplyMergeState {
+func (a *TaskActor) handleSetMergeState(ctx actor.Context, msg *MsgSetMergeState) (ReplyMergeState, <-chan ReplySimple) {
 	cur := a.task.MergeState
 	if cur == "" {
 		cur = domain.MergeNone
@@ -1244,7 +1248,7 @@ func (a *TaskActor) handleSetMergeState(ctx actor.Context, msg *MsgSetMergeState
 		}
 		if !ok {
 			t := a.withBlockedBy()
-			return ReplyMergeState{Task: &t}
+			return ReplyMergeState{Task: &t}, nil
 		}
 	}
 	required := a.task.MergeRequired
@@ -1253,7 +1257,7 @@ func (a *TaskActor) handleSetMergeState(ctx actor.Context, msg *MsgSetMergeState
 	}
 	if cur == msg.State && required == a.task.MergeRequired {
 		t := a.withBlockedBy()
-		return ReplyMergeState{Task: &t}
+		return ReplyMergeState{Task: &t}, nil
 	}
 	at, source := a.task.MergedAt, a.task.MergeSource
 	if msg.State == domain.MergeMerged {
@@ -1266,7 +1270,7 @@ func (a *TaskActor) handleSetMergeState(ctx actor.Context, msg *MsgSetMergeState
 		at, source = nil, ""
 	}
 	if err := a.repo.SetTaskMerge(context.Background(), a.task.ID, &required, msg.State, at, source); err != nil {
-		return ReplyMergeState{Err: fmt.Errorf("db merge state: %w", err)}
+		return ReplyMergeState{Err: fmt.Errorf("db merge state: %w", err)}, nil
 	}
 	done := a.task.State == domain.TaskStateCompleted
 	heldBefore := done && domain.MergeGates(cur)
@@ -1282,20 +1286,38 @@ func (a *TaskActor) handleSetMergeState(ctx actor.Context, msg *MsgSetMergeState
 	t := a.withBlockedBy()
 	a.publish(domain.EventTaskUpdated, t)
 
+	// As in handleComplete, the caller waits for the fan-out, never this actor.
+	var fan chan ReplySimple
 	switch {
 	case heldBefore && !heldAfter:
-		fan := make(chan ReplySimple, 1)
+		fan = make(chan ReplySimple, 1)
 		ctx.Send(a.projectPID, &MsgFanDepCompleted{CompletedTaskID: a.task.ID, ReplyCh: fan})
-		<-fan
 	case heldAfter:
 		// Newly held, or held for a new reason (an abandoned PR): dependents
 		// wait (again) and say why.
-		fan := make(chan ReplySimple, 1)
+		fan = make(chan ReplySimple, 1)
 		ctx.Send(a.projectPID, &MsgFanDepCompleted{CompletedTaskID: a.task.ID,
 			MergeWait: repository.MergeWaitDetail(a.task.ID, msg.State, msg.Where), ReplyCh: fan})
-		<-fan
 	}
-	return ReplyMergeState{Task: &t, Changed: true}
+	return ReplyMergeState{Task: &t, Changed: true}, fan
+}
+
+// replyAfterFan answers a caller once the ProjectActor has acknowledged a
+// dependency fan-out, without holding this actor's mailbox while it waits.
+// A TaskActor that blocks on its ProjectActor deadlocks the project whenever
+// the ProjectActor is itself waiting on this task (collectAllTasks for
+// amp_list_tasks, the board, waiting-on-people), and every later request for
+// the project then hangs. The fan-out only enqueues messages, so the
+// acknowledgement arrives as soon as the ProjectActor is free.
+func replyAfterFan(fan <-chan ReplySimple, reply func()) {
+	if fan == nil {
+		reply()
+		return
+	}
+	go func() {
+		<-fan
+		reply()
+	}()
 }
 
 func (a *TaskActor) publish(evtType domain.EventType, payload interface{}) {
