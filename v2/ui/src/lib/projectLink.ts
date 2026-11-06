@@ -27,3 +27,8 @@ export function viewLink(projectId: number | string, view: ProjectView, search: 
   const focus = Number(new URLSearchParams(search).get('focus'))
   return projectLink(projectId, view, FOCUS_VIEWS.includes(view) && Number.isInteger(focus) ? focus : null)
 }
+
+/** The full-page view of one ticket: `/project/:id/ticket/:ticketId`, with `rest` (tab, run, event) as its query. */
+export function ticketPageLink(projectId: number | string, ticketId: number, rest = ''): string {
+  return `/project/${projectId}/ticket/${ticketId}${rest ? `?${rest}` : ''}`
+}

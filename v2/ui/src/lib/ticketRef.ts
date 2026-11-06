@@ -6,7 +6,7 @@
  * ticket: `/t/BA-34`, `/t/ba-34` and `/t/34` all open ticket 34, wherever it
  * lives. The code is there for people reading the link.
  */
-import { projectLink } from './projectLink'
+import { projectLink, ticketPageLink } from './projectLink'
 
 /** `BA-34` for a project code and id; just the id when the code is unknown. */
 export function ticketRef(code: string | null | undefined, id: number): string {
@@ -67,7 +67,11 @@ export function parseTicketRef(raw: string): { code: string | null; id: number }
 export function ticketLanding(projectId: number, id: number, search: string, extra: Record<string, string> = {}): string {
   const params = new URLSearchParams(search)
   params.delete('focus')
+  // ?view=page asks for the full-page view instead of the drawer.
+  const page = params.get('view') === 'page'
+  params.delete('view')
   for (const [k, v] of Object.entries(extra)) params.set(k, v)
   const rest = params.toString()
+  if (page) return ticketPageLink(projectId, id, rest)
   return `${projectLink(projectId, 'board', id)}${rest ? `&${rest}` : ''}`
 }

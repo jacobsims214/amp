@@ -1,9 +1,9 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
-import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, UserRound, ShieldCheck, ShieldAlert, ArrowRight, GitMerge, Check, RotateCcw, Link2 } from 'lucide-react'
+import { X, Clock, Maximize2, ArrowLeft, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, UserRound, ShieldCheck, ShieldAlert, ArrowRight, GitMerge, Check, RotateCcw, Link2 } from 'lucide-react'
 import { Link, useLocation, useSearchParams } from 'react-router-dom'
 import { HUMAN_REASONS, isHuman, reasonHint, reasonLabel } from '../lib/human'
 import { approvalOf, approvalOwner, formatWhen, isRelayed, isYours, relayedFor } from '../lib/approval'
-import { projectLink, type ProjectView } from '../lib/projectLink'
+import { projectLink, ticketPageLink, type ProjectView } from '../lib/projectLink'
 import { softBreaks } from '../lib/brief'
 import { useSearchParam } from '../hooks/useSearchParam'
 import { usePatchSearchParams } from '../hooks/useSearchParamState'
@@ -48,6 +48,12 @@ interface Props {
   onTaskUpdated?: (task: Task) => void
   /** the project's not_started_flag_minutes: past it the amber badge is filled (0 = flag off) */
   notStartedFlagMinutes?: number
+  /**
+   * `drawer` (default) slides over a board; `page` is the same sections laid
+   * out in a wide centered column on /project/:id/ticket/:id (no scrim, no
+   * Escape; Close becomes "Back to board").
+   */
+  layout?: 'drawer' | 'page'
 }
 
 function relativeTime(iso: string) {
@@ -117,7 +123,8 @@ const inputCls =
   'w-full bg-bg border border-line rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-3 ' +
   'focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-all font-[inherit]'
 
-export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAccess = null, openReassign = false, onTaskUpdated, notStartedFlagMinutes }: Props) {
+export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAccess = null, openReassign = false, onTaskUpdated, notStartedFlagMinutes, layout = 'drawer' }: Props) {
+  const isPage = layout === 'page'
   // History and comments, tagged with the ticket they were read for: until
   // the first read for this ticket answers, the History tab shows a skeleton;
   // a reread (state or owner changed) keeps the rows on screen meanwhile.
@@ -195,11 +202,11 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   useEffect(() => {
     if (!task) return
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !editing && !showDeleteConfirm) onClose()
+      if (!isPage && e.key === 'Escape' && !editing && !showDeleteConfirm) onClose()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [task, editing, showDeleteConfirm, onClose])
+  }, [task, editing, showDeleteConfirm, onClose, isPage])
 
   const handleEditSave = async () => {
     setEditSaving(true)
@@ -215,7 +222,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
       await api.updateTask(task!.id, changes)
       setEditing(false)
       onRefresh?.()
-      onClose()
+      if (!isPage) onClose()
     } catch (e) {
       setEditError(e instanceof Error ? e.message : 'Save failed')
     } finally {
@@ -244,7 +251,8 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   const canPlan = canPlanTask(task, meId, myAccess)
   const history = log?.taskId === task.id ? log : null
   const view = focusView(location.pathname)
-  const ticketHref = (id: number) => projectLink(task.project_id, view, id)
+  const ticketHref = (id: number) => isPage ? ticketPageLink(task.project_id, id) : projectLink(task.project_id, view, id)
+  const fullPageHref = ticketPageLink(task.project_id, task.id, new URLSearchParams([...searchParams].filter(([k]) => ['tab', 'run', 'event', 'ref'].includes(k))).toString())
   // The human panel leads with the brief, so Details doesn't repeat it.
   const showHumanWork = isHuman(task) && task.state !== 'completed' && displayState(task) !== 'flag'
 
@@ -272,16 +280,17 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   return (
     <>
       {/* Backdrop */}
-      <div
+      {!isPage && <div
         className="fixed inset-0 z-40"
         style={{ background: 'var(--scrim)' }}
         onClick={onClose}
-      />
+      />}
 
-      {/* Drawer */}
+      {/* Drawer, or the full-page column */}
       <div
-        className="fixed right-0 top-0 h-full w-[520px] z-50 flex flex-col"
-        style={{
+        data-testid={isPage ? 'ticket-page' : 'task-drawer'}
+        className={isPage ? 'mx-auto w-full max-w-[1080px] min-h-full flex flex-col' : 'fixed right-0 top-0 h-full w-[520px] z-50 flex flex-col'}
+        style={isPage ? { background: 'var(--surface)', borderInline: '1px solid var(--line)' } : {
           background: 'var(--surface)',
           borderLeft: '1px solid var(--line)',
           boxShadow: '-12px 0 32px color-mix(in srgb, var(--ink) 10%, transparent)',
@@ -327,9 +336,21 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
             >
               <Trash2 size={13} className="text-danger/70 hover:text-danger" />
             </button>
-            <button onClick={onClose} className="amp-btn amp-btn-ghost amp-btn-sm" aria-label="Close">
-              <X size={15} className="text-ink-2" />
-            </button>
+            {isPage ? (
+              <Link to={projectLink(task.project_id, 'board', task.id)} className="amp-btn amp-btn-ghost amp-btn-sm"
+                title="Back to the board, with this ticket in the drawer">
+                <ArrowLeft size={13} aria-hidden="true" />Back to board
+              </Link>
+            ) : (
+              <>
+                <Link to={fullPageHref} className="amp-btn amp-btn-ghost amp-btn-sm" title="Open this ticket as a full page" aria-label="Open full page">
+                  <Maximize2 size={13} className="text-ink-2" aria-hidden="true" />
+                </Link>
+                <button onClick={onClose} className="amp-btn amp-btn-ghost amp-btn-sm" aria-label="Close">
+                  <X size={15} className="text-ink-2" />
+                </button>
+              </>
+            )}
           </div>
         </div>
 
@@ -483,7 +504,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto p-6">
+        <div className={`flex-1 p-6 ${isPage ? '' : 'overflow-y-auto'}`}>
           {editing && canPlan ? (
             <div className="space-y-4">
               <div>
@@ -547,7 +568,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
             </div>
           ) : tab === 'details' ? (
             // Details needs nothing from the history read: it renders at once.
-            <DetailsTab task={task} plan={plan} focusRunId={focusRunId} hideBrief={showHumanWork} onClose={onClose} onRefresh={onRefresh} canWork={canWork} canPlan={canPlan}
+            <DetailsTab task={task} plan={plan} focusRunId={focusRunId} hideBrief={showHumanWork} onClose={isPage ? undefined : onClose} onRefresh={onRefresh} canWork={canWork} canPlan={canPlan}
               onUpdated={t => (onTaskUpdated ? onTaskUpdated(t) : onRefresh?.())} />
           ) : history ? (
             <HistoryTab history={history.history} comments={history.comments} people={people} focusEventId={focusEventId} />
@@ -844,7 +865,7 @@ function TaskMetadata({ task, canEdit, onSaved }: { task: Task; canEdit: boolean
 }
 
 function DetailsTab({ task, plan, focusRunId = null, hideBrief, onClose, onRefresh, canWork, canPlan, onUpdated }: {
-  task: Task; plan: ProjectPlan; focusRunId?: number | null; hideBrief: boolean; onClose: () => void; onRefresh?: () => void; canWork: boolean; canPlan: boolean; onUpdated: (t: Task) => void
+  task: Task; plan: ProjectPlan; focusRunId?: number | null; hideBrief: boolean; onClose?: () => void; onRefresh?: () => void; canWork: boolean; canPlan: boolean; onUpdated: (t: Task) => void
 }) {
   const [editingSchedule, setEditingSchedule] = useState(false)
   const [scheduleValue, setScheduleValue] = useState('')
@@ -860,7 +881,7 @@ function DetailsTab({ task, plan, focusRunId = null, hideBrief, onClose, onRefre
       const iso = scheduleValue ? new Date(scheduleValue).toISOString() : null
       await api.setTaskStartAt(task.id, iso)
       setEditingSchedule(false)
-      onClose()
+      onClose?.()
       onRefresh?.()
     } finally {
       setSavingSchedule(false)
@@ -941,7 +962,7 @@ function DetailsTab({ task, plan, focusRunId = null, hideBrief, onClose, onRefre
                 <button
                   onClick={async () => {
                     setSavingSchedule(true)
-                    try { await api.setTaskStartAt(task.id, null); setEditingSchedule(false); onClose(); onRefresh?.() }
+                    try { await api.setTaskStartAt(task.id, null); setEditingSchedule(false); onClose?.(); onRefresh?.() }
                     finally { setSavingSchedule(false) }
                   }}
                   disabled={savingSchedule}

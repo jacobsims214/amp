@@ -51,7 +51,15 @@ anywhere (Trace, Day reports, an agent's message, a commit):
   says so in one line (`?ref=`). It opens the ticket's
   project Board with the drawer open (replace, so Back skips the hop) and
   keeps every other param: `/t/BA-34?tab=details`, `/t/BA-34?run=12`. A ticket
-  that doesn't exist or that you can't see says so.
+  that doesn't exist or that you can't see says so. Add `?view=page` to land
+  on the ticket's full page instead (`/t/BA-34?view=page`).
+- **`/project/:id/ticket/:ticketId`**, a ticket as a full page: the drawer's
+  sections (brief, acceptance criteria, state, owner, runs, artifacts,
+  dependencies, history and comments) in a wide column. The drawer's **Open
+  full page** links here, keeping `tab`, `run`, `event` and `ref`; the page's
+  **Back to board** returns to the Board with `?focus=` set. A ticket under the
+  wrong project's URL redirects to its own; a missing one says "not found" and a
+  forbidden one says "no access".
 - **`/r/<run id>`**, a run. It opens the run's ticket with `?run=<id>`
   (`GET /api/runs/:id` says which ticket).
 
@@ -67,10 +75,11 @@ The server links people to tickets this way (`TaskURL` in amp-api, and the
 |---|---|---|---|---|
 | `focus` | every project view that shows tickets | ticket id; opens its drawer (My work outlines the item) | none | push to open, replace to close |
 | `ticket`, `task` | old links | aliases of `focus`, rewritten to it on arrival | none | replace |
-| `tab` | ticket drawer | `details`, `history` (`runs` reads as `details`) | the ticket's own: Details for a ticket not started and an open human ticket, History otherwise | replace |
+| `tab` | ticket drawer, full-page ticket | `details`, `history` (`runs` reads as `details`) | the ticket's own: Details for a ticket not started and an open human ticket, History otherwise | replace |
 | `run` | ticket drawer | run id: opens Details, scrolls to that run and highlights it | none | link only |
 | `ref` | ticket drawer | the ref a `/t/` link was typed with, when its code isn't the ticket's project's: shown as a one-line notice | none | link only (set by `/t/`) |
 | `event` | ticket drawer | activity id: opens History, scrolls to that entry and highlights it | none | link only |
+| `view` | `/t/<ref>` only | `page`: land on the full-page ticket instead of the drawer (consumed by the redirect) | the drawer | replace |
 | `approve` | My work | `<epic id>[,<epic id>…]` or `all` | none | push |
 | `user` | project My work | user id, whose My work to show | the viewer | link only |
 | `status` | Board | `ready`, `in_progress`, `done`, `waiting` | all states | push |
