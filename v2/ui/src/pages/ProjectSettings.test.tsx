@@ -40,6 +40,16 @@ function renderAs(access: ProjectAccess) {
   )
 }
 
+// Replace an input's text in ONE step (select-all + type), then wait for the
+// controlled input to hold exactly that text. clear-then-type raced a
+// re-render on a loaded CI runner: the cleared '' was reverted to '10' and
+// the typed '5' appended to it, saving 105.
+async function replaceText(user: ReturnType<typeof userEvent.setup>, el: HTMLElement, text: string) {
+  const input = el as HTMLInputElement
+  await user.type(input, text, { initialSelectionStart: 0, initialSelectionEnd: input.value.length })
+  await vi.waitFor(() => expect(input).toHaveValue(text))
+}
+
 beforeEach(() => {
   state.update.mockReset()
   state.credential.mockReset()
@@ -56,12 +66,12 @@ describe('ProjectSettings require_merge', () => {
     expect(toggle).toBeChecked()
 
     await user.click(toggle)
-    expect(state.update).toHaveBeenLastCalledWith(3, { require_merge: false })
+    await vi.waitFor(() => expect(state.update).toHaveBeenLastCalledWith(3, { require_merge: false }))
     expect(await screen.findByText(/dependents start as soon as a ticket is done/i)).toBeInTheDocument()
     expect(toggle).not.toBeChecked()
 
     await user.click(toggle)
-    expect(state.update).toHaveBeenLastCalledWith(3, { require_merge: true })
+    await vi.waitFor(() => expect(state.update).toHaveBeenLastCalledWith(3, { require_merge: true }))
     await vi.waitFor(() => expect(toggle).toBeChecked())
   })
 
@@ -157,10 +167,10 @@ describe('ProjectSettings dispatch watchdog', () => {
     await vi.waitFor(() => expect(flag).toBeEnabled())
     expect(save).toBeDisabled() // nothing changed yet
 
-    await user.clear(flag)
-    await user.type(flag, '5')
+    await replaceText(user, flag, '5')
+    await vi.waitFor(() => expect(save).toBeEnabled())
     await user.click(save)
-    expect(state.update).toHaveBeenLastCalledWith(3, { not_started_flag_minutes: 5, not_started_return_minutes: 30 })
+    await vi.waitFor(() => expect(state.update).toHaveBeenLastCalledWith(3, { not_started_flag_minutes: 5, not_started_return_minutes: 30 }))
     await vi.waitFor(() => expect(screen.getByText('Saved')).toBeInTheDocument())
   })
 
@@ -170,13 +180,14 @@ describe('ProjectSettings dispatch watchdog', () => {
     renderAs('owner')
     const ret = await screen.findByLabelText(/return it to ready after/i)
     await vi.waitFor(() => expect(ret).toBeEnabled())
-    await user.clear(ret)
-    await user.type(ret, '0')
+    await replaceText(user, ret, '0')
     // The hint renders after the input's state update; wait for it rather than racing it on a busy CI runner.
     expect(await screen.findByText('Off: this never happens.')).toBeInTheDocument()
     expect(await screen.findByText(/automatic return is off/i)).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: /save watchdog/i }))
-    expect(state.update).toHaveBeenLastCalledWith(3, { not_started_flag_minutes: 10, not_started_return_minutes: 0 })
+    const saveBtn = screen.getByRole('button', { name: /save watchdog/i })
+    await vi.waitFor(() => expect(saveBtn).toBeEnabled())
+    await user.click(saveBtn)
+    await vi.waitFor(() => expect(state.update).toHaveBeenLastCalledWith(3, { not_started_flag_minutes: 10, not_started_return_minutes: 0 }))
   })
 
   it('refuses text that is not a whole number of minutes, and never sends it', async () => {
@@ -184,8 +195,7 @@ describe('ProjectSettings dispatch watchdog', () => {
     renderAs('owner')
     const flag = await screen.findByLabelText(/flag it for its owner after/i)
     await vi.waitFor(() => expect(flag).toBeEnabled())
-    await user.clear(flag)
-    await user.type(flag, '1.5')
+    await replaceText(user, flag, '1.5')
     expect(screen.getAllByRole('alert').map(e => e.textContent).join(' ')).toMatch(/whole number of minutes, 0 \(off\) to 1440/i)
     expect(screen.getByRole('button', { name: /save watchdog/i })).toBeDisabled()
     expect(state.update).not.toHaveBeenCalled()
@@ -196,8 +206,7 @@ describe('ProjectSettings dispatch watchdog', () => {
     renderAs('owner')
     const flag = await screen.findByLabelText(/flag it for its owner after/i)
     await vi.waitFor(() => expect(flag).toBeEnabled())
-    await user.clear(flag)
-    await user.type(flag, '40')
+    await replaceText(user, flag, '40')
     expect(screen.getByText(/never reaches the flag first/i)).toBeInTheDocument()
   })
 
