@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef } from 'react'
 import type { SSEEvent } from '../types'
+import { checkSession, isSessionEnded, onSessionEnded } from '../lib/session'
 
 const EVENTS_URL = '/api/events'
 
@@ -31,10 +32,19 @@ function open(url: string, shared: Omit<Shared, 'source'>): EventSource {
       try { listener(event) } catch (err) { console.error('useSSE listener failed', err) }
     }
   }
-  // EventSource reconnects by itself after a dropped stream; we let it.
-  source.onerror = () => {}
+  // EventSource reconnects by itself after a dropped stream; we let it. When
+  // it gives up (CLOSED: the answer was an error status or not a stream),
+  // ask whether the session ended, since the stream can't show its status.
+  source.onerror = () => {
+    if (isSessionEnded()) { source.close(); return }
+    if (source.readyState === 2 /* CLOSED */) void checkSession()
+  }
   return source
 }
+
+// A lost session (#153) closes every stream: reconnecting would only get the
+// proxy's sign-in answer again, over and over.
+onSessionEnded(() => { for (const shared of registry.values()) shared.source.close() })
 
 /**
  * Subscribe to the shared event stream at url. Returns the unsubscribe. The
@@ -46,7 +56,7 @@ export function subscribeSSE(url: string, listener: Listener): () => void {
     const listeners = new Set<Listener>()
     shared = { listeners, source: open(url, { listeners }) }
     registry.set(url, shared)
-  } else if (shared.source.readyState === 2 /* CLOSED */) {
+  } else if (shared.source.readyState === 2 /* CLOSED */ && !isSessionEnded()) {
     // The browser gave up (e.g. the server answered with an error status);
     // a new subscriber is a good moment to try again.
     shared.source = open(url, shared)

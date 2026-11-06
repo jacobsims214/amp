@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, render, renderHook } from '@testing-library/react'
 import { sseSubscriberCount, subscribeSSE, useSSE } from './useSSE'
 import type { SSEEvent } from '../types'
+import { isSessionEnded, markSessionEnded, resetSession } from '../lib/session'
 
 class FakeEventSource {
   static instances: FakeEventSource[] = []
@@ -24,7 +25,7 @@ beforeEach(() => {
   FakeEventSource.instances = []
   vi.stubGlobal('EventSource', FakeEventSource)
 })
-afterEach(() => vi.unstubAllGlobals())
+afterEach(() => { vi.unstubAllGlobals(); resetSession() })
 
 describe('useSSE', () => {
   it('shares one EventSource across every subscriber', () => {
@@ -137,5 +138,39 @@ describe('useSSE', () => {
     expect(sseSubscriberCount()).toBe(1)
     offOk()
     expect(es.closed).toBe(true)
+  })
+
+  describe('once the session ended (#153)', () => {
+    it('closes the stream and does not reopen it for new subscribers', () => {
+      const a = renderHook(() => useSSE(1, () => {}))
+      const [es] = FakeEventSource.instances
+      act(() => markSessionEnded())
+      expect(es.closed).toBe(true)
+      const b = renderHook(() => useSSE(2, () => {}))
+      expect(FakeEventSource.instances).toHaveLength(1) // no reconnect loop
+      a.unmount(); b.unmount()
+    })
+
+    it('a stream the browser gave up on asks whether the session ended', async () => {
+      const fetchMock = vi.fn(async () => new Response('Unauthorized', { status: 401 }))
+      vi.stubGlobal('fetch', fetchMock)
+      const a = renderHook(() => useSSE(1, () => {}))
+      const [es] = FakeEventSource.instances
+      es.readyState = 2 // CLOSED: the proxy answered 401, not a stream
+      es.onerror?.()
+      await vi.waitFor(() => expect(isSessionEnded()).toBe(true))
+      expect(fetchMock).toHaveBeenCalledWith('/api/me', expect.objectContaining({ redirect: 'manual' }))
+      a.unmount()
+    })
+
+    it('a blip the browser retries by itself probes nothing', () => {
+      const fetchMock = vi.fn()
+      vi.stubGlobal('fetch', fetchMock)
+      const a = renderHook(() => useSSE(1, () => {}))
+      FakeEventSource.instances[0].onerror?.() // readyState CONNECTING: reconnecting
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(isSessionEnded()).toBe(false)
+      a.unmount()
+    })
   })
 })

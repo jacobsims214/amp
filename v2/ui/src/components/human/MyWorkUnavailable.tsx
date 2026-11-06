@@ -12,12 +12,8 @@ import { Link } from 'react-router-dom'
 import { ChevronRight, LogIn, TriangleAlert, UserX } from 'lucide-react'
 import type { NoMyWork } from '../../lib/myWorkAccess'
 import { projectLink } from '../../lib/projectLink'
+import { signInAgainUrl } from '../../lib/session'
 
-/** Sign in, then come back here (oauth2-proxy's start URL, as AuthProvider uses). */
-function signInHref(): string {
-  const here = window.location.pathname + window.location.search
-  return `/oauth2/start?rd=${encodeURIComponent(here)}`
-}
 
 export function MyWorkUnavailable({ reason, projectId, email }: { reason: NoMyWork; projectId?: number; email?: string }) {
   const local = reason === 'local-dev'
@@ -43,7 +39,7 @@ export function MyWorkUnavailable({ reason, projectId, email }: { reason: NoMyWo
         {local && <li>Check amp-api's startup log for why the Local Dev user wasn't set up, then restart it; or run AMP with sign-in on (set <code className="amp-num text-[12px]">OIDC_ISSUER_URL</code>) and sign in.</li>}
       </ul>
       <div className="flex flex-wrap gap-2.5 mt-1">
-        {!local && <a href={signInHref()} className="amp-btn amp-btn-primary amp-btn-sm inline-flex items-center gap-1.5"><LogIn size={14} aria-hidden="true" />Sign in</a>}
+        {!local && <a href={signInAgainUrl()} className="amp-btn amp-btn-primary amp-btn-sm inline-flex items-center gap-1.5"><LogIn size={14} aria-hidden="true" />Sign in</a>}
         <Link to={board.to} className="amp-btn amp-btn-sm inline-flex items-center gap-1">{board.label}<ChevronRight size={14} aria-hidden="true" /></Link>
       </div>
     </section>

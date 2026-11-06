@@ -8,7 +8,8 @@ import type {
   ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork, MyWorkCounts, PeopleWaiting,
 } from '../types'
 import { auditQuery, auditVerifyUrl, type AuditScope } from '../lib/audit'
-import { apiErrorMessage } from '../lib/apiError'
+import { apiErrorMessage, NOT_SIGNED_IN } from '../lib/apiError'
+import { isSessionEnded, markSessionEnded, sessionLost } from '../lib/session'
 
 const BASE = '/api'
 
@@ -19,64 +20,45 @@ function kbQuery(ref: KBRef): string {
   return `project_id=${ref.project_id}`
 }
 
-async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`)
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `GET ${path}: ${res.status}`)), { status: res.status })
+const sessionEndedError = () => Object.assign(new Error(NOT_SIGNED_IN), { status: 401, sessionEnded: true })
+
+/**
+ * Every AMP API call goes through here. A response from oauth2-proxy rather
+ * than amp-api (the session ended: a 401, a redirect to sign-in, or the
+ * sign-in page as a 200 HTML page) marks the session ended app-wide (lib/session.ts) and throws the
+ * "sign in again" sentence; any other failure throws the server's reason
+ * (lib/apiError.ts), with status set. Once the session has ended nothing is
+ * sent at all, so the pages' pollers go quiet behind the prompt.
+ */
+async function send(method: string, path: string, body?: unknown, base = BASE): Promise<Response> {
+  if (isSessionEnded()) throw sessionEndedError()
+  const res = await fetch(`${base}${path}`, {
+    method,
+    // Don't follow the proxy to the sign-in page: see it as a redirect.
+    redirect: 'manual',
+    headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  })
+  if (sessionLost(res)) {
+    markSessionEnded()
+    throw sessionEndedError()
   }
-  return res.json()
+  if (!res.ok) {
+    const err = await res.json().catch(() => (method === 'GET' ? {} : { error: res.statusText }))
+    throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `${method} ${path}: ${res.status}`)), { status: res.status })
+  }
+  return res
 }
 
-async function post<T>(path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `POST ${path}: ${res.status}`)), { status: res.status })
-  }
-  return res.json()
-}
-
-async function patch<T>(path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `PATCH ${path}: ${res.status}`)), { status: res.status })
-  }
-  return res.json()
-}
-
-async function put<T>(path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `PUT ${path}: ${res.status}`)), { status: res.status })
-  }
-  return res.json()
-}
+const get = <T>(path: string): Promise<T> => send('GET', path).then(r => r.json())
+const post = <T>(path: string, body?: unknown): Promise<T> => send('POST', path, body).then(r => r.json())
+const patch = <T>(path: string, body?: unknown): Promise<T> => send('PATCH', path, body).then(r => r.json())
+const put = <T>(path: string, body?: unknown): Promise<T> => send('PUT', path, body).then(r => r.json())
 
 // del resolves to the parsed JSON body when there is one (several RBAC
 // endpoints return the updated resource), or undefined for empty bodies.
-async function del<T = void>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, { method: 'DELETE' })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `DELETE ${path}: ${res.status}`)), { status: res.status })
-  }
-  return res.json().catch(() => undefined) as Promise<T>
-}
+const del = <T = void>(path: string): Promise<T> =>
+  send('DELETE', path).then(r => r.json().catch(() => undefined) as Promise<T>)
 
 // The credential host travels in the query string; the token never does.
 const credentialHostQuery = (host?: string) => host ? `?host=${encodeURIComponent(host)}` : ''
@@ -332,11 +314,7 @@ export const api = {
 
   // Export
   exportProject: async (projectId: number): Promise<{ blob: Blob; filename: string }> => {
-    const res = await fetch(`${BASE}/projects/${projectId}/export`)
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}))
-      throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `Export failed: ${res.status}`)), { status: res.status })
-    }
+    const res = await send('GET', `/projects/${projectId}/export`)
     
     // Get filename from Content-Disposition header or construct it
     const contentDisposition = res.headers.get('content-disposition')
@@ -490,16 +468,7 @@ export const api = {
 const AUTHADMIN_BASE = '/authadmin'
 
 async function authadminReq<T>(path: string, method: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${AUTHADMIN_BASE}${path}`, {
-    method,
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `${method} ${path}: ${res.status}`)), { status: res.status })
-  }
-  return res.json()
+  return send(method, path, body, AUTHADMIN_BASE).then(r => r.json())
 }
 
 export const authAdminApi = {

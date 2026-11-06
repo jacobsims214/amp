@@ -7,7 +7,8 @@ tags: [operations, sso, cognito, dex, oauth2-proxy, oidc, identity, sign-in]
 
 Use this when people sign in to AMP with an Amazon Cognito user pool, through Dex (an OIDC
 connector) and oauth2-proxy. These are the six problems the first Cognito setup hit (#69) and what
-fixed each one. If sign-in fails and you aren't sure why, go through them in order.
+fixed each one. If sign-in fails and you aren't sure why, go through them in order. Section 7 is
+what AMP shows when a session ends after sign-in.
 
 ## 1. Ask Cognito for the right scopes
 
@@ -86,6 +87,17 @@ When sign-in works but AMP will not make an account, the page says why and who c
 
 A page that needs a role you don't have (for example People & agents, which needs admin) says the
 role and the account you are signed in as, or one of the reasons above if you have no account.
+
+## 7. "Your session ended"
+
+When oauth2-proxy ends a session (the cookie expired, or the token could not be refreshed), it
+answers AMP's API calls itself with a 401 or a redirect to sign-in. AMP then shows one prompt over
+the page, **"Your session ended"**, with a **Sign in again** button that signs you in and brings
+you back to the page you were on. Live updates and saves stop until you do. Whatever you were
+writing stays on the page: choose **Stay on this page** to put the prompt away as a banner and
+copy your text first, because signing in reloads the page. This is not one of
+the refusals above: those come from AMP after sign-in, and the page names the reason. With
+sign-in off (Local Dev) there is no session to end, and the prompt never shows.
 
 See also `operations/where-amp-keeps-data.md` for where Dex keeps its sign-in data, and
 `ui-tour.md` for what AMP runs as when sign-in is off.

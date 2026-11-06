@@ -9,6 +9,7 @@ import { buildCommand, checkEvent, isSecurityVerdict, newClientMsgId, nextSeq, t
 import { NotPairedError } from './crypto'
 import { KeyGateError } from './keyGate'
 import { RelayError } from './transport'
+import { isSessionEnded } from '../lib/session'
 import { forgetPairingLink, pairingLinkFor, type PairingLink } from './pairingLink'
 import { initialSessionState, refusalText, sessionReducer, type SessionState } from './session'
 import type { CommandBody, CommandOp, HarnessPin, RefusedBody, SessionDetail } from './types'
@@ -243,7 +244,8 @@ export function useRemoteSession(sessionId: string) {
     }
 
     const reconnect = () => {
-      if (stopped) return
+      // The sign-in session ended (#153): wait for "sign in again", don't retry.
+      if (stopped || isSessionEnded()) return
       dispatch({ type: 'connection', connection: 'reconnecting' })
       clearTimeout(retry)
       retry = setTimeout(connect, backoff * (0.8 + Math.random() * 0.4))

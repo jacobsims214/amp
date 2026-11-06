@@ -1,6 +1,7 @@
 import { type ReactNode, useEffect, useState } from 'react'
 import type { Me } from '../types'
 import { AuthContext } from './auth-context'
+import { setSignInOff, signInAgainUrl } from '../lib/session'
 
 // AuthProvider resolves the caller's identity via /api/me. In a real
 // deployment the request already carries the session (oauth2-proxy cookie)
@@ -18,13 +19,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // to it is redirected to sign-in, which we see as an opaque redirect.
     fetch('/api/me', { redirect: 'manual', headers: { Accept: 'application/json' } })
       .then(async res => {
+        // Only a 401 or a redirect sends the browser to sign-in. An HTML error
+        // page (nginx's 502 while amp-api starts) is an outage: redirecting on
+        // it would loop, since nothing serves /oauth2/start without sign-in.
         if (res.type === 'opaqueredirect' || res.status === 401) {
-          const here = window.location.pathname + window.location.search
-          window.location.replace(here === '/' ? '/home/' : `/oauth2/start?rd=${encodeURIComponent(here)}`)
+          window.location.replace(window.location.pathname === '/' && !window.location.search ? '/home/' : signInAgainUrl())
           return
         }
         if (!res.ok) throw new Error(`Failed to load identity (${res.status})`)
-        setMe(await res.json())
+        const who: Me = await res.json()
+        // Sign-in off (Local Dev): there is no session to lose, so never prompt.
+        setSignInOff(!!who.local_dev)
+        setMe(who)
       })
       .catch(e => setError(e instanceof Error ? e.message : 'Failed to load identity'))
       .finally(() => setLoading(false))
