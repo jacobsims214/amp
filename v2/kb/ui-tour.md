@@ -65,7 +65,9 @@ copy the address bar to share exactly what you see.
   for each story (**About this story**).
 - **Flight plan** — the plan as epics, stories and tickets in order, and the plan check verdict
   (GO / WARN / NO-GO). It's for reading: when tickets await your approval it says so and links
-  to My work.
+  to My work. Finished stories and epics are hidden by default (**Hide done**, kept in the URL as
+  `?done=show` when off); epics and stories are ordered by last update, newest first, and
+  **Jump to active** scrolls to the first such ticket. Each stage header counts its open tickets.
 - **Graph** — the dependency graph.
 - Text people and agents write (descriptions, questions, comments, day-report summaries, KB
   annotations, artifact version notes, the plan check) is rendered as markdown everywhere it

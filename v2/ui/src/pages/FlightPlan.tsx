@@ -17,9 +17,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { useFocusParam } from '../hooks/useFocusParam'
+import { flagParam, useSearchParamState } from '../hooks/useSearchParamState'
 import { FocusNotFound } from '../components/FocusNotFound'
 import { useFocusFallback } from '../hooks/useFocusFallback'
-import { GitBranch, Loader2, RefreshCw } from 'lucide-react'
+import { Crosshair, GitBranch, Loader2, RefreshCw } from 'lucide-react'
 import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
 import { useAuth } from '../hooks/useAuth'
@@ -36,6 +37,17 @@ import { displayState, STATE_LABEL, STATE_VAR, type DisplayState } from '../lib/
 import type { PlanIssue, PlanReport, Task } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
 import { Markdown } from '../components/ui/Markdown'
+
+/** Finished work is hidden unless the URL says `done=show` (same switch as the Board). */
+const HIDE_DONE = flagParam(true, 'hide', 'show')
+
+/** Latest touch on a set of tickets (or the container's own stamp), as a sortable number. */
+function lastTouched(ts: Task[], own: string): number {
+  return Math.max(Date.parse(own) || 0, ...ts.map(t => Date.parse(t.updated_at) || 0))
+}
+/** Most recently updated first; finished work (only visible with Hide done off) sinks to the end. */
+const byRecent = (a: { finished: boolean; touched: number; id: number }, b: { finished: boolean; touched: number; id: number }) =>
+  Number(a.finished) - Number(b.finished) || b.touched - a.touched || a.id - b.id
 
 /** Each ticket's stage (dependency depth) and the plan's critical path. */
 function planShape(tasks: Task[]) {
@@ -90,13 +102,13 @@ const ISSUE_TITLE: Record<string, string> = {
   duplicate_merge_step: 'One merge step per PR',
 }
 
-function Chip({ t, state, crit, lit, sel, dim, onClick }: {
-  t: Task; state: DisplayState; crit: boolean; lit: boolean; sel: boolean; dim: boolean; onClick: () => void
+function Chip({ t, state, crit, active, lit, sel, dim, onClick }: {
+  t: Task; state: DisplayState; crit: boolean; active: boolean; lit: boolean; sel: boolean; dim: boolean; onClick: () => void
 }) {
   const filled = state === 'done' || state === 'flag'
   return (
     <button type="button" onClick={onClick} title={`#${t.id} ${t.name} · ${STATE_LABEL[state]}`}
-      aria-label={`Ticket ${t.id}: ${t.name}, ${STATE_LABEL[state]}`} aria-pressed={sel}
+      aria-label={`Ticket ${t.id}: ${t.name}, ${STATE_LABEL[state]}`} aria-pressed={sel} data-active={active}
       className="relative inline-grid place-items-center min-w-[40px] h-[19px] px-[3px] m-[1px] amp-num text-[10px] cursor-pointer transition-opacity"
       style={{
         borderRadius: 'var(--radius)', border: `1px solid ${STATE_VAR[state]}`,
@@ -122,7 +134,7 @@ export function FlightPlan() {
   // ?focus=ID opens that ticket's drawer (and lights its chain on arrival); it stays in the URL until closed.
   const [openId, setOpenId] = useFocusParam()
   const [focus, setFocus] = useState<number | null>(() => openId)
-  const [hideDone, setHideDone] = useState(false)
+  const [hideDone, setHideDone] = useSearchParamState('done', HIDE_DONE)
   const [report, setReport] = useState<PlanReport | null>(null)
   // Bumped on each check, so the GO stamps replay like a fresh poll.
   const [poll, setPoll] = useState(0)
@@ -152,20 +164,36 @@ export function FlightPlan() {
   const opened = openId != null ? tasks.find(t => t.id === openId) ?? null : null
   const focusMissing = useFocusFallback(pid, 'plan', openId, tasks, loading)
 
-  const rows = useMemo(() => epics.slice().sort((a, b) => a.id - b.id).map(e => ({
-    epic: e,
-    stories: stories.filter(s => s.epic_id === e.id).sort((a, b) => a.id - b.id).map(s => ({
-      story: s,
-      tasks: tasks.filter(t => t.story_id === s.id && (!hideDone || t.state !== 'completed')),
-      total: tasks.filter(t => t.story_id === s.id).length,
-    })),
-  })), [epics, stories, tasks, hideDone])
+  // Most recently updated first, finished work last. Hiding done drops a story or epic with nothing open
+  // (including one with no tickets), so what's left is the live plan. The focused ticket's story and epic
+  // stay (with their done chips) so a ?focus= link to finished work still lands on it.
+  const focusTask = focus != null ? tasks.find(t => t.id === focus) : undefined
+  const rows = useMemo(() => epics.map(e => {
+    // Epic totals come from its stories' tickets (the rows shown), not t.epic_id, so metadata drift can't hide open work.
+    const all = stories.filter(s => s.epic_id === e.id).map(s => {
+      const own = tasks.filter(t => t.story_id === s.id)
+      const open = own.filter(t => t.state !== 'completed').length
+      return { story: s, own, tasks: own.filter(t => !hideDone || t.state !== 'completed' || t.id === focusTask?.id), total: own.length,
+        open, finished: open === 0, touched: lastTouched(own, s.updated_at), id: s.id }
+    })
+    const ss = all.filter(s => !(hideDone && s.open === 0 && s.story.id !== focusTask?.story_id)).sort(byRecent)
+    const total = all.reduce((n, s) => n + s.total, 0)
+    const open = all.reduce((n, s) => n + s.open, 0)
+    return { epic: e, stories: ss, total, open, finished: open === 0, id: e.id,
+      touched: Math.max(lastTouched([], e.updated_at), ...all.map(s => s.touched)) }
+  }).filter(r => !(hideDone && r.open === 0 && r.epic.id !== focusTask?.epic_id)).sort(byRecent),
+  [epics, stories, tasks, hideDone, focusTask])
+  const hiddenEpics = hideDone ? epics.length - rows.length : 0
 
   const stageCounts = useMemo(() => {
-    const c = Array.from({ length: shape.stages }, () => 0)
-    for (const t of tasks) c[shape.depth.get(t.id) ?? 0]++
+    const c = Array.from({ length: shape.stages }, () => ({ total: 0, open: 0 }))
+    for (const t of tasks) { const x = c[shape.depth.get(t.id) ?? 0]; x.total++; if (t.state !== 'completed') x.open++ }
     return c
   }, [tasks, shape])
+
+  // Tickets in flight or asking a question: where "Jump to active" lands.
+  const activeCount = rows.reduce((n, r) => n + r.stories.reduce((m, s) => m + s.tasks.filter(t => ['prog', 'flag'].includes(displayState(t))).length, 0), 0)
+  const jumpToActive = () => document.querySelector('[data-active="true"]')?.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' })
 
   const issueByKind = new Map((report?.issues ?? []).map(i => [i.kind, i]))
   const pollOrder = ['isolated', 'wide_start', 'empty_stories', 'no_context', 'coupled_gate', 'metadata_drift']
@@ -203,6 +231,8 @@ export function FlightPlan() {
         <label className="inline-flex items-center gap-2 text-[12.5px] text-ink-2 cursor-pointer select-none">
           <input type="checkbox" checked={hideDone} onChange={e => setHideDone(e.target.checked)} className="accent-[var(--ink)]" />Hide done
         </label>
+        <button type="button" className="amp-btn" onClick={jumpToActive} disabled={activeCount === 0}
+          title="Scroll to the first ticket in progress or asking a question"><Crosshair size={12} />Jump to active{activeCount > 0 && <span className="amp-num"> · {activeCount}</span>}</button>
         <Link to={`/project/${pid}/dag`} className="amp-btn"><GitBranch size={12} />Graph</Link>
       </>} />
       <div className="p-7 pt-5 grid gap-4">
@@ -229,14 +259,20 @@ export function FlightPlan() {
                     <th className="amp-label text-left px-4 py-2.5 border-b border-line">Story</th>
                     {stageCounts.map((n, i) => (
                       <th key={i} className="amp-label text-center px-1 py-2.5 border-b border-line">Stage {i + 1}
-                        <span className="block amp-num normal-case tracking-normal text-[10px] mt-1">{n}</span></th>
+                        <span className="block amp-num normal-case tracking-normal text-[10px] mt-1"
+                          title={`${n.open} open of ${n.total} tickets in this stage`}>{n.open} open{n.open < n.total && <span className="text-ink-3"> / {n.total}</span>}</span></th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
+                  {rows.length === 0 && (
+                    <tr><td colSpan={shape.stages + 1} className="px-5 py-6 text-center text-[13px] text-ink-2">
+                      Everything here is done. <button type="button" className="underline underline-offset-2 cursor-pointer" onClick={() => setHideDone(false)}>Show done</button>
+                    </td></tr>
+                  )}
                   {rows.map(r => (
                     <FragmentRows key={r.epic.id} epicName={r.epic.name} epicPriority={r.epic.priority} cols={shape.stages}
-                      count={r.stories.reduce((a, s) => a + s.total, 0)}>
+                      count={r.total} open={r.open}>
                       {r.stories.map(s => (
                         <tr key={s.story.id}>
                           <td className="px-4 py-1.5 border-b border-line align-top">
@@ -247,7 +283,7 @@ export function FlightPlan() {
                             <td key={i} className="px-0.5 py-1 border-b border-l border-dashed border-line text-center align-top">
                               {s.tasks.filter(t => shape.depth.get(t.id) === i).map(t => (
                                 <Chip key={t.id} t={t} state={displayState(t)} crit={shape.crit.has(t.id)}
-                                  lit={!!lit?.all.has(t.id)} sel={focus === t.id} dim={focus != null}
+                                  active={['prog', 'flag'].includes(displayState(t))} lit={!!lit?.all.has(t.id)} sel={focus === t.id} dim={focus != null}
                                   onClick={() => setFocus(f => f === t.id ? null : t.id)} />
                               ))}
                             </td>
@@ -256,6 +292,11 @@ export function FlightPlan() {
                       ))}
                     </FragmentRows>
                   ))}
+                  {rows.length > 0 && hiddenEpics > 0 && (
+                    <tr><td colSpan={shape.stages + 1} className="px-4 py-2 text-[11.5px] text-ink-3">
+                      {hiddenEpics} finished {hiddenEpics === 1 ? 'epic' : 'epics'} hidden. <button type="button" className="underline underline-offset-2 cursor-pointer" onClick={() => setHideDone(false)}>Show done</button>
+                    </td></tr>
+                  )}
                 </tbody>
               </table>
             )}
@@ -342,8 +383,8 @@ function Verdict({ ok, warn, stampDelay }: { ok: boolean; warn?: boolean; stampD
   )
 }
 
-function FragmentRows({ epicName, epicPriority, count, cols, children }: {
-  epicName: string; epicPriority: string; count: number; cols: number; children: React.ReactNode
+function FragmentRows({ epicName, epicPriority, count, open, cols, children }: {
+  epicName: string; epicPriority: string; count: number; open: number; cols: number; children: React.ReactNode
 }) {
   return (
     <>
@@ -353,7 +394,7 @@ function FragmentRows({ epicName, epicPriority, count, cols, children }: {
             <span className="amp-bands-v h-[14px]" aria-hidden="true" />
             <span className="font-label text-[11.5px] font-semibold uppercase tracking-[0.14em] text-ink">{epicName}</span>
             <PriorityMark priority={epicPriority} />
-            <span className="amp-num text-[10.5px] text-ink-3">{count} {count === 1 ? 'ticket' : 'tickets'}</span>
+            <span className="amp-num text-[10.5px] text-ink-3">{open < count ? `${open} open of ${count} tickets` : `${count} ${count === 1 ? 'ticket' : 'tickets'}`}</span>
           </span>
         </td>
       </tr>
