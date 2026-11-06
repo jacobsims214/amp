@@ -10,6 +10,8 @@
  *   oldest first within each kind, and Do items by what they block, then age.
  *   A Do card says "blocks N · waiting Xd" (or "Nothing waits on it ·
  *   waiting Xd"); one with a decision doc links to its drawer to decide.
+ *   A decide-by date shows as a chip ("Decide in 2d", red "Overdue · 3h")
+ *   and the date in the reader's zone; overdue Do items come first (#146).
  *   Approve items are ApproveCards that open the Approve view in place
  *   (`?approve=`); the rest carry HumanActions.
  * - Side panels: Coming up with what each waits on, Your agents here (links to
@@ -41,6 +43,7 @@ import { KIND_LABEL, needsLine } from '../lib/humanActions'
 import { startItemText } from '../lib/dispatchState'
 import { mergeCardState } from '../lib/merge'
 import { waitLine } from '../lib/decisions'
+import { describeDecideBy } from '../lib/decideBy'
 import { projectLink } from '../lib/projectLink'
 import { refreshWaitCounts } from '../lib/waitCounts'
 import { isNoUserError, noMyWorkReason } from '../lib/myWorkAccess'
@@ -374,6 +377,12 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
   const hasDoc = !!(it.has_decision_doc || t?.has_decision_doc)
   const actionTask = t && hasDoc && !t.has_decision_doc ? { ...t, has_decision_doc: true } : t
   if (kind === 'start') meta.push(startItemText(it))
+  // A decide-by date (#146): the chip says how far off or overdue it is, and
+  // the meta line the date in the reader's own zone. The server flags it
+  // overdue and sorts it first; this only shows it.
+  const decide = describeDecideBy(it.decide_by ?? t?.decide_by)
+  const overdue = !!(it.overdue || decide?.overdue)
+  if (decide) meta.push(`Decide by ${decide.absolute}`)
   return (
     <>
       <article className={frame} data-item-key={it.key} data-focused={focused || undefined} aria-label={`${KIND_LABEL[kind]}: #${it.task_id} ${it.name}`}>
@@ -384,6 +393,12 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
           <span className="it-id">#{it.task_id}</span>
           {kind === 'do' && <span className="amp-label border border-line px-1.5 py-1 leading-none">{it.state === 'in_progress' ? 'In progress' : 'Ready'}</span>}
           {kind === 'start' && <span className="amp-label border px-1.5 py-1 leading-none" style={{ borderColor: 'var(--warning)', color: 'var(--warning-ink)' }}>Not started</span>}
+          {decide && (
+            <span className={`amp-label border px-1.5 py-1 leading-none${overdue ? '' : ' border-line'}`} data-testid="decide-by-chip"
+              data-overdue={overdue || undefined} title={decide.absolute}
+              style={overdue ? { borderColor: 'var(--danger)', color: 'var(--danger-ink)' } : undefined}>
+              {overdue ? `Overdue · ${decide.relative.replace(/ overdue$/, '')}` : `Decide ${decide.relative}`}</span>
+          )}
         </div>
         <p className="m-0 mt-1 text-[13.5px] leading-snug text-ink" data-needs="">{needsLine(it)}</p>
         <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[12.5px] text-ink-2">{meta.map(m => <span key={m}>{m}</span>)}</div>

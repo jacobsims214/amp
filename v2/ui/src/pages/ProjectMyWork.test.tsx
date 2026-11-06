@@ -567,6 +567,31 @@ describe('My work tab: what each item needs from you', () => {
     }
   })
 
+  it('a Do card shows its decide-by date: red "Overdue" once passed, with the date in the reader\'s zone (#146)', async () => {
+    const d = myWork('busy')
+    const hours = (n: number) => new Date(Date.now() + n * 3_600_000).toISOString()
+    // The server flags overdue and puts it first; the card only shows it.
+    d.items.do = [
+      { ...doItem(), key: 'task:2482', task_id: 2482, task_ids: [2482], name: 'Pick the vendor', decide_by: hours(-3), overdue: true,
+        task: task(2482, { performer: 'human', human_reason: 'judgment', decide_by: hours(-3) }) },
+      { ...doItem(), decide_by: hours(50), task: task(2481, { performer: 'human', human_reason: 'judgment', decide_by: hours(50) }) },
+      { ...doItem(), key: 'task:2483', task_id: 2483, task_ids: [2483], name: 'Rotate keys',
+        task: task(2483, { performer: 'human', human_reason: 'access' }) },
+    ]
+    data = d
+    at('/project/2/my-work')
+    await screen.findByRole('region', { name: 'Waiting on you' })
+    const card = (key: string) => document.querySelector(`[data-item-key="${key}"]`) as HTMLElement
+    const late = within(card('task:2482')).getByTestId('decide-by-chip')
+    expect(late).toHaveTextContent('Overdue · 3h')
+    expect(late).toHaveAttribute('data-overdue', 'true')
+    expect(within(card('task:2482')).getByText(/^Decide by /)).toBeInTheDocument()
+    const soon = within(card('task:2481')).getByTestId('decide-by-chip')
+    expect(soon).toHaveTextContent('Decide in 2d')
+    expect(soon).not.toHaveAttribute('data-overdue')
+    expect(within(card('task:2483')).queryByTestId('decide-by-chip')).toBeNull()
+  })
+
   it('a Do card for a ticket with a decision doc links to its drawer, with no Mark done', async () => {
     data = withDo({ description: 'Pick the metric.', has_decision_doc: true })
     data.items.do[0].has_decision_doc = true

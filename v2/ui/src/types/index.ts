@@ -25,6 +25,12 @@ export interface Project {
   not_started_flag_minutes?: number
   /** a dispatched ticket no worker starts is returned to ready after this many minutes; 0 = off (AMP #2801) */
   not_started_return_minutes?: number
+  /** a person's ticket this many minutes past its decide_by is escalated once; 0 = off, the default (#146) */
+  decision_escalation_minutes?: number
+  /** the escalation also raises the ticket's priority one step (#146) */
+  decision_escalation_raise_priority?: boolean
+  /** the escalation hands the ticket to this user; null = nobody (#146) */
+  decision_backup_decider?: number | null
 }
 
 export interface Epic {
@@ -117,6 +123,8 @@ export interface Task {
   metadata?: Metadata
   /** it has a decision doc: its decision is recorded on the doc (Record decision), never by Mark done (#125) */
   has_decision_doc?: boolean
+  /** a person's ticket's decide-by date (RFC 3339): set by the person or suggested by an agent (#146) */
+  decide_by?: string
   created_at: string
   updated_at: string
 }
@@ -463,6 +471,8 @@ export interface UpdateTaskRequest {
   assigned_to?: string
   priority?: string
   start_at?: string | null
+  /** a person's ticket's decide-by date (RFC 3339); clear: ['decide_by'] removes it (#146) */
+  decide_by?: string
   metadata?: MetadataPatch
   /** Fields to blank; an empty value otherwise means "keep". */
   clear?: string[]
@@ -935,6 +945,9 @@ export interface WaitItem extends MergeClassifier {
   owner_user_id?: number
   /** the ticket has a decision doc: it is decided in its drawer, not by Mark done (#125) */
   has_decision_doc?: boolean
+  /** a person's ticket's decide-by date (RFC 3339), and whether it has passed (#146) */
+  decide_by?: string
+  overdue?: boolean
   epic_id?: number
   epic_name?: string
   /** approve: how many tickets await */

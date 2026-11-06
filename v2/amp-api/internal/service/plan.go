@@ -149,6 +149,12 @@ func (s *Service) createTask(ctx context.Context, p authz.Principal, req domain.
 	if err := s.checkHumanBrief(p, req.Performer, req.Description, req.AcceptanceCriteria, req.HumanReason, req.Ask, ""); err != nil {
 		return nil, nil, err
 	}
+	if err := domain.CheckDecideBy(req.Performer, req.DecideBy); err != nil {
+		return nil, nil, authz.BadRequest("%v", err)
+	}
+	if err := s.checkSuggestedDecideBy(p, nil, req.DecideBy, false, time.Now()); err != nil {
+		return nil, nil, err
+	}
 	// merge_for names the ticket whose PR merge this person's step tracks
 	// (AMP #3009): checked before the ticket exists, so a bad link never
 	// creates a half-wired step.
@@ -943,6 +949,8 @@ type TaskSpec struct {
 	HumanReason        string
 	// Ask: a judgment ticket's question and options (input only).
 	Ask *domain.Ask
+	// DecideBy: a person's ticket's decide-by date (#146).
+	DecideBy *time.Time
 }
 
 // HumanNeedsOwner refuses a human ticket nobody would do.
@@ -990,6 +998,12 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 		}
 		if err := s.checkHumanBrief(p, perf, sp.Description, sp.AcceptanceCriteria, reason, sp.Ask, ref); err != nil {
 			return nil, nil, err
+		}
+		if err := domain.CheckDecideBy(perf, sp.DecideBy); err != nil {
+			return nil, nil, authz.BadRequest("%q: %v", ref, err)
+		}
+		if err := s.checkSuggestedDecideBy(p, nil, sp.DecideBy, false, time.Now()); err != nil {
+			return nil, nil, authz.BadRequest("%q: %v", ref, err)
 		}
 		specs[i].Performer, specs[i].HumanReason = perf, reason
 	}
@@ -1135,7 +1149,7 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 			ProjectID: projectID, StoryID: sp.StoryID, Name: sp.Name, Description: sp.Description,
 			AcceptanceCriteria: sp.AcceptanceCriteria, Priority: sp.Priority, AssignedTo: sp.AssignedTo,
 			DependencyIDs: deps, StartAt: sp.StartAt, Metadata: meta,
-			Performer: sp.Performer, HumanReason: sp.HumanReason, Ask: sp.Ask,
+			Performer: sp.Performer, HumanReason: sp.HumanReason, Ask: sp.Ask, DecideBy: sp.DecideBy,
 		}, sp.Owner, true)
 		if err != nil {
 			var made []string

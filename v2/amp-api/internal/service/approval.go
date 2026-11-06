@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net/mail"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/authz"
@@ -398,6 +400,10 @@ func (s *Service) UpdateTask(ctx context.Context, p authz.Principal, t *domain.T
 	if err := s.checkUpdateBrief(ctx, p, t, req); err != nil {
 		return nil, err
 	}
+	clearsDecideBy := slices.ContainsFunc(req.Clear, func(c string) bool { return strings.EqualFold(strings.TrimSpace(c), "decide_by") })
+	if err := s.checkSuggestedDecideBy(p, t, req.DecideBy, clearsDecideBy, time.Now()); err != nil {
+		return nil, err
+	}
 	keepHuman := ""
 	if !p.InUI() {
 		refusal := authz.UIOnly(fmt.Sprintf("Switching ticket %d (a person's ticket) to agent work", t.ID), s.TaskURL(t.ProjectID, t.ID))
@@ -406,13 +412,27 @@ func (s *Service) UpdateTask(ctx context.Context, p authz.Principal, t *domain.T
 		}
 		keepHuman = refusal.Error()
 	}
+	// The decide-by rule is re-checked by the task actor against the ticket
+	// as it is when written: only its person (the owner, in the web UI; anyone
+	// with auth off) moves or removes a date it already has.
+	suggestOnly, person := "", 0
+	if (req.DecideBy != nil || clearsDecideBy) && !(p.InUI() && !p.HasUser()) {
+		suggestOnly = fmt.Sprintf("Ticket %d's decide-by date is its person's (the ticket's owner): you can suggest a date only on a ticket that has none", t.ID)
+		if p.InUI() {
+			person = p.UserID
+		}
+	}
 	replyCh := make(chan actor.ReplySimple, 1)
-	if err := s.Registry.Send(t.ProjectID, &actor.MsgUpdateTask{Req: req, KeepHuman: keepHuman, ReplyCh: replyCh}); err != nil {
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgUpdateTask{Req: req, KeepHuman: keepHuman, By: p.UserRef(), ByName: p.Label(),
+		DecideBySuggestOnly: suggestOnly, DecideByPerson: person, ReplyCh: replyCh}); err != nil {
 		return nil, err
 	}
 	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 		if keepHuman != "" && reply.Err.Error() == keepHuman {
 			return nil, &authz.Error{Status: 403, Msg: keepHuman}
+		}
+		if suggestOnly != "" && reply.Err.Error() == suggestOnly {
+			return nil, &authz.Error{Status: 403, Msg: suggestOnly}
 		}
 		return nil, &authz.Error{Status: 400, Msg: reply.Err.Error()}
 	}
