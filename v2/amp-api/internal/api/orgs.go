@@ -29,6 +29,8 @@ import (
 //	GET    /api/orgs/:id/invites                                       org admin
 //	POST   /api/orgs/:id/invites           {email, org_role?, team_id?, team_role?}
 //	DELETE /api/orgs/:id/invites/:inviteId                             org admin
+//	GET    /api/orgs/:id/receipts                                      org admin (receipts.go)
+//	PUT    /api/orgs/:id/receipts        {mode}                        org admin, web UI
 //	GET    /api/orgs/:id/remote-control                                org admin (remote.go)
 //	PUT    /api/orgs/:id/remote-control  {enabled, idle_timeout_min, max_lifetime_hours, device_pin_days}  org admin, web UI
 //	GET    /api/teams/:id                  team + members
@@ -93,6 +95,11 @@ func (h *RestHandler) orgSub(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+
+	if len(parts) == 2 && parts[1] == "receipts" {
+		h.orgReceipts(w, r, pr, orgID)
+		return
+	}
 
 	if len(parts) == 2 && parts[1] == "remote-control" {
 		h.orgRemoteControl(w, r, pr, orgID)

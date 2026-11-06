@@ -25,6 +25,110 @@ export interface Project {
   not_started_flag_minutes?: number
   /** a dispatched ticket no worker starts is returned to ready after this many minutes; 0 = off (AMP #2801) */
   not_started_return_minutes?: number
+  /** verification receipts (#126): '' uses the org's default */
+  receipts_mode?: '' | ReceiptsMode
+  /** what a Require ticket must reach before it completes */
+  receipts_min_level?: ReceiptMinLevel
+}
+
+// ---- Verification receipts (#126) ----
+
+export type ReceiptsMode = 'off' | 'inform' | 'require'
+export type ReceiptMinLevel = 'self_checked' | 'independently_verified'
+export type VerificationStatus = 'unverified' | 'self_checked' | 'independently_verified' | 'human_accepted'
+
+export interface Receipt {
+  id: number
+  task_id: number
+  project_id: number
+  run_id?: number
+  state: 'draft' | 'final'
+  mode: 'inform' | 'require'
+  held: boolean
+  agent_id: string
+  summary: string
+  files_changed: { path: string; added: number; removed: number }[]
+  commit_sha: string
+  tree_sha: string
+  branch: string
+  base_branch: string
+  pr_url: string
+  kept: boolean
+  created_at: string
+  finalized_at?: string
+}
+
+export interface ReceiptCheck {
+  id: number
+  receipt_id: number
+  role: 'worker' | 'verifier' | 'human'
+  kind: 'command' | 'test' | 'ci' | 'visual' | 'manual' | 'verdict'
+  verdict: 'pass' | 'fail' | 'cant_tell'
+  criterion_ref: string
+  command?: string
+  exit_code?: number
+  duration_ms?: number
+  note?: string
+  evidence_key?: string
+  checked_by: string
+  user_id?: number
+  created_at: string
+}
+
+export interface ReceiptEvidence {
+  id: number
+  receipt_id: number
+  key: string
+  name: string
+  /** the revision it was recorded on */
+  tree_sha?: string
+  content_type: string
+  bytes: number
+  sha256?: string
+  duration_ms?: number
+  frames?: number
+  status: 'pending' | 'stored' | 'expired'
+  created_at: string
+  stored_at?: string
+  /** when unkept evidence is (or was) deleted; unset once kept (merged or accepted) */
+  expires_at?: string
+}
+
+export interface ReceiptSettings {
+  mode: ReceiptsMode
+  min_level: ReceiptMinLevel
+  /** the project's own value ('' = the org's) */
+  project_mode: '' | ReceiptsMode
+  org_mode: ReceiptsMode
+}
+
+export interface ReceiptView {
+  receipt: Receipt
+  checks: ReceiptCheck[]
+  evidence: ReceiptEvidence[]
+  status: VerificationStatus
+  held: boolean
+  /** why a held receipt is below its minimum */
+  hold_reason?: string
+}
+
+/** GET /api/tasks/:id/receipt: the latest final receipt, or receipt: null. */
+export type TaskReceipt =
+  | (ReceiptView & { attempts: number; settings: ReceiptSettings })
+  | { receipt: null; mode: ReceiptsMode; settings: ReceiptSettings }
+
+export interface ReceiptSummaryRow {
+  task_id: number
+  status: VerificationStatus
+  held: boolean
+  has_media: boolean
+  /** why a held one waits for a person */
+  reason?: string
+}
+
+export interface ReceiptSummary extends ReceiptSettings {
+  tasks: ReceiptSummaryRow[]
+  would_hold_last_7_days: number
 }
 
 export interface Epic {
@@ -395,6 +499,7 @@ export interface SSEEvent {
     | 'epic.updated'
     | 'story.updated'
     | 'artifact.updated'
+    | 'receipt.updated'
   project_id?: number
   payload?: unknown
   at?: string
@@ -762,6 +867,8 @@ export interface Org {
   slug: string
   created_by: number | null
   created_at: string
+  /** the org's default verification receipts mode (#126) */
+  receipts_mode?: ReceiptsMode
   /** caller's role in the org; "" when not a member (e.g. a global admin browsing) */
   my_role?: OrgRole | ''
 }
@@ -869,13 +976,15 @@ export interface MyWork {
 
 // ---- Waiting on you (service.WaitingOn; KB decisions/human-work-ux.md §1) ----
 
-export type WaitKind = 'approve' | 'answer' | 'merge' | 'start' | 'do'
+export type WaitKind = 'approve' | 'answer' | 'verify' | 'merge' | 'start' | 'do'
 
-/** Waiting is approve + answer + merge + start + do; coming_up is shown, never counted. */
+/** Waiting is approve + answer + verify + merge + start + do; coming_up is shown, never counted. */
 export interface WaitCounts {
   waiting: number
   approve: number
   answer: number
+  /** a completion Require holds for you: its receipt is below the minimum (#126); absent from older servers */
+  verify?: number
   merge: number
   /** a ticket of yours dispatched to an agent that no worker has started (AMP #2801) */
   start: number
@@ -941,6 +1050,8 @@ export interface WaitItem extends MergeClassifier {
   /** approve: how many tickets await */
   count?: number
   question?: string
+  /** verify: why the receipt is below its minimum (#126) */
+  hold_reason?: string
   merge_state?: string
   pr_url?: string
   branch?: string
@@ -1084,6 +1195,8 @@ export interface Run {
   cost_usd?: number
   branch?: string
   commit?: string
+  /** the branch the work is meant to merge into */
+  base_branch?: string
   pr_url?: string
   pushed?: boolean
   merged?: boolean
@@ -1458,7 +1571,8 @@ export interface ProjectMyWork {
   read_only: boolean
   kinds: WaitKind[]
   counts: WaitCounts
-  items: Record<WaitKind, ProjectWaitItem[]>
+  /** verify is absent from servers that predate receipts (#126) */
+  items: Record<Exclude<WaitKind, 'verify'>, ProjectWaitItem[]> & { verify?: ProjectWaitItem[] }
   coming_up: ProjectWaitItem[]
   done_today: DoneItem[]
   agents: { project_id: number; in_progress: number; ready: number; waiting: number; done_today: number }

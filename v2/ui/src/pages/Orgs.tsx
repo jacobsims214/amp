@@ -9,6 +9,7 @@ import { AccountBadges } from '../components/admin'
 import { AuditLogPanel } from '../components/AuditLogPanel'
 import { WebhooksPanel } from '../components/WebhooksPanel'
 import { OrgRemoteControlSetting } from '../components/remote/OrgRemoteControlSetting'
+import { OrgReceiptsSetting } from '../components/receipt/OrgReceiptsSetting'
 import { personName } from '../lib/people'
 import type { AddMemberResult, Invite, Member, Org, OrgRole, Team, TeamRole } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
@@ -301,7 +302,12 @@ function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
         </div>
       )}
       {tab === 'audit' && <AuditLogPanel orgId={org.id} verify />}
-      {tab === 'settings' && canManage && <OrgRemoteControlSetting orgId={org.id} />}
+      {tab === 'settings' && canManage && (
+        <div className="space-y-6">
+          <OrgReceiptsSetting key={org.id} org={org} />
+          <OrgRemoteControlSetting orgId={org.id} />
+        </div>
+      )}
       </div>
 
       {confirmDelete && (

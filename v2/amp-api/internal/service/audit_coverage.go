@@ -303,7 +303,7 @@ func (s *Service) auditTaskDenied(ctx context.Context, p authz.Principal, action
 	}
 	details["state"] = string(t.State)
 	verb := map[string]string{"task.dispatch": "dispatch", "task.complete": "completion", "task.state": "state change",
-		"task.human.complete": "marking done"}[action]
+		"task.human.complete": "marking done", "task.delete": "deletion", "task.return": "return", "task.block": "block"}[action]
 	s.auditDenied(ctx, p, action, domain.AuditEntry{ProjectID: intRef(t.ProjectID), TargetType: "task", TargetID: idStr(t.ID), TargetName: t.Name,
 		Summary: fmt.Sprintf("refused %s of ticket %d by %s", verb, t.ID, p.Label()), Details: details}, err)
 }

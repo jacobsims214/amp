@@ -440,7 +440,7 @@ func TestPlan_ServerInstructions_CurrentMergeWorkflow(t *testing.T) {
 	raw, _ := json.Marshal(srv.HandleMessage(context.Background(), []byte(
 		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`)))
 	s := string(raw)
-	for _, want := range []string{"approve, answer, merge (Merge needed), start or do", "PEOPLE IN THE LOOP"} {
+	for _, want := range []string{"approve, answer, verify, merge (Merge needed), start or do", "PEOPLE IN THE LOOP"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("initialize response lacks %q", want)
 		}
@@ -454,7 +454,7 @@ func TestPlan_ServerInstructions_CurrentMergeWorkflow(t *testing.T) {
 // removed review-and-merge human ticket: WaitKinds is the source of truth,
 // and the instructions and the amp_create_tasks description follow it.
 func TestMCPText_NoStaleWaitingKindLists(t *testing.T) {
-	if got := strings.Join(service.WaitKinds, ", "); got != "approve, answer, merge, start, do" {
+	if got := strings.Join(service.WaitKinds, ", "); got != "approve, answer, verify, merge, start, do" {
 		t.Fatalf("WaitKinds = %q", got)
 	}
 	s := setupMCP(t)

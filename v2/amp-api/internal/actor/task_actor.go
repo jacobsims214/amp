@@ -127,8 +127,10 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgCompleteTask:
+		was := a.task.State
 		closeout, err := a.handleComplete(ctx, msg)
-		msg.ReplyCh <- ReplyComplete{Task: ptrTask(a.withBlockedBy()), Closeout: closeout, Err: err}
+		changed := err == nil && was != domain.TaskStateCompleted && a.task.State == domain.TaskStateCompleted
+		msg.ReplyCh <- ReplyComplete{Task: ptrTask(a.withBlockedBy()), Closeout: closeout, Changed: changed, Err: err}
 
 	case *MsgClaimStart:
 		started, err := a.handleClaimStart(msg)
@@ -179,8 +181,10 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		if state != msg.State {
 			reason = "" // blocked on its dependencies: no reason of its own
 		}
+		was := a.task.State
 		err := a.handleSetState(state, reason, msg.By, msg.ByName)
-		msg.ReplyCh <- ReplySimple{Err: err}
+		msg.ReplyCh <- ReplySimple{Err: err,
+			Changed: err == nil && was != domain.TaskStateCompleted && a.task.State == domain.TaskStateCompleted}
 
 	case *MsgSetTaskStartAt:
 		err := a.handleSetTaskStartAt(msg.StartAt)
@@ -379,6 +383,30 @@ func (a *TaskActor) handleDispatch(msg *MsgDispatchTask, ctx actor.Context) erro
 	return nil
 }
 
+// handleHold holds a completion for a person (#126): the ticket keeps its
+// state (in progress, for a worker's completion), but its dispatch is over,
+// in the database too, so no worker holds it while it waits. The service
+// posts the "Couldn't verify, needs you" comment and finalizes the receipt.
+func (a *TaskActor) handleHold(msg *MsgCompleteTask) error {
+	if err := a.repo.ClearTaskDispatch(context.Background(), a.task.ID, false); err != nil {
+		return fmt.Errorf("db clear dispatch: %w", err)
+	}
+	a.task.DispatchID = ""
+	a.task.UpdatedAt = time.Now()
+	who := nameOr(msg.ByName, "agent")
+	if a.task.AgentID != "" && !msg.InUI {
+		who = a.task.AgentID
+	}
+	detail := "Completion held: couldn't verify, needs a person"
+	if r := strings.TrimSpace(msg.HoldReason); r != "" {
+		detail += ": " + r
+	}
+	a.logActivityBy(who, msg.By, "held", string(a.task.State), string(a.task.State), detail)
+	a.publish(domain.EventTaskUpdated, a.withBlockedBy())
+	a.log.Info("completion held")
+	return nil
+}
+
 // handleComplete completes the ticket. It returns whether the completion was
 // recorded as a closeout: a caller that isn't the ticket's worker (no
 // dispatch_id, or not the current one), or a ticket no worker ever started
@@ -431,6 +459,9 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 		if at, err := a.repo.StartTask(context.Background(), a.task.ID, by); err == nil {
 			a.task.StartedAt, a.task.StartedBy = &at, by
 		}
+	}
+	if msg.Hold {
+		return closeout, a.handleHold(msg)
 	}
 	// A done ticket has no current dispatch, in the database too: a reload
 	// mustn't make the old token current again (AMP #2944).

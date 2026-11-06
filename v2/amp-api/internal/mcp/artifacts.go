@@ -18,6 +18,9 @@ import (
 // SetAppURL tells the server AMP's public address, for links to artifacts.
 func (s *Server) SetAppURL(u string) { s.svc.AppURL = u }
 
+// SetReceiptStore sets the receipt evidence store (#126; nil: none).
+func (s *Server) SetReceiptStore(e *service.EvidenceStore) { s.svc.Evidence = e }
+
 // SetArtifactRetention sets how long unkept artifacts live after their last version.
 func (s *Server) SetArtifactRetention(d time.Duration) { s.svc.ArtifactRetention = d }
 

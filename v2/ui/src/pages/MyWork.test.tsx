@@ -215,6 +215,23 @@ describe('top-level My work: a dispatched ticket no worker started', () => {
   })
 })
 
+describe('top-level My work: a completion held for you (#126)', () => {
+  it('counts it as Verify, says why, and links into My work', async () => {
+    const held = item({ kind: 'verify', task_id: 77, name: 'Settings page', state: 'in_progress', hold_reason: 'no checks were recorded' })
+    payload = {
+      ...busy,
+      counts: { ...counts({}), verify: 1, waiting: 1 },
+      projects: [{ project_id: 2, project_code: 'AMPV2', project_name: 'AMP v2', agents_in_progress: 0, more: 0,
+        counts: { ...counts({}), verify: 1, waiting: 1 }, rows: [held] }],
+    }
+    renderMyWork()
+    const amp = await screen.findByRole('article', { name: /AMP v2/ })
+    expect(amp.textContent).toMatch(/Verify 1/)
+    expect(within(amp).getByText(/Couldn't verify #77: no checks were recorded/)).toBeInTheDocument()
+    expect(within(amp).getByRole('link', { name: /#77/ })).toHaveAttribute('href', '/project/2/my-work?focus=77')
+  })
+})
+
 describe('top-level My work loading', () => {
   it('draws the header at once and the summary skeleton only once the load runs past 250ms', async () => {
     let release!: () => void

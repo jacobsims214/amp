@@ -3,6 +3,7 @@ import { api } from '../api/client'
 import type { Run, Usage } from '../types'
 import { tokens, usd } from '../lib/usage'
 import { Markdown } from './ui/Markdown'
+import { safeUrl } from '../lib/safeUrl'
 
 const OUTCOME: Record<Run['outcome'], string> = {
   completed: 'var(--st-done)', blocked: 'var(--st-flag)', progress: 'var(--st-prog)', abandoned: 'var(--ink-3)',
@@ -48,9 +49,9 @@ export function RunsPanel({ taskId, refreshKey }: { taskId: number; refreshKey?:
               <span className="col-span-2 amp-num text-[11px] text-ink-2 flex flex-wrap gap-x-3 gap-y-0.5">
                 {(r.input_tokens != null || r.output_tokens != null) && <span>{tokens(r.input_tokens)} in · {tokens(r.output_tokens)} out{r.cache_read_tokens ? ` · ${tokens(r.cache_read_tokens)} cached` : ''}</span>}
                 {r.cost_usd != null && <span>{usd(r.cost_usd)}</span>}
-                {(r.branch || r.commit) && <span>{r.branch || '?'}{r.commit ? ` @ ${r.commit.slice(0, 9)}` : ''}{r.pushed === false ? ' · not pushed' : r.pushed ? ' · pushed' : ''}</span>}
+                {(r.branch || r.commit) && <span>{r.branch || '?'}{r.commit ? ` @ ${r.commit.slice(0, 9)}` : ''}{r.base_branch ? ` → ${r.base_branch}` : ''}{r.pushed === false ? ' · not pushed' : r.pushed ? ' · pushed' : ''}</span>}
                 {r.merged && <span className="text-success-ink">merged</span>}
-                {r.pr_url && <a href={r.pr_url} target="_blank" rel="noreferrer" className="underline underline-offset-2 hover:text-ink">PR</a>}
+                {r.pr_url && safeUrl(r.pr_url) && <a href={safeUrl(r.pr_url)} target="_blank" rel="noreferrer" className="underline underline-offset-2 hover:text-ink">PR</a>}
               </span>
               {/* The run's note is the agent's own summary, written as markdown. */}
               {r.note && <><span /><div className="col-span-2 min-w-0" data-testid="run-note"><Markdown size="compact">{r.note}</Markdown></div></>}
