@@ -30,5 +30,10 @@ If you contribute as part of your job, make sure your employer allows it
 - UI (`v2/ui`): `npx tsc -b` and `npm run lint` pass.
 - Changes must be backward compatible: database migrations only add, and
   existing MCP tools and REST endpoints keep working for current clients.
+- Migrations in `v2/amp-api/cmd/server/migrations/` are numbered `NNN_name.sql`
+  (three digits). Take the next free number and check open pull requests for
+  the same one before you push. `TestMigrationPrefixes` fails on a duplicate
+  or malformed prefix. Put only `.sql` files in that directory; every entry is
+  run as a migration.
 - If you change how AMP is used, update the guide in [`v2/kb/`](./v2/kb/).
   It ships with AMP and agents teach users from it.
