@@ -177,7 +177,8 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 			return
 		}
 		replyCh := make(chan ReplySimple, 1)
-		ctx.Send(pid, &MsgUpdateTask{Req: msg.Req, KeepHuman: msg.KeepHuman, ReplyCh: replyCh})
+		ctx.Send(pid, &MsgUpdateTask{Req: msg.Req, KeepHuman: msg.KeepHuman, By: msg.By, ByName: msg.ByName,
+			DecideBySuggestOnly: msg.DecideBySuggestOnly, DecideByPerson: msg.DecideByPerson, ReplyCh: replyCh})
 		msg.ReplyCh <- <-replyCh
 
 	case *MsgSetTaskState:

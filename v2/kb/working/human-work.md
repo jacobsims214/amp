@@ -92,7 +92,9 @@ project, and every action happens in place:
 - **Do**: **Start**, then **Mark done…**, which takes a note, a link and the hours you spent.
   Each card says **blocks N · waiting Xd** (or **Nothing waits on it · waiting Xd**), where N is
   every open ticket downstream of it, and the Do cards are sorted by that count, most first.
-  Answer and Merge items count the same way. A judgment ticket with a decision doc offers
+  A ticket past its **decide-by date** (below) comes before all of them, the longest overdue
+  first, with a red **Overdue · 3h** chip; one with a date still ahead says **Decide in 2d**, and
+  the card gives the date in your own time zone. Answer and Merge items count the same way. A judgment ticket with a decision doc offers
   **Start** and **Decide in the ticket**, which opens its panel: it is recorded there, on the
   doc, never by Mark done.
 
@@ -184,6 +186,31 @@ on them.
   doc; you write your decision when you mark it done. Once a ticket has a doc, who does it and
   why are fixed: changing its **Done by** or reason is refused ("This ticket's decision is in its
   doc; record it there or plan a new judgment ticket: <link>"), from the web UI and over MCP.
+- **A decide-by date.** A person's ticket can say when it should be decided by. The agent that
+  plans a decision can suggest one (`decide_by`, ISO 8601 with a time zone, on `amp_create_tasks`,
+  `amp_create_task` or `amp_update_task`): it must be at least an hour ahead, and only on a ticket
+  that has none. Moving or removing a date is the person's (the ticket's owner), in the web UI:
+  over MCP it's refused, and so is anyone else's change in the web UI or REST, a lead's or the
+  ticket's creator's included (they too can only suggest a first date an hour or more ahead). Its
+  person sets, changes or removes it on the decision card (**Set a date**, **Change**, **Remove**), or over REST
+  (`PATCH /api/tasks/{id}` with `decide_by`, or `clear: ["decide_by"]`). The card reads "Decide by
+  Thu, Nov 12, 5:00 PM EST · in 2d", in your time zone, and turns red once it passes ("3h
+  overdue"); My work flags it and puts it first. Each change is on the ticket's history. Only a
+  person's ticket has one (an agent's ticket is refused), and a done ticket can't get one.
+  - **Escalation when overdue** is per project, in **Settings › Decision escalation**, and off
+    (0) by default. With it on, a ticket still open that many minutes after its date is escalated
+    **once**: AMP comments on the ticket that the decision is overdue and whom it waits on, and,
+    if the project chose them, raises its priority one step and hands it to the **backup
+    decider**. Only a ticket its person can act on now is escalated: one still waiting on
+    dependencies, a schedule or plan approval, or with a decision being recorded, waits until it
+    can be (its date stands). A ticket its person has started stays with them (reminded, not
+    handed over), and so does any ticket when the backup decider has left the project or been
+    disabled. The ticket's history says what was done (`decision_escalated`), and the audit log
+    has `task.decision_overdue` (delivered to webhooks). A new date starts it over; saving the same
+    date again doesn't. Only project
+    owners change these settings, in the web UI; agents can't. Escalation always reaches a person:
+    AMP never records the decision or picks the recommended option.
+  - `amp_list_tasks`' `waiting_on_people` items carry `decide_by` and `overdue` too.
 - **It's never flagged as quiet.** People work in days, not the minutes an agent takes. It shows as
   **stale** after two days with no activity.
 

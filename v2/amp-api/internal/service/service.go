@@ -589,9 +589,10 @@ func planApprovalGate(proj *domain.Project, lookupErr error, t *domain.Task, pla
 // needs project owner access. Callers publish project.updated.
 func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectID int, u domain.ProjectSettings) (*domain.Project, error) {
 	if u.Name == nil && u.Description == nil && u.OpenReassign == nil && u.RequirePlanApproval == nil && u.RequireMerge == nil &&
-		u.NotStartedFlagMinutes == nil && u.NotStartedReturnMinutes == nil && u.Metadata == nil {
+		u.NotStartedFlagMinutes == nil && u.NotStartedReturnMinutes == nil && u.Metadata == nil && !u.ChangesEscalation() {
 		return nil, authz.BadRequest("nothing to change: pass name, description, open_reassign, require_plan_approval, require_merge, " +
-			"not_started_flag_minutes, not_started_return_minutes, or metadata")
+			"not_started_flag_minutes, not_started_return_minutes, decision_escalation_minutes, decision_escalation_raise_priority, " +
+			"decision_backup_decider, or metadata")
 	}
 	if _, _, err := u.Metadata.Split(); err != nil {
 		return nil, authz.BadRequest("%s", err.Error())
@@ -604,6 +605,9 @@ func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectI
 		u.Name = &name
 	}
 	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Owner); err != nil {
+		return nil, err
+	}
+	if err := s.checkEscalationSettings(ctx, p, projectID, u); err != nil {
 		return nil, err
 	}
 	// Turning plan approval off lets agents start work nobody approved, so
@@ -622,7 +626,8 @@ func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectI
 		e := domain.AuditEntry{Action: "project.settings", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
 			TargetName: proj.Name, Summary: "changed project settings", Details: map[string]any{"name": u.Name, "description_changed": u.Description != nil,
 				"open_reassign": u.OpenReassign, "require_plan_approval": u.RequirePlanApproval, "require_merge": u.RequireMerge,
-				"metadata": u.Metadata, "channel": p.Channel},
+				"decision_escalation_minutes": u.DecisionEscalationMinutes, "decision_escalation_raise_priority": u.DecisionEscalationRaisePriority,
+				"decision_backup_decider": u.DecisionBackupDecider, "metadata": u.Metadata, "channel": p.Channel},
 			After: projectSettingsOf(proj)}
 		if prevErr == nil {
 			e.Before = projectSettingsOf(prev)
@@ -769,7 +774,9 @@ func projectSettingsOf(p *domain.Project) map[string]any {
 		return nil
 	}
 	m := map[string]any{"name": p.Name, "description_length": len(p.Description), "open_reassign": p.OpenReassign,
-		"require_plan_approval": p.RequirePlanApproval, "require_merge": p.RequireMerge}
+		"require_plan_approval": p.RequirePlanApproval, "require_merge": p.RequireMerge,
+		"decision_escalation_minutes": p.DecisionEscalationMinutes, "decision_escalation_raise_priority": p.DecisionEscalationRaisePriority,
+		"decision_backup_decider": p.DecisionBackupDecider}
 	if len(p.Metadata) > 0 {
 		md := make(map[string]any, len(p.Metadata))
 		for k, v := range p.Metadata {

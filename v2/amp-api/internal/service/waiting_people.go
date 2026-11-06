@@ -89,6 +89,9 @@ type PersonWaitItem struct {
 	EpicID   int       `json:"epic_id,omitempty"`   // approve
 	EpicName string    `json:"epic_name,omitempty"` // approve
 	Since    time.Time `json:"since"`
+	// DecideBy / Overdue: a person's ticket's decide-by date (#146).
+	DecideBy *time.Time `json:"decide_by,omitempty"`
+	Overdue  bool       `json:"overdue,omitempty"`
 }
 
 // ProjectWaitingOnPeople is what projectID waits on each person for.
@@ -121,7 +124,7 @@ func (s *Service) ProjectWaitingOnPeople(ctx context.Context, p authz.Principal,
 			if ids == nil {
 				ids = []int{}
 			}
-			item := PersonWaitItem{Kind: it.Kind, TaskIDs: ids, Since: it.Since}
+			item := PersonWaitItem{Kind: it.Kind, TaskIDs: ids, Since: it.Since, DecideBy: it.DecideBy, Overdue: it.Overdue}
 			if it.Kind == WaitApprove {
 				item.EpicID, item.EpicName = it.EpicID, it.EpicName
 			}

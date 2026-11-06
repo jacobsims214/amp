@@ -141,12 +141,14 @@ func (r *Repo) Close() { r.db.Close() }
 type rowScanner interface{ Scan(dest ...any) error }
 
 const projectCols = `id, name, code, description, state, org_id, created_by, open_reassign, plan_approved_at, plan_approved_by, require_plan_approval, metadata, created_at, updated_at,
-	require_merge, require_merge_since, not_started_flag_minutes, not_started_return_minutes`
+	require_merge, require_merge_since, not_started_flag_minutes, not_started_return_minutes,
+	decision_escalation_minutes, decision_escalation_raise_priority, decision_backup_decider`
 
 func scanProject(row rowScanner, p *domain.Project) error {
 	return row.Scan(&p.ID, &p.Name, &p.Code, &p.Description, &p.State, &p.OrgID, &p.CreatedBy, &p.OpenReassign,
 		&p.PlanApprovedAt, &p.PlanApprovedBy, &p.RequirePlanApproval, &p.Metadata, &p.CreatedAt, &p.UpdatedAt,
-		&p.RequireMerge, &p.RequireMergeSince, &p.NotStartedFlagMinutes, &p.NotStartedReturnMinutes)
+		&p.RequireMerge, &p.RequireMergeSince, &p.NotStartedFlagMinutes, &p.NotStartedReturnMinutes,
+		&p.DecisionEscalationMinutes, &p.DecisionEscalationRaisePriority, &p.DecisionBackupDecider)
 }
 
 const epicCols = `e.id, e.project_id, e.name, e.description, e.state, e.priority, e.created_by,
@@ -169,7 +171,8 @@ const taskCols = `id, project_id, epic_id, story_id, name, description, acceptan
 	assigned_to, agent_id, dispatched_at, completed_at, block_reason, start_at, created_by, owner_user_id, metadata, created_at, updated_at,
 	performer, human_reason, ready_at, planned_at, approved_at, approved_by, approved_for,
 	merge_required, merge_state, merged_at, merge_source,
-	dispatch_id, started_at, started_by, returned_at, returned_reason`
+	dispatch_id, started_at, started_by, returned_at, returned_reason,
+	decide_by, decide_by_escalated_at`
 
 // taskFields are the scan targets for taskCols, in order.
 func taskFields(t *domain.Task) []any {
@@ -183,6 +186,7 @@ func taskFields(t *domain.Task) []any {
 		&t.Performer, &t.HumanReason, &t.ReadyAt, &t.PlannedAt, &t.ApprovedAt, &t.ApprovedBy, &t.ApprovedFor,
 		&t.MergeRequired, &t.MergeState, &t.MergedAt, &t.MergeSource,
 		&t.DispatchID, &t.StartedAt, &t.StartedBy, &t.ReturnedAt, &t.ReturnedReason,
+		&t.DecideBy, &t.DecideByEscalatedAt,
 	}
 }
 
@@ -299,10 +303,15 @@ func (r *Repo) UpdateProject(ctx context.Context, id int, u domain.ProjectSettin
 		   require_merge = COALESCE($8, require_merge),
 		   not_started_flag_minutes = COALESCE($9, not_started_flag_minutes),
 		   not_started_return_minutes = COALESCE($10, not_started_return_minutes),
+		   decision_escalation_minutes = COALESCE($11, decision_escalation_minutes),
+		   decision_escalation_raise_priority = COALESCE($12, decision_escalation_raise_priority),
+		   decision_backup_decider = CASE WHEN $13::int IS NULL THEN decision_backup_decider
+		                                  WHEN $13::int = 0 THEN NULL ELSE $13::int END,
 		   updated_at = NOW()
 		 WHERE id = $1 RETURNING `+projectCols,
 		id, u.Name, u.Description, u.OpenReassign, set, removeOrEmpty(remove), u.RequirePlanApproval, u.RequireMerge,
 		u.NotStartedFlagMinutes, u.NotStartedReturnMinutes,
+		u.DecisionEscalationMinutes, u.DecisionEscalationRaisePriority, u.DecisionBackupDecider,
 	), p)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("project %d not found", id)
@@ -501,11 +510,11 @@ func (r *Repo) CreateTask(ctx context.Context, req domain.CreateTaskRequest) (*d
 	t := &domain.Task{}
 	err := scanTask(r.db.QueryRow(ctx,
 		`INSERT INTO tasks (project_id, epic_id, story_id, name, description, acceptance_criteria, priority, assigned_to, start_at, created_by, owner_user_id, metadata,
-		                    performer, human_reason, ready_at, planned_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), clock_timestamp())
+		                    performer, human_reason, ready_at, planned_at, decide_by)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), clock_timestamp(), $15)
 		 RETURNING `+taskCols,
 		req.ProjectID, req.EpicID, req.StoryID, req.Name, req.Description, req.AcceptanceCriteria, req.Priority, req.AssignedTo, req.StartAt,
-		req.CreatedBy, req.OwnerUserID, metaOrEmpty(req.Metadata), performerOrAgent(req.Performer), req.HumanReason,
+		req.CreatedBy, req.OwnerUserID, metaOrEmpty(req.Metadata), performerOrAgent(req.Performer), req.HumanReason, req.DecideBy,
 	), t)
 	if err != nil {
 		// Two merge steps created at once for the same ticket: the loser of
@@ -784,6 +793,18 @@ func (r *Repo) UpdateTaskPlanned(ctx context.Context, req domain.UpdateTaskReque
 	} else if req.HumanReason != "" || clr("human_reason") {
 		args = append(args, req.HumanReason)
 		query += fmt.Sprintf(`, human_reason = $%d`, len(args))
+	}
+	// A new (or cleared) decide-by date is a new deadline: the escalation
+	// sweep may act on it once more (#146). Re-sending the same date keeps
+	// the escalation mark, so a save without an edit doesn't re-arm it.
+	if req.DecideBy != nil || clr("decide_by") {
+		var at *time.Time
+		if !clr("decide_by") {
+			at = req.DecideBy
+		}
+		args = append(args, at)
+		n := len(args)
+		query += fmt.Sprintf(`, decide_by = $%d::timestamptz, decide_by_escalated_at = CASE WHEN decide_by IS DISTINCT FROM $%d::timestamptz THEN NULL ELSE decide_by_escalated_at END`, n, n)
 	}
 
 	query += ` WHERE id = $` + fmt.Sprint(len(args)+1) + ` RETURNING planned_at`

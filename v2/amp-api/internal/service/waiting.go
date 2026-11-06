@@ -108,6 +108,10 @@ type WaitItem struct {
 	// HasDecisionDoc: the ticket's decision is recorded on its doc, in the
 	// ticket's drawer, not by Mark done (Task.HasDecisionDoc).
 	HasDecisionDoc bool `json:"has_decision_doc,omitempty"`
+	// DecideBy: a person's ticket's decide-by date, and Overdue once it has
+	// passed (#146). Overdue Do items sort first, the earliest date first.
+	DecideBy *time.Time `json:"decide_by,omitempty"`
+	Overdue  bool       `json:"overdue,omitempty"`
 
 	// approve
 	EpicID   int    `json:"epic_id,omitempty"`
@@ -213,6 +217,7 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 	approve := map[epicKey]*WaitItem{}
 	var approveOrder []epicKey
 	var merges, comingDeps []int
+	now := time.Now()
 	add := func(it WaitItem) {
 		if it.Kind == "coming_up" {
 			w.ComingUp = append(w.ComingUp, it)
@@ -225,7 +230,7 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 		it := WaitItem{Kind: kind, Key: fmt.Sprintf("task:%d", t.ID), ProjectID: t.ProjectID, ProjectCode: c.ProjectCode,
 			ProjectName: c.ProjectName, TaskID: t.ID, TaskIDs: []int{t.ID}, Name: t.Name, State: string(t.State), Since: since,
 			Performer: t.Performer, HumanReason: t.HumanReason, OwnerUserID: t.OwnerUserID, EpicID: t.EpicID,
-			HasDecisionDoc: t.HasDecisionDoc}
+			HasDecisionDoc: t.HasDecisionDoc, DecideBy: t.DecideBy, Overdue: t.DecisionOverdue(now)}
 		if opt.detail {
 			cp := *t
 			it.Task = &cp
@@ -406,7 +411,14 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 		if rank[a.Kind] != rank[b.Kind] {
 			return rank[a.Kind] < rank[b.Kind]
 		}
-		// Do items: the ones holding up the most work first.
+		// Do items: overdue decisions first, the longest overdue first
+		// (#146); then the ones holding up the most work.
+		if a.Kind == WaitDo && a.Overdue != b.Overdue {
+			return a.Overdue
+		}
+		if a.Kind == WaitDo && a.Overdue && !a.DecideBy.Equal(*b.DecideBy) {
+			return a.DecideBy.Before(*b.DecideBy)
+		}
 		if a.Kind == WaitDo && len(a.HoldingUp) != len(b.HoldingUp) {
 			return len(a.HoldingUp) > len(b.HoldingUp)
 		}

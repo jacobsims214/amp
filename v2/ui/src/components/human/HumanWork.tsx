@@ -30,6 +30,7 @@ import type { ProjectPlan } from '../../hooks/useProjectPlan'
 import type { DecisionDoc, Task } from '../../types'
 import { Markdown } from '../ui/Markdown'
 import { DecisionCard } from './DecisionCard'
+import { DecideBy } from './DecideBy'
 import { HumanActions } from './HumanActions'
 
 /** How many dependents are listed by name before "+N more". */
@@ -186,7 +187,14 @@ export function HumanWork({ task, meId, people, plan, canPlan, onEdit, ticketHre
         </div>
       ) : hasDoc && loaded !== 'none' ? (
         <span className="text-[12.5px] text-ink-2" data-testid="decision-loading">Loading the decision doc…</span>
-      ) : <HumanActions task={task} kind="do" canAct={mine} ownerName={owner?.name} onChanged={t => { if (t) onChanged(t) }} />}
+      ) : <>
+        {/* A decision without a doc carries its decide-by date here (#146);
+            any other person's ticket shows one only when it has one. */}
+        {(task.decide_by || task.human_reason === 'judgment' || task.human_reason === 'approval') && (
+          <DecideBy task={task} canEdit={mine} onChanged={onChanged} />
+        )}
+        <HumanActions task={task} kind="do" canAct={mine} ownerName={owner?.name} onChanged={t => { if (t) onChanged(t) }} />
+      </>}
     </div>
   )
 }

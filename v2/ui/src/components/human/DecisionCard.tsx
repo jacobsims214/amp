@@ -9,7 +9,9 @@
  * colour and an "Agent" tag on hover; the owner's have no mark (line blame
  * across the doc's versions, lib/provenance.ts).
  *
- * The header says "blocks N · waiting Xd" (J1) while the ticket is open.
+ * The header says "blocks N · waiting Xd" (J1) while the ticket is open,
+ * and its decide-by date (DecideBy, #146): relative and absolute, red once
+ * overdue; its person sets or changes it there.
  *
  * Edit doc opens the markdown (with a preview) and the option editor; Save
  * writes both as one new version. A 409 keeps the draft and says why. It is
@@ -32,6 +34,7 @@ import { blame, blameRuns, type Author } from '../../lib/provenance'
 import type { DecisionAsk, DecisionDoc, Task } from '../../types'
 import { Markdown } from '../ui/Markdown'
 import { OptionPicker } from './OptionPicker'
+import { DecideBy } from './DecideBy'
 
 export interface DecisionCardProps {
   task: Task
@@ -212,6 +215,7 @@ export function DecisionCard({ task, doc, canAct, ownerName, onChanged, onDocCha
       {open && blocks !== undefined && (
         <span className="text-[12.5px] text-ink-2" data-testid="decision-wait">{waitLine(blocks, waitingSince, now())}</span>
       )}
+      {open && !claimed && <DecideBy task={task} canEdit={canAct} onChanged={onChanged} now={now} />}
       <span className="text-[12px] text-ink-3" data-testid="decision-meta">
         Decision doc · drafted by {(doc.versions?.[0]?.author_kind ?? 'agent') === 'agent' ? 'an agent' : 'a person'} · v{doc.current_version}
         {' · '}<a href={`/artifacts/${doc.artifact_id}`} className="underline underline-offset-2 hover:text-ink">open the doc</a>

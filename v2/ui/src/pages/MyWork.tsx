@@ -22,6 +22,7 @@ import { expiresIn } from '../lib/artifacts'
 import { MySessionsPanel } from '../components/remote/MySessionsPanel'
 import { remoteAvailable, useRemote } from '../remote/remote-context'
 import { projectLink } from '../lib/projectLink'
+import { describeDecideBy } from '../lib/decideBy'
 import { isNoUserError, noMyWorkReason } from '../lib/myWorkAccess'
 import { MyWorkLoadError, MyWorkUnavailable } from '../components/human/MyWorkUnavailable'
 
@@ -89,9 +90,13 @@ function describe(it: WaitItem): { title: string; sub: string } {
       // The server's own minutes (not_started_minutes): no local arithmetic.
       return { title: `#${it.task_id} ${it.name}`,
         sub: `${needs} · dispatched${it.agent_id ? ` to ${it.agent_id}` : ''}${it.not_started_minutes != null ? ` ${it.not_started_minutes} min ago` : ''}, no worker has started it` }
-    default:
+    default: {
+      // A decide-by date (#146): when, in the reader's zone, and how far off.
+      const d = describeDecideBy(it.decide_by)
       return { title: `#${it.task_id} ${it.name}`,
-        sub: `${needs} · ${it.state === 'in_progress' ? `started ${ago(it.since)} ago` : `ready for ${ago(it.since)}`}` }
+        sub: `${needs} · ${it.state === 'in_progress' ? `started ${ago(it.since)} ago` : `ready for ${ago(it.since)}`}` +
+          (d ? ` · decide by ${d.absolute} (${d.relative})` : '') }
+    }
   }
 }
 

@@ -409,6 +409,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"performer":           str(performerDesc),
 			"human_reason":        str("With performer 'human': why a person does it. " + humanReasonList() + "."),
 			"ask":                 askProp(),
+			"decide_by":           str(decideByDesc),
 		}), wrap(ctx, s.guard(authz.Member, s.createTask)))
 
 	mcp.AddTool(tool("amp_create_tasks",
@@ -452,6 +453,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 						"performer":    str(performerDesc),
 						"human_reason": str("With performer 'human': why a person does it. " + humanReasonList() + "."),
 						"ask":          askProp(),
+						"decide_by":    str(decideByDesc),
 					},
 					"required": []string{"ref", "story_id", "name"},
 				},
@@ -547,6 +549,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"human_reason":        str("Why a person does it. " + humanReasonList() + ". Making it 'judgment' needs an ask."),
 			"clear":               strArr(clearDesc("description, acceptance_criteria, assigned_to, agent_id")),
 			"ask":                 askProp(),
+			"decide_by":           str(decideByDesc),
 		}), wrap(ctx, s.guard(authz.Member, s.updateTask)))
 
 	mcp.AddTool(tool("amp_claim_task",
@@ -1370,6 +1373,10 @@ func (s *Server) createTask(rctx context.Context, args map[string]interface{}) (
 	if err != nil {
 		return nil, err
 	}
+	decideBy, err := optDecideBy(args)
+	if err != nil {
+		return nil, err
+	}
 	task, warnings, err := s.svc.CreateTask(rctx, caller(rctx).p, domain.CreateTaskRequest{
 		ProjectID:          projectID,
 		EpicID:             optInt(args, "epic_id", 0),
@@ -1385,6 +1392,7 @@ func (s *Server) createTask(rctx context.Context, args map[string]interface{}) (
 		Performer:          optStr(args, "performer", ""),
 		HumanReason:        optStr(args, "human_reason", ""),
 		Ask:                ask,
+		DecideBy:           decideBy,
 	}, optStr(args, "owner", ""))
 	if err != nil {
 		return nil, err
@@ -1465,12 +1473,16 @@ func (s *Server) createTasks(rctx context.Context, args map[string]interface{}) 
 		if err != nil {
 			return nil, fmt.Errorf("tasks[%d]: %w", i, err)
 		}
+		decideBy, err := optDecideBy(m)
+		if err != nil {
+			return nil, fmt.Errorf("tasks[%d]: %w", i, err)
+		}
 		specs = append(specs, service.TaskSpec{
 			Ref: optStr(m, "ref", ""), StoryID: optInt(m, "story_id", 0), Name: optStr(m, "name", ""),
 			Description: optStr(m, "description", ""), AcceptanceCriteria: optStr(m, "acceptance_criteria", ""),
 			Priority: optStr(m, "priority", "1"), AssignedTo: optStr(m, "assigned_to", ""), Owner: optStr(m, "owner", ""),
 			DependsOn: deps, StartAt: startAt, Metadata: meta,
-			Performer: optStr(m, "performer", ""), HumanReason: optStr(m, "human_reason", ""), Ask: ask,
+			Performer: optStr(m, "performer", ""), HumanReason: optStr(m, "human_reason", ""), Ask: ask, DecideBy: decideBy,
 		})
 	}
 	created, warnings, err := s.svc.CreateTasks(rctx, caller(rctx).p, projectID, specs)
@@ -1833,6 +1845,9 @@ func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (
 		return nil, err
 	}
 	if req.Ask, err = optAsk(args); err != nil {
+		return nil, err
+	}
+	if req.DecideBy, err = optDecideBy(args); err != nil {
 		return nil, err
 	}
 	// A person's ticket isn't switched to agent work off the web UI.
@@ -3951,4 +3966,24 @@ func orEmpty(m map[domain.TaskState]int) map[domain.TaskState]int {
 		return map[domain.TaskState]int{}
 	}
 	return m
+}
+
+// decideByDesc describes the decide_by argument (#146).
+const decideByDesc = "Optional, for a person's ticket (performer 'human') only: when it should be decided by, ISO 8601 with a " +
+	"time zone (e.g. '2026-11-12T17:00:00Z'), in the future. Suggest one when a decision holds up other work. Once a ticket has one, " +
+	"only its person moves or removes it, in the AMP web UI. " +
+	"Past it, My Work shows the ticket overdue, and a project with escalation on reminds its person (it never decides for them)."
+
+// optDecideBy reads an optional decide_by (RFC 3339, so its zone is never
+// guessed).
+func optDecideBy(args map[string]interface{}) (*time.Time, error) {
+	v := strings.TrimSpace(optStr(args, "decide_by", ""))
+	if v == "" {
+		return nil, nil
+	}
+	t, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		return nil, fmt.Errorf("decide_by: use ISO 8601 with a time zone, e.g. 2026-11-12T17:00:00Z (%v)", err)
+	}
+	return &t, nil
 }

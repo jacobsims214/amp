@@ -58,6 +58,8 @@ func (s *Service) RunDispatchWatchdog(ctx context.Context, interval time.Duratio
 		} else if n > 0 {
 			slog.Info("dispatch watchdog returned tickets nobody started", "count", n)
 		}
+		// Overdue decisions ride the same tick (#146, decide_by.go).
+		s.runDecisionSweep(ctx, lock)
 		select {
 		case <-ctx.Done():
 			return
