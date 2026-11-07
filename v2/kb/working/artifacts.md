@@ -32,6 +32,16 @@ Who can review: the ticket's owner or creator, a lead, or a project owner (anyon
 for an artifact without a ticket), in the web UI. No agent can approve, not even one under your
 own login: a person approves, like plan approval.
 
+## Finding an artifact
+
+On the **Artifacts** tab, search by title or ticket, and filter by status, kind (page, drawing,
+image, document, PDF, text) and expiry (**Expiring soon** is within a week; **Kept** never
+expires). Sort by waiting-first, recently updated, or **Group by ticket**, which puts each ticket's
+artifacts under its own heading (those without a ticket come last). The filters and sort are in
+the page's address, so you can share or bookmark a view. Each card links to the ticket it belongs
+to, and its **v2**-style version number opens the version history. Cards that expire within a week
+have a one-click **Keep**.
+
 ## Keeping or letting go
 
 Artifacts don't pile up: each one is deleted 45 days after its last version (the server's

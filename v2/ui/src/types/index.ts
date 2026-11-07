@@ -8,6 +8,8 @@ export interface Project {
   description: string
   state: 'active' | 'archived'
   org_id?: number | null
+  /** set on project lists: the org's name, even when the caller isn't a member */
+  org_name?: string
   created_by?: number | null
   /** any project member may reassign tickets that aren't in progress */
   open_reassign?: boolean
