@@ -1,8 +1,10 @@
 import type { GettingStarted } from '../types'
 
-/** Every step of the Get started checklist is done. */
+/**
+ * Every step of the Get started checklist is done. The fourth step, seeing a
+ * receipt, arrived with verification receipts (#149), which landed after
+ * this list.
+ */
 export function gettingStartedDone(g: GettingStarted): boolean {
-  // The "See your first receipt" step is added by whichever of this change
-  // (#128) and verification receipts (#149) lands second.
-  return g.agent.done && g.project.done && g.plan.done
+  return g.agent.done && g.project.done && g.plan.done && g.receipt.done
 }

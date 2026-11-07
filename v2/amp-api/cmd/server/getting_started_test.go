@@ -12,7 +12,8 @@ import (
 
 // The Get started checklist (#128) reads every step from server state: an
 // agent reached AMP over MCP as you (or as an agent account you manage, or
-// with a token of yours), you can see a project, and you approved a plan.
+// with a token of yours), you can see a project, you approved a plan, and a
+// receipt is visible to you.
 func TestGettingStarted_StepsFromServerState(t *testing.T) {
 	w := newRBACWorld(t)
 	ra := newRestAs(t, w)
@@ -41,13 +42,15 @@ func TestGettingStarted_StepsFromServerState(t *testing.T) {
 
 	// Someone with no projects and no agent: nothing is done.
 	out := ra.want(t, 200, "outsider", "GET", path, nil)
-	for _, name := range []string{"agent", "project", "plan"} {
+	for _, name := range []string{"agent", "project", "plan", "receipt"} {
 		if step(out, name)["done"] != false {
 			t.Fatalf("outsider's %s step is done: %v", name, out)
 		}
 	}
-	if _, ok := out["receipt"]; ok {
-		t.Fatalf("a receipt step on a build without receipts: %v", out)
+	// The receipt step is there even when nothing can be seen yet: it has
+	// nothing to link to, and a receipt is never held out of sight.
+	if r := step(out, "receipt"); r["project_id"] != nil || r["task_id"] != nil {
+		t.Fatalf("an outsider's receipt step points somewhere: %v", r)
 	}
 
 	// alice can see the Acme project; no agent of hers has connected yet.
@@ -60,6 +63,9 @@ func TestGettingStarted_StepsFromServerState(t *testing.T) {
 	}
 	if p := step(out, "plan"); p["done"] != false || num(t, p, "project_id") != w.s.projectID {
 		t.Fatalf("plan step before any approval: %v", out)
+	}
+	if r := step(out, "receipt"); r["done"] != false {
+		t.Fatalf("receipt step before any receipt: %v", out)
 	}
 
 	// Her agent calls a tool over MCP: the step is done, and stays done.
@@ -173,5 +179,33 @@ func TestGettingStarted_StepsFromServerState(t *testing.T) {
 		if s := step(out, name); s["done"] != false || s["project_id"] != nil {
 			t.Fatalf("outsider's %s step after an approval elsewhere: %v", name, out)
 		}
+	}
+
+	// The receipt step is done once the user can see a receipt: a completing
+	// run's final receipt in a project they can see, the same visibility the
+	// ticket's own receipt view uses. A draft nobody can see yet doesn't count.
+	setReceiptsMode(t, ra, w.s.projectID, "inform")
+	alice := w.as(w.alice)
+	ridTicket := mkIn(t, alice, w.s.storyID, "receipt me")
+	ridDispatch := dispatchClaims(t, alice, ridTicket)
+	alice.call(t, "amp_open_receipt", map[string]any{"task_id": float64(ridTicket), "dispatch_id": ridDispatch})
+	if r := step(ra.want(t, 200, "alice", "GET", path, nil), "receipt"); r["done"] != false {
+		t.Fatalf("an open draft checked alice's receipt step: %v", r)
+	}
+	if out := alice.call(t, "amp_complete_task", map[string]any{"task_id": float64(ridTicket), "dispatch_id": ridDispatch,
+		"checks": []any{passCheck("1")}}); out["state"] != "completed" {
+		t.Fatalf("complete: %v", out)
+	}
+	r := step(ra.want(t, 200, "alice", "GET", path, nil), "receipt")
+	if r["done"] != true || r["at"] == nil || num(t, r, "project_id") != w.s.projectID || num(t, r, "task_id") != ridTicket {
+		t.Fatalf("receipt step after a receipt: %v", r)
+	}
+	// Anyone who can read that ticket sees the same receipt; someone who can't
+	// see the project doesn't, and learns nothing about it.
+	if r := step(ra.want(t, 200, "bob", "GET", path, nil), "receipt"); r["done"] != true || num(t, r, "task_id") != ridTicket {
+		t.Fatalf("bob's receipt step, same project: %v", r)
+	}
+	if r := step(ra.want(t, 200, "outsider", "GET", path, nil), "receipt"); r["done"] != false || r["project_id"] != nil {
+		t.Fatalf("a receipt in a project outsider can't see checked their step: %v", r)
 	}
 }

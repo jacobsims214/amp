@@ -2,8 +2,9 @@
  * The Get started checklist (#128), shown on an empty My work where the
  * queue will later be. Each step is read from the server
  * (GET /api/my-work/getting-started), so a step stays checked once it's
- * done, on every device. The one thing kept in this browser is that you
- * hid the list.
+ * done, on every device. The fourth step, seeing a receipt, arrived with
+ * verification receipts (#149). The one thing kept in this browser is that
+ * you hid the list.
  */
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
@@ -11,7 +12,7 @@ import { CheckCircle2, ChevronRight, Circle } from 'lucide-react'
 import { api } from '../api/client'
 import { CopyButton } from './admin'
 import { ManagerAgent } from './ManagerAgent'
-import { CONNECT_AGENT_DOC, mcpURL } from '../lib/guide'
+import { CONNECT_AGENT_DOC, RECEIPTS_DOC, mcpURL } from '../lib/guide'
 import { projectLink } from '../lib/projectLink'
 import { gettingStartedDone } from '../lib/gettingStarted'
 import type { GettingStarted, GettingStartedStep } from '../types'
@@ -21,6 +22,10 @@ const hidden = (who: string) => { try { return localStorage.getItem(HIDE_KEY(who
 const hide = (who: string) => { try { localStorage.setItem(HIDE_KEY(who), '1') } catch { /* this visit only */ } }
 
 const CLIENT: Record<string, string> = { harness: 'the AMP Harness', mcp: 'an MCP client', token: 'an API token' }
+
+/** The step count in words, so the heading reads "four steps" rather than "4 steps". */
+const COUNT_WORD = ['no', 'one', 'two', 'three', 'four', 'five', 'six']
+const inWords = (n: number) => COUNT_WORD[n] ?? String(n)
 
 function ago(iso?: string): string {
   if (!iso) return ''
@@ -63,14 +68,17 @@ export function GetStarted({ who }: { who: string }) {
   }, [])
   if (!g || isHidden || gettingStartedDone(g)) return null
 
-  const steps = [g.agent, g.project, g.plan]
+  const steps = [g.agent, g.project, g.plan, g.receipt]
   const done = steps.filter(s => s.done).length
   const pid = g.plan.project_id || g.project.project_id
+  // The receipt step's link opens the first receipt on the Board, where a
+  // completed ticket's receipt heads its drawer.
+  const receiptPid = g.receipt.project_id || pid
   return (
     <section className="amp-panel amp-panel-top" aria-labelledby="get-started-title">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-5 py-3.5 border-b border-line">
         <span className="amp-label">Get started</span>
-        <h2 id="get-started-title" className="m-0 text-[17px] font-semibold text-ink">Set up AMP in three steps</h2>
+        <h2 id="get-started-title" className="m-0 text-[17px] font-semibold text-ink">Set up AMP in {inWords(steps.length)} steps</h2>
         <span className="ml-auto amp-num text-[11px] text-ink-3">{done} of {steps.length} done</span>
         <button type="button" className="amp-btn amp-btn-ghost amp-btn-sm" onClick={() => { hide(who); setHidden(true) }}>Hide</button>
       </div>
@@ -101,6 +109,18 @@ export function GetStarted({ who }: { who: string }) {
           ) : <>
             <p className="m-0">Ask your <ManagerAgent /> to plan the project. Its plan waits for you here and in the project's My work: read it, then Approve. Agents start only on approved tickets.</p>
             {pid ? <Link to={projectLink(pid, 'my-work')} className={linkCls}>Open the project's My work<ChevronRight size={13} aria-hidden="true" /></Link> : null}
+          </>}
+        </Step>
+        <Step n={4} title="See your first receipt" step={g.receipt}>
+          {g.receipt.done ? <>
+            <p className="m-0">You have a receipt{g.receipt.at ? `, ${ago(g.receipt.at)}` : ''}: who did the work, where the code is, and how it was checked.</p>
+            {g.receipt.task_id && receiptPid ? (
+              <Link to={projectLink(receiptPid, 'board', g.receipt.task_id)} className={linkCls}>Open the receipt<ChevronRight size={13} aria-hidden="true" /></Link>
+            ) : null}
+          </> : <>
+            <p className="m-0">A receipt shows who did a ticket, where the code is, and how it was checked. An agent records one when it finishes a ticket, once receipts are on in the project.</p>
+            <Link to={RECEIPTS_DOC} className={linkCls}>How receipts work<ChevronRight size={13} aria-hidden="true" /></Link>
+            {receiptPid ? <Link to={projectLink(receiptPid, 'settings')} className={linkCls}>Turn receipts on in Project settings<ChevronRight size={13} aria-hidden="true" /></Link> : null}
           </>}
         </Step>
       </ol>

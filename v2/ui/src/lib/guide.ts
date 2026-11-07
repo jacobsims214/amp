@@ -10,5 +10,8 @@ export function guideDoc(path: string): string {
 /** How to connect an agent harness, and what the manager agent is. */
 export const CONNECT_AGENT_DOC = guideDoc('setup/connect-your-agent.md')
 
+/** What a verification receipt is, and how to turn receipts on. */
+export const RECEIPTS_DOC = guideDoc('working/verification-receipts.md')
+
 /** AMP's MCP endpoint, the address an agent harness connects to. */
 export const mcpURL = () => `${window.location.origin}/mcp`

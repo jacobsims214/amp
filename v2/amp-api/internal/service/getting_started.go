@@ -13,10 +13,8 @@ import (
 // The Get started checklist on an empty My work (#128). Every step is read
 // from what the server already knows, so a step stays checked once it's
 // done, on every device: an agent reached AMP as you, you can see a
-// project, and you approved a plan.
-//
-// The fourth step, "See your first receipt", is added by whichever of this
-// change (#128) and verification receipts (#149) lands second.
+// project, you approved a plan, and you can see a receipt. The receipt step
+// arrived with verification receipts (#149), which landed after this list.
 
 // GettingStartedStep is one step: whether it's done, since when, and the
 // project it happened in when that's useful for a link.
@@ -26,6 +24,8 @@ type GettingStartedStep struct {
 	ProjectID int        `json:"project_id,omitempty"`
 	// Client is how the agent connected (mcp, harness, token); agent step only.
 	Client string `json:"client,omitempty"`
+	// TaskID is the ticket the link goes to; receipt step only.
+	TaskID int `json:"task_id,omitempty"`
 }
 
 // GettingStarted is GET /api/my-work/getting-started.
@@ -33,6 +33,7 @@ type GettingStarted struct {
 	Agent   GettingStartedStep `json:"agent"`
 	Project GettingStartedStep `json:"project"`
 	Plan    GettingStartedStep `json:"plan"`
+	Receipt GettingStartedStep `json:"receipt"`
 }
 
 // agentContactKey names the caller in agent_contacts: their AMP user, or
@@ -108,6 +109,19 @@ func (s *Service) GettingStarted(ctx context.Context, p authz.Principal) (*Getti
 		out.Plan = GettingStartedStep{Done: true, At: start.PlanApprovedAt, ProjectID: start.PlanProjectID}
 	} else {
 		out.Plan.ProjectID = start.FirstProjectID
+	}
+
+	// A receipt is visible to whoever can read its ticket, the rule the
+	// shipped receipt views use (GetTaskReceipt), so "see your first
+	// receipt" is done once one final receipt exists in a project p can
+	// see. Drafts aren't shown anywhere, so they don't count.
+	receipt, err := s.Repo.FirstVisibleReceipt(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	if receipt != nil {
+		at := receipt.At
+		out.Receipt = GettingStartedStep{Done: true, At: &at, ProjectID: receipt.ProjectID, TaskID: receipt.TaskID}
 	}
 
 	return out, nil

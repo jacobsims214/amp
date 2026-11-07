@@ -49,6 +49,37 @@ func (r *Repo) FirstAgentContact(ctx context.Context, principal string, userID i
 	return &c, nil
 }
 
+// VisibleReceipt is the first receipt someone can see: the ticket and
+// project it belongs to, and when it was finalized.
+type VisibleReceipt struct {
+	TaskID    int
+	ProjectID int
+	At        time.Time
+}
+
+// FirstVisibleReceipt reads the caller's first receipt in a project among
+// ids (nil: every project, for a global admin), or nil when there's none.
+// The visibility rule is the ones the shipped receipt views use (a receipt
+// shows to whoever can read its ticket: service.GetTaskReceipt), and only a
+// final receipt is ever shown, so drafts don't count. The ticket join leaves
+// out a purged ticket's receipt, which has no drawer to open. One query over
+// the caller's whole scope, not a per-project fan-out.
+func (r *Repo) FirstVisibleReceipt(ctx context.Context, ids []int) (*VisibleReceipt, error) {
+	var out VisibleReceipt
+	err := r.db.QueryRow(ctx, `
+		SELECT rc.task_id, rc.project_id, COALESCE(rc.finalized_at, rc.created_at)
+		  FROM task_receipts rc JOIN tasks t ON t.id = rc.task_id
+		 WHERE rc.state = 'final' AND ($1::int[] IS NULL OR rc.project_id = ANY($1))
+		 ORDER BY rc.id LIMIT 1`, ids).Scan(&out.TaskID, &out.ProjectID, &out.At)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // ProjectStart is what the checklist needs from the projects someone can see.
 type ProjectStart struct {
 	FirstProjectID int        // the oldest active project, 0 when there's none
