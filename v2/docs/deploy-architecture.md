@@ -32,6 +32,7 @@ cert-manager, with authn/authz for humans (browser/UI) and machines
 | **amp-api** | Existing Go service (MCP tools + REST/SSE) | Adds JWT validation middleware (validates Dex JWKS-signed tokens on both the MCP and REST listeners) and a `users`/`user_roles` migration + `/api/me` endpoint. Trusts Envoy for edge auth but re-validates the token itself (defense in depth, per user request). |
 | **ui** | Existing React app | Adds an `AuthContext` (calls `/api/me`), a login redirect handler, and a `Users` admin page calling `amp-authadmin`. |
 | **typesense**, **ollama** | Unchanged | Same images, now as k8s Deployments+PVCs instead of compose volumes. Post-install Job pulls `nomic-embed-text` into Ollama (replaces `make kb-setup`). |
+| **seaweedfs** (opt-in, `seaweedfs.enabled`) | S3 store for verification receipt evidence (#126, #144) | SeaweedFS (Apache-2.0), one-replica StatefulSet with its own PVC, non-root (uid 1000), telemetry off. Only amp-api reaches it (ClusterIP Service on the S3 port, NetworkPolicy), with a chart-generated key pair (`amp-seaweedfs-s3`). No Envoy route: amp-api proxies every evidence read. Off by default; then evidence is on the `amp-receipts` PVC. See KB `operations/where-amp-keeps-data`. |
 
 ## Namespaces
 
@@ -113,7 +114,7 @@ Note on the internal CA: regardless of `global.tls.enabled`, `templates/cert-iss
 
 ## Not yet production-ready
 
-- **CNPG backups are not configured.** `values-production.yaml` has a commented-out `barmanObjectStore` block as a starting point — needs an S3-compatible endpoint (MinIO on Proxmox, real S3, B2, etc.) before this touches real user data.
+- **CNPG backups are not configured.** `values-production.yaml` has a commented-out `barmanObjectStore` block as a starting point — needs an S3-compatible endpoint before this touches real user data. On-prem, use SeaweedFS (its S3 gateway; the bundled one from #126/#144 works). Any S3-compatible endpoint works, including real S3 or Backblaze B2. See #145.
 - **Typesense's API key is still the local-dev default** (`amp-local-dev`) in `values-production.yaml` — needs a real generated secret before go-live.
 
 ## Deploying to the datacenter cluster (Talos/Proxmox, GitOps via ArgoCD)

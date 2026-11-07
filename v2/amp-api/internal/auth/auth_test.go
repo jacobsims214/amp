@@ -12,6 +12,7 @@ import (
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
+	"github.com/simstech/amp-api/internal/domain"
 )
 
 const testIssuer = "https://amp.example.test/dex"
@@ -360,5 +361,71 @@ func TestSessionSurvivesRefresh(t *testing.T) {
 	}
 	if DexSessionID("", 1, "n", t0) != "" {
 		t.Fatal("session id without a subject")
+	}
+}
+
+// RequireRole's 403 says what's missing, never a bare "forbidden" (#124).
+func TestRequireRole_SaysWhatIsMissing(t *testing.T) {
+	h := RequireRole(domain.RoleAdmin, func(w http.ResponseWriter, r *http.Request) { t.Fatal("handler ran") })
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/users", nil)
+	req = req.WithContext(WithIdentity(req.Context(), &Identity{Subject: "s", User: &domain.User{ID: 1, Roles: []string{domain.RoleMember}}}))
+	h(rec, req)
+	var body struct{ Error string }
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || rec.Code != 403 {
+		t.Fatalf("%d %s (%v)", rec.Code, rec.Body, err)
+	}
+	if strings.EqualFold(strings.TrimSpace(body.Error), "forbidden") || !strings.Contains(body.Error, "admin") {
+		t.Fatalf("403 body = %q", body.Error)
+	}
+}
+
+// RequireRole's 403 says which role is needed and who the caller is signed
+// in as, in the {"error": string} shape the UI already reads (#69).
+func TestRequireRole_Message(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		ident *Identity
+		code  int
+		want  string
+	}{
+		{"no identity", nil, 403, "this needs the AMP admin role, and this request isn't signed in as anyone AMP knows; sign in, then ask an AMP admin to grant it"},
+		{"user without the role", &Identity{Email: "tok@example.test", User: &domain.User{ID: 1, Email: "ann@example.test"}}, 403,
+			"this needs the AMP admin role, which your account (ann@example.test) doesn't have; ask an AMP admin to grant it"},
+		{"identity without a user", &Identity{Email: "bob@example.test"}, 403,
+			"this needs the AMP admin role, and you're signed in as bob@example.test, who has no AMP account; ask an AMP admin to invite you, then sign in again"},
+		{"sign-in that provisioning refused", &Identity{Email: "eve@example.test", ProvisionRefusal: RefusalUnverifiedEmail}, 403,
+			"this needs the AMP admin role. Your identity provider reports your email as unverified, so AMP did not create your account; ask your IdP admin to verify it."},
+		{"local dev without its user", &Identity{Subject: LocalDevSubject, Email: LocalDevEmail, LocalDev: true}, 403,
+			"this needs the AMP admin role, and the Local Dev user couldn't be set up at startup (see amp-api's log); restart amp-api once that's fixed"},
+		{"identity with no user and no email", &Identity{Subject: "machine"}, 403,
+			"this needs the AMP admin role, and this request isn't signed in as anyone AMP knows; sign in, then ask an AMP admin to grant it"},
+		{"admin", &Identity{User: &domain.User{ID: 2, Email: "root@example.test", Roles: []string{domain.RoleAdmin}}}, 200, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := RequireRole(domain.RoleAdmin, func(w http.ResponseWriter, r *http.Request) {})
+			req := httptest.NewRequest(http.MethodGet, "/api/users", nil)
+			if tc.ident != nil {
+				req = req.WithContext(WithIdentity(req.Context(), tc.ident))
+			}
+			rec := httptest.NewRecorder()
+			h(rec, req)
+			if rec.Code != tc.code {
+				t.Fatalf("status %d, want %d", rec.Code, tc.code)
+			}
+			if tc.code == 200 {
+				return
+			}
+			if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+				t.Errorf("Content-Type %q", ct)
+			}
+			var body map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("body %q: %v", rec.Body, err)
+			}
+			if body["error"] != tc.want || len(body) != 1 {
+				t.Errorf("body %v, want {error: %q}", body, tc.want)
+			}
+		})
 	}
 }

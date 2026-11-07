@@ -22,12 +22,15 @@ import { displayState } from '../lib/ticketState'
 import { ConfirmDeleteModal } from './ConfirmDeleteModal'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
 import { activityActor, canPlanTask, canTakeOverTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
-import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata, HumanReason, Run } from '../types'
+import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata, HumanReason, Run, TaskReceipt } from '../types'
 import { DependencyPicker } from './DependencyPicker'
 import { MetadataEditor } from './MetadataEditor'
 import { metadataPatch } from '../lib/metadata'
 import { Markdown } from './ui/Markdown'
 import { RunsPanel } from './RunsPanel'
+import { CompletionReceipt } from './receipt/CompletionReceipt'
+import { latestRunWith } from '../lib/receipt'
+import { useSSE } from '../hooks/useSSE'
 
 interface Props {
   task: Task | null
@@ -154,6 +157,35 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
     if (prev != null && prev !== lastId.current && searchParams.has('tab')) setTabParam(null)
   }, [task?.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // The ticket's runs, read once and shared by the receipt, the merge panel and
+  // the merge-gate note. Reread when the ticket's state or merge state changes.
+  const [runsFor, setRunsFor] = useState<{ taskId: number; runs: Run[] } | null>(null)
+  useEffect(() => {
+    if (!task) return
+    const id = task.id
+    let live = true
+    api.taskRuns(id).then(r => { if (live) setRunsFor({ taskId: id, runs: r.runs }) })
+      .catch(() => { if (live) setRunsFor(prev => prev?.taskId === id ? prev : { taskId: id, runs: [] }) })
+    return () => { live = false }
+  }, [task?.id, task?.state, task?.merge_state]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The ticket's verification receipt (#126), for the receipt and the
+  // header's "Requires receipt". Reread on its state, and on receipt.updated.
+  const [receiptFor, setReceiptFor] = useState<{ taskId: number; data: TaskReceipt | null } | null>(null)
+  const [receiptTick, setReceiptTick] = useState(0)
+  const agentTicket = !!task && !isHuman(task)
+  useEffect(() => {
+    if (!task || !agentTicket) return
+    const id = task.id
+    let live = true
+    api.getTaskReceipt(id).then(r => { if (live) setReceiptFor({ taskId: id, data: r }) })
+      .catch(() => { if (live) setReceiptFor(prev => prev?.taskId === id ? prev : { taskId: id, data: null }) })
+    return () => { live = false }
+  }, [task?.id, task?.state, agentTicket, receiptTick]) // eslint-disable-line react-hooks/exhaustive-deps
+  useSSE(task?.project_id ?? null, e => {
+    if (e.type === 'receipt.updated' && (e.payload as { task_id?: number } | undefined)?.task_id === task?.id) setReceiptTick(n => n + 1)
+  })
+
   useEffect(() => {
     if (!task) return
     const id = task.id
@@ -225,6 +257,11 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   // Editing the plan (text, dependencies, story) is wider than working it.
   const canPlan = canPlanTask(task, meId, myAccess)
   const history = log?.taskId === task.id ? log : null
+  const runs = runsFor?.taskId === task.id ? runsFor.runs : null
+  const receipt = receiptFor?.taskId === task.id ? receiptFor.data : undefined
+  const requiresReceipt = !isHuman(task) && receipt?.settings?.mode === 'require'
+  // A completed agent ticket shows its Done and merge lines in the receipt.
+  const agentReceipt = task.state === 'completed' && !isHuman(task)
   const view = focusView(location.pathname)
   const ticketHref = (id: number) => projectLink(task.project_id, view, id)
   // The human panel leads with the brief, so Details doesn't repeat it.
@@ -365,20 +402,28 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
               ))}</span>
             </div>
           ) : null}
-          {task.state === 'completed' && task.completed_at && (
+          {/* A completed agent ticket's Done and merge lines live in its receipt below. */}
+          {!agentReceipt && task.state === 'completed' && task.completed_at && (
             <div className="flex items-center gap-1.5 text-xs text-success">
               <CheckCircle2 size={11} />
               <span>Done {relativeTime(task.completed_at)}</span>
             </div>
           )}
-          {mergeStatusText(task) && (
+          {!agentReceipt && mergeStatusText(task) && (
             <div className="flex items-center gap-1.5 text-xs" data-testid="merge-status"
               style={{ color: task.merge_state === 'merged' ? 'var(--success-ink)' : 'var(--teal)' }}>
               <GitMerge size={11} aria-hidden="true" />
               <span>{mergeStatusText(task)}</span>
             </div>
           )}
-          <MergeGateNote task={task} />
+          {requiresReceipt && (
+            <div className="flex items-center gap-1.5 text-xs text-warning-ink" data-testid="requires-receipt"
+              title="This project requires a verification receipt: below its minimum, a completion waits for a person to accept it">
+              <ShieldCheck size={11} aria-hidden="true" />
+              <span>Requires receipt</span>
+            </div>
+          )}
+          <MergeGateNote task={task} runs={runs} />
         </div>
 
         {/* Dispatched to an agent that hasn't started it (AMP #2801) */}
@@ -411,7 +456,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
 
         {/* Done with an unmerged PR: Mark merged / Not needed (or Reopen when the PR was closed) */}
         {task.state === 'completed' && (task.merge_state === 'needed' || task.merge_state === 'abandoned') && (
-          <MergePanel key={`merge-${task.id}`} task={task} canWork={canWork}
+          <MergePanel key={`merge-${task.id}`} task={task} canWork={canWork} runs={runs}
             onChanged={t => { if (t && onTaskUpdated) onTaskUpdated(t); else onRefresh?.() }} />
         )}
 
@@ -421,6 +466,11 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
             canPlan={canPlan} onEdit={() => { startEdit(); setTabParam('details') }} ticketHref={ticketHref}
             onChanged={t => { if (onTaskUpdated) onTaskUpdated(t); else onRefresh?.() }} />
         )}
+
+        {/* Receipt v0: who did it, where the code is, how it was checked */}
+        <CompletionReceipt key={`receipt-${task.id}`} task={task} runs={runs} comments={history?.comments ?? null}
+          receipt={receipt} canWork={canWork}
+          onChanged={() => { setReceiptTick(n => n + 1); onRefresh?.() }} />
 
         {/* Mockups, diagrams and documents published to this ticket */}
         <TicketArtifacts projectId={task.project_id} taskId={task.id} />
@@ -1041,16 +1091,9 @@ function MetaItem({ label, value }: { label: string; value: string }) {
 }
 
 /** A done ticket waiting on its merge: the PR from its latest run, Mark merged / Not needed, or Reopen. */
-function MergePanel({ task, canWork, onChanged }: { task: Task; canWork: boolean; onChanged: (t: Task | null) => void }) {
-  const [pr, setPr] = useState<{ url?: string; branch?: string }>({})
-  useEffect(() => {
-    let live = true
-    api.taskRuns(task.id).then(({ runs }) => {
-      const r = [...runs].reverse().find(x => x.pr_url || x.branch)
-      if (live && r) setPr({ url: r.pr_url, branch: r.branch })
-    }).catch(() => {})
-    return () => { live = false }
-  }, [task.id])
+function MergePanel({ task, canWork, runs, onChanged }: { task: Task; canWork: boolean; runs: Run[] | null; onChanged: (t: Task | null) => void }) {
+  const r = runs ? latestRunWith(runs) : undefined
+  const pr = { url: r?.pr_url, branch: r?.branch }
   return (
     <div className="px-6 py-4 border-b border-line grid gap-2" style={{ background: 'color-mix(in srgb, var(--teal) 6%, var(--surface))', boxShadow: 'inset 3px 0 0 var(--teal)' }}>
       <span className="amp-label" style={{ color: 'var(--teal)' }}>Merge</span>
@@ -1063,9 +1106,8 @@ function MergePanel({ task, canWork, onChanged }: { task: Task; canWork: boolean
 // a done ticket whose run went to the integration branch (its dependents
 // don't wait; the merge to main comes later), and a ticket that starts when its
 // dependencies are done without waiting for their merge (waits_for_merge: false).
-function MergeGateNote({ task }: { task: Task }) {
+function MergeGateNote({ task, runs }: { task: Task; runs: Run[] | null }) {
   const [inherited, setInherited] = useState<Metadata | undefined>()
-  const [runs, setRuns] = useState<Run[]>([])
   const meta = useMemo(() => effectiveMetadata(inherited, task.metadata), [inherited, task.metadata])
   const branch = integrationBranch(meta)
   const wantRuns = task.state === 'completed' && !!branch
@@ -1076,16 +1118,8 @@ function MergeGateNote({ task }: { task: Task }) {
     return () => { live = false }
   }, [task.id])
 
-  useEffect(() => {
-    if (!wantRuns) return
-    let live = true
-    api.taskRuns(task.id).then(r => { if (live) setRuns(r.runs) }).catch(() => {})
-    return () => { live = false }
-  }, [task.id, wantRuns, task.merge_state])
-
-  // Runs are only read while they matter; otherwise ignore any stale ones
-  // (derived here rather than reset with setState inside the effect).
-  const into = mergedIntoIntegration(task, meta, wantRuns ? runs : [])
+  // Runs only matter for a done ticket with an integration branch.
+  const into = mergedIntoIntegration(task, meta, wantRuns ? runs ?? [] : [])
   const noWait = !waitsForMerge(meta) && task.state !== 'completed' && task.dependency_ids.length > 0
   if (!into && !noWait) return null
   return (

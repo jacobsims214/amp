@@ -23,6 +23,17 @@ tickets completed, in progress, questions, by project), writes the summary with 
 (`amp_save_day_report`) and gives you copy-ready Markdown for Slack or email. Use an IANA
 timezone (e.g. `America/Chicago`) so "today" is your day. Saved reports are under **Day reports**.
 
+## Run a report for a past day
+
+In the app, open **Day reports**, find **Your day**, and pick the date. The Completed, Started,
+Created and Also worked on lists come from that day. In progress and Blocked show where tickets
+stood when the report was generated, not on that day, and the panel says so.
+
+Through your agent, call `amp_day_report` with `date` (`YYYY-MM-DD`, default today) and `tz` (an
+IANA timezone such as `America/Chicago`, default UTC). The timezone decides where the day starts
+and ends, so pass it. Saving with `amp_save_day_report` for the same `date` and `tz` replaces any
+report already saved for that day.
+
 ## Standup
 
 Everything for a standup is already in AMP:

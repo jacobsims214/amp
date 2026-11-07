@@ -99,6 +99,8 @@ var toolCatalog = map[string]toolInfo{
 	"amp_block_task":         {title: "Block ticket with a question", keywords: "ask the user a question, stop for a decision, flag a blocker, request review"},
 	"amp_answer_question":    {title: "Answer ticket question", keywords: "record the user's answer to a blocked ticket, unblock"},
 	"amp_complete_task":      {title: "Complete ticket", keywords: "finish, close or mark a ticket done, with the run's tokens and commit"},
+	"amp_open_receipt":       {title: "Open receipt", keywords: "verification receipt before completing: checks, evidence, self-check, verified", idempotent: true},
+	"amp_add_evidence":       {title: "Add receipt evidence", keywords: "upload screenshots, a video or logs as verification evidence for a receipt"},
 	"amp_report_run":         {title: "Report run", keywords: "record a run's model, token usage, cost, branch, PR, merge, or an abandoned run"},
 	"amp_set_task_state":     {title: "Set ticket state", keywords: "escape hatch: reopen or force a ticket's state", idempotent: true},
 	"amp_set_task_start_at":  {title: "Schedule ticket", keywords: "schedule a ticket to start later", idempotent: true},

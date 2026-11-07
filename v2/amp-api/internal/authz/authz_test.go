@@ -1,9 +1,11 @@
 package authz
 
 import (
+	"context"
 	"strings"
 	"testing"
 
+	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/repository"
 )
@@ -219,5 +221,28 @@ func TestRequireUI(t *testing.T) {
 		if err != nil && (StatusOf(err, 0) != 403 || !strings.Contains(err.Error(), "https://amp.test/project/1/plan")) {
 			t.Errorf("%s: refusal %q (status %d) lacks the link", tc.name, err, StatusOf(err, 0))
 		}
+	}
+}
+
+// A signed-in caller with no AMP user is told why in plain words, one
+// sentence per provisioning refusal; no token or secret is in it (#69).
+func TestFromContext_ProvisionRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		refusal auth.ProvisionRefusal
+		want    string
+	}{
+		{auth.RefusalUnverifiedEmail, "Your identity provider reports your email as unverified, so AMP did not create your account; ask your IdP admin to verify it."},
+		{auth.RefusalDomainNotAllowed, "Your email's domain isn't allowed to sign up to AMP and you have no invite, so AMP did not create your account; ask an AMP admin to invite you."},
+		{auth.RefusalNoEmail, "Your identity provider didn't send an email address, so AMP has no account for you; ask your IdP admin to include the email claim, then sign in again."},
+		{auth.RefusalReservedIdentity, "Your sign-in uses the Local Dev identity (local-dev@amp.local), which is reserved for AMP with sign-in off, so AMP did not create your account; sign in with another account."},
+		{"", "this token has no AMP user (missing email claim); sign in again"},
+	} {
+		t.Run(string(tc.refusal), func(t *testing.T) {
+			ident := &auth.Identity{Subject: "s", Email: "pat@example.test", ProvisionRefusal: tc.refusal}
+			_, err := FromContext(auth.WithIdentity(context.Background(), ident))
+			if StatusOf(err, 0) != 403 || err.Error() != tc.want {
+				t.Errorf("err %q (status %d), want 403 %q", err, StatusOf(err, 0), tc.want)
+			}
+		})
 	}
 }

@@ -5,7 +5,10 @@ describe('noMyWorkReason', () => {
   it('a signed-in AMP user has My work', () => {
     expect(noMyWorkReason({ subject: 'oidc|1', email: 'jo@x.io', name: 'Jo', roles: [], user_id: 7 })).toBeNull()
   })
-  it('the local-dev identity (sign-in off) has none', () => {
+  it('the provisioned Local Dev user (sign-in off, #124) has My work', () => {
+    expect(noMyWorkReason({ subject: 'local-dev', email: 'local-dev@amp.local', name: 'Local Dev', roles: ['admin'], user_id: 1, local_dev: true })).toBeNull()
+  })
+  it('the local-dev identity without an AMP user (provisioning failed) has none', () => {
     expect(noMyWorkReason({ subject: 'local-dev', email: 'local-dev@amp.local', name: 'Local Dev', roles: [] })).toBe('local-dev')
   })
   it('any other identity without an AMP user is not signed in', () => {

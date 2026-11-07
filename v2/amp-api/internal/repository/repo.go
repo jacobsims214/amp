@@ -141,12 +141,12 @@ func (r *Repo) Close() { r.db.Close() }
 type rowScanner interface{ Scan(dest ...any) error }
 
 const projectCols = `id, name, code, description, state, org_id, created_by, open_reassign, plan_approved_at, plan_approved_by, require_plan_approval, metadata, created_at, updated_at,
-	require_merge, require_merge_since, not_started_flag_minutes, not_started_return_minutes`
+	require_merge, require_merge_since, not_started_flag_minutes, not_started_return_minutes, receipts_mode, receipts_min_level`
 
 func scanProject(row rowScanner, p *domain.Project) error {
 	return row.Scan(&p.ID, &p.Name, &p.Code, &p.Description, &p.State, &p.OrgID, &p.CreatedBy, &p.OpenReassign,
 		&p.PlanApprovedAt, &p.PlanApprovedBy, &p.RequirePlanApproval, &p.Metadata, &p.CreatedAt, &p.UpdatedAt,
-		&p.RequireMerge, &p.RequireMergeSince, &p.NotStartedFlagMinutes, &p.NotStartedReturnMinutes)
+		&p.RequireMerge, &p.RequireMergeSince, &p.NotStartedFlagMinutes, &p.NotStartedReturnMinutes, &p.ReceiptsMode, &p.ReceiptsMinLevel)
 }
 
 const epicCols = `e.id, e.project_id, e.name, e.description, e.state, e.priority, e.created_by,
@@ -265,7 +265,38 @@ func (r *Repo) ListProjects(ctx context.Context) ([]domain.Project, error) {
 	if err != nil {
 		return nil, err
 	}
-	return collect(rows, scanProject)
+	return r.withOrgNames(ctx, rows)
+}
+
+// withOrgNames collects project rows and fills in each project's OrgName.
+func (r *Repo) withOrgNames(ctx context.Context, rows pgx.Rows) ([]domain.Project, error) {
+	ps, err := collect(rows, scanProject)
+	if err != nil || len(ps) == 0 {
+		return ps, err
+	}
+	orows, err := r.db.Query(ctx, `SELECT id, name FROM orgs`)
+	if err != nil {
+		return nil, err
+	}
+	defer orows.Close()
+	names := map[int]string{}
+	for orows.Next() {
+		var id int
+		var name string
+		if err := orows.Scan(&id, &name); err != nil {
+			return nil, err
+		}
+		names[id] = name
+	}
+	if err := orows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range ps {
+		if ps[i].OrgID != nil {
+			ps[i].OrgName = names[*ps[i].OrgID]
+		}
+	}
+	return ps, nil
 }
 
 func (r *Repo) ArchiveProject(ctx context.Context, id int) (*domain.Project, error) {
@@ -299,10 +330,12 @@ func (r *Repo) UpdateProject(ctx context.Context, id int, u domain.ProjectSettin
 		   require_merge = COALESCE($8, require_merge),
 		   not_started_flag_minutes = COALESCE($9, not_started_flag_minutes),
 		   not_started_return_minutes = COALESCE($10, not_started_return_minutes),
+		   receipts_mode = COALESCE($11, receipts_mode),
+		   receipts_min_level = COALESCE($12, receipts_min_level),
 		   updated_at = NOW()
 		 WHERE id = $1 RETURNING `+projectCols,
 		id, u.Name, u.Description, u.OpenReassign, set, removeOrEmpty(remove), u.RequirePlanApproval, u.RequireMerge,
-		u.NotStartedFlagMinutes, u.NotStartedReturnMinutes,
+		u.NotStartedFlagMinutes, u.NotStartedReturnMinutes, u.ReceiptsMode, u.ReceiptsMinLevel,
 	), p)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("project %d not found", id)
@@ -401,7 +434,7 @@ func (r *Repo) ListArchivedProjects(ctx context.Context) ([]domain.Project, erro
 	if err != nil {
 		return nil, err
 	}
-	return collect(rows, scanProject)
+	return r.withOrgNames(ctx, rows)
 }
 
 // ---- Epics ----

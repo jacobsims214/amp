@@ -195,8 +195,23 @@ export function Access() {
 
       <div className="p-7 pt-5 grid gap-4">
         {error && <p className="m-0 amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</p>}
+        {me?.local_dev && me.user_id && (
+          <p className="m-0 amp-panel px-4 py-3 text-[13px] text-ink-2 leading-normal">
+            Sign-in is off on this AMP (local mode), so AMP doesn't check tokens: an agent connects to <code className="amp-num text-[12px]">{mcpURL()}</code> without
+            one and acts as Local Dev. If sign-in is turned on later (set <code className="amp-num text-[12px]">OIDC_ISSUER_URL</code>), Local Dev is deactivated and its tokens stop working, but agent accounts made here and their tokens stay active: review them then.
+          </p>
+        )}
         {authLoading ? <Loader2 size={18} className="text-ink-3 animate-spin" /> : !me?.user_id ? (
-          <p className="m-0 amp-panel px-4 py-4 text-[13px] text-ink-2">Sign in to manage tokens and agent accounts.</p>
+          me?.local_dev ? (
+            <p className="m-0 amp-panel px-4 py-4 text-[13px] text-ink-2">
+              Token management needs an AMP user, and this AMP couldn't set up its Local Dev user: check amp-api's startup log, or turn sign-in on (set <code className="amp-num text-[12px]">OIDC_ISSUER_URL</code>) and sign in.
+            </p>
+          ) : (
+            <div className="m-0 amp-panel px-4 py-4 flex flex-wrap items-center gap-3 text-[13px] text-ink-2">
+              <span>Tokens and agent accounts belong to an AMP user, and this session isn't signed in as one.</span>
+              <a href={`/oauth2/start?rd=${encodeURIComponent(window.location.pathname + window.location.search)}`} className="amp-btn amp-btn-primary amp-btn-sm">Sign in</a>
+            </div>
+          )
         ) : (
           <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]">
             <section className="amp-panel min-w-0" aria-label="Accounts">

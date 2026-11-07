@@ -5,8 +5,12 @@ import type {
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
   Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, GitHubCredentialInfo, GitHubCredentialChange, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
-  ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork, MyWorkCounts, PeopleWaiting, GettingStarted } from '../types'
+  ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork, MyWorkCounts, PeopleWaiting,
+  GettingStarted, ReceiptsMode, ReceiptMinLevel, ReceiptSummary, ReceiptView, TaskReceipt,
+} from '../types'
 import { auditQuery, auditVerifyUrl, type AuditScope } from '../lib/audit'
+import { apiErrorMessage, NOT_SIGNED_IN } from '../lib/apiError'
+import { isSessionEnded, markSessionEnded, sessionLost } from '../lib/session'
 
 const BASE = '/api'
 
@@ -17,64 +21,45 @@ function kbQuery(ref: KBRef): string {
   return `project_id=${ref.project_id}`
 }
 
-async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`)
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error(err.error || `GET ${path}: ${res.status}`)
+const sessionEndedError = () => Object.assign(new Error(NOT_SIGNED_IN), { status: 401, sessionEnded: true })
+
+/**
+ * Every AMP API call goes through here. A response from oauth2-proxy rather
+ * than amp-api (the session ended: a 401, a redirect to sign-in, or the
+ * sign-in page as a 200 HTML page) marks the session ended app-wide (lib/session.ts) and throws the
+ * "sign in again" sentence; any other failure throws the server's reason
+ * (lib/apiError.ts), with status set. Once the session has ended nothing is
+ * sent at all, so the pages' pollers go quiet behind the prompt.
+ */
+async function send(method: string, path: string, body?: unknown, base = BASE): Promise<Response> {
+  if (isSessionEnded()) throw sessionEndedError()
+  const res = await fetch(`${base}${path}`, {
+    method,
+    // Don't follow the proxy to the sign-in page: see it as a redirect.
+    redirect: 'manual',
+    headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  })
+  if (sessionLost(res)) {
+    markSessionEnded()
+    throw sessionEndedError()
   }
-  return res.json()
+  if (!res.ok) {
+    const err = await res.json().catch(() => (method === 'GET' ? {} : { error: res.statusText }))
+    throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `${method} ${path}: ${res.status}`)), { status: res.status })
+  }
+  return res
 }
 
-async function post<T>(path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw Object.assign(new Error(err.error || `POST ${path}: ${res.status}`), { status: res.status })
-  }
-  return res.json()
-}
-
-async function patch<T>(path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(err.error || `PATCH ${path}: ${res.status}`)
-  }
-  return res.json()
-}
-
-async function put<T>(path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw Object.assign(new Error(err.error || `PUT ${path}: ${res.status}`), { status: res.status })
-  }
-  return res.json()
-}
+const get = <T>(path: string): Promise<T> => send('GET', path).then(r => r.json())
+const post = <T>(path: string, body?: unknown): Promise<T> => send('POST', path, body).then(r => r.json())
+const patch = <T>(path: string, body?: unknown): Promise<T> => send('PATCH', path, body).then(r => r.json())
+const put = <T>(path: string, body?: unknown): Promise<T> => send('PUT', path, body).then(r => r.json())
 
 // del resolves to the parsed JSON body when there is one (several RBAC
 // endpoints return the updated resource), or undefined for empty bodies.
-async function del<T = void>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, { method: 'DELETE' })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw Object.assign(new Error(err.error || `DELETE ${path}: ${res.status}`), { status: res.status })
-  }
-  return res.json().catch(() => undefined) as Promise<T>
-}
+const del = <T = void>(path: string): Promise<T> =>
+  send('DELETE', path).then(r => r.json().catch(() => undefined) as Promise<T>)
 
 // The credential host travels in the query string; the token never does.
 const credentialHostQuery = (host?: string) => host ? `?host=${encodeURIComponent(host)}` : ''
@@ -90,7 +75,7 @@ const userRef = (user: string | number) => String(user)
 export const api = {
   listProjects: () => get<{ projects: Project[] }>('/projects').then(r => r.projects),
   getProject: (id: number) => get<{ project: Project }>(`/projects/${id}`).then(r => r.project),
-  updateProjectSettings: (id: number, settings: { name?: string; description?: string; open_reassign?: boolean; require_plan_approval?: boolean; require_merge?: boolean; not_started_flag_minutes?: number; not_started_return_minutes?: number; metadata?: Record<string, string | number | boolean | null> }) =>
+  updateProjectSettings: (id: number, settings: { name?: string; description?: string; open_reassign?: boolean; require_plan_approval?: boolean; require_merge?: boolean; not_started_flag_minutes?: number; not_started_return_minutes?: number; receipts_mode?: '' | ReceiptsMode; receipts_min_level?: ReceiptMinLevel; metadata?: Record<string, string | number | boolean | null> }) =>
     patch<{ project: Project }>(`/projects/${id}`, settings).then(r => r.project),
   createProject: (req: CreateProjectRequest) => post<Project>('/projects', req),
   archiveProject: (id: number) => post<Project>(`/projects/${id}/archive`),
@@ -219,6 +204,8 @@ export const api = {
   expiringArtifacts: (days = 14) => get<{ artifacts: Artifact[] }>(`/artifacts/expiring?days=${days}`).then(r => r.artifacts ?? []),
   /** Where a version's content is served (sandboxed). */
   artifactContentUrl: (id: number, version?: number) => `${BASE}/artifacts/${id}/content${version ? `?version=${version}` : ''}`,
+  /** a receipt evidence file (#126): served with Range, so a video seeks */
+  receiptEvidenceUrl: (key: string) => `${BASE}/receipts/${key.split('/').map(encodeURIComponent).join('/')}`,
 
   // Comments
   getComments: (taskId: number) =>
@@ -315,8 +302,22 @@ export const api = {
    *  timeout; this is the earlier, knowing version. */
   returnTask: (taskId: number, reason: string) =>
     post<{ task: Task }>(`/tasks/${taskId}/return`, { reason }).then(r => r.task),
+  /** Completes an agent ticket; where the project requires a receipt, a
+   *  completion below its minimum comes back held (with why) instead. */
   completeTask: (taskId: number) =>
-    post(`/tasks/${taskId}/complete`),
+    post<{ task_id: number; state: string; held?: boolean; reason?: string }>(`/tasks/${taskId}/complete`),
+
+  // Verification receipts (#126)
+  getTaskReceipt: (taskId: number) => get<TaskReceipt>(`/tasks/${taskId}/receipt`),
+  listTaskReceipts: (taskId: number) =>
+    get<{ receipts: ReceiptView[] | null }>(`/tasks/${taskId}/receipts`).then(r => r.receipts ?? []),
+  /** A person accepts the ticket's latest receipt (a held ticket completes). */
+  acceptReceipt: (taskId: number, note?: string) => post<ReceiptView>(`/tasks/${taskId}/receipt/accept`, { note: note ?? '' }),
+  /** A person rejects it, with a note (a held ticket goes back to ready). */
+  rejectReceipt: (taskId: number, note: string) => post<ReceiptView>(`/tasks/${taskId}/receipt/reject`, { note }),
+  receiptSummary: (projectId: number) => get<ReceiptSummary>(`/projects/${projectId}/receipts/summary`),
+  setOrgReceiptsMode: (orgId: number, mode: ReceiptsMode) =>
+    put<{ mode: ReceiptsMode; org: Org }>(`/orgs/${orgId}/receipts`, { mode }).then(r => r.org),
   /** A person starts their own human ticket. */
   startHumanTask: (taskId: number) =>
     post<{ task: Task }>(`/tasks/${taskId}/start`).then(r => r.task),
@@ -330,8 +331,7 @@ export const api = {
 
   // Export
   exportProject: async (projectId: number): Promise<{ blob: Blob; filename: string }> => {
-    const res = await fetch(`${BASE}/projects/${projectId}/export`)
-    if (!res.ok) throw new Error(`Export failed: ${res.status}`)
+    const res = await send('GET', `/projects/${projectId}/export`)
     
     // Get filename from Content-Disposition header or construct it
     const contentDisposition = res.headers.get('content-disposition')
@@ -487,16 +487,7 @@ export const api = {
 const AUTHADMIN_BASE = '/authadmin'
 
 async function authadminReq<T>(path: string, method: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${AUTHADMIN_BASE}${path}`, {
-    method,
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(err.error || `${method} ${path}: ${res.status}`)
-  }
-  return res.json()
+  return send(method, path, body, AUTHADMIN_BASE).then(r => r.json())
 }
 
 export const authAdminApi = {

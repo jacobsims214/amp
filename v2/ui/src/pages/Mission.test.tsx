@@ -100,7 +100,7 @@ describe('Mission (informational)', () => {
     expect(screen.getByText('Nothing waits on you here').closest('a')).toHaveAttribute('href', '/project/2/my-work')
   })
 
-  it('without an AMP user (sign-in off): no counts, no green, and where to look instead', async () => {
+  it('without an AMP user (sign-in off, Local Dev not provisioned): no counts, no green, and where to look instead', async () => {
     counts = { counts: { waiting: 0, approve: 0, answer: 0, merge: 0, start: 0, do: 0, coming_up: 0 }, projects: {} }
     await open({ subject: 'local-dev', email: 'local-dev@amp.local', name: 'Local Dev', roles: [] })
     expect(screen.queryByText('Nothing waits on you here')).toBeNull()

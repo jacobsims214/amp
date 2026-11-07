@@ -41,12 +41,23 @@ def test(args, label, enabled=True):
         else:
             check(not authz_disabled(hook) and hook.get("match") == {"prefix": "/api"},
                   f"{label}/{listener}: inboundHooks off still bypasses the session: {hook}")
-        # Only the hook prefix is opened: nothing else under /api skips ext_authz.
+        # Receipt evidence uploads (#126) authenticate with the one-time token
+        # in the path (checked by amp-api), so that prefix skips ext_authz too;
+        # it must still reach amp-api, and reading evidence stays behind /api.
+        upload = first_match(routes, "/api/receipt-uploads/abc")
+        check(upload is not None and upload.get("match") == {"prefix": "/api/receipt-uploads/"}
+              and upload.get("route", {}).get("cluster") == "amp_api_rest" and authz_disabled(upload),
+              f"{label}/{listener}: receipt upload route is {upload}")
+        evidence = first_match(routes, "/api/receipts/3/5/attempts/1/abc/video.mp4")
+        check(evidence is not None and not authz_disabled(evidence),
+              f"{label}/{listener}: evidence reads lost their session check: {evidence}")
+        # Only the hook and receipt-upload prefixes are opened: nothing else
+        # under /api skips ext_authz.
         for r in routes:
             m = r.get("match", {})
             p = m.get("prefix", m.get("path", ""))
             if p.startswith("/api") and authz_disabled(r):
-                check(p == "/api/hooks/", f"{label}/{listener}: {p} skips ext_authz")
+                check(p in ("/api/hooks/", "/api/receipt-uploads/"), f"{label}/{listener}: {p} skips ext_authz")
     # Nothing in front of Envoy: no Ingress or Gateway objects for it.
     kinds = {d.get("kind") for d in docs}
     check(not kinds & {"Ingress", "HTTPRoute", "Gateway", "IngressRoute", "VirtualService"},

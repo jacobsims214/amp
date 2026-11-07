@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { Loader2, Clock, Layers, Archive, RotateCcw, ChevronDown, ChevronUp, Download, Upload, Plus } from 'lucide-react'
 import { api } from '../api/client'
+import { stripMarkdown } from '../lib/stripMarkdown'
 import { useSSE } from '../hooks/useSSE'
 import { CrudModal, FieldError, inputCls, labelCls } from '../components/CrudModal'
 import { CODE_MAX, cleanCode, suggestCode } from '../lib/projectCode'
@@ -413,7 +414,7 @@ function ProjectCard({ project: p, onExport, exporting, exportError, onArchive, 
         </div>
       </div>
       <Link to={`/project/${p.id}`} className="block px-4 pb-4 pt-3 flex-1">
-        {p.description && <p className="text-[13px] text-ink-2 mb-3 line-clamp-2 leading-relaxed">{p.description}</p>}
+        {p.description && <p className="text-[13px] text-ink-2 mb-3 line-clamp-2 leading-relaxed">{stripMarkdown(p.description)}</p>}
         <span className="amp-num text-[11px] text-ink-3 inline-flex items-center gap-1.5"><Clock size={10} />updated {relativeTime(p.updated_at)}</span>
       </Link>
       {exportError && <div className="mx-4 mb-4 text-[12px] text-danger-ink border border-danger px-3 py-2">{exportError}</div>}

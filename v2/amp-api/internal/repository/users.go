@@ -29,6 +29,23 @@ var EmptyEmailClaimError = errors.New("upsert user: empty email claim — skippi
 // SetSignupDomains) with no pending invite.
 var ErrSignupNotAllowed = errors.New("upsert user: email domain not allowed to sign up")
 
+// The identity every request has when auth is off (no OIDC_ISSUER_URL),
+// provisioned as a user by ProvisionLocalDevUser (#124).
+const (
+	LocalDevSubject = "local-dev"
+	LocalDevEmail   = "local-dev@amp.local"
+)
+
+// ErrReservedIdentity is returned by ProvisionUserFromClaims for a sign-in
+// whose subject or email is the Local Dev user's: that row is a global
+// admin made while auth was off, and a sign-in never takes it over (#124).
+var ErrReservedIdentity = errors.New("upsert user: the Local Dev identity is reserved for auth-off mode")
+
+// isLocalDev reports whether subject or email is the Local Dev user's.
+func isLocalDev(subject, email string) bool {
+	return subject == LocalDevSubject || strings.EqualFold(strings.TrimSpace(email), LocalDevEmail)
+}
+
 // SetSignupDomains limits who can become an AMP user by signing in: a new
 // user's email must be in one of these domains, or have a pending invite,
 // or be a bootstrap admin. Existing users are unaffected. Empty allows
@@ -53,7 +70,7 @@ func (r *Repo) signupAllowed(ctx context.Context, email string, bootstrapAdmins 
 	}
 	var invited bool
 	err := r.db.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM users WHERE lower(email) = lower($1))
+		`SELECT EXISTS (SELECT 1 FROM users WHERE lower(email) = lower($1) AND subject <> '`+LocalDevSubject+`')
 		     OR EXISTS (SELECT 1 FROM invites WHERE lower(email) = lower($1) AND accepted_at IS NULL)`, email,
 	).Scan(&invited)
 	return invited, err
@@ -120,6 +137,9 @@ func (r *Repo) upsertUserFromClaims(ctx context.Context, subject, email, display
 	if email == "" {
 		return nil, EmptyEmailClaimError
 	}
+	if isLocalDev(subject, email) {
+		return nil, ErrReservedIdentity
+	}
 	if len(r.signupDomains) > 0 {
 		if _, err := r.GetUserBySubject(ctx, subject); err != nil {
 			ok, err := r.signupAllowed(ctx, email, bootstrapAdmins)
@@ -168,13 +188,14 @@ func (r *Repo) updateExistingUserByEmail(ctx context.Context, subject, email, di
 		 SET subject = $1,
 		     display_name = CASE WHEN $3 != '' THEN $3 ELSE display_name END,
 		     last_seen_at = NOW()
-		 WHERE email = $2 AND kind = 'human'
+		 WHERE email = $2 AND kind = 'human' AND subject <> '`+LocalDevSubject+`'
 		 RETURNING `+userCols,
 		subject, email, displayName,
 	).Scan(userDest(u)...)
 	if errors.Is(err, pgx.ErrNoRows) {
-		// The email belongs to an agent account: a sign-in never takes one over.
-		return nil, fmt.Errorf("update existing user by email: %s belongs to an agent account", email)
+		// The email belongs to an agent account (or the Local Dev user): a
+		// sign-in never takes one over.
+		return nil, fmt.Errorf("update existing user by email: %s belongs to an agent account or the Local Dev user", email)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("update existing user by email: %w", err)
@@ -195,7 +216,9 @@ func (r *Repo) finishUpsert(ctx context.Context, u *domain.User, email string, b
 		grantAdmin := bootstrapAdmins[email]
 		if !grantAdmin {
 			var totalUsers int
-			if err := r.db.QueryRow(ctx, `SELECT COUNT(*) FROM users`).Scan(&totalUsers); err != nil {
+			// People only: the Local Dev user (made while auth was off) and
+			// agent accounts don't make a sign-in "not the first" (#124).
+			if err := r.db.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE kind = 'human' AND subject <> $1`, LocalDevSubject).Scan(&totalUsers); err != nil {
 				return nil, fmt.Errorf("count users: %w", err)
 			}
 			grantAdmin = totalUsers == 1 // this upsert just created the very first user
@@ -232,6 +255,75 @@ func (r *Repo) finishUpsert(ctx context.Context, u *domain.User, email string, b
 		pv.Invites = accepted
 	}
 	return u, nil
+}
+
+// ProvisionLocalDevUser makes the identity every request has when auth is
+// off (no OIDC_ISSUER_URL) a real AMP user (#124): the user row (active,
+// human), the global admin role, admin of the Default org (an owner stays
+// owner) and lead of its Everyone team, which owns the projects created
+// there. Idempotent: safe on every boot and on an existing database. Only
+// for auth-off servers; auth.Verifier.ProvisionLocalDev is its one caller.
+func (r *Repo) ProvisionLocalDevUser(ctx context.Context, subject, email, displayName string) (*domain.User, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var id int
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO users (subject, email, display_name) VALUES ($1, $2, $3)
+		ON CONFLICT (subject) DO UPDATE SET disabled_at = NULL, last_seen_at = NOW()
+		RETURNING id`, subject, email, displayName).Scan(&id); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "users_email_key" {
+			return nil, fmt.Errorf("provision local dev user: another user already has the email %s; rename or delete that user", email)
+		}
+		return nil, fmt.Errorf("provision local dev user: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO user_roles (user_id, role) VALUES ($1, $2) ON CONFLICT DO NOTHING`, id, domain.RoleAdmin); err != nil {
+		return nil, fmt.Errorf("provision local dev user: admin role: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO org_members (org_id, user_id, role)
+		SELECT o.id, $1, 'admin' FROM orgs o WHERE o.slug = 'default'
+		ON CONFLICT (org_id, user_id) DO UPDATE SET role = 'admin' WHERE org_members.role = 'member'`, id); err != nil {
+		return nil, fmt.Errorf("provision local dev user: Default org: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO team_members (team_id, user_id, role)
+		SELECT t.id, $1, 'lead' FROM teams t JOIN orgs o ON o.id = t.org_id
+		WHERE o.slug = 'default' AND t.name = 'Everyone'
+		ON CONFLICT (team_id, user_id) DO UPDATE SET role = 'lead'`, id); err != nil {
+		return nil, fmt.Errorf("provision local dev user: Everyone team: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return r.GetUserBySubject(ctx, subject)
+}
+
+// DisableLocalDevUser deactivates the Local Dev user, for a server with auth
+// on (#124): it is a global admin nobody signs in as, so neither a sign-in
+// nor one of its tokens may act as it. Idempotent; a no-op when there is no
+// such user. It returns whether the user exists and how many active agent
+// accounts it manages (those are left as they are).
+func (r *Repo) DisableLocalDevUser(ctx context.Context) (exists bool, agents int, err error) {
+	var id int
+	err = r.db.QueryRow(ctx, `
+		UPDATE users SET disabled_at = COALESCE(disabled_at, NOW())
+		WHERE subject = $1 AND kind = 'human' RETURNING id`, LocalDevSubject).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, 0, nil
+	}
+	if err != nil {
+		return false, 0, fmt.Errorf("disable local dev user: %w", err)
+	}
+	if err := r.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM users WHERE managed_by = $1 AND kind = 'agent' AND disabled_at IS NULL`, id,
+	).Scan(&agents); err != nil {
+		return true, 0, fmt.Errorf("count local dev agents: %w", err)
+	}
+	return true, agents, nil
 }
 
 func (r *Repo) getUserRoles(ctx context.Context, userID int) ([]string, error) {
