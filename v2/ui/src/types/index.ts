@@ -31,6 +31,12 @@ export interface Project {
   receipts_mode?: '' | ReceiptsMode
   /** what a Require ticket must reach before it completes */
   receipts_min_level?: ReceiptMinLevel
+  /** a person's ticket this many minutes past its decide_by is escalated once; 0 = off, the default (#146) */
+  decision_escalation_minutes?: number
+  /** the escalation also raises the ticket's priority one step (#146) */
+  decision_escalation_raise_priority?: boolean
+  /** the escalation hands the ticket to this user; null = nobody (#146) */
+  decision_backup_decider?: number | null
 }
 
 // ---- Verification receipts (#126) ----
@@ -221,6 +227,10 @@ export interface Task {
   waiting_detail?: string
   /** free-form key/value data for integrations (its own, not inherited) */
   metadata?: Metadata
+  /** it has a decision doc: its decision is recorded on the doc (Record decision), never by Mark done (#125) */
+  has_decision_doc?: boolean
+  /** a person's ticket's decide-by date (RFC 3339): set by the person or suggested by an agent (#146) */
+  decide_by?: string
   created_at: string
   updated_at: string
 }
@@ -502,6 +512,7 @@ export interface SSEEvent {
     | 'story.updated'
     | 'artifact.updated'
     | 'receipt.updated'
+    | 'decision.updated'
   project_id?: number
   payload?: unknown
   at?: string
@@ -567,6 +578,8 @@ export interface UpdateTaskRequest {
   assigned_to?: string
   priority?: string
   start_at?: string | null
+  /** a person's ticket's decide-by date (RFC 3339); clear: ['decide_by'] removes it (#146) */
+  decide_by?: string
   metadata?: MetadataPatch
   /** Fields to blank; an empty value otherwise means "keep". */
   clear?: string[]
@@ -976,7 +989,7 @@ export interface MyWork {
   flags_truncated?: boolean
 }
 
-// ---- Waiting on you (service.WaitingOn; KB decisions/human-work-ux.md §1) ----
+// ---- Waiting on you (service.WaitingOn; v2/kb/working/human-work.md) ----
 
 export type WaitKind = 'approve' | 'answer' | 'verify' | 'merge' | 'start' | 'do'
 
@@ -1066,6 +1079,11 @@ export interface WaitItem extends MergeClassifier {
   performer?: string
   human_reason?: string
   owner_user_id?: number
+  /** the ticket has a decision doc: it is decided in its drawer, not by Mark done (#125) */
+  has_decision_doc?: boolean
+  /** a person's ticket's decide-by date (RFC 3339), and whether it has passed (#146) */
+  decide_by?: string
+  overdue?: boolean
   epic_id?: number
   epic_name?: string
   /** approve: how many tickets await */
@@ -1080,7 +1098,7 @@ export interface WaitItem extends MergeClassifier {
   /** start: the agent it was dispatched to, and how long it has waited (AMP #2801) */
   agent_id?: string
   not_started_minutes?: number
-  /** merge: open tickets that depend on it directly */
+  /** merge, do, answer: open tickets downstream of it, transitively */
   holding_up?: number[]
   /**
    * merge (AMP #3011): the branch the merge would land on, as a run reported it.
@@ -1389,6 +1407,8 @@ export interface Artifact {
   expires_at: string | null
   expiry_dismissed_at: string | null
   url?: string
+  /** 'decision' for a ticket's decision doc */
+  role?: string
 }
 
 export interface ArtifactVersion {
@@ -1598,4 +1618,70 @@ export interface ProjectMyWork {
   done_today: DoneItem[]
   agents: { project_id: number; in_progress: number; ready: number; waiting: number; done_today: number }
   day: string
+}
+
+/** What a person decided on a completed human ticket that another ticket depends on (GET /tasks/:id/decisions). */
+export interface UpstreamDecision {
+  task_id: number
+  name: string
+  human_reason: string
+  /** the note, or option + decided text */
+  decision: string
+  option?: string
+  doc_url?: string
+  version?: number
+  decided_by: number | null
+  decided_by_name: string
+  decided_at: string
+}
+
+/** One answer a person can choose on a judgment ticket (the agent questions of #130 reuse it). */
+export interface AskOption {
+  label: string
+  consequence: string
+}
+
+/** A decision doc version's options: its stored metadata. */
+export interface DecisionAsk {
+  question: string
+  options: AskOption[]
+  /** index into options; only marks a badge, never chooses */
+  recommended: number
+}
+
+/** A judgment ticket's ask as tool input (it drafts the doc; not stored on the ticket). */
+export interface Ask extends DecisionAsk {
+  recommendation_reason: string
+  evidence?: string[]
+}
+
+export interface DecisionDocVersion {
+  version: number
+  author_kind: 'person' | 'agent'
+  text: string
+  ask: DecisionAsk | null
+  created_by: number | null
+  created_at: string
+}
+
+/** A judgment ticket's decision doc (GET /tasks/:id/decision, and /decisions' own). */
+export interface DecisionDoc {
+  task_id: number
+  artifact_id: number
+  doc_url?: string
+  current_version: number
+  /** who wrote the current version */
+  author_kind: 'person' | 'agent'
+  /** the current version's options */
+  ask: DecisionAsk | null
+  /** the current version's markdown (prose only) */
+  text: string
+  decided_version: number | null
+  chosen_option: number | null
+  decision_text?: string
+  decided_by: number | null
+  decided_by_name?: string
+  recording_started_at: string | null
+  decided_at: string | null
+  versions?: DecisionDocVersion[]
 }
