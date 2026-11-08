@@ -9,6 +9,7 @@ import { useSearchParamState, usePatchSearchParams, type ParamCodec } from '../h
 import { KIND_LABEL, STATUS_LABEL, expiresIn, expiryBucket, type ExpiryFilter } from '../lib/artifacts'
 import { projectLink } from '../lib/projectLink'
 import type { Artifact, ArtifactKind, ArtifactStatus } from '../types'
+import { ManagerAgent } from '../components/ManagerAgent'
 
 const FILTERS: (ArtifactStatus | 'all')[] = ['all', 'in_review', 'changes_requested', 'approved']
 const KINDS = Object.keys(KIND_LABEL) as ArtifactKind[]
@@ -117,7 +118,7 @@ export function Artifacts() {
             <h2 className="amp-heading m-0 text-[17px]">{list.length ? 'No artifacts match these filters' : 'No artifacts yet'}</h2>
             <p className="m-0 text-[13px] text-ink-2 leading-relaxed">
               Artifacts are what agents make for you to look at before code: UI mockups, prototypes, diagrams, images and documents.
-              Ask your manager agent to put a design step in the plan, or have any agent call <code>amp_publish_artifact</code>.
+              Ask your <ManagerAgent /> to put a design step in the plan, or have any agent call <code>amp_publish_artifact</code>.
               Each one is versioned here, and you approve it or ask for changes.
             </p>
           </div>

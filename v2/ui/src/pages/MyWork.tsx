@@ -26,6 +26,7 @@ import { useFind } from '../hooks/useFind'
 import { FindBox, NoMatches } from '../components/ui/FindBox'
 import { isNoUserError, noMyWorkReason } from '../lib/myWorkAccess'
 import { MyWorkLoadError, MyWorkUnavailable } from '../components/human/MyWorkUnavailable'
+import { GetStarted } from '../components/GetStarted'
 
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone
 const ymd = (d: Date) => d.toLocaleDateString('en-CA', { timeZone: TZ })
@@ -300,6 +301,8 @@ export function MyWork() {
       <PageHeader crumb="Overview" title="My work"
         meta="A summary across your projects. Each row opens the item in that project's My work." />
       <div className="p-4 sm:p-7 sm:pt-5 grid gap-4">
+        {/* No AMP user (sign-in off): the checklist still guides a first run (#128). */}
+        {noWork === 'local-dev' && <GetStarted who="local-dev" />}
         {noWork && <MyWorkUnavailable reason={noWork} email={me?.email} />}
         {!noWork && error && <MyWorkLoadError error={error} onRetry={() => { setError(null); loadWork() }} />}
         {firstLoad && (
@@ -359,18 +362,22 @@ export function MyWork() {
               </> : q && counts.waiting > 0 ? (
                 <NoMatches find={find} what="waiting items" note="and project names; only the listed rows are searched" className="amp-panel px-4 py-4 grid gap-2" />
               ) : (
-                <div className="amp-panel px-7 py-9 grid gap-2.5">
-                  {done24 > 0
-                    ? <span className="amp-label" style={{ color: 'var(--success-ink)' }}>All clear</span>
-                    : <span className="amp-label">Nothing waits on you</span>}
-                  <h2 className="m-0 text-[20px] font-semibold text-ink">
-                    {done24 > 0 ? `Nothing waits on you. ${plural(done24, 'ticket')} done in the last 24h.` : 'No project needs you right now.'}
-                  </h2>
-                  <p className="m-0 text-ink-2 max-w-[56ch] leading-normal text-[13.5px]">
-                    Approvals, questions, merges and your own tickets appear here, grouped by project. Open a project to act on them.
-                  </p>
-                  <div className="flex gap-3.5 flex-wrap mt-1.5">{KINDS.map(k => <KindMark key={k.kind} kind={k.kind} />)}</div>
-                </div>
+                <>
+                  {/* Where the queue will be: the first-run checklist until its steps are done (#128). */}
+                  <GetStarted who={me?.user_id != null ? String(me.user_id) : 'local-dev'} />
+                  <div className="amp-panel px-7 py-9 grid gap-2.5">
+                    {done24 > 0
+                      ? <span className="amp-label" style={{ color: 'var(--success-ink)' }}>All clear</span>
+                      : <span className="amp-label">Nothing waits on you</span>}
+                    <h2 className="m-0 text-[20px] font-semibold text-ink">
+                      {done24 > 0 ? `Nothing waits on you. ${plural(done24, 'ticket')} done in the last 24h.` : 'No project needs you right now.'}
+                    </h2>
+                    <p className="m-0 text-ink-2 max-w-[56ch] leading-normal text-[13.5px]">
+                      Approvals, questions, merges and your own tickets appear here, grouped by project. Open a project to act on them.
+                    </p>
+                    <div className="flex gap-3.5 flex-wrap mt-1.5">{KINDS.map(k => <KindMark key={k.kind} kind={k.kind} />)}</div>
+                  </div>
+                </>
               )}
 
               {(comingOnly.length > 0 || clear.length > 0) && <>
@@ -442,7 +449,7 @@ export function MyWork() {
               </Panel>
 
               <p className="m-0 px-0.5 text-[12px] leading-normal text-ink-3">
-                Nothing on this page is a button. To act, open the project: the item opens focused, with its action.
+                Nothing here acts on a ticket. To act, open the project: the item opens focused, with its action.
               </p>
             </aside>
           </div>

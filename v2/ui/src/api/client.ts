@@ -6,7 +6,7 @@ import type {
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
   Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, GitHubCredentialInfo, GitHubCredentialChange, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
   ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork, MyWorkCounts, PeopleWaiting,
-  ReceiptsMode, ReceiptMinLevel, ReceiptSummary, ReceiptView, TaskReceipt,
+  GettingStarted, ReceiptsMode, ReceiptMinLevel, ReceiptSummary, ReceiptView, TaskReceipt,
 } from '../types'
 import { auditQuery, auditVerifyUrl, type AuditScope } from '../lib/audit'
 import { apiErrorMessage, NOT_SIGNED_IN } from '../lib/apiError'
@@ -369,6 +369,8 @@ export const api = {
   myWork: () => get<MyWork>('/my-work'),
   /** The sidebar and tab badges: what waits on the caller, in total and per project (only projects with something). */
   myWorkCounts: () => get<MyWorkCounts>('/my-work/counts'),
+  /** The Get started checklist on an empty My work (#128): each step from server state. */
+  gettingStarted: () => get<GettingStarted>('/my-work/getting-started'),
   /** Mission's Waiting on people: each person's counts by kind and ticket ids (any member). */
   waitingOnPeople: (projectId: number) => get<PeopleWaiting>(`/projects/${projectId}/waiting-on-people`),
   /** The project's My work tab: what waits on the caller (or `user`, for a lead), each approve item with its plan. */

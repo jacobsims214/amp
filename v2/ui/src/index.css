@@ -216,6 +216,14 @@ body {
 .amp-bands-h { height: 4px;
   background: linear-gradient(90deg, var(--band-1) 0 25%, var(--band-2) 25% 50%, var(--band-3) 50% 75%, var(--band-4) 75%); }
 
+/* Skip link (#128): the first thing Tab reaches, off-screen until focused. */
+.amp-skip-link {
+  position: absolute; left: 8px; top: -48px; z-index: 100;
+  padding: 8px 12px; background: var(--ink); color: var(--surface);
+  font-family: var(--font-label); font-weight: 600; font-size: 12px; text-decoration: none;
+}
+.amp-skip-link:focus { top: 8px; outline: 2px solid var(--link); outline-offset: 2px; }
+
 /* Buttons: black primary, outlined secondary, condensed caps. */
 .amp-btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;

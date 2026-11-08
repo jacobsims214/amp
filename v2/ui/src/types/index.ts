@@ -1000,6 +1000,25 @@ export interface MyWorkCounts {
   projects: Record<string, WaitCounts>
 }
 
+/** One step of the Get started checklist: done (and since when), and the project it's about. */
+export interface GettingStartedStep {
+  done: boolean
+  at?: string
+  project_id?: number
+  /** How the agent connected: mcp, harness (AMP Harness) or token (an API token). */
+  client?: string
+  /** The ticket the step's link goes to: the one carrying the first receipt. */
+  task_id?: number
+}
+
+/** GET /api/my-work/getting-started (#128, plus the receipt step #149 owes it). */
+export interface GettingStarted {
+  agent: GettingStartedStep
+  project: GettingStartedStep
+  plan: GettingStartedStep
+  receipt: GettingStartedStep
+}
+
 /** One item in a person's Waiting on people row: a ticket, or for approve, an epic's tickets awaiting them. */
 export interface PersonWaitItem {
   kind: WaitKind
