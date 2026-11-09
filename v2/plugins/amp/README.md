@@ -1,6 +1,6 @@
 # AMP — Claude Code plugin
 
-A manager/worker/reviewer agent team that plans work onto the [AMP](https://amp.simstech.cloud)
+A manager/worker/reviewer agent team that plans work onto the [AMP](https://amp.rp-tools-nonprod.rvohealth.com)
 board over MCP, dispatches specialists in review-gated waves, and accumulates project knowledge
 in the AMP knowledge base.
 

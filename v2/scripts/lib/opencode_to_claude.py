@@ -22,6 +22,7 @@ Usage: opencode_to_claude.py <v2-dir> <plugin-out-dir>
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sys
@@ -58,6 +59,13 @@ from pathlib import Path
 PLUGIN_NAME = "amp"
 PLUGIN_VERSION = "2.0.0"
 MCP_SERVER_NAME = "amp"
+
+# Which AMP server the plugin targets, set at build time:
+#   AMP_URL=https://amp.rp-tools-nonprod.rvohealth.com ./scripts/build-claude-plugin.sh
+# Unset, the plugin uses the amp URL from opencode.json. Accepts the base URL
+# or the /mcp endpoint. Users can still override per machine with AMP_MCP_URL.
+DEFAULT_AMP_HOME = "https://amp.simstech.cloud"
+AMP_HOME = re.sub(r"/mcp$", "", os.environ.get("AMP_URL", "").strip().rstrip("/"))
 
 # openrouter model -> Claude Code model tier. Empty: every Claude Code agent
 # inherits the session's model. The opencode roster picks open-weight models by
@@ -428,6 +436,8 @@ def convert_mcp(opencode_json: Path) -> dict:
         if entry.get("type") == "remote" or "url" in entry:
             url = entry["url"]
             if name == MCP_SERVER_NAME:
+                if AMP_HOME:
+                    url = f"{AMP_HOME}/mcp"
                 # Let operators point at a local server without editing the file.
                 url = "${AMP_MCP_URL:-%s}" % url
             servers[name] = {"type": "http", "url": url}
@@ -518,7 +528,7 @@ def main() -> int:
             "work onto the AMP board over MCP, dispatches specialists in review-gated "
             "waves, and accumulates project knowledge in the AMP knowledge base."
         ),
-        "author": {"name": "AMP", "url": "https://amp.simstech.cloud"},
+        "author": {"name": "AMP", "url": AMP_HOME or DEFAULT_AMP_HOME},
         "keywords": ["amp", "project-management", "agents", "mcp", "knowledge-base"],
     }, indent=2) + "\n")
 

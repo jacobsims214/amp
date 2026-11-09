@@ -11,6 +11,10 @@
 # Usage:
 #   ./scripts/build-claude-plugin.sh          (from v2/)
 #   /abs/path/to/v2/scripts/build-claude-plugin.sh
+#
+#   AMP_URL=https://amp.rp-tools-nonprod.rvohealth.com ./scripts/build-claude-plugin.sh
+#     Build for a specific AMP server (base URL or .../mcp). Unset, the plugin
+#     uses the amp URL in opencode.json. opencode's own config is not changed.
 
 set -euo pipefail
 
@@ -19,6 +23,11 @@ V2_DIR="${SCRIPT_DIR:h}"
 REPO_DIR="${V2_DIR:h}"
 PLUGIN_DIR="${V2_DIR}/plugins/amp"
 CONVERTER="${SCRIPT_DIR}/lib/opencode_to_claude.py"
+
+# Must match DEFAULT_AMP_HOME in the converter.
+AMP_HOME="${AMP_URL:-https://amp.simstech.cloud}"
+AMP_HOME="${AMP_HOME%/}"
+AMP_HOME="${AMP_HOME%/mcp}"
 
 info() { print -P "%F{blue}→%f $*" }
 ok()   { print -P "%F{green}✓%f $*" }
@@ -29,6 +38,11 @@ print ""
 print "AMP v2 opencode → Claude Code plugin"
 print "Source : ${V2_DIR}/.opencode"
 print "Output : ${PLUGIN_DIR}"
+if [[ -n "${AMP_URL:-}" ]]; then
+  print "AMP    : ${AMP_HOME}/mcp"
+else
+  print "AMP    : (amp URL from opencode.json)"
+fi
 print ""
 
 command -v python3 &>/dev/null || die "python3 required"
@@ -43,7 +57,7 @@ info "Writing plugin README..."
 cat > "${PLUGIN_DIR}/README.md" << 'EOF'
 # AMP — Claude Code plugin
 
-A manager/worker/reviewer agent team that plans work onto the [AMP](https://amp.simstech.cloud)
+A manager/worker/reviewer agent team that plans work onto the [AMP](__AMP_HOME__)
 board over MCP, dispatches specialists in review-gated waves, and accumulates project knowledge
 in the AMP knowledge base.
 
@@ -89,6 +103,7 @@ export AMP_MCP_URL=http://localhost:8000/mcp
 This directory is generated from `v2/.opencode/` by `v2/scripts/build-claude-plugin.sh`.
 Edit the opencode sources and rebuild — direct edits here are overwritten.
 EOF
+sed -i '' "s|__AMP_HOME__|${AMP_HOME}|g" "${PLUGIN_DIR}/README.md"
 ok "  README.md"
 
 # Refresh the marketplace manifest version so `claude plugin update` sees changes.

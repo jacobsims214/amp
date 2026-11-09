@@ -4,7 +4,7 @@
   "description": "AMP v2 for Claude Code \u2014 a manager/worker/reviewer agent team that plans work onto the AMP board over MCP, dispatches specialists in review-gated waves, and accumulates project knowledge in the AMP knowledge base.",
   "author": {
     "name": "AMP",
-    "url": "https://amp.simstech.cloud"
+    "url": "https://amp.rp-tools-nonprod.rvohealth.com"
   },
   "keywords": [
     "amp",

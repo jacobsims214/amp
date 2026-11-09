@@ -2,7 +2,7 @@
   "mcpServers": {
     "amp": {
       "type": "http",
-      "url": "${AMP_MCP_URL:-https://amp.simstech.cloud/mcp}"
+      "url": "${AMP_MCP_URL:-https://amp.rp-tools-nonprod.rvohealth.com/mcp}"
     },
     "chrome-devtools": {
       "command": "npx",

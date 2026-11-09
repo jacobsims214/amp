@@ -65,7 +65,12 @@ else
 fi
 
 # 3. AMP server reachability — a dead MCP server is the usual first failure.
-AMP_URL="${AMP_MCP_URL:-https://amp.simstech.cloud/mcp}"
+# Default to whatever server the built plugin points at.
+PLUGIN_AMP_URL="$(python3 -c 'import json, re, sys
+u = json.load(open(sys.argv[1]))["mcpServers"]["amp"]["url"]
+m = re.fullmatch(r"\$\{AMP_MCP_URL:-(.*)\}", u)
+print(m.group(1) if m else u)' "${PLUGIN_DIR}/.mcp.json" 2>/dev/null || true)"
+AMP_URL="${AMP_MCP_URL:-${PLUGIN_AMP_URL:-https://amp.simstech.cloud/mcp}}"
 info "Checking AMP MCP server at ${AMP_URL}..."
 if command -v curl &>/dev/null; then
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${AMP_URL}" 2>/dev/null || print 000)"
