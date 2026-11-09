@@ -240,24 +240,109 @@ func newHeaderReceiver(t *testing.T, header string) *headerReceiver {
 	return rc
 }
 
-func (rc *headerReceiver) find(t *testing.T, what string, match func(headerDelivery) bool) headerDelivery {
+// headerDeliveryTimeout bounds find's wait for a delivery. An account-level
+// entry (token.create has no org) has the longest path to the receiver: two
+// async goroutines and two Postgres round trips. CI's replicated step
+// (TEST_CLUSTER=1, -race, a shared 2-core runner) does not always fit that in
+// 5 s under load, so this matches the other bounded waits in these suites.
+const headerDeliveryTimeout = 30 * time.Second
+
+// fatalf is find's reporting side: *testing.T, or a recorder in the unit check
+// of the message below.
+type fatalf interface {
+	Helper()
+	Fatalf(format string, args ...any)
+}
+
+func (rc *headerReceiver) find(t fatalf, what string, match func(headerDelivery) bool) headerDelivery {
+	return rc.findWithin(t, headerDeliveryTimeout, what, match)
+}
+
+// findWithin is find with the bound passed in, so the timeout message can be
+// checked without waiting the full time.
+func (rc *headerReceiver) findWithin(t fatalf, timeout time.Duration, what string, match func(headerDelivery) bool) headerDelivery {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	d, ok := rc.waitFor(timeout, match)
+	if !ok {
+		// Name what did arrive: a timeout that reports only the missing event
+		// cannot be told apart from a different one.
+		t.Fatalf("%s", missingDelivery(what, timeout, rc.all()))
+	}
+	return d
+}
+
+// waitFor polls for a matching delivery until timeout, then reports it missing.
+func (rc *headerReceiver) waitFor(timeout time.Duration, match func(headerDelivery) bool) (headerDelivery, bool) {
+	deadline := time.Now().Add(timeout)
 	for {
-		rc.mu.Lock()
-		for _, d := range rc.got {
+		for _, d := range rc.all() {
 			if match(d) {
-				rc.mu.Unlock()
-				return d
+				return d, true
 			}
 		}
-		rc.mu.Unlock()
 		if time.Now().After(deadline) {
-			t.Fatalf("no delivery of %s", what)
+			return headerDelivery{}, false
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// all returns a copy of the deliveries received so far.
+func (rc *headerReceiver) all() []headerDelivery {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	return append([]headerDelivery(nil), rc.got...)
+}
+
+// missingDelivery is find's failure text: what was wanted, how long it waited,
+// and how many deliveries of which events did arrive.
+func missingDelivery(what string, timeout time.Duration, got []headerDelivery) string {
+	events := make([]string, 0, len(got))
+	for _, d := range got {
+		events = append(events, d.event)
+	}
+	return fmt.Sprintf("no delivery of %s within %s; received %d: %v", what, timeout, len(got), events)
+}
+
+// TestAuditUI_HeaderReceiverTimeoutIsDiagnosable pins the two halves of #3680:
+// find waits long enough for the replicated CI step, and a timeout says what did
+// arrive instead of only what did not (the three production occurrences were
+// byte-identical and could not be told apart). No stack: a zero receiver never
+// got a delivery.
+func TestAuditUI_HeaderReceiverTimeoutIsDiagnosable(t *testing.T) {
+	if headerDeliveryTimeout < 30*time.Second {
+		t.Fatalf("headerDeliveryTimeout = %s, want at least 30s for loaded CI", headerDeliveryTimeout)
+	}
+	var rc headerReceiver
+	rc.got = []headerDelivery{{event: "audit.access.denied"}, {event: "audit.webhook.create"}}
+	// find reports a missing delivery through t.Fatalf; capture it instead of
+	// aborting, and use a short bound so the check stays fast.
+	fake := &recordingT{T: t}
+	rc.findWithin(fake, 50*time.Millisecond, "token.create", func(headerDelivery) bool { return false })
+	for _, want := range []string{
+		"no delivery of token.create within 50ms",
+		"received 2: [audit.access.denied audit.webhook.create]",
+	} {
+		if !strings.Contains(fake.failed, want) {
+			t.Fatalf("timeout message = %q, want it to contain %q", fake.failed, want)
+		}
+	}
+	// At the bound find actually uses, the same text names 30s.
+	want := "no delivery of token.create within 30s; received 2: [audit.access.denied audit.webhook.create]"
+	if got := missingDelivery("token.create", headerDeliveryTimeout, rc.all()); got != want {
+		t.Fatalf("timeout message at the real bound = %q, want %q", got, want)
+	}
+}
+
+// recordingT captures what find reports instead of aborting the test.
+type recordingT struct {
+	*testing.T
+	failed string
+}
+
+func (r *recordingT) Helper() {}
+
+func (r *recordingT) Fatalf(format string, args ...any) { r.failed = fmt.Sprintf(format, args...) }
 
 func (rc *headerReceiver) has(match func(headerDelivery) bool) bool {
 	rc.mu.Lock()
