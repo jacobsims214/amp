@@ -7,7 +7,7 @@
  */
 import { BarChart } from '../components/ui/BarChart'
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useParams } from 'react-router-dom'
 import { Download } from 'lucide-react'
 import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
@@ -26,10 +26,19 @@ import { StateBar } from '../components/ui/StateTag'
 import type { DisplayState } from '../lib/ticketState'
 import type { ActivityLog, ProjectReport, ReportGroup, ReportStates } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
-import { projectLink } from '../lib/projectLink'
+import { TaskDrawer } from '../components/TaskDrawer'
+import { FocusNotFound } from '../components/FocusNotFound'
+import { useFocusParam } from '../hooks/useFocusParam'
+import { useFocusFallback } from '../hooks/useFocusFallback'
+import { useSearchParamState, type ParamCodec } from '../hooks/useSearchParamState'
 
 type Range = '1d' | '7d' | '30d' | 'all'
 const RANGE_LABELS: Record<Range, string> = { '1d': '24h', '7d': '7 days', '30d': '30 days', all: 'All time' }
+const RANGE_PARAM: ParamCodec<Range> = {
+  default: '7d',
+  parse: raw => (Object.hasOwn(RANGE_LABELS, raw) ? raw as Range : '7d'),
+  serialize: v => v,
+}
 const RANGE_DAYS: Record<Range, number> = { '1d': 1, '7d': 7, '30d': 30, all: 3650 }
 
 function hours(h?: number | null): string {
@@ -83,7 +92,7 @@ function DailyChart({ days }: { days: { day: string; n: number }[] }) {
 export function Report() {
   const { projectId } = useParams<{ projectId: string }>()
   const pid = Number(projectId)
-  const [range, setRangeState] = useState<Range>('7d')
+  const [range, setRangeState] = useSearchParamState('range', RANGE_PARAM)
   // The range ends when it was picked, not at each render.
   const [now, setNow] = useState(Date.now)
   const setRange = (r: Range) => { setRangeState(r); setNow(() => Date.now()) }
@@ -92,9 +101,10 @@ export function Report() {
   const [activity, setActivity] = useState<ActivityLog[]>([])
   const [error, setError] = useState<string | null>(null)
   const [actionFilter, setActionFilter] = useState('all')
-  const { tasks } = useBoardData(pid)
-  const { people } = useProjectPeople(pid)
-  const navigate = useNavigate()
+  const { tasks, loading, refresh, applyTask } = useBoardData(pid)
+  const { people, members, myAccess, openReassign } = useProjectPeople(pid)
+  const [focusId, setFocusId] = useFocusParam()
+  const focusMissing = useFocusFallback(pid, 'report', focusId, tasks, loading)
   const taskById = useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks])
 
   const since = useMemo(() => new Date(now - RANGE_DAYS[range] * 86_400_000).toISOString(), [range, now])
@@ -183,12 +193,12 @@ export function Report() {
 
           <PeoplePanel tasks={tasks} activity={activity} people={people} since={since} rangeLabel={RANGE_LABELS[range]}
             usageByPerson={new Map((report.people ?? []).map(g => [g.key, g.usage]))}
-            onOpen={id => navigate(projectLink(pid, 'mission', id))} />
+            onOpen={setFocusId} />
 
           <StandupSheet projectId={pid} />
 
           <HumanWorkPanel work={report.work} people={people} rangeLabel={RANGE_LABELS[range]}
-            onOpen={id => navigate(projectLink(pid, 'mission', id))} />
+            onOpen={setFocusId} />
 
           <Panel label="Spend" title="Tokens by model" right={<span>runs recorded in {RANGE_LABELS[range].toLowerCase()}</span>}>
             {!report.usage_by_model?.length ? (
@@ -301,7 +311,10 @@ export function Report() {
             </Panel>
           </div>
         </>}
+        {focusMissing != null && <FocusNotFound id={focusMissing} onDismiss={() => setFocusId(null)} />}
       </div>
+      <TaskDrawer task={focusId != null ? taskById.get(focusId) ?? null : null} onClose={() => setFocusId(null)} onRefresh={refresh}
+        members={members} myAccess={myAccess} openReassign={openReassign} onTaskUpdated={applyTask} />
     </div>
   )
 }

@@ -60,7 +60,11 @@ func NewServer(registry *actor.Registry, repo *repository.Repo, h *hub.Hub, kbSv
 		// One reindex per KB across every replica, not just this one.
 		kbSvc.SetReindexLock(repo.TryNamedLock)
 	}
-	return &Server{registry: registry, repo: repo, hub: h, kb: kbSvc, svc: service.New(repo, registry, kbSvc)}
+	svc := service.New(repo, registry, kbSvc)
+	if h != nil {
+		svc.Notify = h.Publish
+	}
+	return &Server{registry: registry, repo: repo, hub: h, kb: kbSvc, svc: svc}
 }
 
 // Register wires all MCP tools onto the provided MCPServer.
@@ -590,13 +594,15 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		"history and runs, and takes closeout_reason (never dispatch a ticket just to complete it: close out a ready ticket with "+
 		"runs directly). Also record the run: the model you used, your token usage if your harness can tell you (opencode: "+
 		"amp_session_usage), and where the work is (branch, commit, PR, pushed, base_branch). AMP reports token spend and traces "+
-		"code back to tickets from these. A person's own human ticket is marked done by that person in AMP's web UI, not here.",
+		"code back to tickets from these. Where the project records verification receipts (amp_open_receipt's mode isn't off), pass "+
+		"receipt_id and checks[]; a project that requires them may hold the completion for a person (held: true): then stop, don't "+
+		"retry. A person's own human ticket is marked done by that person in AMP's web UI, not here.",
 		withRunProps(props{
 			"task_id":         num("REQUIRED. Task ID."),
 			"dispatch_id":     str("The dispatch_id you were dispatched with. Pass it: it is what makes this the worker's own completion rather than a closeout."),
 			"closeout_reason": str("Closing out a ticket that isn't your own work: why its worker couldn't finish it (connection lost, timed out, approved after the worker blocked). Without your current dispatch_id, a completion that gives one is always recorded as a closeout."),
 			"hours_worked":    num("Human tickets: the hours the person says they spent on it."),
-		})), wrap(ctx, s.guard(authz.Member, s.completeTask)))
+		}, receiptProps())), wrap(ctx, s.guard(authz.Member, s.completeTask)))
 	mcp.AddTool(tool("amp_report_run",
 		"Record an agent run on a ticket without changing its state: the model, token usage, and where the work went. "+
 			"Use it for a run that ended some other way (killed, abandoned, handed over), for usage you learn about afterwards "+
@@ -702,6 +708,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.guard(authz.Member, s.answerQuestion)))
 
 	s.registerArtifacts(mcp)
+	s.registerReceipts(mcp)
 	s.registerDesign(mcp)
 
 	mcp.AddTool(tool("amp_add_task_comment", "Post a comment to a task's log. Used by agents to report progress.",
@@ -953,6 +960,9 @@ func (s *Server) createProject(rctx context.Context, args map[string]interface{}
 		return nil, err
 	}
 	req.OrgID, req.TeamID, req.CreatedBy = home.OrgID, home.TeamID, home.CreatedBy
+	if err := s.svc.GuardReceiptsNewProject(rctx, caller(rctx).p, req.OrgID, req.Metadata); err != nil {
+		return nil, err
+	}
 	p, err := s.repo.CreateProject(context.Background(), req)
 	if err != nil {
 		return nil, err
@@ -1220,6 +1230,9 @@ func (s *Server) createEpic(rctx context.Context, args map[string]interface{}) (
 		CreatedBy:   caller(rctx).p.UserRef(),
 		Metadata:    meta,
 	}
+	if err := s.svc.GuardReceiptsCreate(rctx, caller(rctx).p, "project", projectID, meta); err != nil {
+		return nil, err
+	}
 	// Route through ProjectActor so EpicActor is spawned and registered.
 	pid, err := s.registry.Get(projectID)
 	if err != nil {
@@ -1302,6 +1315,9 @@ func (s *Server) createStory(rctx context.Context, args map[string]interface{}) 
 		AcceptanceCriteria: optStr(args, "acceptance_criteria", ""),
 		Priority:           optStr(args, "priority", "1"),
 		CreatedBy:          caller(rctx).p.UserRef(),
+	}
+	if err := s.svc.GuardReceiptsCreate(rctx, caller(rctx).p, "epic", epicID, meta); err != nil {
+		return nil, err
 	}
 	// Route through ProjectActor → EpicActor so StoryActor is spawned and registered.
 	pid, err := s.registry.Get(projectID)
@@ -1727,7 +1743,7 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 		"quiet":             quiet,      // in progress with no activity for 15+ min: the worker likely died; check comments, close out or reset to backlog, re-dispatch
 		"not_started":       notStarted, // dispatched but no worker started it: start the worker now, or undo the dispatch
 		"returned":          returned,   // returned to ready because no worker started it; re-dispatch knowingly or ask the user
-		"waiting_on_people": people,     // Waiting on you: what each person must do next (kind approve, answer, merge, start, do); never dispatch these
+		"waiting_on_people": people,     // Waiting on you: what each person must do next (kind approve, answer, verify, merge, start, do); never dispatch these
 		"coming_up":         comingUp,   // people's human tickets not actionable yet (waiting on dependencies, a schedule or approval)
 		"count":             len(tasks),
 		"owner_filter":      view.Mode, // pass owner='unassigned' or 'any' to widen
@@ -1891,6 +1907,9 @@ func (s *Server) updateEpic(rctx context.Context, args map[string]interface{}) (
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
 	}
+	if err := s.svc.GuardReceiptsUpdate(rctx, caller(rctx).p, "epic", epicID, req.Metadata); err != nil {
+		return nil, err
+	}
 	replyCh := make(chan ReplySimple, 1)
 	pid, err := s.registry.Get(epic.ProjectID)
 	if err != nil {
@@ -1936,6 +1955,9 @@ func (s *Server) updateStory(rctx context.Context, args map[string]interface{}) 
 		Clear:              optStrSlice(args, "clear"),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
+		return nil, err
+	}
+	if err := s.svc.GuardReceiptsUpdate(rctx, caller(rctx).p, "story", storyID, req.Metadata); err != nil {
 		return nil, err
 	}
 	replyCh := make(chan ReplySimple, 1)
@@ -2041,11 +2063,40 @@ func (s *Server) completeTask(rctx context.Context, args map[string]interface{})
 	// service falls back to the run note for a closeout's reason itself.
 	claim := service.CompleteClaim{DispatchID: strings.TrimSpace(optStr(args, "dispatch_id", "")),
 		Reason: optStr(args, "closeout_reason", "")}
-	t, closed, err := s.svc.CompleteTaskWithRun(rctx, caller(rctx).p, taskID, &finish, claim)
+	// Its verification receipt (#126): checked before anything moves, so a
+	// malformed check or another ticket's receipt leaves the ticket open.
+	rin, err := receiptFromArgs(args, claim.DispatchID)
 	if err != nil {
 		return nil, err
 	}
+	t, closed, err := s.svc.CompleteTaskWithReceipt(rctx, caller(rctx).p, taskID, &finish, claim, rin)
+	if err != nil {
+		return nil, err
+	}
+	if closed.Held {
+		// Require held it: not done, and not an error, so the worker stops
+		// rather than retrying. The run is still recorded, and the receipt
+		// points at it.
+		out := map[string]interface{}{"task_id": taskID, "state": string(t.State), "held": true, "reason": closed.HoldReason,
+			"next": fmt.Sprintf("Stop. Ticket %d wasn't completed: this project requires a verification receipt and yours is below its "+
+				"minimum (%s). It waits for a person, who accepts it or sends it back, in the AMP web UI. Say why in your closing "+
+				"message; don't retry the completion.", taskID, closed.HoldReason)}
+		finish.Outcome = domain.RunCompleted
+		run, err := s.svc.RecordRun(rctx, caller(rctx).p, taskID, finish)
+		if err != nil {
+			out["run_error"] = err.Error()
+			s.svc.FinalizeReceipt(rctx, caller(rctx).p, taskID, nil, closed)
+		} else {
+			out["run"] = run
+			s.svc.FinalizeReceipt(rctx, caller(rctx).p, taskID, &run, closed)
+		}
+		return jsonResult(out)
+	}
 	out := map[string]interface{}{"task_id": taskID, "state": "completed", "next": completeNext(t, closed.Closeout)}
+	if st := closed.ReceiptStatus(); st != "" && closed.Completed {
+		out["receipt_status"] = st
+	}
+	var recorded *domain.Run
 	if closed.Closeout {
 		out["closeout"] = true
 		if closed.Reason != "" {
@@ -2065,17 +2116,22 @@ func (s *Server) completeTask(rctx context.Context, args map[string]interface{})
 		}
 		args["run_note"] = note
 		finish.Note = note
-		if _, err := s.svc.RecordRun(rctx, caller(rctx).p, taskID, finish); err != nil {
+		if run, err := s.svc.RecordRun(rctx, caller(rctx).p, taskID, finish); err != nil {
 			out["run_error"] = err.Error()
+		} else {
+			recorded = &run
 		}
 	} else if run, err := s.recordRunFromArgs(rctx, taskID, args, domain.RunCompleted); err != nil {
 		out["run_error"] = err.Error()
 	} else if run != nil {
 		out["run"] = run
+		recorded = run
 	}
 	if runs, err := s.repo.TaskRuns(rctx, taskID); err == nil && len(runs) > 0 {
 		out["run"] = runs[len(runs)-1]
 	}
+	// After the run is recorded, so the receipt points at it.
+	s.svc.FinalizeReceipt(rctx, caller(rctx).p, taskID, recorded, closed)
 	return jsonResult(out)
 }
 
@@ -2099,6 +2155,10 @@ func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*
 		return nil, err
 	}
 	if err := s.checkProjectNotArchived(context.Background(), task.ProjectID); err != nil {
+		return nil, err
+	}
+	// A held ticket waits for a person; a question doesn't release it (#126).
+	if err := s.svc.RefuseIfHeld(rctx, caller(rctx).p, task, "task.block"); err != nil {
 		return nil, err
 	}
 	replyCh := make(chan ReplySimple, 1)
@@ -2256,7 +2316,11 @@ func (s *Server) resetProject(rctx context.Context, args map[string]interface{})
 	if p.State == domain.ProjectStateArchived {
 		return nil, fmt.Errorf("⚠️  Project %d (%s) is archived. Restore it first with amp_restore_project before making changes.", p.ID, p.Name)
 	}
-	// 1. Wipe postgres
+	// 1. Wipe postgres. Receipts have no FK to tasks: they and their
+	// evidence go first (#126).
+	if err := s.svc.DeleteProjectReceipts(rctx, projectID); err != nil {
+		return nil, fmt.Errorf("reset project: %w", err)
+	}
 	if err := s.repo.ResetProject(context.Background(), projectID); err != nil {
 		return nil, fmt.Errorf("reset project: %w", err)
 	}
@@ -2350,7 +2414,7 @@ func (s *Server) setTaskState(rctx context.Context, args map[string]interface{})
 
 	// Through the service, which keeps agents from moving work forward by
 	// hand (see Service.SetTaskState), then the actor hierarchy.
-	updated, err := s.svc.SetTaskStateAs(rctx, caller(rctx).p, taskID, domain.TaskState(stateStr), reason,
+	updated, held, err := s.svc.SetTaskStateHeld(rctx, caller(rctx).p, taskID, domain.TaskState(stateStr), reason,
 		strings.TrimSpace(optStr(args, "dispatch_id", "")))
 	if err != nil {
 		return nil, err
@@ -2361,6 +2425,13 @@ func (s *Server) setTaskState(rctx context.Context, args map[string]interface{})
 		"to_state":   string(updated.State),
 		"reason":     reason,
 		"next":       stateNext(updated),
+	}
+	if held {
+		// Require held it for a person (#126): say so, so the caller stops.
+		out["held"] = true
+		out["next"] = fmt.Sprintf("Ticket %d wasn't completed: its project requires a verification receipt and this completion is "+
+			"below the minimum, so it waits for a person to accept it in the AMP web UI. Stop; don't retry.", taskID)
+		return jsonResult(out)
 	}
 	if string(updated.State) != stateStr {
 		// Moved back while a dependency is open: it waits on it.
@@ -2512,6 +2583,9 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 	if err != nil {
 		return nil, err
 	}
+	// Off the web UI, receipts keys aren't imported (the new project follows
+	// the org default until a person sets it, #126).
+	stripped := s.svc.StripImportedReceipts(caller(rctx).p, &bundle)
 	newProject, err := s.repo.ImportBundle(ctx, bundle, newCode, newName, home)
 	if err != nil {
 		return nil, fmt.Errorf("import bundle: %w", err)
@@ -2544,7 +2618,12 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 	// 4. Publish event for real-time UI updates
 	s.hub.Publish(domain.Event{Type: domain.EventProjectCreated, ProjectID: newProject.ID, Payload: newProject, At: time.Now()})
 
-	return jsonResult(map[string]interface{}{"project": newProject, "kb_docs_imported": imported, "kb_docs_failed": failed})
+	out := map[string]interface{}{"project": newProject, "kb_docs_imported": imported, "kb_docs_failed": failed}
+	if stripped > 0 {
+		out["receipts_keys_removed"] = stripped
+		out["note"] = "The bundle's verification receipts metadata wasn't imported: a person sets it in the AMP web UI."
+	}
+	return jsonResult(out)
 }
 
 // ---- Metadata ----

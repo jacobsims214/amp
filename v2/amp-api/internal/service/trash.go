@@ -21,7 +21,7 @@ func (s *Service) RunTrashPurge(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
-		if n, err := s.Repo.PurgeTrash(ctx); err != nil {
+		if n, err := s.PurgeTrash(ctx); err != nil {
 			slog.Warn("trash purge failed", "err", err)
 		} else if n > 0 {
 			slog.Info("trash purge", "deleted", n)
@@ -32,6 +32,16 @@ func (s *Service) RunTrashPurge(ctx context.Context, interval time.Duration) {
 		case <-t.C:
 		}
 	}
+}
+
+// PurgeTrash is one pass of RunTrashPurge. Receipts have no FK to tasks,
+// so a purged ticket's receipts and evidence go first (#126); if they
+// can't, the trash waits for the next pass, so no evidence is orphaned.
+func (s *Service) PurgeTrash(ctx context.Context) (int64, error) {
+	if _, err := s.PurgeTrashedReceipts(ctx); err != nil {
+		return 0, fmt.Errorf("receipts of purged tickets: %w", err)
+	}
+	return s.Repo.PurgeTrash(ctx)
 }
 
 // DeletedTasks lists a project's trash for its members.

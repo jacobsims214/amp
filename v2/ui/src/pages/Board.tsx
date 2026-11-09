@@ -4,6 +4,7 @@ import { useFocusParam } from '../hooks/useFocusParam'
 import { RefreshCw, RotateCw, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users, ListChecks } from 'lucide-react'
 import { useBoardData } from '../hooks/useBoardData'
 import { useSSE } from '../hooks/useSSE'
+import { useReceiptSummary } from '../hooks/useReceiptSummary'
 import { useAuth } from '../hooks/useAuth'
 import { TaskCard } from '../components/TaskCard'
 import { TaskDrawer } from '../components/TaskDrawer'
@@ -13,12 +14,14 @@ import { flagParam, useSearchParamState } from '../hooks/useSearchParamState'
 import { FocusNotFound } from '../components/FocusNotFound'
 import { useFocusFallback } from '../hooks/useFocusFallback'
 import { HandoverBar } from '../components/HandoverBar'
-import { CrudModal } from '../components/CrudModal'
+import { CrudModal, FieldError, inputCls, labelCls } from '../components/CrudModal'
 import { MetadataEditor } from '../components/MetadataEditor'
 import { DependencyPicker } from '../components/DependencyPicker'
 import { PlanCheckModal } from '../components/PlanCheckModal'
 import { metadataPatch } from '../lib/metadata'
+import { errMsg } from '../lib/adminStyles'
 import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal'
+import { ManagerAgent } from '../components/ManagerAgent'
 import { ProjectNav } from '../components/ProjectNav'
 import { OwnerStack } from '../components/OwnerAvatar'
 import { OwnersEditor } from '../components/OwnersEditor'
@@ -58,12 +61,6 @@ const COLUMNS: {
 function isScheduledTask(task: Task): boolean {
   return task.state === 'blocked' && task.block_reason?.startsWith('scheduled:') === true
 }
-
-const inputCls =
-  'w-full bg-bg border border-line rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-3 ' +
-  'focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-all font-[inherit]'
-
-const labelCls = 'text-xs font-medium text-ink-2 block mb-1.5'
 
 // owner: '' = me (server default), 'none' = unassigned, or a member's user id
 const EMPTY_TASK_FORM = { name: '', description: '', acceptance_criteria: '', assigned_to: 'amp-worker', priority: '1', owner: '', dependency_ids: [] as number[],
@@ -105,6 +102,8 @@ export function Board() {
   const [notStartedFlagMinutes, setNotStartedFlagMinutes] = useState<number | undefined>(undefined)
   const [teamAccessOpen, setTeamAccessOpen] = useState(false)
   const people = useMemo(() => peopleById(members), [members])
+  // Each ticket's verification receipt status, for the card badges (#126).
+  const receipts = useReceiptSummary(pid)
   // Tickets waiting on approval: a one-line link to My work, where approving happens.
   const approval = usePlanApproval(pid)
   const awaiting = useMemo(() => awaitingApproval(tasks, approval.project), [tasks, approval.project])
@@ -146,6 +145,8 @@ export function Board() {
 
   // Task create
   const [taskCreateModal, setTaskCreateModal] = useState<{ story: Story } | null>(null)
+  // The open dialog's Name was left empty on save: said at the field, cleared as you type (#128).
+  const [nameMissing, setNameMissing] = useState(false)
   const [taskForm, setTaskForm] = useState({ ...EMPTY_TASK_FORM })
   const [taskSaving, setTaskSaving] = useState(false)
   const [taskError, setTaskError] = useState<string | null>(null)
@@ -227,7 +228,6 @@ export function Board() {
   const toggleStory = (id: number) =>
     setCollapsedStories(prev => { const s = new Set(prev); if (s.has(id)) s.delete(id); else s.add(id); return s })
 
-  const errMsg = (e: unknown, fallback: string) => e instanceof Error ? e.message : fallback
 
   // Metadata being edited in the epic / story dialog: what it started as,
   // the edited value, and what the item inherits (shown read-only).
@@ -242,11 +242,11 @@ export function Board() {
   const projectMeta = () => api.getProject(pid).then(p => p.metadata ?? {})
 
   const openEpicModal = (m: { mode: 'create' | 'edit'; epic?: Epic }) => {
-    setEpicError(null); setEpicModal(m)
+    setEpicError(null); setNameMissing(false); setEpicModal(m)
     startMeta(setEpicMeta, m.epic?.metadata, m.epic ? api.inheritedMetadata('epic', m.epic.id) : projectMeta())
   }
   const openStoryModal = (m: { mode: 'create' | 'edit'; story?: Story; epicId?: number }) => {
-    setStoryError(null); setStoryModal(m); setStoryEpicId(m.story?.epic_id ?? null)
+    setStoryError(null); setNameMissing(false); setStoryModal(m); setStoryEpicId(m.story?.epic_id ?? null)
     const parent = m.epicId != null ? epics.find(e => e.id === m.epicId) : undefined
     startMeta(setStoryMeta, m.story?.metadata, m.story
       ? api.inheritedMetadata('story', m.story.id)
@@ -254,7 +254,7 @@ export function Board() {
   }
 
   const handleEpicSave = async () => {
-    if (!epicForm.name.trim()) return
+    if (!epicForm.name.trim()) { setNameMissing(true); document.getElementById('dialog-name')?.focus(); return }
     if (epicMeta.error) { setEpicError(epicMeta.error); return }
     setEpicSaving(true)
     setEpicError(null)
@@ -277,7 +277,7 @@ export function Board() {
   }
 
   const handleStorySave = async () => {
-    if (!storyForm.name.trim()) return
+    if (!storyForm.name.trim()) { setNameMissing(true); document.getElementById('dialog-name')?.focus(); return }
     if (storyMeta.error) { setStoryError(storyMeta.error); return }
     setStorySaving(true)
     setStoryError(null)
@@ -303,7 +303,8 @@ export function Board() {
   }
 
   const handleTaskCreate = async () => {
-    if (!taskForm.name.trim() || !taskCreateModal) return
+    if (!taskCreateModal) return
+    if (!taskForm.name.trim()) { setNameMissing(true); document.getElementById('dialog-name')?.focus(); return }
     // A person's ticket needs its brief, written for them (the server checks too).
     if (taskForm.performer === 'human' && (!taskForm.description.trim() || !taskForm.acceptance_criteria.trim())) {
       setTaskError("A person's ticket needs a description (what they must do) and acceptance criteria (what done means).")
@@ -464,7 +465,7 @@ export function Board() {
       {/* Board scroll area */}
       <div className="flex-1 overflow-auto">
         {epics.length === 0 ? (
-          <EmptyState />
+          <EmptyState onCreate={() => { setEpicForm({ name: '', description: '', priority: '1' }); openEpicModal({ mode: 'create' }) }} />
         ) : (
           <div style={{ minWidth: LABEL_COL + COLUMNS.length * TASK_COL }}>
             {/* Column headers — sticky */}
@@ -530,15 +531,18 @@ export function Board() {
                           setStoryForm({ name: '', description: '', acceptance_criteria: '', priority: '1' })
                           openStoryModal({ mode: 'create', epicId: epic.id })
                         }}
-                        className="p-1 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
-                        title="Add story" aria-label={`Add a story to ${epic.name}`}
+                        // An epic with no stories shows "+ Story" in full (#128); otherwise a quiet icon.
+                        className={allEpicStories.length === 0
+                          ? 'amp-btn amp-btn-sm shrink-0'
+                          : 'p-1 opacity-50 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer'}
+                        title="Add a story to this epic" aria-label={`Add a story to ${epic.name}`}
                       >
-                        <Plus size={11} className="text-ink-2" />
+                        <Plus size={11} className="text-ink-2" aria-hidden="true" />{allEpicStories.length === 0 && 'Story'}
                       </button>
                       <button
                         onClick={e => { e.stopPropagation(); setOpenEpicMenu(openEpicMenu === epic.id ? null : epic.id) }}
-                        aria-label={`Epic actions: ${epic.name}`} aria-haspopup="menu" aria-expanded={openEpicMenu === epic.id} title="Edit or delete epic"
-                        className="p-1 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
+                        aria-label={`Epic actions: ${epic.name}`} aria-haspopup="menu" aria-expanded={openEpicMenu === epic.id} title="Edit or delete this epic"
+                        className="p-1 opacity-50 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
                       >
                         <MoreHorizontal size={12} className="text-ink-2" />
                       </button>
@@ -581,6 +585,7 @@ export function Board() {
                   {!isEpicCollapsed && epicStories.map(story => {
                     const storyTasks = ownerTasks.filter(t => t.story_id === story.id)
                     const isStoryCollapsed = collapsedStories.has(story.id)
+                    const storyEmpty = !tasks.some(t => t.story_id === story.id)
 
                     return (
                       <div key={story.id} className="border-b border-line-sub/60 last:border-b-0">
@@ -604,18 +609,21 @@ export function Board() {
                               onClick={e => {
                                 e.stopPropagation()
                                 setTaskForm({ ...EMPTY_TASK_FORM })
-                                setTaskError(null)
+                                setTaskError(null); setNameMissing(false)
                                 setTaskCreateModal({ story })
                               }}
-                              className="p-1 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
-                              title="Add task" aria-label={`Add a task to ${story.name}`}
+                              // A story with no tickets shows "+ Task" in full (#128); otherwise a quiet icon.
+                              className={storyEmpty
+                                ? 'amp-btn amp-btn-sm shrink-0'
+                                : 'p-1 opacity-50 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer'}
+                              title="Add a task to this story" aria-label={`Add a task to ${story.name}`}
                             >
-                              <Plus size={11} className="text-ink-2" />
+                              <Plus size={11} className="text-ink-2" aria-hidden="true" />{storyEmpty && 'Task'}
                             </button>
                             <button
                               onClick={e => { e.stopPropagation(); setOpenStoryMenu(openStoryMenu === story.id ? null : story.id) }}
-                              aria-label={`Story actions: ${story.name}`} aria-haspopup="menu" aria-expanded={openStoryMenu === story.id} title="Edit or delete story"
-                              className="p-1 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
+                              aria-label={`Story actions: ${story.name}`} aria-haspopup="menu" aria-expanded={openStoryMenu === story.id} title="Edit or delete this story"
+                              className="p-1 opacity-50 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
                             >
                               <MoreHorizontal size={11} className="text-ink-2" />
                             </button>
@@ -680,6 +688,7 @@ export function Board() {
                                         isScheduled={col.state === 'scheduled'}
                                         owner={lookupPerson(people, task.owner_user_id)}
                                         notStartedFlagMinutes={notStartedFlagMinutes}
+                                        receipt={receipts.byTask.get(task.id)}
                                       />
                                     ))}
                                     {colTasks.length === 0 && <div className="h-8" />}
@@ -732,8 +741,10 @@ export function Board() {
       {epicModal && (
         <CrudModal title={epicModal.mode === 'create' ? 'New Epic' : 'Edit Epic'} onClose={() => setEpicModal(null)} onSave={handleEpicSave} saving={epicSaving}>
           <div className="space-y-4">
-            <div><label className={labelCls}>Name *</label>
-              <input autoFocus value={epicForm.name} onChange={e => setEpicForm(f => ({ ...f, name: e.target.value }))} className={inputCls} placeholder="Epic name" /></div>
+            <div><label htmlFor="dialog-name" className={labelCls}>Name *</label>
+              <input id="dialog-name" autoFocus value={epicForm.name} onChange={e => { setEpicForm(f => ({ ...f, name: e.target.value })); setNameMissing(false) }}
+                aria-invalid={nameMissing} aria-describedby={nameMissing ? 'dialog-name-error' : undefined} className={inputCls} placeholder="Epic name" />
+              <FieldError id="dialog-name-error">{nameMissing && 'Give it a name.'}</FieldError></div>
             <div><label className={labelCls}>Description</label>
               <textarea value={epicForm.description} onChange={e => setEpicForm(f => ({ ...f, description: e.target.value }))} rows={3} className={`${inputCls} resize-none`} placeholder="Optional description" /></div>
             <div><label className={labelCls}>Priority</label>
@@ -741,7 +752,7 @@ export function Board() {
                 <option value="0">Low</option><option value="1">Normal</option><option value="2">High</option><option value="3">Critical</option>
               </select></div>
             {editingEpic && (
-              <div><label className={labelCls}>Owners</label>
+              <div data-applies-now><label className={labelCls}>Owners</label>
                 <OwnersEditor
                   ownerIds={editingEpic.owner_ids ?? []}
                   people={people}
@@ -771,8 +782,10 @@ export function Board() {
       {storyModal && (
         <CrudModal title={storyModal.mode === 'create' ? 'New Story' : 'Edit Story'} onClose={() => setStoryModal(null)} onSave={handleStorySave} saving={storySaving}>
           <div className="space-y-4">
-            <div><label className={labelCls}>Name *</label>
-              <input autoFocus value={storyForm.name} onChange={e => setStoryForm(f => ({ ...f, name: e.target.value }))} className={inputCls} placeholder="Story name" /></div>
+            <div><label htmlFor="dialog-name" className={labelCls}>Name *</label>
+              <input id="dialog-name" autoFocus value={storyForm.name} onChange={e => { setStoryForm(f => ({ ...f, name: e.target.value })); setNameMissing(false) }}
+                aria-invalid={nameMissing} aria-describedby={nameMissing ? 'dialog-name-error' : undefined} className={inputCls} placeholder="Story name" />
+              <FieldError id="dialog-name-error">{nameMissing && 'Give it a name.'}</FieldError></div>
             <div><label className={labelCls}>Description</label>
               <textarea value={storyForm.description} onChange={e => setStoryForm(f => ({ ...f, description: e.target.value }))} rows={2} className={`${inputCls} resize-none`} /></div>
             <div><label className={labelCls}>Acceptance Criteria</label>
@@ -791,7 +804,7 @@ export function Board() {
                 <option value="0">Low</option><option value="1">Normal</option><option value="2">High</option><option value="3">Critical</option>
               </select></div>
             {editingStory && (
-              <div><label className={labelCls}>Owners</label>
+              <div data-applies-now><label className={labelCls}>Owners</label>
                 <OwnersEditor
                   ownerIds={editingStory.owner_ids ?? []}
                   people={people}
@@ -821,8 +834,10 @@ export function Board() {
       {taskCreateModal && (
         <CrudModal title="New Task" onClose={() => setTaskCreateModal(null)} onSave={handleTaskCreate} saving={taskSaving}>
           <div className="space-y-4">
-            <div><label className={labelCls}>Name *</label>
-              <input autoFocus value={taskForm.name} onChange={e => setTaskForm(f => ({ ...f, name: e.target.value }))} className={inputCls} placeholder="Task name" /></div>
+            <div><label htmlFor="dialog-name" className={labelCls}>Name *</label>
+              <input id="dialog-name" autoFocus value={taskForm.name} onChange={e => { setTaskForm(f => ({ ...f, name: e.target.value })); setNameMissing(false) }}
+                aria-invalid={nameMissing} aria-describedby={nameMissing ? 'dialog-name-error' : undefined} className={inputCls} placeholder="Task name" />
+              <FieldError id="dialog-name-error">{nameMissing && 'Give it a name.'}</FieldError></div>
             <div><label htmlFor="new-description" className={labelCls}>Description{taskForm.performer === 'human' ? ' *' : ''}</label>
               <textarea id="new-description" value={taskForm.description} onChange={e => setTaskForm(f => ({ ...f, description: e.target.value }))} rows={3} className={`${inputCls} resize-none`}
                 required={taskForm.performer === 'human'} aria-required={taskForm.performer === 'human'}
@@ -918,7 +933,7 @@ function BoardSkeleton() {
   )
 }
 
-function EmptyState() {
+function EmptyState({ onCreate }: { onCreate: () => void }) {
   return (
     <div className="flex flex-col items-center justify-center h-64 gap-4">
       <div
@@ -927,10 +942,11 @@ function EmptyState() {
       >
         <GitBranch size={22} className="text-line-str" />
       </div>
-      <div className="text-center">
-        <p className="text-sm font-semibold text-ink">No epics yet</p>
-        <p className="text-xs text-ink-2 mt-1.5 max-w-xs leading-relaxed">
-          Ask the amp-manager to plan your project — tasks will appear here in real time.
+      <div className="text-center grid justify-items-center gap-3">
+        <p className="m-0 text-sm font-semibold text-ink">No epics yet</p>
+        <button type="button" onClick={onCreate} className="amp-btn amp-btn-primary"><Plus size={12} />Create your first epic</button>
+        <p className="m-0 text-xs text-ink-2 max-w-xs leading-relaxed">
+          Or ask your <ManagerAgent /> to plan the project: its tickets appear here as it files them.
         </p>
       </div>
     </div>

@@ -5,6 +5,42 @@ from AMP's server images, and follows [Semantic Versioning](https://semver.org/)
 tagged `harness-vX.Y.Z`. The versioning and compatibility policy is D14 in the AMP project 2 KB,
 `decisions/amp-harness-architecture.md`. How to cut a release: [RELEASING.md](RELEASING.md).
 
+## [0.3.0] - 2026-11-05
+
+Resume a saved conversation from the chat, and worker runs that change nothing no longer ask for a
+merge.
+
+### Added
+
+- Resume a saved conversation: `/sessions` lists the chats started in the current directory, newest
+  activity first, with the id, age, role and latest text, and marks the one this chat is writing. A
+  second Enter loads it and the conversation carries on with its own history; the chat keeps its
+  current model, tools and policy and says so (#3000, #3010, #3012).
+- Resuming is a transaction that refuses rather than half-doing it: another directory's session, a
+  file a live writer holds, a damaged header or an unsupported format are rows that say why, and a
+  resume is refused while the manager is replying, prompts are queued, a worker of this chat is
+  running, remote control is on or an approval wait is armed (#3010, #3012).
+- One writer per saved session: a per-file lock beside the session file, refused rather than joined,
+  released by the OS when the holder dies however it dies, and held for the whole time the session
+  can be written. Repairs run only under the lock (#3004, #3006, #3220).
+- End-to-end tests for close, reopen and resume through the real binary: a saved conversation is
+  reopened and continued, a compacted one resumes from its summary, a recorded dispatch and its
+  queued prompts are shown but never run, and a truncated tail is repaired while the conversation
+  before it is kept (#3014).
+- A worktree handover records the commit the run starts from, so a run's own work can be told from
+  the branch it inherited (#3003).
+
+### Fixed
+
+- A worker run that changes nothing no longer reports a branch or `pushed`: an untouched worktree on
+  an already-public base was reported as pushed and landed in Merge needed waiting for a merge that
+  did not exist (#3005).
+- A `--no-session` chat that resumes a saved conversation stops claiming the session is in memory;
+  the banner names the file the chat writes now, like `/usage` and the exit line (#3129).
+- Test isolation: the busy-turn resume test waits on the product's queue notice instead of its own
+  typed draft, and the compaction test gives in-process teardown a bounded grace before asserting a
+  lock is free (#3108, #3109, #3146).
+
 ## [0.2.0] - 2026-10-31
 
 Interactive chat launches workers in the background, and dispatch is safer end to end.

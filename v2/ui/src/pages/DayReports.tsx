@@ -2,7 +2,6 @@ import { PageHeader } from '../components/ui/PageHeader'
 import { Avatar } from '../components/ui/Avatar'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import ReactMarkdown from 'react-markdown'
 import { Check, ClipboardCopy, Loader2, RefreshCw, Save } from 'lucide-react'
 import { api } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
@@ -11,6 +10,7 @@ import type { DayReport, DayReportItem, Member, VelocityDay } from '../types'
 import { projectLink } from '../lib/projectLink'
 import { withTimeout } from '../lib/timeout'
 import { LoadError } from '../components/ui/LoadError'
+import { Markdown } from '../components/ui/Markdown'
 
 // /reports — end-of-day reports. Your own day is built live from AMP (what
 // you completed, have in progress, are blocked on, started, created, and
@@ -112,6 +112,9 @@ function Velocity({ person }: { person: Member }) {
         <span className="ml-auto amp-num text-[11px] text-ink-3">{total} total · {weekly} this week · {(total / 30).toFixed(1)}/day</span>
       </div>
       <div className="px-4 pt-4 pb-3">
+      {days.length === 0 ? (
+        <p className="m-0 h-24 flex items-center text-[12.5px] text-ink-3">No completed tickets to chart yet.</p>
+      ) : (<>
       <div className="flex items-end gap-1 h-24">
         {days.map(d => (
           <div key={d.day} className="flex-1 flex flex-col justify-end h-full group relative"
@@ -124,6 +127,7 @@ function Velocity({ person }: { person: Member }) {
       <div className="flex justify-between amp-num text-[10.5px] text-ink-3 mt-1.5">
         <span>{prettyDay(days[0].day)}</span><span>Today</span>
       </div>
+      </>)}
       </div>
     </section>
   )
@@ -164,6 +168,7 @@ function MyDay() {
     }
   }
 
+  const isToday = day === localDay()
   const dirty = report != null && summary !== report.summary
   return (
     <section className="amp-panel-top" style={card}>
@@ -180,9 +185,16 @@ function MyDay() {
       </div>
       <div className="p-4 grid gap-3">
       <p className="m-0 text-[12.5px] text-ink-2 leading-relaxed">
-        Built from today's AMP activity across your projects. Add a summary in your own words, then save it so your
+        Built from {isToday ? "today's" : `${prettyDay(day)}'s`} AMP activity across your projects. Add a summary in your own words, then save it so your
         team can read it. Or ask your agent to "wrap up today" and it will draft and save this for you.
       </p>
+      {!isToday && (
+        <p data-testid="past-day-note" className="m-0 text-[12px] text-ink-3 leading-relaxed">
+          Completed, Started, Created and Touched come from {prettyDay(day)}. In progress and Blocked show where
+          tickets stood when this report was generated
+          {report?.data.generated_at ? ` (${new Date(report.data.generated_at).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })})` : ''}, not on that day.
+        </p>
+      )}
       <textarea value={summary} onChange={e => setSummary(e.target.value)} rows={5}
         placeholder="Highlights, blockers, and what's next…"
         className="amp-input resize-y" />
@@ -273,9 +285,7 @@ function ReportBody({ report, showSummary }: { report: DayReport; showSummary: b
         </span>
       </div>
       {showSummary && report.summary && (
-        <div className="text-sm text-ink leading-relaxed [&_p]:mb-2 [&_ul]:list-disc [&_ul]:pl-5">
-          <ReactMarkdown>{report.summary}</ReactMarkdown>
-        </div>
+        <Markdown size="compact">{report.summary}</Markdown>
       )}
       <Section title="Completed" items={d.completed} tone="var(--st-done)" />
       <Section title="In progress" items={d.in_progress} tone="var(--st-prog)" />

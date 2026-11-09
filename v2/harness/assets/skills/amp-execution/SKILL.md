@@ -319,6 +319,38 @@ Acceptance criteria:
 """, author="amp-worker")
 ```
 
+**Open your receipt** before you complete (verification receipts: a structured record of how
+you checked the work):
+
+```
+amp_open_receipt(task_id=YOUR_TASK_ID, dispatch_id="<your dispatch ID>",
+  summary="<one or two sentences>", files_changed=[{path, added, removed}, …])
+```
+
+If it returns `mode: "off"`, the project doesn't record receipts: complete exactly as below and
+leave the receipt fields out. Otherwise pass its `receipt_id` and one check per acceptance
+criterion to `amp_complete_task`:
+
+```
+receipt_id=<from amp_open_receipt>,
+checks=[{criterion_ref: "1", kind: "test", verdict: "pass", command: "go test ./...", exit_code: 0},
+        {criterion_ref: "2", kind: "visual", verdict: "cant_tell", note: "no browser here"}, …]
+```
+
+`criterion_ref` is the criterion's number (1-based) in `acceptance_criteria`. `kind` is `command`,
+`test`, `ci`, `visual` or `manual`. `verdict` is what actually happened: `pass` only for a check
+you ran this task, `fail` when it failed, `cant_tell` when you couldn't check it — the same honesty
+as VERIFIED / COULD NOT VERIFY above, which you still write in the comment. A `visual` pass
+counts only with its own uploaded evidence (screenshots, a recording): declare the files with
+`amp_add_evidence` before completing, upload each to its one-time URL, and cite its `key` as the
+check's `evidence_key` (`amp-worker-frontend` describes how). Without that it counts as
+`cant_tell`.
+
+**If the result says `held: true`**, stop: the project requires a receipt and yours is below its
+minimum (no passing check, or a failing one). The ticket is not done; it waits for a person, who
+accepts it or sends it back. Don't retry the completion. Say why in your closing message, with
+the `reason` it gave.
+
 Then complete it **with the run record** — what you used and where the work is. AMP reports and
 capitalizes token spend from these numbers, and traces code back to tickets from the git fields:
 
@@ -328,7 +360,8 @@ amp_session_usage()          ← if your harness has it (amp-harness does): your
 amp_complete_task(task_id=YOUR_TASK_ID, dispatch_id="<your dispatch ID>",
   model="<the model you ran on>",
   input_tokens=…, output_tokens=…, cache_read_tokens=…, cost_usd=…,   ← only numbers your harness gave you
-  branch="<branch>", commit="<sha>", pushed=true|false, pr_url="<if one>", base_branch="<if a PR")
+  branch="<branch>", commit="<sha>", pushed=true|false, pr_url="<if one>", base_branch="<if a PR",
+  receipt_id=…, checks=[…])                                            ← unless amp_open_receipt said mode "off"
 ```
 
 **The dispatch ID is filled in for you.** The harness injects it into your `amp_complete_task`
@@ -350,7 +383,9 @@ amp_claim_task {task_id, dispatch_id}   ← FIRST, if your prompt has a dispatch
 amp_get_task {task_id, include: ["comments"]}   ← read before starting; answers to questions are in the comments
 amp_add_task_comment {task_id, body, author}
 amp_block_task {task_id, dispatch_id?, reason, …run fields}   ← only to ask a person a question (Step 5)
-amp_complete_task {task_id, dispatch_id, model?, input_tokens?, output_tokens?, cache_read_tokens?, cost_usd?, branch?, commit?, pushed?, pr_url?, base_branch?}
+amp_open_receipt {task_id, dispatch_id, summary?, files_changed?}   ← before completing; mode "off" means skip the receipt fields
+amp_add_evidence {receipt_id, dispatch_id, tree_sha, commit?, files: [{name, bytes, sha256, duration_ms?, frames?}]}   ← one-time upload URLs for a visual check's evidence
+amp_complete_task {task_id, dispatch_id, model?, input_tokens?, output_tokens?, cache_read_tokens?, cost_usd?, branch?, commit?, pushed?, pr_url?, base_branch?, receipt_id?, checks?}
 amp_report_run {task_id, outcome, …run fields}  ← a run that ended another way, or a PR opened later
 amp_session_usage {}                  ← your own model/tokens/cost
 amp_get_task {task_id, include: ["history","runs"]}   ← what happened before you

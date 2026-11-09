@@ -58,6 +58,13 @@ type Service struct {
 	// a rule that names someone stays the honest unknown arm; see
 	// MergeAlertPersonSource.
 	MergeAlertPerson MergeAlertPersonSource
+	// Notify, when set, publishes the events the service makes itself
+	// (receipt.updated, #126): the REST and MCP handlers point it at their
+	// hub. nil drops them.
+	Notify func(domain.Event)
+	// Evidence is the receipt evidence store (#126; nil: not configured,
+	// so evidence calls are refused and visual checks can't count).
+	Evidence *EvidenceStore
 	// DecisionDocFault, when set, is called before a decision doc is written
 	// and fails the write with its error. Tests use it to force the "ticket
 	// created, doc not" path.
@@ -109,8 +116,8 @@ func (s *Service) ResolveProjectHome(ctx context.Context, p authz.Principal, org
 		if err != nil {
 			return home, err
 		}
-		if !p.HasUser() {
-			// Local dev (auth disabled) is one anonymous user: use the
+		if !p.HasUser() || p.LocalDev() {
+			// Local dev (auth disabled) is one global admin: use the
 			// Default org the migration creates, if there's a choice.
 			for _, o := range orgs {
 				if o.Slug == "default" {
@@ -510,6 +517,10 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 		return nil, reply.Err
 	}
+	// A new dispatch is a new attempt: no earlier hold still waits (#126).
+	if err := s.Repo.ClearTaskHeld(ctx, taskID); err != nil {
+		slog.Warn("clear held receipts on dispatch", "task_id", taskID, "err", err)
+	}
 	return s.Repo.GetTask(ctx, taskID)
 }
 
@@ -530,6 +541,13 @@ func (s *Service) ReturnTask(ctx context.Context, p authz.Principal, taskID int,
 	if err != nil {
 		return nil, err
 	}
+	// A held ticket isn't returned off the web UI: it waits for a person
+	// (#126). The watchdog never sees one: it has no dispatch.
+	if !system {
+		if err := s.RefuseIfHeld(ctx, p, t, "task.return"); err != nil {
+			return nil, err
+		}
+	}
 	byName := p.Label()
 	if system {
 		byName = "system"
@@ -542,6 +560,9 @@ func (s *Service) ReturnTask(ctx context.Context, p authz.Principal, taskID int,
 	reply := actor.Await(ctx, replyCh)
 	if reply.Err != nil {
 		return nil, &authz.Error{Status: 409, Msg: reply.Err.Error()}
+	}
+	if err := s.Repo.ClearTaskHeld(ctx, taskID); err != nil {
+		slog.Warn("clear held receipts on return", "task_id", taskID, "err", err)
 	}
 	details := map[string]any{"reason": reason, "automatic": system}
 	if d := strings.TrimSpace(dispatchID); d != "" {
@@ -589,7 +610,8 @@ func planApprovalGate(proj *domain.Project, lookupErr error, t *domain.Task, pla
 // needs project owner access. Callers publish project.updated.
 func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectID int, u domain.ProjectSettings) (*domain.Project, error) {
 	if u.Name == nil && u.Description == nil && u.OpenReassign == nil && u.RequirePlanApproval == nil && u.RequireMerge == nil &&
-		u.NotStartedFlagMinutes == nil && u.NotStartedReturnMinutes == nil && u.Metadata == nil && !u.ChangesEscalation() {
+		u.NotStartedFlagMinutes == nil && u.NotStartedReturnMinutes == nil && u.Metadata == nil &&
+		u.ReceiptsMode == nil && u.ReceiptsMinLevel == nil && !u.ChangesEscalation() {
 		return nil, authz.BadRequest("nothing to change: pass name, description, open_reassign, require_plan_approval, require_merge, " +
 			"not_started_flag_minutes, not_started_return_minutes, decision_escalation_minutes, decision_escalation_raise_priority, " +
 			"decision_backup_decider, or metadata")
@@ -605,6 +627,17 @@ func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectI
 		u.Name = &name
 	}
 	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Owner); err != nil {
+		return nil, err
+	}
+	// The verification receipts setting is a person's, in the web UI (#126,
+	// D9), and so is weakening it through the project's metadata (D11).
+	if err := s.checkReceiptsSettings(p, projectID, &u); err != nil {
+		s.auditDenied(ctx, p, "project.settings", domain.AuditEntry{ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
+			Summary: "refused changing the receipts setting for " + p.Label(), Details: map[string]any{"receipts_mode": u.ReceiptsMode,
+				"receipts_min_level": u.ReceiptsMinLevel}}, err)
+		return nil, err
+	}
+	if err := s.GuardReceiptsUpdate(ctx, p, "project", projectID, u.Metadata); err != nil {
 		return nil, err
 	}
 	if err := s.checkEscalationSettings(ctx, p, projectID, u); err != nil {
@@ -626,6 +659,7 @@ func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectI
 		e := domain.AuditEntry{Action: "project.settings", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
 			TargetName: proj.Name, Summary: "changed project settings", Details: map[string]any{"name": u.Name, "description_changed": u.Description != nil,
 				"open_reassign": u.OpenReassign, "require_plan_approval": u.RequirePlanApproval, "require_merge": u.RequireMerge,
+				"receipts_mode": u.ReceiptsMode, "receipts_min_level": u.ReceiptsMinLevel,
 				"decision_escalation_minutes": u.DecisionEscalationMinutes, "decision_escalation_raise_priority": u.DecisionEscalationRaisePriority,
 				"decision_backup_decider": u.DecisionBackupDecider, "metadata": u.Metadata, "channel": p.Channel},
 			After: projectSettingsOf(proj)}
@@ -775,6 +809,7 @@ func projectSettingsOf(p *domain.Project) map[string]any {
 	}
 	m := map[string]any{"name": p.Name, "description_length": len(p.Description), "open_reassign": p.OpenReassign,
 		"require_plan_approval": p.RequirePlanApproval, "require_merge": p.RequireMerge,
+		"receipts_mode": p.ReceiptsMode, "receipts_min_level": p.ReceiptsMinLevel,
 		"decision_escalation_minutes": p.DecisionEscalationMinutes, "decision_escalation_raise_priority": p.DecisionEscalationRaisePriority,
 		"decision_backup_decider": p.DecisionBackupDecider}
 	if len(p.Metadata) > 0 {

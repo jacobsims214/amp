@@ -18,7 +18,7 @@ const HumanStaleAfter = 48 * time.Hour
 
 // PersonWait is one item in amp_list_tasks' waiting_on_people ("Waiting on
 // you", v2/kb/working/human-work.md): something a person has to
-// do next, of one of five kinds (approve, answer, merge, start, do), or, in
+// do next, of one of six kinds (approve, answer, verify, merge, start, do), or, in
 // coming_up, a human ticket of theirs that isn't actionable yet.
 //
 // The fields before Kind are the original shape (when the list only held
@@ -39,7 +39,7 @@ type PersonWait struct {
 	DecideBy *time.Time `json:"decide_by,omitempty"`
 	Overdue  bool       `json:"overdue,omitempty"`
 
-	Kind        string    `json:"kind"`     // approve | answer | merge | start | do | coming_up
+	Kind        string    `json:"kind"`     // approve | answer | verify | merge | start | do | coming_up
 	TaskIDs     []int     `json:"task_ids"` // every ticket in the item (approve: all awaiting in the epic)
 	OwnerUserID *int      `json:"owner_user_id,omitempty"`
 	Since       time.Time `json:"since"`

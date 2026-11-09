@@ -23,8 +23,10 @@ import { useBoardData } from '../hooks/useBoardData'
 import { useAuth } from '../hooks/useAuth'
 import { useProjectPeople } from '../hooks/useProjectPeople'
 import { ProjectNav } from '../components/ProjectNav'
+import { ManagerAgent } from '../components/ManagerAgent'
 import { TaskDrawer } from '../components/TaskDrawer'
 import { Panel, Readouts } from '../components/ui/PageHeader'
+import { useReceiptSummary } from '../hooks/useReceiptSummary'
 import { StateBar, StateDot } from '../components/ui/StateTag'
 import { Avatar } from '../components/ui/Avatar'
 import { PriorityMark } from '../components/ui/PriorityMark'
@@ -145,7 +147,7 @@ function NoWaitingStrip({ projectId, reason }: { projectId: number; reason: NoMy
     <div className="amp-panel flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-3" role="status">
       <span className="amp-label inline-flex items-center gap-1.5" style={{ color: 'var(--warning-ink)' }}><UserX size={14} aria-hidden="true" />Waiting on you: not counted</span>
       <span className="text-[13px] text-ink-2">
-        {reason === 'local-dev' ? 'Sign-in is off on this AMP, so nothing can wait on you.' : 'You are not signed in as an AMP user.'} The Board has every ticket.
+        {reason === 'local-dev' ? "Sign-in is off on this AMP and its Local Dev user isn't set up, so nothing can wait on you." : 'You are not signed in as an AMP user.'} The Board has every ticket.
       </span>
       <span className="ml-auto flex gap-4">
         <Link to={projectLink(projectId, 'board')} className="amp-label inline-flex items-center gap-1" style={{ color: 'var(--link)' }}>Board<ChevronRight size={14} aria-hidden="true" /></Link>
@@ -264,6 +266,12 @@ export function Mission() {
     return () => { clearTimeout(t); stop?.() }
   }, [tasks, loadWaiting])
   const mergeNeeded = useMemo(() => tasks.filter(needsMerge).length, [tasks])
+  // Verification receipts (#126): completed agent tickets whose receipt is
+  // unverified. Held ones are in "Waiting on you" (the server's verify kind).
+  const receipts = useReceiptSummary(pid)
+  const unverified = useMemo(() => tasks.filter(t => t.state === 'completed' && !isHuman(t) &&
+    receipts.byTask.get(t.id)?.status === 'unverified').length, [tasks, receipts.byTask])
+  const receiptsOn = !!receipts.summary && receipts.summary.mode !== 'off'
   const mine = useMemo(() => ticketsWaitingOn(waiting.find(p => p.user_id === me?.user_id)), [waiting, me?.user_id])
   const waitingPeople = useMemo(() => panelOrder(waiting, me?.user_id), [waiting, me?.user_id])
   const flying = useMemo(() => tasks.filter(t => t.state === 'in_progress')
@@ -316,14 +324,18 @@ export function Mission() {
           { label: 'Merge needed', value: mergeNeeded, color: mergeNeeded ? 'var(--teal)' : undefined,
             sub: yours ? `${yours.merge} yours` : mergeNeeded ? 'dependents wait on them' : 'none' },
           { label: 'Done', value: <>{counts.done}<span className="text-[13px] text-ink-3">/{tasks.length}</span></>,
-            sub: tasks.length ? `${Math.round(counts.done / tasks.length * 100)}% of the plan` : 'no tickets yet' },
+            sub: receiptsOn || unverified
+              ? `${unverified} unverified`
+              : tasks.length ? `${Math.round(counts.done / tasks.length * 100)}% of the plan` : 'no tickets yet' },
         ]} />
 
         <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1fr)_340px]">
           <div className="grid grid-cols-1 gap-3 min-w-0">
             {open.length === 0 && finished.length === 0 && (
-              <div className="amp-panel px-5 py-8 text-center text-[13.5px] text-ink-2">
-                No epics yet. Ask your planner agent to plan this project, or add an epic from the Board view.
+              <div className="amp-panel px-5 py-8 text-center text-[13.5px] text-ink-2 grid justify-items-center gap-3">
+                <span className="text-ink font-semibold">No epics yet</span>
+                <Link to={projectLink(pid, 'board')} className="amp-btn amp-btn-primary amp-btn-sm">Add the first epic on the Board</Link>
+                <span>Or ask your <ManagerAgent /> to plan this project.</span>
               </div>
             )}
             <div className="grid gap-3 grid-cols-[repeat(auto-fill,minmax(310px,1fr))] items-start">

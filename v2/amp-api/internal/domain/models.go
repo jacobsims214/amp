@@ -51,8 +51,11 @@ type Project struct {
 	State       ProjectState `json:"state"`
 	// OrgID is the org the project belongs to. Only that org's teams can be
 	// linked to it. Nil only transiently for rows predating orgs.
-	OrgID     *int `json:"org_id"`
-	CreatedBy *int `json:"created_by"`
+	OrgID *int `json:"org_id"`
+	// OrgName is filled on project lists only, so the UI can name the org of a
+	// project the caller can see without belonging to that org.
+	OrgName   string `json:"org_name,omitempty"`
+	CreatedBy *int   `json:"created_by"`
 	// OpenReassign lets any project member take or reassign a ticket that
 	// isn't in progress. Otherwise only its owner or a lead can.
 	OpenReassign bool `json:"open_reassign"`
@@ -73,6 +76,11 @@ type Project struct {
 	// NotStartedReturnMinutes. 0 turns either off; both default on (10, 30).
 	NotStartedFlagMinutes   int `json:"not_started_flag_minutes"`
 	NotStartedReturnMinutes int `json:"not_started_return_minutes"`
+	// Verification receipts (#126): ReceiptsMode is "" (use the org's) or
+	// off / inform / require; ReceiptsMinLevel is what a Require ticket
+	// must reach before it completes (v1: self_checked).
+	ReceiptsMode     string `json:"receipts_mode"`
+	ReceiptsMinLevel string `json:"receipts_min_level"`
 	// Decision escalation (#146): a person's ticket still open this many
 	// minutes after its decide_by is escalated once: its owner is reminded,
 	// and, when set, its priority goes up a step and it is handed to the
@@ -108,6 +116,11 @@ type ProjectSettings struct {
 	// watchdog's timeouts (AMP #2801); 0 disables each.
 	NotStartedFlagMinutes   *int `json:"not_started_flag_minutes"`
 	NotStartedReturnMinutes *int `json:"not_started_return_minutes"`
+	// ReceiptsMode ("" = the org's, off, inform, require) and
+	// ReceiptsMinLevel: the verification receipts setting (#126). Only a
+	// person in the web UI changes either.
+	ReceiptsMode     *string `json:"receipts_mode"`
+	ReceiptsMinLevel *string `json:"receipts_min_level"`
 	// Decision escalation (#146); changed only in the web UI. A backup
 	// decider of 0 removes it.
 	DecisionEscalationMinutes       *int  `json:"decision_escalation_minutes"`
@@ -626,6 +639,11 @@ const (
 	EventEpicUpdated       EventType = "epic.updated"
 	EventStoryUpdated      EventType = "story.updated"
 	EventArtifactUpdated   EventType = "artifact.updated"
+	// EventReceiptUpdated: a verification receipt changed (#126); payload
+	// {task_id, receipt_id, status, held}, or {task_id, receipt_id,
+	// evidence_key} when an evidence upload finished (the status and hold
+	// aren't re-derived by an upload, so they are left out).
+	EventReceiptUpdated EventType = "receipt.updated"
 	// EventDecisionUpdated: a ticket's decision doc was written; payload
 	// {task_id, version}.
 	EventDecisionUpdated EventType = "decision.updated"
@@ -638,7 +656,7 @@ var AllEventTypes = []EventType{
 	EventStoryCreated, EventStoryStateChanged, EventStoryUpdated,
 	EventTaskCreated, EventTaskUpdated, EventTaskDispatched, EventTaskCompleted,
 	EventTaskBlocked, EventTaskUnblocked, EventTaskAssigned, EventCommentAdded,
-	EventArtifactUpdated, EventDecisionUpdated,
+	EventArtifactUpdated, EventReceiptUpdated, EventDecisionUpdated,
 }
 
 type Event struct {
@@ -892,6 +910,9 @@ type Org struct {
 	Slug      string    `json:"slug"`
 	CreatedBy *int      `json:"created_by"`
 	CreatedAt time.Time `json:"created_at"`
+	// ReceiptsMode is the org's default verification receipts mode (#126):
+	// off (the default), inform or require.
+	ReceiptsMode string `json:"receipts_mode"`
 	// MyRole is the caller's role in the org ("" when not a member, e.g. a
 	// global admin browsing). Filled by list endpoints only.
 	MyRole string `json:"my_role,omitempty"`

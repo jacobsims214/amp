@@ -13,7 +13,7 @@ import { ProjectNav } from '../components/ProjectNav'
 import { fixedTab, landingPath, landingTab } from '../lib/landing'
 import { resetWaitCounts } from '../lib/waitCounts'
 import { alertMergeItem, doItem, linkedMergeItem, legacyMergeItem, mergeItem, myWork, task } from '../test/myWorkFixture'
-import type { Me, MyWorkCounts, ProjectMyWork as Data, Task } from '../types'
+import type { Me, MyWorkCounts, ProjectMyWork as Data, ProjectWaitItem, Task } from '../types'
 
 let data: Data = myWork('busy')
 let counts: MyWorkCounts = { counts: { waiting: 5, approve: 1, answer: 1, merge: 1, start: 1, do: 1, coming_up: 1 }, projects: { 2: { waiting: 5, approve: 1, answer: 1, merge: 1, start: 1, do: 1, coming_up: 1 } } }
@@ -240,6 +240,47 @@ describe('My work tab: ?focus=', () => {
     expect(await screen.findByRole('heading', { level: 1, name: /Human work UX/ })).toBeInTheDocument()
     await userEvent.click(screen.getAllByRole('button', { name: /my work/i })[0])
     expect(await screen.findByRole('region', { name: 'Waiting on you' })).toBeInTheDocument()
+  })
+})
+
+describe('My work tab: find box', () => {
+  it('?q= narrows the items and Coming up, keeps the readouts, and the box is on the page', async () => {
+    at('/project/2/my-work?q=2473')
+    const list = await screen.findByRole('region', { name: 'Waiting on you' })
+    const kinds = Array.from(list.querySelectorAll('[data-item-key]')).map(e => e.getAttribute('data-item-key'))
+    expect(kinds).toEqual(['task:2473'])
+    expect(screen.getByRole('searchbox', { name: 'Find in My work' })).toHaveValue('2473')
+    expect(within(screen.getByRole('group', { name: 'Waiting on you in AMP v2' })).getByText('Waiting on you').nextSibling).toHaveTextContent('5')
+    const coming = screen.getByRole('region', { name: 'Coming up' })
+    expect(within(coming).getByText('1 · not counted yet')).toBeInTheDocument()
+    expect(within(coming).getByText('No coming-up tickets match.')).toBeInTheDocument()
+  })
+
+  it('typing writes ?q=; a title matches; Clear and Escape bring everything back', async () => {
+    const user = userEvent.setup()
+    at('/project/2/my-work')
+    const box = await screen.findByRole('searchbox', { name: 'Find in My work' })
+    await user.type(box, 'harness')
+    expect(where()).toBe('/project/2/my-work?q=harness')
+    const coming = screen.getByRole('region', { name: 'Coming up' })
+    expect(within(coming).getByText('M5-TAG: tag harness v0.5.0')).toBeInTheDocument()
+    expect(screen.getByText('No matches')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Clear' }))
+    expect(where()).toBe('/project/2/my-work')
+    expect(box).toHaveFocus()
+    await user.type(box, 'zzzz')
+    await user.keyboard('{Escape}')
+    expect(box).toHaveValue('')
+    expect(screen.getAllByRole('article').length).toBeGreaterThan(1)
+  })
+
+  it('"/" focuses the box', async () => {
+    const user = userEvent.setup()
+    at('/project/2/my-work')
+    const box = await screen.findByRole('searchbox', { name: 'Find in My work' })
+    await user.keyboard('/')
+    expect(box).toHaveFocus()
+    expect(box).toHaveValue('')
   })
 })
 
@@ -623,5 +664,22 @@ describe('My work tab: what each item needs from you', () => {
     const card = document.querySelector('[data-item-key="task:2481"]') as HTMLElement
     expect(within(card).getByText('No instructions: open the ticket')).toBeInTheDocument()
     expect(card.querySelector('details')).toBeNull()
+  })
+})
+
+describe('My work tab: held receipts (#126)', () => {
+  it('shows a verify item from the server, with why and a link to Accept or Reject on the ticket', async () => {
+    const held: ProjectWaitItem = {
+      project_id: 2, project_code: 'AMPV2', project_name: 'AMP v2', kind: 'verify', key: 'task:77', task_id: 77, task_ids: [77],
+      name: 'Settings page', since: new Date(Date.now() - 3_600_000).toISOString(), state: 'in_progress', agent_id: 'amp-worker',
+      hold_reason: 'no checks were recorded', task: task(77, { state: 'in_progress', agent_id: 'amp-worker' }),
+    }
+    data = myWork('empty')
+    data.items.verify = [held]
+    data.counts = { ...data.counts, verify: 1, waiting: 1 }
+    at('/project/2/my-work')
+    const card = await screen.findByRole('article', { name: /Verify: #77 Settings page/ })
+    expect(card).toHaveTextContent("Couldn't verify #77: no checks were recorded. Accept or reject it on the ticket")
+    expect(within(card).getByRole('link', { name: 'Open #77 to accept or reject' })).toHaveAttribute('href', '/project/2/board?focus=77')
   })
 })

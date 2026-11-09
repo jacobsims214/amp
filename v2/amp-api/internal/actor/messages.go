@@ -192,14 +192,24 @@ type MsgCompleteTask struct {
 	// nobody reads it as a sign-off the person gave.
 	MergeStepFor int
 	Source       string
-	ReplyCh      chan ReplyComplete
+	// Hold (#126): the ticket's project requires a verification receipt and
+	// this completion's is below the minimum, so after every check a
+	// completion makes, the ticket is held for a person instead: it keeps
+	// its state, its dispatch ends, and HoldReason is logged. An old replica
+	// ignores the field and completes the ticket.
+	Hold       bool
+	HoldReason string
+	ReplyCh    chan ReplyComplete
 }
 
 // ReplyComplete answers MsgCompleteTask: the ticket after the completion and
 // whether it was recorded as a closeout (the caller wasn't its worker).
+// Changed is set when this call moved the ticket into completed (not a
+// repeat of an earlier completion, nor a hold).
 type ReplyComplete struct {
 	Task     *domain.Task
 	Closeout bool
+	Changed  bool
 	Err      error
 }
 
@@ -578,8 +588,11 @@ type ReplyApproveTask struct {
 	Err      error
 }
 
+// ReplySimple answers messages with nothing to return. Changed is set by
+// MsgSetTaskState when the call moved the ticket into completed.
 type ReplySimple struct {
-	Err error
+	Changed bool
+	Err     error
 }
 
 type ReplyAddComment struct {

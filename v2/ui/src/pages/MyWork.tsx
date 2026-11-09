@@ -23,25 +23,29 @@ import { MySessionsPanel } from '../components/remote/MySessionsPanel'
 import { remoteAvailable, useRemote } from '../remote/remote-context'
 import { projectLink } from '../lib/projectLink'
 import { describeDecideBy } from '../lib/decideBy'
+import { useFind } from '../hooks/useFind'
+import { FindBox, NoMatches } from '../components/ui/FindBox'
 import { isNoUserError, noMyWorkReason } from '../lib/myWorkAccess'
 import { MyWorkLoadError, MyWorkUnavailable } from '../components/human/MyWorkUnavailable'
+import { GetStarted } from '../components/GetStarted'
 
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone
 const ymd = (d: Date) => d.toLocaleDateString('en-CA', { timeZone: TZ })
 /** How many projects with nothing for you are listed before "N more". */
 const CLEAR_SHOWN = 8
 
-/** The five kinds, in display order. Color is always next to its label. */
+/** The six kinds, in display order. Color is always next to its label. */
 const KINDS: { kind: WaitKind; label: string; color: string; unit: (n: number) => string }[] = [
   { kind: 'approve', label: 'Approve', color: 'var(--violet)', unit: n => (n === 1 ? 'plan' : 'plans') },
   { kind: 'answer', label: 'Answer', color: 'var(--st-flag)', unit: n => (n === 1 ? 'question' : 'questions') },
+  { kind: 'verify', label: 'Verify', color: 'var(--warning)', unit: () => "couldn't verify" },
   { kind: 'merge', label: 'Merge', color: 'var(--teal)', unit: n => (n === 1 ? 'PR' : 'PRs') },
   { kind: 'start', label: 'Start', color: 'var(--warning)', unit: () => 'not started' },
   { kind: 'do', label: 'Do', color: 'var(--ink)', unit: n => (n === 1 ? 'your ticket' : 'your tickets') },
 ]
 const kindOf = (k: string) => KINDS.find(x => x.kind === k)
 
-const ZERO: WaitCounts = { waiting: 0, approve: 0, answer: 0, merge: 0, start: 0, do: 0, coming_up: 0 }
+const ZERO: WaitCounts = { waiting: 0, approve: 0, answer: 0, verify: 0, merge: 0, start: 0, do: 0, coming_up: 0 }
 
 function ago(iso?: string | null): string {
   if (!iso) return ''
@@ -63,6 +67,17 @@ function itemLink(it: WaitItem): string {
   return projectLink(it.project_id, 'my-work', itemFocus(it))
 }
 
+/** Does the project itself match the query (name or code)? */
+function projectMatches(q: string, name: string, code: string): boolean {
+  return `${name} ${code}`.toLowerCase().includes(q)
+}
+
+/** Does a row match: its ticket ref (`#123` or `123`), title, or project. */
+function itemMatches(q: string, it: WaitItem): boolean {
+  const ids = [it.task_id, ...(it.task_ids ?? [])].filter(Boolean).map(id => `#${id}`)
+  return projectMatches(q, it.project_name, it.project_code) || `${ids.join(' ')} ${it.name ?? ''}`.toLowerCase().includes(q)
+}
+
 function prNumber(url?: string): string | null {
   const m = url?.match(/\/pull\/(\d+)/)
   return m ? `PR #${m[1]}` : null
@@ -81,6 +96,8 @@ function describe(it: WaitItem): { title: string; sub: string } {
         sub: `Epic ${it.epic_id} · planned ${ago(it.since)} ago` }
     case 'answer':
       return { title: `#${it.task_id} ${it.name}`, sub: `${needs} · waiting ${ago(it.since)}` }
+    case 'verify':
+      return { title: `#${it.task_id} Couldn't verify: ${it.name}`, sub: `${needs} · held ${ago(it.since)}` }
     case 'merge': {
       const pr = prNumber(it.pr_url)
       return { title: `#${it.task_id} ${pr ? `Merge ${pr}: ` : 'Merge: '}${it.name}`,
@@ -212,6 +229,9 @@ export function MyWork() {
   const [velocity, setVelocity] = useState<VelocityDay[]>([])
   const [draft, setDraft] = useState<DayReport | null>(null)
   const [expiring, setExpiring] = useState<Artifact[]>([])
+  // The find box: `?q=` in the URL, so a filtered view can be linked and survives reload.
+  const find = useFind()
+  const { q } = find
 
   const loadWork = useCallback(() => {
     api.myWork().then(setWork).catch(e => setError(e instanceof Error ? e.message : 'Failed to load'))
@@ -237,11 +257,23 @@ export function MyWork() {
 
   const counts = work?.counts ?? ZERO
   const cards = work?.projects ?? []
-  const waitingCards = cards.filter(p => p.counts.waiting > 0)
-  const comingOnly = cards.filter(p => p.counts.waiting === 0)
-  const clear = work?.clear_projects ?? []
-  const totalProjects = (work?.projects_total ?? cards.length) + clear.length
+  // The find box narrows the lists below, not the counts above: those stay the server's.
+  // A project that matches by name or code keeps all its rows; otherwise only matching rows.
+  const narrow = (p: ProjectWait): ProjectWait | null => {
+    if (!q || projectMatches(q, p.project_name, p.project_code)) return p
+    const rows = p.rows.filter(r => itemMatches(q, r))
+    return rows.length ? { ...p, rows } : null
+  }
+  const waitingCards = cards.filter(p => p.counts.waiting > 0).flatMap(p => narrow(p) ?? [])
+  const waitingAll = cards.filter(p => p.counts.waiting > 0).length
+  const comingOnly = cards.filter(p => p.counts.waiting === 0 && (!q || projectMatches(q, p.project_name, p.project_code)))
+  const allClear = work?.clear_projects ?? []
+  const clear = allClear.filter(r => !q || projectMatches(q, r.name, r.code))
+  const totalProjects = (work?.projects_total ?? cards.length) + allClear.length
+  // Search covers only the rows the server sent: say so when some were left out.
+  const unsearchedRows = cards.reduce((n, p) => n + p.more, 0)
   const approveRows = waitingCards.flatMap(p => p.rows.filter(r => r.kind === 'approve'))
+  const noMatches = !!q && waitingCards.length === 0 && comingOnly.length === 0 && clear.length === 0
 
   // Your agents, per project: your agent tickets in progress (the older
   // `owned` list) plus agent accounts' tickets.
@@ -274,6 +306,8 @@ export function MyWork() {
       <PageHeader crumb="Overview" title="My work"
         meta="A summary across your projects. Each row opens the item in that project's My work." />
       <div className="p-4 sm:p-7 sm:pt-5 grid gap-4">
+        {/* No AMP user (sign-in off): the checklist still guides a first run (#128). */}
+        {noWork === 'local-dev' && <GetStarted who="local-dev" />}
         {noWork && <MyWorkUnavailable reason={noWork} email={me?.email} />}
         {!noWork && error && <MyWorkLoadError error={error} onRetry={() => { setError(null); loadWork() }} />}
         {firstLoad && (
@@ -288,53 +322,67 @@ export function MyWork() {
           </SkeletonRegion>
         )}
         {work && !authLoading && !error && !noWork && <>
-          <div className="amp-panel amp-panel-top grid grid-cols-3 md:grid-cols-7" aria-label="Waiting on you, across your projects">
+          <div className="amp-panel amp-panel-top grid grid-cols-3 md:grid-cols-8" aria-label="Waiting on you, across your projects">
             <div className="col-span-3 md:col-span-1 px-4 py-3 grid gap-1.5 border-b md:border-b-0 border-line"
               style={counts.waiting ? { background: 'var(--st-flag)', color: '#fff' } : undefined}>
               <span className="amp-label" style={counts.waiting ? { color: '#fff' } : undefined}>Waiting on you</span>
               <span className="amp-num text-[26px] leading-none" style={counts.waiting ? undefined : { color: 'var(--success-ink)' }}>{counts.waiting}</span>
               <span className="text-[11.5px]" style={{ color: counts.waiting ? '#fff' : 'var(--ink-2)' }}>
-                {counts.waiting ? `in ${waitingCards.length} of ${totalProjects} project${totalProjects === 1 ? '' : 's'}` : `in all ${totalProjects} project${totalProjects === 1 ? '' : 's'}`}
+                {counts.waiting ? `in ${waitingAll} of ${totalProjects} project${totalProjects === 1 ? '' : 's'}` : `in all ${totalProjects} project${totalProjects === 1 ? '' : 's'}`}
               </span>
             </div>
             {KINDS.map((k, i) => (
-              <div key={k.kind} className={`px-4 py-3 grid gap-1.5 border-line ${i % 3 ? 'border-l' : ''} md:border-l ${i < 3 ? 'border-b md:border-b-0' : ''} ${counts[k.kind] ? '' : 'opacity-60'}`}>
+              <div key={k.kind} className={`px-4 py-3 grid gap-1.5 border-line ${i % 3 ? 'border-l' : ''} md:border-l ${i < 6 ? 'border-b md:border-b-0' : ''} ${counts[k.kind] ? '' : 'opacity-60'}`}>
                 <KindMark kind={k.kind} />
-                <span className="amp-num text-[26px] leading-none text-ink">{counts[k.kind]}</span>
-                {counts[k.kind] > 0 && <span className="text-[11.5px] text-ink-2">{k.unit(counts[k.kind])}</span>}
+                <span className="amp-num text-[26px] leading-none text-ink">{counts[k.kind] ?? 0}</span>
+                {(counts[k.kind] ?? 0) > 0 && <span className="text-[11.5px] text-ink-2">{k.unit(counts[k.kind] ?? 0)}</span>}
               </div>
             ))}
-            <div className="col-span-2 md:col-span-1 px-4 py-3 grid gap-1.5 border-l border-line">
+            <div className="col-span-3 md:col-span-1 px-4 py-3 grid gap-1.5 md:border-l border-line">
               <span className="amp-label">Your agents</span>
               <span className="amp-num text-[26px] leading-none" style={{ color: 'var(--st-prog)' }}>{agentsTotal}</span>
               <span className="text-[11.5px] text-ink-2">in progress</span>
             </div>
           </div>
 
+          <FindBox find={find} label="Find in My work" placeholder="Find a ticket or project  ( / )" />
+          {q && (unsearchedRows > 0 || work.projects_more) && (
+            <p className="m-0 text-[12px] text-ink-3">
+              Only the rows listed here are searched.{unsearchedRows > 0 ? ` ${plural(unsearchedRows, 'more item')} in the cards ${unsearchedRows === 1 ? 'is' : 'are'} not searched: open the project's My work.` : ''}{work.projects_more ? ` Showing ${cards.length} of ${work.projects_total} projects with something for you.` : ''}
+            </p>
+          )}
+
           <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)]">
             <section className="grid gap-4 min-w-0" aria-label="By project">
-              {counts.approve > 0 && <PlansToApprove rows={approveRows} total={counts.approve} />}
-              {waitingCards.length > 0 ? <>
+              {noMatches && <NoMatches find={find} what="waiting items or projects" note="and project names; only the listed rows are searched" />}
+              {counts.approve > 0 && (!q || approveRows.length > 0) && <PlansToApprove rows={approveRows} total={q ? approveRows.length : counts.approve} />}
+              {noMatches ? null : waitingCards.length > 0 ? <>
                 <SectionRule>By project · most waiting first</SectionRule>
                 {waitingCards.map(p => <ProjectCard key={p.project_id} p={p} />)}
-                {work.projects_more && (
+                {work.projects_more && !q && (
                   <p className="m-0 text-[12px] text-ink-3">
                     Showing {cards.length} of {work.projects_total} projects with something for you.
                   </p>
                 )}
-              </> : (
-                <div className="amp-panel px-7 py-9 grid gap-2.5">
-                  {done24 > 0
-                    ? <span className="amp-label" style={{ color: 'var(--success-ink)' }}>All clear</span>
-                    : <span className="amp-label">Nothing waits on you</span>}
-                  <h2 className="m-0 text-[20px] font-semibold text-ink">
-                    {done24 > 0 ? `Nothing waits on you. ${plural(done24, 'ticket')} done in the last 24h.` : 'No project needs you right now.'}
-                  </h2>
-                  <p className="m-0 text-ink-2 max-w-[56ch] leading-normal text-[13.5px]">
-                    Approvals, questions, merges and your own tickets appear here, grouped by project. Open a project to act on them.
-                  </p>
-                  <div className="flex gap-3.5 flex-wrap mt-1.5">{KINDS.map(k => <KindMark key={k.kind} kind={k.kind} />)}</div>
-                </div>
+              </> : q && counts.waiting > 0 ? (
+                <NoMatches find={find} what="waiting items" note="and project names; only the listed rows are searched" className="amp-panel px-4 py-4 grid gap-2" />
+              ) : (
+                <>
+                  {/* Where the queue will be: the first-run checklist until its steps are done (#128). */}
+                  <GetStarted who={me?.user_id != null ? String(me.user_id) : 'local-dev'} />
+                  <div className="amp-panel px-7 py-9 grid gap-2.5">
+                    {done24 > 0
+                      ? <span className="amp-label" style={{ color: 'var(--success-ink)' }}>All clear</span>
+                      : <span className="amp-label">Nothing waits on you</span>}
+                    <h2 className="m-0 text-[20px] font-semibold text-ink">
+                      {done24 > 0 ? `Nothing waits on you. ${plural(done24, 'ticket')} done in the last 24h.` : 'No project needs you right now.'}
+                    </h2>
+                    <p className="m-0 text-ink-2 max-w-[56ch] leading-normal text-[13.5px]">
+                      Approvals, questions, merges and your own tickets appear here, grouped by project. Open a project to act on them.
+                    </p>
+                    <div className="flex gap-3.5 flex-wrap mt-1.5">{KINDS.map(k => <KindMark key={k.kind} kind={k.kind} />)}</div>
+                  </div>
+                </>
               )}
 
               {(comingOnly.length > 0 || clear.length > 0) && <>
@@ -406,7 +454,7 @@ export function MyWork() {
               </Panel>
 
               <p className="m-0 px-0.5 text-[12px] leading-normal text-ink-3">
-                Nothing on this page is a button. To act, open the project: the item opens focused, with its action.
+                Nothing here acts on a ticket. To act, open the project: the item opens focused, with its action.
               </p>
             </aside>
           </div>

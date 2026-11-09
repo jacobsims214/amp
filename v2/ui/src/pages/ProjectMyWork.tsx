@@ -6,7 +6,7 @@
  *
  * - Readouts: Waiting on you (red above 0), Approve, Answer, Merge, Do, and
  *   Coming up (shown, never counted) or Cleared today.
- * - One list of items, approve → answer → merge → do, in the server's order:
+ * - One list of items, approve → answer → verify → merge → do, in the server's order:
  *   oldest first within each kind, and Do items by what they block, then age.
  *   A Do card says "blocks N · waiting Xd" (or "Nothing waits on it ·
  *   waiting Xd"); one with a decision doc links to its drawer to decide.
@@ -35,6 +35,8 @@ import { ApproveView, type AlsoAwaiting } from '../components/approve/ApproveVie
 import { HumanActions } from '../components/human/HumanActions'
 import { useApproveParam } from '../hooks/useApproveParam'
 import { useFocusParam } from '../hooks/useFocusParam'
+import { ticketMatches, useFind } from '../hooks/useFind'
+import { FindBox, NoMatches } from '../components/ui/FindBox'
 import { useSSE } from '../hooks/useSSE'
 import { personName } from '../lib/people'
 import { ago } from '../lib/approval'
@@ -52,7 +54,7 @@ import { MyWorkLoadError, MyWorkUnavailable } from '../components/human/MyWorkUn
 import type { DepSummary, DoneItem, Project, ProjectMyWork as Data, ProjectWaitItem, Task, WaitKind } from '../types'
 import './projectMyWork.css'
 
-const KINDS: WaitKind[] = ['approve', 'answer', 'merge', 'start', 'do']
+const KINDS: WaitKind[] = ['approve', 'answer', 'verify', 'merge', 'start', 'do']
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
 /** "3h" from "3h ago"; "just now" stays. */
 const short = (iso?: string) => ago(iso).replace(/ ago$/, '')
@@ -61,6 +63,7 @@ const hm = (iso?: string) => (iso ? new Date(iso).toLocaleTimeString(undefined, 
 const UNIT: Record<WaitKind, (n: number) => string> = {
   approve: n => (n === 1 ? 'plan' : 'plans'),
   answer: n => (n === 1 ? 'question' : 'questions'),
+  verify: () => "couldn't verify",
   merge: n => (n === 1 ? 'PR' : 'PRs'),
   // A ticket of yours dispatched to an agent that no worker has started yet
   // (AMP #2801): its run was never launched, so nothing is happening on it.
@@ -81,6 +84,7 @@ function oldestLabel(it: ProjectWaitItem): string {
   switch (it.kind) {
     case 'approve': return 'the plan approval'
     case 'answer': return `the question on #${it.task_id}`
+    case 'verify': return `the held completion of #${it.task_id}`
     case 'merge': return `the merge of #${it.task_id}`
     case 'start': return `#${it.task_id}, not started`
     default: return `#${it.task_id}`
@@ -259,6 +263,12 @@ function Body({ data, items, name, pid, focusId, setFocus, onReview, onChanged, 
   const counts = data.counts
   const done = data.done_today ?? []
   const coming = data.coming_up ?? []
+  // The find box narrows the lists, not the readouts: those stay the server's.
+  const find = useFind()
+  const { q } = find
+  const hit = (it: ProjectWaitItem) => !q || ticketMatches(q, [it.task_id, ...(it.task_ids ?? [])], it.name)
+  const shownItems = items.filter(hit)
+  const shownComing = coming.filter(hit)
   const state: 'busy' | 'empty' | 'done' = counts.waiting > 0 || items.length > 0 ? 'busy' : done.length > 0 ? 'done' : 'empty'
 
   // ?focus=: the item (or Coming up row) that contains the ticket.
@@ -285,8 +295,8 @@ function Body({ data, items, name, pid, focusId, setFocus, onReview, onChanged, 
         {KINDS.map(k => (
           <div key={k} className={`ro ${counts[k] ? '' : 'zero'}`}>
             <KindMark kind={k} />
-            <span className="v">{counts[k]}</span>
-            {counts[k] > 0 && <span className="s">{k === 'approve' ? `${UNIT.approve(counts[k])} · ${plural(approveTickets, 'ticket')}` : UNIT[k](counts[k])}</span>}
+            <span className="v">{counts[k] ?? 0}</span>
+            {(counts[k] ?? 0) > 0 && <span className="s">{k === 'approve' ? `${UNIT.approve(counts[k] ?? 0)} · ${plural(approveTickets, 'ticket')}` : UNIT[k](counts[k] ?? 0)}</span>}
           </div>
         ))}
         {state === 'done'
@@ -302,6 +312,8 @@ function Body({ data, items, name, pid, focusId, setFocus, onReview, onChanged, 
         </div>
       )}
 
+      {(items.length > 0 || coming.length > 0) && <FindBox find={find} label="Find in My work" placeholder="Find a ticket  ( / )" />}
+
       <div className="pmw-layout">
         <section aria-label={state === 'busy' ? `Waiting on ${who}` : state === 'done' ? 'Cleared today' : `Nothing waits on ${who}`} className="grid gap-2 min-w-0">
           {state === 'busy' && <>
@@ -309,11 +321,12 @@ function Body({ data, items, name, pid, focusId, setFocus, onReview, onChanged, 
               <span className="amp-label whitespace-nowrap">Waiting on {readOnly ? 'them' : 'you'} · oldest first within each kind</span>
               <span className="flex-1 h-px bg-line" />
             </div>
-            {items.map((it, i) => (
+            {q && shownItems.length === 0 && items.length > 0 && <NoMatches find={find} what="waiting items" />}
+            {shownItems.map((it, i) => (
               <ItemCard key={it.key} it={it} pid={pid} all={items} readOnly={readOnly}
                 focused={focusItem?.key === it.key} onDismiss={() => setFocus(null)}
                 onReview={onReview} onChanged={onChanged}
-                note={it.kind === 'merge' && items[i + 1]?.kind !== 'merge' ? <MergeNote /> : null} />
+                note={it.kind === 'merge' && shownItems[i + 1]?.kind !== 'merge' ? <MergeNote /> : null} />
             ))}
           </>}
           {state === 'empty' && <ClearPanel name={name} readOnly={readOnly} />}
@@ -321,7 +334,7 @@ function Body({ data, items, name, pid, focusId, setFocus, onReview, onChanged, 
         </section>
 
         <aside aria-label="Context" className="pmw-side min-w-0">
-          <ComingUp items={coming} pid={pid} focusKey={focusComing?.key ?? null} />
+          <ComingUp items={shownComing} total={coming.length} pid={pid} focusKey={focusComing?.key ?? null} />
           <Agents pid={pid} a={data.agents} />
           {state === 'busy' && done.length > 0 && (
             <section className="amp-panel" aria-label="Done today">
@@ -383,6 +396,8 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
   const decide = describeDecideBy(it.decide_by ?? t?.decide_by)
   const overdue = !!(it.overdue || decide?.overdue)
   if (decide) meta.push(`Decide by ${decide.absolute}`)
+  // main's receipt verification (#126): a held claim shows how long it has waited.
+  if (kind === 'verify') meta.push(`Held ${ago(it.since)}${it.agent_id ? `, finished by ${it.agent_id}` : ''}`)
   return (
     <>
       <article className={frame} data-item-key={it.key} data-focused={focused || undefined} aria-label={`${KIND_LABEL[kind]}: #${it.task_id} ${it.name}`}>
@@ -404,12 +419,16 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
         <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[12.5px] text-ink-2">{meta.map(m => <span key={m}>{m}</span>)}</div>
         {kind === 'do' && t && <Brief task={t} />}
         <div className="mt-3">
-          {actionTask ? <HumanActions task={actionTask} kind={kind} canAct={!readOnly} prUrl={it.pr_url} branch={it.branch}
-            baseBranch={it.base_branch} targetSource={it.target_source}
-            holdingUp={it.holding_up} notWaiting={it.not_waiting} trackedBy={it.tracked_by}
-            alert={it.alert} alertReason={it.alert_reason} rule={it.rule} reviewUrl={it.review_url}
-            defaultBranch={it.default_branch}
-            minutes={it.not_started_minutes} decideHref={hasDoc ? projectLink(pid, 'board', it.task_id) : undefined} onChanged={() => onChanged()} />
+          {/* main's receipt verification (#126) first: accepting or rejecting a
+              held claim is that item's whole action, never a decision-doc chore. */}
+          {kind === 'verify'
+            ? <Link to={projectLink(pid, 'board', it.task_id)} className="amp-btn amp-btn-sm">Open #{it.task_id} to accept or reject</Link>
+            : actionTask ? <HumanActions task={actionTask} kind={kind} canAct={!readOnly} prUrl={it.pr_url} branch={it.branch}
+              baseBranch={it.base_branch} targetSource={it.target_source}
+              holdingUp={it.holding_up} notWaiting={it.not_waiting} trackedBy={it.tracked_by}
+              alert={it.alert} alertReason={it.alert_reason} rule={it.rule} reviewUrl={it.review_url}
+              defaultBranch={it.default_branch}
+              minutes={it.not_started_minutes} decideHref={hasDoc ? projectLink(pid, 'board', it.task_id) : undefined} onChanged={() => onChanged()} />
             : <span className="text-[12.5px] text-ink-2">{it.question ?? ''}</span>}
         </div>
       </article>
@@ -507,15 +526,15 @@ function DoneList({ done }: { done: DoneItem[] }) {
   )
 }
 
-function ComingUp({ items, pid, focusKey }: { items: ProjectWaitItem[]; pid: number; focusKey: string | null }) {
+function ComingUp({ items, total, pid, focusKey }: { items: ProjectWaitItem[]; total: number; pid: number; focusKey: string | null }) {
   return (
     <section className="amp-panel" aria-label="Coming up">
       <div className="flex items-center gap-2.5 px-4 py-3 border-b border-line">
         <span className="amp-label">Coming up</span>
-        <span className="ml-auto amp-num text-[11px] text-ink-3">{items.length ? `${items.length} · not counted yet` : '0'}</span>
+        <span className="ml-auto amp-num text-[11px] text-ink-3">{total ? `${total} · not counted yet` : '0'}</span>
       </div>
       {items.length === 0
-        ? <p className="m-0 px-4 py-3.5 text-[13px] text-ink-2">None of your tickets are waiting on other work.</p>
+        ? <p className="m-0 px-4 py-3.5 text-[13px] text-ink-2">{total ? 'No coming-up tickets match.' : 'None of your tickets are waiting on other work.'}</p>
         : (
           <ul className="pmw-list">
             {items.map(it => (

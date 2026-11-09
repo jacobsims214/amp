@@ -25,11 +25,11 @@
 
   /* Action */
   --primary:     #16181B;   /* primary buttons, focus */
-  --accent:      #D9482B;   /* selected marks, flags, alarm */
+  --accent:      #C23D23;   /* selected marks, flags, alarm; darkened for AA on white text */
   --link:        #2C66B8;   /* links, info, selection tints */
 
   /* Signature bands */
-  --band-1:      #D9482B;
+  --band-1:      #C23D23;
   --band-2:      #EB8A2E;
   --band-3:      #EBC34B;
   --band-4:      #2C66B8;
@@ -38,17 +38,17 @@
   --st-ready:    #16181B;
   --st-prog:     #2C66B8;
   --st-wait:     #8E939A;
-  --st-flag:     #D9482B;
+  --st-flag:     #C23D23;
   --st-sched:    #7A5BB5;
   --st-done:     #16181B;
 
   /* Semantic */
-  --danger:      #D9482B;
-  --danger-ink:  #B23A20;
+  --danger:      #C23D23;
+  --danger-ink:  #9A2E19;
   --success:     #2F7D4E;
   --success-ink: #2A6E45;
   --warning:     #D08A1C;
-  --warning-ink: #9A5E0A;
+  --warning-ink:  #9A5E0A;
   --violet:      #7A5BB5;
   --teal:        #1F8A7E;
   --pink:        #C2457E;
@@ -63,8 +63,62 @@
   color-scheme: light;
 }
 
+/* ─── Dark mode palette (matches approved artifact #33) ────────────────────
+   Driven by `.dark` class on html, set by the theme store. `data-theme` is a
+   non-class hook for any CSS that predates Tailwind v4's dark variant. */
+.dark,
+[data-theme="dark"] {
+  --bg:          #121315;
+  --surface:     #1A1C1F;
+  --surface-2:   #1F2125;
+  --surface-3:   #2A2D31;
+  --scrim:       rgba(0, 0, 0, 0.55);
+
+  --line-sub:    #2F3338;
+  --line:        #3A3F45;
+  --line-str:    #4A5058;
+
+  --ink:         #F0F1F3;
+  --ink-2:       #A6ADB6;
+  --ink-3:       #8E98A2;
+  --on-ink:      #FFFFFF;
+
+  --primary:     #F0F1F3;
+  --accent:      #C23D23;
+  --link:        #7DA7EC;
+
+  --band-1:      #C23D23;
+  --band-2:      #F5A050;
+  --band-3:      #F5D77A;
+  --band-4:      #7DA7EC;
+
+  --st-ready:    #F0F1F3;
+  --st-prog:     #7DA7EC;
+  --st-wait:     #8E98A2;
+  --st-flag:     #C23D23;
+  --st-sched:    #A88BD8;
+  --st-done:     #F0F1F3;
+
+  --danger:      #C23D23;
+  --danger-ink:  #9A2E19;
+  --success:     #4CAF7C;
+  --success-ink: #3D8A62;
+  --warning:     #E5A845;
+  --warning-ink: #B07D28;
+  --violet:      #A88BD8;
+  --teal:        #4ECDC4;
+  --pink:        #E07FA8;
+  --orange:      #F5A050;
+
+  color-scheme: dark;
+}
+
 /* ─── Tailwind: expose the tokens as utilities (bg-surface, text-ink-2, …) ── */
 @theme inline {
+  /* Dark mode is class-driven so the Zustand store can toggle it. */
+  --color: initial;
+  --variant-dark: .dark;
+
   /* Square corners everywhere; rounded-full (avatars, dots) stays round. */
   --radius-xs: 1px;
   --radius-sm: 2px;
@@ -161,6 +215,14 @@ body {
   background: linear-gradient(var(--band-1) 0 25%, var(--band-2) 25% 50%, var(--band-3) 50% 75%, var(--band-4) 75%); }
 .amp-bands-h { height: 4px;
   background: linear-gradient(90deg, var(--band-1) 0 25%, var(--band-2) 25% 50%, var(--band-3) 50% 75%, var(--band-4) 75%); }
+
+/* Skip link (#128): the first thing Tab reaches, off-screen until focused. */
+.amp-skip-link {
+  position: absolute; left: 8px; top: -48px; z-index: 100;
+  padding: 8px 12px; background: var(--ink); color: var(--surface);
+  font-family: var(--font-label); font-weight: 600; font-size: 12px; text-decoration: none;
+}
+.amp-skip-link:focus { top: 8px; outline: 2px solid var(--link); outline-offset: 2px; }
 
 /* Buttons: black primary, outlined secondary, condensed caps. */
 .amp-btn {
