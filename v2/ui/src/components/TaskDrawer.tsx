@@ -1,11 +1,14 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
-import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, UserRound, ShieldCheck, ShieldAlert, ArrowRight, GitMerge, Check, RotateCcw, Link2 } from 'lucide-react'
+import { X, Clock, Maximize2, ArrowLeft, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, UserRound, ShieldCheck, ShieldAlert, ArrowRight, GitMerge, Check, RotateCcw, Link2 } from 'lucide-react'
 import { Link, useLocation, useSearchParams } from 'react-router-dom'
 import { HUMAN_REASONS, isHuman, reasonHint, reasonLabel } from '../lib/human'
 import { approvalOf, approvalOwner, formatWhen, isRelayed, isYours, relayedFor } from '../lib/approval'
-import { projectLink, type ProjectView } from '../lib/projectLink'
+import { projectLink, ticketPageLink, type ProjectView } from '../lib/projectLink'
 import { softBreaks } from '../lib/brief'
 import { useSearchParam } from '../hooks/useSearchParam'
+import { usePatchSearchParams } from '../hooks/useSearchParamState'
+import { useProject } from '../lib/projectCache'
+import { mismatchedRef, ticketPath, ticketRef } from '../lib/ticketRef'
 import { useProjectPlan, type ProjectPlan } from '../hooks/useProjectPlan'
 import { HumanActions } from './human/HumanActions'
 import { HumanWork } from './human/HumanWork'
@@ -47,6 +50,12 @@ interface Props {
   onTaskUpdated?: (task: Task) => void
   /** the project's not_started_flag_minutes: past it the amber badge is filled (0 = flag off) */
   notStartedFlagMinutes?: number
+  /**
+   * `drawer` (default) slides over a board; `page` is the same sections laid
+   * out in a wide centered column on /project/:id/ticket/:id (no scrim, no
+   * Escape; Close becomes "Back to board").
+   */
+  layout?: 'drawer' | 'page'
   /** the project's require_plan_approval: only then does an unapproved ready ticket say Needs approval */
   requireApproval?: boolean
 }
@@ -118,7 +127,8 @@ const inputCls =
   'w-full bg-bg border border-line rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-3 ' +
   'focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-all font-[inherit]'
 
-export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAccess = null, openReassign = false, onTaskUpdated, notStartedFlagMinutes, requireApproval = false }: Props) {
+export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAccess = null, openReassign = false, onTaskUpdated, notStartedFlagMinutes, layout = 'drawer', requireApproval = false }: Props) {
+  const isPage = layout === 'page'
   // History and comments, tagged with the ticket they were read for: until
   // the first read for this ticket answers, the History tab shows a skeleton;
   // a reread (state or owner changed) keeps the rows on screen meanwhile.
@@ -146,16 +156,31 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   if (task && opened?.id !== task.id) setOpened({ id: task.id, tab: defaultTabFor(task) })
   const defaultTab: Tab = task ? (opened?.id === task.id ? opened.tab : defaultTabFor(task)) : 'details'
   const [tabParam, setTabParam] = useSearchParam('tab', defaultTab)
-  const tab: Tab = tabParam === 'history' || tabParam === 'details' ? tabParam : defaultTab
+  // ?run=<id> (a /r/ link) points at one of the ticket's runs, which are on
+  // Details; `tab=runs` is accepted for the same place.
+  // ?event=<activity id> points at one entry of its History.
+  const runParam = Number(searchParams.get('run'))
+  const focusRunId = Number.isInteger(runParam) && runParam > 0 ? runParam : null
+  const eventParam = Number(searchParams.get('event'))
+  const focusEventId = Number.isInteger(eventParam) && eventParam > 0 ? eventParam : null
+  // (useSearchParam reads the default when ?tab= is absent: a run or an event link decides then.)
+  const named = searchParams.get('tab')
+  const tab: Tab = named === 'history' || named === 'details' ? named
+    : named === 'runs' || focusRunId != null ? 'details' : focusEventId != null ? 'history'
+      : tabParam === 'history' || tabParam === 'details' ? tabParam : defaultTab
+  const projectCode = useProject(task?.project_id)?.code
+  // ?ref=: the /t/ link named another project's code (TicketRedirect); say which ticket this is.
+  const typedRef = mismatchedRef(searchParams.get('ref'), task?.id ?? 0, projectCode)
+  const patchParams = usePatchSearchParams()
 
-  // ?tab= belongs to the open ticket: closing the drawer or switching tickets
-  // drops it. (Views that focus with ?focus= already drop it; this covers the
-  // rest, e.g. the DAG.)
+  // ?tab=, ?run= and ?event= belong to the open ticket: closing the drawer or
+  // switching tickets drops them. (Views that focus with ?focus= already drop
+  // them; this covers the rest, e.g. the DAG.)
   const lastId = useRef<number | null>(task?.id ?? null)
   useEffect(() => {
     const prev = lastId.current
     lastId.current = task?.id ?? null
-    if (prev != null && prev !== lastId.current && searchParams.has('tab')) setTabParam(null)
+    if (prev != null && prev !== lastId.current && (searchParams.has('tab') || searchParams.has('run') || searchParams.has('event') || searchParams.has('ref'))) patchParams({ tab: null, run: null, event: null, ref: null })
   }, [task?.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -181,11 +206,11 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   useEffect(() => {
     if (!task) return
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !editing && !showDeleteConfirm) onClose()
+      if (!isPage && e.key === 'Escape' && !editing && !showDeleteConfirm) onClose()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [task, editing, showDeleteConfirm, onClose])
+  }, [task, editing, showDeleteConfirm, onClose, isPage])
 
   const handleEditSave = async () => {
     setEditSaving(true)
@@ -201,7 +226,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
       await api.updateTask(task!.id, changes)
       setEditing(false)
       onRefresh?.()
-      onClose()
+      if (!isPage) onClose()
     } catch (e) {
       setEditError(e instanceof Error ? e.message : 'Save failed')
     } finally {
@@ -230,7 +255,8 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   const canPlan = canPlanTask(task, meId, myAccess)
   const history = log?.taskId === task.id ? log : null
   const view = focusView(location.pathname)
-  const ticketHref = (id: number) => projectLink(task.project_id, view, id)
+  const ticketHref = (id: number) => isPage ? ticketPageLink(task.project_id, id) : projectLink(task.project_id, view, id)
+  const fullPageHref = ticketPageLink(task.project_id, task.id, new URLSearchParams([...searchParams].filter(([k]) => ['tab', 'run', 'event', 'ref'].includes(k))).toString())
   // The human panel leads with the brief, so Details doesn't repeat it.
   const showHumanWork = isHuman(task) && task.state !== 'completed' && displayState(task) !== 'flag'
 
@@ -248,24 +274,27 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
     setEditing(true)
   }
 
+  // The canonical link, /t/<CODE>-<id>; it names the tab only when it isn't
+  // the one this ticket opens on.
   const copyLink = () => {
-    const url = `${window.location.origin}${ticketHref(task.id)}&tab=${tab}`
+    const url = `${window.location.origin}${ticketPath(projectCode, task.id)}${tab !== defaultTab ? `?tab=${tab}` : ''}`
     navigator.clipboard?.writeText(url).then(() => setCopied(true)).catch(() => {})
   }
 
   return (
     <>
       {/* Backdrop */}
-      <div
+      {!isPage && <div
         className="fixed inset-0 z-40"
         style={{ background: 'var(--scrim)' }}
         onClick={onClose}
-      />
+      />}
 
-      {/* Drawer */}
+      {/* Drawer, or the full-page column */}
       <div
-        className="fixed right-0 top-0 h-full w-[520px] z-50 flex flex-col"
-        style={{
+        data-testid={isPage ? 'ticket-page' : 'task-drawer'}
+        className={isPage ? 'mx-auto w-full max-w-[1080px] min-h-full flex flex-col' : 'fixed right-0 top-0 h-full w-[520px] z-50 flex flex-col'}
+        style={isPage ? { background: 'var(--surface)', borderInline: '1px solid var(--line)' } : {
           background: 'var(--surface)',
           borderLeft: '1px solid var(--line)',
           boxShadow: '-12px 0 32px color-mix(in srgb, var(--ink) 10%, transparent)',
@@ -275,7 +304,8 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
         <div className="flex items-start justify-between gap-3 px-6 pt-5 pb-4 border-b border-line" style={{ boxShadow: 'inset 0 3px 0 var(--ink)' }}>
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2.5 mb-2.5 flex-wrap">
-              <span className="amp-num text-[13px] text-ink-3">#{task.id}</span>
+              <Link to={ticketPath(projectCode, task.id)} className="amp-num text-[13px] text-ink-3 hover:text-ink hover:underline underline-offset-2"
+                title="This ticket's link">{projectCode ? ticketRef(projectCode, task.id) : `#${task.id}`}</Link>
               <StatusBadge state={task.state} blockReason={task.block_reason} />
               <ApprovalTag task={task} requireApproval={requireApproval} />
               <NotStartedTag task={task} flagMinutes={notStartedFlagMinutes} />
@@ -283,6 +313,11 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
               <PriorityMark priority={task.priority} showLabel={task.priority === '2' || task.priority === '3'} />
             </div>
             <h2 className="text-[17px] font-semibold text-ink leading-snug m-0">{task.name}</h2>
+            {typedRef && (
+              <p role="note" className="m-0 mt-1.5 text-[12px] text-warning-ink">
+                The link said {typedRef}; ticket {task.id} is {ticketRef(projectCode, task.id)}, in another project.
+              </p>
+            )}
           </div>
           <div className="flex items-center gap-0.5 flex-shrink-0">
             <button type="button" onClick={copyLink}
@@ -306,9 +341,21 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
             >
               <Trash2 size={13} className="text-danger/70 hover:text-danger" />
             </button>
-            <button onClick={onClose} className="amp-btn amp-btn-ghost amp-btn-sm" aria-label="Close">
-              <X size={15} className="text-ink-2" />
-            </button>
+            {isPage ? (
+              <Link to={projectLink(task.project_id, 'board', task.id)} className="amp-btn amp-btn-ghost amp-btn-sm"
+                title="Back to the board, with this ticket in the drawer">
+                <ArrowLeft size={13} aria-hidden="true" />Back to board
+              </Link>
+            ) : (
+              <>
+                <Link to={fullPageHref} className="amp-btn amp-btn-ghost amp-btn-sm" title="Open this ticket as a full page" aria-label="Open full page">
+                  <Maximize2 size={13} className="text-ink-2" aria-hidden="true" />
+                </Link>
+                <button onClick={onClose} className="amp-btn amp-btn-ghost amp-btn-sm" aria-label="Close">
+                  <X size={15} className="text-ink-2" />
+                </button>
+              </>
+            )}
           </div>
         </div>
 
@@ -462,7 +509,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto p-6">
+        <div className={`flex-1 p-6 ${isPage ? '' : 'overflow-y-auto'}`}>
           {editing && canPlan ? (
             <div className="space-y-4">
               <div>
@@ -526,10 +573,10 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
             </div>
           ) : tab === 'details' ? (
             // Details needs nothing from the history read: it renders at once.
-            <DetailsTab task={task} plan={plan} hideBrief={showHumanWork} onClose={onClose} onRefresh={onRefresh} canWork={canWork} canPlan={canPlan}
+            <DetailsTab task={task} plan={plan} focusRunId={focusRunId} hideBrief={showHumanWork} onClose={isPage ? undefined : onClose} onRefresh={onRefresh} canWork={canWork} canPlan={canPlan}
               onUpdated={t => (onTaskUpdated ? onTaskUpdated(t) : onRefresh?.())} />
           ) : history ? (
-            <HistoryTab history={history.history} comments={history.comments} people={people} />
+            <HistoryTab history={history.history} comments={history.comments} people={people} focusEventId={focusEventId} />
           ) : (
             <HistorySkeleton />
           )}
@@ -831,8 +878,8 @@ function TaskMetadata({ task, canEdit, onSaved }: { task: Task; canEdit: boolean
   )
 }
 
-function DetailsTab({ task, plan, hideBrief, onClose, onRefresh, canWork, canPlan, onUpdated }: {
-  task: Task; plan: ProjectPlan; hideBrief: boolean; onClose: () => void; onRefresh?: () => void; canWork: boolean; canPlan: boolean; onUpdated: (t: Task) => void
+function DetailsTab({ task, plan, focusRunId = null, hideBrief, onClose, onRefresh, canWork, canPlan, onUpdated }: {
+  task: Task; plan: ProjectPlan; focusRunId?: number | null; hideBrief: boolean; onClose?: () => void; onRefresh?: () => void; canWork: boolean; canPlan: boolean; onUpdated: (t: Task) => void
 }) {
   const [editingSchedule, setEditingSchedule] = useState(false)
   const [scheduleValue, setScheduleValue] = useState('')
@@ -848,7 +895,7 @@ function DetailsTab({ task, plan, hideBrief, onClose, onRefresh, canWork, canPla
       const iso = scheduleValue ? new Date(scheduleValue).toISOString() : null
       await api.setTaskStartAt(task.id, iso)
       setEditingSchedule(false)
-      onClose()
+      onClose?.()
       onRefresh?.()
     } finally {
       setSavingSchedule(false)
@@ -873,7 +920,7 @@ function DetailsTab({ task, plan, hideBrief, onClose, onRefresh, canWork, canPla
           </div>
         </div>
       )}
-      <RunsPanel taskId={task.id} refreshKey={task.state} />
+      <RunsPanel taskId={task.id} refreshKey={task.state} focusRunId={focusRunId} />
       <div className="grid grid-cols-2 gap-2.5">
         <MetaItem label="Task ID" value={`#${task.id}`} />
         {/* The header's words, never the stored state name ("backlog"), so the drawer says one thing (#129). */}
@@ -930,7 +977,7 @@ function DetailsTab({ task, plan, hideBrief, onClose, onRefresh, canWork, canPla
                 <button
                   onClick={async () => {
                     setSavingSchedule(true)
-                    try { await api.setTaskStartAt(task.id, null); setEditingSchedule(false); onClose(); onRefresh?.() }
+                    try { await api.setTaskStartAt(task.id, null); setEditingSchedule(false); onClose?.(); onRefresh?.() }
                     finally { setSavingSchedule(false) }
                   }}
                   disabled={savingSchedule}
@@ -971,7 +1018,17 @@ function HistorySkeleton() {
   )
 }
 
-function HistoryTab({ history, comments, people }: { history: ActivityLog[]; comments: Comment[]; people: Map<number, Person> }) {
+function HistoryTab({ history, comments, people, focusEventId = null }: { history: ActivityLog[]; comments: Comment[]; people: Map<number, Person>; focusEventId?: number | null }) {
+  // ?event=<id>: scroll to that entry once it's on screen, and only once, so
+  // a history reread later doesn't pull the reader back.
+  const scrolledTo = useRef<number | null>(null)
+  useEffect(() => {
+    if (focusEventId == null || scrolledTo.current === focusEventId) return
+    const el = document.getElementById(`event-${focusEventId}`)
+    if (!el) return
+    scrolledTo.current = focusEventId
+    el.scrollIntoView?.({ block: 'center' })
+  }, [focusEventId, history.length])
   if (history.length === 0 && comments.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-12 gap-2">
@@ -989,7 +1046,8 @@ function HistoryTab({ history, comments, people }: { history: ActivityLog[]; com
         // A manager passing on its person's answer over MCP: shown apart from the person's own words.
         const relayed = isRelayed(entry.actor)
         return (
-        <div key={entry.id} className="flex gap-3">
+        <div key={entry.id} id={`event-${entry.id}`} aria-current={entry.id === focusEventId ? 'true' : undefined}
+          className={`flex gap-3 ${entry.id === focusEventId ? 'bg-surface-2 -mx-2 px-2' : ''}`}>
           <div className="flex flex-col items-center flex-shrink-0">
             <div className="mt-1.5">
               <span className={`block w-2 h-2 rounded-full ${ACTION_DOT[entry.action] ?? ACTION_DOT.comment}`} />

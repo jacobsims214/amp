@@ -22,6 +22,8 @@ import { Artifacts } from './pages/Artifacts'
 import { ArtifactView } from './pages/ArtifactView'
 import { Session } from './pages/Session'
 import { Sessions } from './pages/Sessions'
+import { TicketPage } from './pages/TicketPage'
+import { RunRedirect, TicketRedirect } from './pages/TicketRedirect'
 import { RemoteProvider } from './remote/RemoteProvider'
 import { AuthProvider } from './contexts/AuthContext'
 import { AppShell } from './components/shell/AppShell'
@@ -61,6 +63,9 @@ export default function App() {
             <Route path="/" element={<MyWork />} />
             <Route path="/sessions" element={<Sessions />} />
             <Route path="/projects" element={<Projects />} />
+            {/* Canonical links: a ticket by its ref (BA-34 or 34), a run by its id. */}
+            <Route path="/t/:ref" element={<TicketRedirect />} />
+            <Route path="/r/:runId" element={<RunRedirect />} />
             {/* No tab: My work when something waits on you here, else Mission (lib/landing.ts). */}
             <Route path="/project/:projectId" element={<ProjectLanding />} />
             <Route path="/project/:projectId/mission" element={<Mission />} />
@@ -68,6 +73,7 @@ export default function App() {
             <Route path="/project/:projectId/board" element={<Board />} />
             <Route path="/project/:projectId/plan" element={<FlightPlan />} />
             <Route path="/project/:projectId/dag" element={<DAGView />} />
+            <Route path="/project/:projectId/ticket/:ticketId" element={<TicketPage />} />
             <Route path="/project/:projectId/report" element={<Report />} />
             <Route path="/project/:projectId/kb" element={<KB />} />
             <Route path="/project/:projectId/artifacts" element={<Artifacts />} />

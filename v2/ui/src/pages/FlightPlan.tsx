@@ -34,7 +34,8 @@ import { StateDot, StateTag } from '../components/ui/StateTag'
 import { PriorityMark } from '../components/ui/PriorityMark'
 import { displayState, STATE_LABEL, STATE_VAR, type DisplayState } from '../lib/ticketState'
 import type { PlanIssue, PlanReport, Task } from '../types'
-import { BandLoader } from '../components/brand/BandLoader'
+import { Skeleton, SkeletonReadouts, SkeletonRegion } from '../components/ui/Skeleton'
+import { useDelayedFlag } from '../hooks/useDelayedFlag'
 import { Markdown } from '../components/ui/Markdown'
 
 /** Each ticket's stage (dependency depth) and the plan's critical path. */
@@ -192,8 +193,19 @@ export function FlightPlan() {
     )
   }
 
-  if (loading && !tasks.length) {
-    return <div className="flex items-center justify-center h-full"><BandLoader label="Loading the flight plan" /></div>
+  // First load (tier 1, KB design/loading.md): the header now, skeletons
+  // shaped like the readouts and the epic bars with their stories after 250 ms.
+  const firstLoad = loading && !tasks.length
+  const showSkeleton = useDelayedFlag(firstLoad, undefined, 400)
+  if (firstLoad || showSkeleton && !tasks.length) {
+    return (
+      <div className="flex flex-col min-h-full">
+        <ProjectNav projectId={pid} currentView="plan" />
+        <div className="p-7 pt-5 grid gap-4">
+          {showSkeleton && <FlightPlanSkeleton />}
+        </div>
+      </div>
+    )
   }
 
   const openCount = tasks.filter(t => t.state !== 'completed').length
@@ -359,5 +371,27 @@ function FragmentRows({ epicName, epicPriority, count, cols, children }: {
       </tr>
       {children}
     </>
+  )
+}
+
+/** The flight plan before its first load: readouts, then epic bars with story rows nested under them. */
+function FlightPlanSkeleton() {
+  return (
+    <SkeletonRegion label="Loading the flight plan" className="grid gap-4">
+      <SkeletonReadouts cells={5} />
+      <div aria-hidden="true" className="amp-panel">
+        {Array.from({ length: 3 }, (_, e) => (
+          <div key={e} className="border-t border-line first:border-t-0">
+            <div className="px-4 py-2.5 bg-surface-2"><Skeleton w={180} h={11} /></div>
+            {Array.from({ length: 2 }, (_, s) => (
+              <div key={s} className="pl-8 pr-4 py-2.5 grid grid-cols-[160px_1fr] gap-4 border-t border-line-sub">
+                <Skeleton w="80%" h={9} />
+                <Skeleton w="55%" h={9} />
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    </SkeletonRegion>
   )
 }

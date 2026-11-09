@@ -17,6 +17,30 @@ export const SEEN_KEY = 'amp.launch.seen'
 
 type Where = Pick<Location, 'pathname' | 'search'>
 
+/**
+ * How long the launch runs, in ms (KB design/loading.md, tier 0). It is the
+ * app's one long wait, and only on a cold start:
+ *
+ * - short: at least SHORT (a floor, so it reads as a beat rather than a
+ *   flash), then it ends as soon as /api/me has answered; it waits for the
+ *   answer up to SHORT_MAX in all.
+ * - full: FULL, played only right after sign-in (or `?launch=full`); it waits
+ *   for /api/me up to FULL_HOLD_CAP longer.
+ * - reduced motion: the logo fades in over REDUCED.
+ */
+export const LAUNCH_MS = { full: 5000, short: 600, shortMax: 2000, fullHoldCap: 4000, reduced: 700 } as const
+
+export type LaunchMode = 'full' | 'short' | 'reduced'
+
+/** Sign-in pages a browser comes back from: the launch after them is the full one. */
+const SIGN_IN_REFERRER = /\/(oauth2|dex|auth|login|sso|saml|oidc)\b/i
+
+/** Which launch plays: reduced motion wins, then `?launch=`, then full only right after sign-in. */
+export function launchMode(env: { reducedMotion: boolean; search: string; referrer: string }): LaunchMode {
+  if (env.reducedMotion) return 'reduced'
+  return forcedLaunch(env.search) ?? (SIGN_IN_REFERRER.test(env.referrer) ? 'full' : 'short')
+}
+
 export function forcedLaunch(search: string): 'full' | 'short' | null {
   const forced = new URLSearchParams(search).get('launch')
   return forced === 'full' || forced === 'short' ? forced : null

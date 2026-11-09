@@ -325,6 +325,12 @@ impl Instance {
         )
     }
 
+    /// A ticket's canonical link (AMP #131): the web UI looks the ticket up and opens it on its
+    /// own project's board, so no project id is needed (or can be wrong).
+    pub fn canonical_ticket_url(&self, ticket_id: i64) -> String {
+        format!("{}/t/{ticket_id}", self.web_base)
+    }
+
     /// The project's Mission page.
     pub fn project_url(&self, project_id: i64) -> String {
         format!("{}/project/{project_id}", self.web_base)

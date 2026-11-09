@@ -1122,7 +1122,20 @@ export interface Run {
   note?: string
   /** a person's reported time on a human ticket */
   hours_worked?: number
+  /** the remote-control session the run happened in (links to /sessions/<id>) */
+  session_id?: string
   created_at: string
+}
+
+/** GET /api/runs/:id: a run and the ticket it belongs to. */
+export interface RunView {
+  run: Run
+  task_id: number
+  project_id: number
+  /** the ticket's ref, CODE-<id> */
+  ref: string
+  /** the ticket's canonical link, /t/<ref> */
+  url: string
 }
 
 /** A ticket a commit, branch, or PR leads back to. */

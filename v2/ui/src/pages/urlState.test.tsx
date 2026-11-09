@@ -32,7 +32,7 @@ vi.mock('../hooks/useBoardData', () => ({
 vi.mock('../hooks/usePlanApproval', () => ({
   usePlanApproval: () => ({ project, approving: false, error: null, notice: null, approve: vi.fn() }),
 }))
-vi.mock('../hooks/useSSE', () => ({ useSSE: () => 'connected' }))
+vi.mock('../hooks/useSSE', () => ({ useSSE: () => 'connected', subscribeSSE: () => () => {} }))
 // The drawer is its own PR's business; here it only has to say which ticket it shows.
 vi.mock('../components/TaskDrawer', () => ({
   TaskDrawer: ({ task, onClose }: { task: Task | null; onClose: () => void }) => task

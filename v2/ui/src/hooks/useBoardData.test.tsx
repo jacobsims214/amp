@@ -10,7 +10,7 @@ const task = (id: number, project_id: number) => ({ id, project_id, epic_id: 1, 
 
 let pending: { resolve: () => void; reject: (e: Error) => void } | null = null
 let tasksFor: Record<number, Task[]> = {}
-vi.mock('./useSSE', () => ({ useSSE: () => 'connected' }))
+vi.mock('./useSSE', () => ({ useSSE: () => 'connected', subscribeSSE: () => () => {} }))
 vi.mock('../api/client', () => ({
   api: {
     listEpics: (pid: number) => new Promise<Epic[]>((resolve, reject) => {

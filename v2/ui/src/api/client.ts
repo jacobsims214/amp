@@ -4,7 +4,7 @@ import type {
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
-  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, GitHubCredentialInfo, GitHubCredentialChange, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
+  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, GitHubCredentialInfo, GitHubCredentialChange, Run, RunView, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
   ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork, MyWorkCounts, PeopleWaiting,
 } from '../types'
 import { auditQuery, auditVerifyUrl, type AuditScope } from '../lib/audit'
@@ -18,11 +18,14 @@ function kbQuery(ref: KBRef): string {
   return `project_id=${ref.project_id}`
 }
 
+/** A failed request's error carries the HTTP status (404 not found, 403 no access). */
+export type HttpError = Error & { status?: number }
+
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`)
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
-    throw new Error(err.error || `GET ${path}: ${res.status}`)
+    throw Object.assign(new Error(err.error || `GET ${path}: ${res.status}`), { status: res.status })
   }
   return res.json()
 }
@@ -103,6 +106,16 @@ export const api = {
   getEpic: (id: number) => get<{ epic: Epic }>(`/epics/${id}`).then(r => r.epic),
 
   // Stories
+  /**
+   * Every story in the project, in one request. Rejects when the API doesn't
+   * have the endpoint yet (an older server), so callers fall back to
+   * listStories per epic.
+   */
+  listProjectStories: (projectId: number) =>
+    get<{ stories?: Story[] | null }>(`/projects/${projectId}/stories`).then(r => {
+      if (!r || !('stories' in r)) throw new Error('GET /projects/:id/stories: not supported')
+      return r.stories ?? []
+    }),
   listStories: (epicId: number) =>
     get<{ stories: Story[] }>(`/epics/${epicId}/stories`).then(r => r.stories ?? []),
   getStory: (id: number) => get<{ story: Story }>(`/stories/${id}`).then(r => r.story),
@@ -228,6 +241,7 @@ export const api = {
     post<Comment>(`/tasks/${taskId}/comments`, { body, author }),
 
   // History
+  getRun: (runId: number) => get<RunView>(`/runs/${runId}`),
   taskRuns: (taskId: number) => get<{ runs: Run[] | null; usage: Usage }>(`/tasks/${taskId}/runs`).then(r => ({ runs: r.runs ?? [], usage: r.usage })),
   trace: (q: { commit?: string; branch?: string; pr?: string }) => {
     const p = new URLSearchParams()

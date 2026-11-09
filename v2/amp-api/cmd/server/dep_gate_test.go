@@ -42,7 +42,7 @@ func TestDependencies_WorkWaitsForEveryDependency(t *testing.T) {
 	if st := stateOf(t, alice, review); st != "backlog" {
 		t.Fatalf("review after build = %s, want backlog", st)
 	}
-	reviewLink := fmt.Sprintf("/project/%d/board?task=%d", w.s.projectID, review)
+	reviewLink := fmt.Sprintf("/t/%d", review)
 
 	// 1. The reviewer's chain, over MCP: set backlog is refused, naming the
 	// open human ticket and where the person finishes it.

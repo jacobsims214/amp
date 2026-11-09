@@ -28,6 +28,7 @@ func runProps() props {
 		"pushed":             boolean("Optional. Whether the commit is pushed where teammates can get it."),
 		"merged":             boolean("Optional. Whether the work is merged into the main line. Whoever merges (a person, or the agent told to) records merged=true with amp_report_run."),
 		"run_note":           str("Optional. One line about the run, e.g. 'closeout only: implementation was committed by the previous run'."),
+		"session_id":         str("Optional. The AMP remote-control session this run happened in, if your harness has one: the run then links to that session."),
 	}
 }
 
@@ -83,6 +84,7 @@ func runFromArgs(args map[string]interface{}, outcome string) domain.Run {
 		Pushed:           optBoolPtr(args, "pushed"),
 		Merged:           optBoolPtr(args, "merged"),
 		Note:             strings.TrimSpace(optStr(args, "run_note", "")),
+		SessionID:        strings.TrimSpace(optStr(args, "session_id", "")),
 	}
 }
 

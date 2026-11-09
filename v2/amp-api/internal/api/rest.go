@@ -30,6 +30,7 @@ import (
 //	POST /api/projects/import
 //	GET  /api/projects/:id
 //	GET  /api/projects/:id/epics
+//	GET  /api/projects/:id/stories   every story in the project (one request, not one per epic)
 //	GET  /api/projects/:id/tasks
 //	POST /api/projects/:id/tasks
 //	GET  /api/projects/:id/export
@@ -46,6 +47,7 @@ import (
 //	POST /api/tasks/:id/start      (a person starts their human ticket)
 //	POST /api/tasks/:id/complete
 //	POST /api/tasks/:id/start_at
+//	GET  /api/runs/:id            a run, with its ticket's task_id, project_id, ref and url (404 when not visible)
 //	GET  /api/events              ← SSE stream (only events for projects you can see)
 //
 // Project GitHub credentials (write-only; see github_credentials.go):
@@ -128,6 +130,7 @@ func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("/api/epics/", h.epicSub)
 	mux.HandleFunc("/api/stories/", h.storySub)
 	mux.HandleFunc("/api/tasks/", h.taskSub)
+	mux.HandleFunc("/api/runs/", h.runSub)
 	mux.HandleFunc("/api/kb/", h.kbDoc)
 	mux.mux.HandleFunc("/api/events", h.events) // SSE: streams, never a 403 after it starts
 	mux.HandleFunc("/api/orgs", h.orgs)
@@ -1007,6 +1010,19 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, p)
 		return
 
+	case "stories":
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET required", 405)
+			return
+		}
+		stories, err := h.repo.ListStoriesByProject(r.Context(), projectID)
+		if err != nil {
+			jsonErr(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"stories": stories})
+		return
+
 	case "epics":
 		switch r.Method {
 		case http.MethodGet:
@@ -1425,12 +1441,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 				fail(w, err, 500)
 				return
 			}
-			h.hub.Publish(domain.Event{
-				Type:      domain.EventTaskUpdated,
-				ProjectID: task.ProjectID,
-				Payload:   map[string]interface{}{"task_id": taskID, "deleted": true},
-				At:        time.Now(),
-			})
+			// service.DeleteTask sends the live deleted signal.
 			jsonOK(w, map[string]interface{}{"task_id": taskID, "deleted": true})
 
 		default:
@@ -1774,6 +1785,35 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// runSub serves GET /api/runs/:id: one run and where it belongs, for
+// anyone who can see its ticket (/r/<run id> links resolve through it).
+func (h *RestHandler) runSub(w http.ResponseWriter, r *http.Request) {
+	parts := splitPath(r.URL.Path[len("/api/runs/"):])
+	if len(parts) != 1 {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET required", 405)
+		return
+	}
+	runID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || runID <= 0 {
+		jsonErr(w, errorf("invalid run id"), 400)
+		return
+	}
+	pr, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	view, err := h.svc.GetRun(r.Context(), pr, runID)
+	if err != nil {
+		fail(w, err, 404)
+		return
+	}
+	jsonOK(w, view)
 }
 
 // taskActionFor maps a task route to the ownership rule its outer check
