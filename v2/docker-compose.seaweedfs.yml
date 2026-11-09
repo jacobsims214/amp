@@ -1,0 +1,28 @@
+# Receipt evidence (#126, #144) in the bundled SeaweedFS instead of the
+# amp-receipts volume. Use with the seaweedfs profile:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.seaweedfs.yml --profile seaweedfs up -d
+#
+# The profile is required (or COMPOSE_PROFILES=seaweedfs): without it the
+# seaweedfs service doesn't exist and compose refuses this file's
+# depends_on. Set SEAWEEDFS_ACCESS_KEY / SEAWEEDFS_SECRET_KEY on any shared
+# host (the defaults are well-known local-dev values).
+#
+# amp-api creates the bucket on first start. Evidence is still served by
+# amp-api (members-only, Range, the same safety headers); SeaweedFS has no
+# host port. Switching doesn't move what's already on amp-receipts: evidence
+# there stays unreachable until you switch back (or copy it over, KB
+# operations/where-amp-keeps-data). Retention is AMP's (Postgres): don't add
+# bucket lifecycle rules, they would delete kept receipts.
+services:
+  amp-api:
+    environment:
+      RECEIPT_STORE: s3
+      RECEIPT_S3_ENDPOINT: seaweedfs:8333
+      RECEIPT_S3_BUCKET: amp-receipts
+      RECEIPT_S3_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY:-amp-local-dev}
+      RECEIPT_S3_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY:-amp-local-dev-secret}
+      RECEIPT_S3_USE_SSL: "false"
+    depends_on:
+      seaweedfs:
+        condition: service_healthy

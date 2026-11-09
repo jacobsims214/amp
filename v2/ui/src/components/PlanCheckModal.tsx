@@ -14,6 +14,8 @@ const ISSUE_TITLE: Record<string, string> = {
   metadata_drift: "Epics' metadata doesn't match",
   awaiting_approval: 'Waiting for plan approval',
   human_without_owner: "A person's ticket has no owner",
+  human_without_brief: "A person's ticket has no brief",
+  judgment_without_doc: 'A decision has no decision doc',
   unlinked_merge_step: 'Merge step not linked to its PR',
   duplicate_merge_step: 'Two merge steps for one PR',
 }

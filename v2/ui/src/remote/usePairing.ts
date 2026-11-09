@@ -14,6 +14,7 @@ import { pairPostText, pairResultText, preparePairing, type PreparedPairing } fr
 import { keyMatchesId } from './protocol'
 import { deviceNameFromUA } from './deviceName'
 import { RelayError } from './transport'
+import { isSessionEnded } from '../lib/session'
 import { MAX_PIN_MS } from './webCrypto'
 import type { HarnessPin, PairResultBody, SessionDetail } from './types'
 
@@ -147,6 +148,7 @@ export function usePairing(detail: SessionDetail, link: PairingLink, onPaired: (
             if (stopped) return
             if (err && (err.status === 404 || err.status === 410)) return fail('This session has ended', 'Run /remote on the laptop to start a new session, then open its link.')
             if (err && err.status === 403) return fail('Not paired', pairPostText(err.code, err.message))
+            if (isSessionEnded()) return // signed out (#153): the app prompts to sign in again
             retry = setTimeout(connect, 2_000)
           },
         })

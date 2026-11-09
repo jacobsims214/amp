@@ -147,6 +147,25 @@ runAsUser: 0
 {{- end }}
 {{- end -}}
 
+{{/* amp.receiptUploadRoutes: verification receipt evidence uploads (#126).
+     The one-time token in the path is the credential, checked by amp-api,
+     so ext_authz is off for this prefix only. Uploads are up to
+     ampApi.receipts.maxBytes (200 MiB), so the route timeout is long and a
+     stalled upload is cut off by idle_timeout instead. Every other receipts route (GET /api/receipts/<key>) stays
+     behind the session under the /api prefix. */}}
+{{- define "amp.receiptUploadRoutes" -}}
+# ---- Receipt evidence uploads: one-time token checked by amp-api, not ext_authz ----
+- match: { prefix: "/api/receipt-uploads/" }
+  route:
+    cluster: amp_api_rest
+    timeout: {{ .Values.ampApi.receipts.uploadTimeout | default "3600s" }}
+    idle_timeout: {{ .Values.ampApi.receipts.uploadIdleTimeout | default "120s" }}
+  typed_per_filter_config:
+    envoy.filters.http.ext_authz:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+      disabled: true
+{{- end -}}
+
 {{/* amp.relayBrowserRoutes: the relay's browser leg, /api/sessions, goes to
      amp-relay behind the cookie session (ext_authz stays on). Its
      per-session SSE stream is long-lived like the harness's command stream
@@ -192,4 +211,27 @@ runAsUser: 0
 {{/* amp-relay's cluster token Secret, #2392. */}}
 {{- define "amp.relayTokenSecret" -}}
 {{- .Values.relay.clusterToken.existingSecret | default "amp-relay-cluster-token" -}}
+{{- end -}}
+
+{{/* amp.receiptStore: where receipt evidence lives (#126, #144): "seaweedfs"
+     (the bundled store, seaweedfs.enabled), "s3" (ampApi.receipts.s3.endpoint)
+     or "local" (the amp-receipts PVC, the default). Both S3 settings at
+     once is refused: one store at a time. */}}
+{{- define "amp.receiptStore" -}}
+{{- $ext := .Values.ampApi.receipts.s3 | default dict -}}
+{{- if and .Values.seaweedfs.enabled $ext.endpoint -}}
+{{- fail "seaweedfs.enabled and ampApi.receipts.s3.endpoint are both set: receipt evidence goes to one store; unset one" -}}
+{{- end -}}
+{{- if .Values.seaweedfs.enabled -}}
+seaweedfs
+{{- else if $ext.endpoint -}}
+s3
+{{- else -}}
+local
+{{- end -}}
+{{- end -}}
+
+{{/* amp.seaweedfsSecret: the Secret with the bundled SeaweedFS's key pair. */}}
+{{- define "amp.seaweedfsSecret" -}}
+{{- .Values.seaweedfs.existingSecret | default "amp-seaweedfs-s3" -}}
 {{- end -}}

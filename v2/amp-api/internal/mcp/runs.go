@@ -32,9 +32,15 @@ func runProps() props {
 	}
 }
 
-func withRunProps(p props) props {
+// withRunProps adds the run's props (and any more, e.g. receiptProps) to p.
+func withRunProps(p props, more ...props) props {
 	for k, v := range runProps() {
 		p[k] = v
+	}
+	for _, m := range more {
+		for k, v := range m {
+			p[k] = v
+		}
 	}
 	return p
 }

@@ -51,8 +51,11 @@ type Project struct {
 	State       ProjectState `json:"state"`
 	// OrgID is the org the project belongs to. Only that org's teams can be
 	// linked to it. Nil only transiently for rows predating orgs.
-	OrgID     *int `json:"org_id"`
-	CreatedBy *int `json:"created_by"`
+	OrgID *int `json:"org_id"`
+	// OrgName is filled on project lists only, so the UI can name the org of a
+	// project the caller can see without belonging to that org.
+	OrgName   string `json:"org_name,omitempty"`
+	CreatedBy *int   `json:"created_by"`
 	// OpenReassign lets any project member take or reassign a ticket that
 	// isn't in progress. Otherwise only its owner or a lead can.
 	OpenReassign bool `json:"open_reassign"`
@@ -73,6 +76,18 @@ type Project struct {
 	// NotStartedReturnMinutes. 0 turns either off; both default on (10, 30).
 	NotStartedFlagMinutes   int `json:"not_started_flag_minutes"`
 	NotStartedReturnMinutes int `json:"not_started_return_minutes"`
+	// Verification receipts (#126): ReceiptsMode is "" (use the org's) or
+	// off / inform / require; ReceiptsMinLevel is what a Require ticket
+	// must reach before it completes (v1: self_checked).
+	ReceiptsMode     string `json:"receipts_mode"`
+	ReceiptsMinLevel string `json:"receipts_min_level"`
+	// Decision escalation (#146): a person's ticket still open this many
+	// minutes after its decide_by is escalated once: its owner is reminded,
+	// and, when set, its priority goes up a step and it is handed to the
+	// backup decider. 0 (the default) turns it off.
+	DecisionEscalationMinutes       int  `json:"decision_escalation_minutes"`
+	DecisionEscalationRaisePriority bool `json:"decision_escalation_raise_priority"`
+	DecisionBackupDecider           *int `json:"decision_backup_decider"`
 	// Metadata is free-form key/value data for integrations (see Metadata).
 	Metadata  Metadata  `json:"metadata"`
 	CreatedAt time.Time `json:"created_at"`
@@ -101,6 +116,16 @@ type ProjectSettings struct {
 	// watchdog's timeouts (AMP #2801); 0 disables each.
 	NotStartedFlagMinutes   *int `json:"not_started_flag_minutes"`
 	NotStartedReturnMinutes *int `json:"not_started_return_minutes"`
+	// ReceiptsMode ("" = the org's, off, inform, require) and
+	// ReceiptsMinLevel: the verification receipts setting (#126). Only a
+	// person in the web UI changes either.
+	ReceiptsMode     *string `json:"receipts_mode"`
+	ReceiptsMinLevel *string `json:"receipts_min_level"`
+	// Decision escalation (#146); changed only in the web UI. A backup
+	// decider of 0 removes it.
+	DecisionEscalationMinutes       *int  `json:"decision_escalation_minutes"`
+	DecisionEscalationRaisePriority *bool `json:"decision_escalation_raise_priority"`
+	DecisionBackupDecider           *int  `json:"decision_backup_decider"`
 	// Metadata sets keys; null removes one (see MetadataPatch).
 	Metadata MetadataPatch `json:"metadata,omitempty"`
 }
@@ -251,6 +276,19 @@ type Task struct {
 	// client has to do the arithmetic (the board's "18 min", My work's
 	// "not_started_minutes"). Computed on read, never stored.
 	NotStartedMinutes int `json:"not_started_minutes,omitempty"`
+	// HasDecisionDoc says the ticket has a decision doc (a decision_docs
+	// row; docs/specs/human-decision-docs.md): its decision is recorded on
+	// the doc (Record decision), never by Mark done. Read with the ticket
+	// and set by the task actor when the doc is drafted; never stored on
+	// tasks. Once true it stays true: a doc is never removed.
+	HasDecisionDoc bool `json:"has_decision_doc,omitempty"`
+	// DecideBy is when a person's ticket should be decided by (#146): set by
+	// a person, or suggested by an agent. Only human tickets have one.
+	DecideBy *time.Time `json:"decide_by,omitempty"`
+	// DecideByEscalatedAt is when the escalation sweep acted on the current
+	// DecideBy; setting or clearing DecideBy resets it. Read from the row
+	// (the task actor does not track it).
+	DecideByEscalatedAt *time.Time `json:"-"`
 }
 
 // Display phases of an in-progress ticket (Task.Phase, AMP #2801). There is
@@ -497,6 +535,11 @@ type CreateTaskRequest struct {
 	// Performer: "agent" (default) or "human"; HumanReason with "human".
 	Performer   string `json:"performer,omitempty"`
 	HumanReason string `json:"human_reason,omitempty"`
+	// Ask: a judgment ticket's question and options. Input only: it renders
+	// the ticket's decision doc and is not stored on the ticket.
+	Ask *Ask `json:"ask,omitempty"`
+	// DecideBy: when a person's ticket should be decided by (#146).
+	DecideBy *time.Time `json:"decide_by,omitempty"`
 }
 
 type UpdateTaskRequest struct {
@@ -516,6 +559,12 @@ type UpdateTaskRequest struct {
 	Metadata MetadataPatch `json:"metadata,omitempty"`
 	// Clear names fields to blank (see TaskClearable); "" otherwise means keep.
 	Clear []string `json:"clear,omitempty"`
+	// Ask creates a judgment ticket's missing decision doc (input only; see
+	// CreateTaskRequest.Ask). Refused once the ticket has a doc.
+	Ask *Ask `json:"ask,omitempty"`
+	// DecideBy sets a person's ticket's decide-by date (#146); clear
+	// "decide_by" removes it.
+	DecideBy *time.Time `json:"decide_by,omitempty"`
 }
 
 type UpdateEpicRequest struct {
@@ -594,6 +643,14 @@ const (
 	EventEpicUpdated       EventType = "epic.updated"
 	EventStoryUpdated      EventType = "story.updated"
 	EventArtifactUpdated   EventType = "artifact.updated"
+	// EventReceiptUpdated: a verification receipt changed (#126); payload
+	// {task_id, receipt_id, status, held}, or {task_id, receipt_id,
+	// evidence_key} when an evidence upload finished (the status and hold
+	// aren't re-derived by an upload, so they are left out).
+	EventReceiptUpdated EventType = "receipt.updated"
+	// EventDecisionUpdated: a ticket's decision doc was written; payload
+	// {task_id, version}.
+	EventDecisionUpdated EventType = "decision.updated"
 )
 
 // AllEventTypes lists every event the hub publishes.
@@ -603,7 +660,7 @@ var AllEventTypes = []EventType{
 	EventStoryCreated, EventStoryStateChanged, EventStoryUpdated,
 	EventTaskCreated, EventTaskUpdated, EventTaskDispatched, EventTaskCompleted,
 	EventTaskBlocked, EventTaskUnblocked, EventTaskAssigned, EventCommentAdded,
-	EventArtifactUpdated,
+	EventArtifactUpdated, EventReceiptUpdated, EventDecisionUpdated,
 }
 
 type Event struct {
@@ -857,6 +914,9 @@ type Org struct {
 	Slug      string    `json:"slug"`
 	CreatedBy *int      `json:"created_by"`
 	CreatedAt time.Time `json:"created_at"`
+	// ReceiptsMode is the org's default verification receipts mode (#126):
+	// off (the default), inform or require.
+	ReceiptsMode string `json:"receipts_mode"`
 	// MyRole is the caller's role in the org ("" when not a member, e.g. a
 	// global admin browsing). Filled by list endpoints only.
 	MyRole string `json:"my_role,omitempty"`

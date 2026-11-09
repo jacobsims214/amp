@@ -27,6 +27,7 @@ import { RunRedirect, TicketRedirect } from './pages/TicketRedirect'
 import { RemoteProvider } from './remote/RemoteProvider'
 import { AuthProvider } from './contexts/AuthContext'
 import { AppShell } from './components/shell/AppShell'
+import { SessionEndedGate } from './components/shell/SessionEnded'
 import { LaunchSequence } from './components/brand/LaunchSequence'
 import { shouldLaunch } from './lib/launch'
 
@@ -53,6 +54,8 @@ export default function App() {
   const [launch] = useState(() => !window.location.pathname.startsWith('/sessions/') && shouldLaunch())
   return (
     <AuthProvider>
+      {/* Once oauth2-proxy ends the session, one sign-in prompt replaces the app (#153). */}
+      <SessionEndedGate>
       <RemoteProvider>
       {launch && <LaunchSequence />}
       <BrowserRouter>
@@ -95,6 +98,7 @@ export default function App() {
         </Routes>
       </BrowserRouter>
       </RemoteProvider>
+      </SessionEndedGate>
     </AuthProvider>
   )
 }

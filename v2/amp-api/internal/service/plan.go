@@ -118,7 +118,18 @@ func formatPath(path []int) string {
 // CreateTask creates a ticket in a story (its epic is the story's), after
 // checking its dependencies. The ticket's owner is resolved from ownerRef
 // as for ResolveNewTaskOwner. Warnings point out likely planning mistakes.
+//
+// A human ticket needs its brief (checkHumanBrief); a judgment ticket's ask
+// renders its decision doc once the ticket exists. If the doc can't be
+// written the ticket is still created, with DecisionDocWarning.
 func (s *Service) CreateTask(ctx context.Context, p authz.Principal, req domain.CreateTaskRequest, ownerRef string) (*domain.Task, []string, error) {
+	return s.createTask(ctx, p, req, ownerRef, false)
+}
+
+// createTask is CreateTask; deferDoc leaves the decision doc to the caller
+// (CreateTasks writes docs once the whole batch exists, so a doc lists the
+// batch tickets waiting on it).
+func (s *Service) createTask(ctx context.Context, p authz.Principal, req domain.CreateTaskRequest, ownerRef string, deferDoc bool) (*domain.Task, []string, error) {
 	story, err := s.Repo.GetStory(ctx, req.StoryID)
 	if err != nil || story.ProjectID != req.ProjectID {
 		return nil, nil, authz.BadRequest("story %d is not in project %d", req.StoryID, req.ProjectID)
@@ -130,11 +141,23 @@ func (s *Service) CreateTask(ctx context.Context, p authz.Principal, req domain.
 	if strings.TrimSpace(req.Name) == "" {
 		return nil, nil, authz.BadRequest("name is required")
 	}
+	if err := s.GuardReceiptsCreate(ctx, p, "story", story.ID, req.Metadata); err != nil {
+		return nil, nil, err
+	}
 	if req.DependencyIDs, err = s.ValidateDependencies(ctx, req.ProjectID, 0, req.DependencyIDs); err != nil {
 		return nil, nil, err
 	}
 	if req.Performer, req.HumanReason, err = domain.NormalizePerformer(req.Performer, req.HumanReason); err != nil {
 		return nil, nil, authz.BadRequest("%v", err)
+	}
+	if err := s.checkHumanBrief(p, req.Performer, req.Description, req.AcceptanceCriteria, req.HumanReason, req.Ask, ""); err != nil {
+		return nil, nil, err
+	}
+	if err := domain.CheckDecideBy(req.Performer, req.DecideBy); err != nil {
+		return nil, nil, authz.BadRequest("%v", err)
+	}
+	if err := s.checkSuggestedDecideBy(p, nil, req.DecideBy, false, time.Now()); err != nil {
+		return nil, nil, err
 	}
 	// merge_for names the ticket whose PR merge this person's step tracks
 	// (AMP #3009): checked before the ticket exists, so a bad link never
@@ -167,6 +190,9 @@ func (s *Service) CreateTask(ctx context.Context, p authz.Principal, req domain.
 		if err == nil && len(others) > 1 {
 			warnings = append(warnings, NoDependenciesWarning)
 		}
+	}
+	if req.Ask != nil && !deferDoc && !s.draftDecisionDoc(ctx, p, reply.Task, req.Ask) {
+		warnings = append(warnings, DecisionDocWarning)
 	}
 	return reply.Task, warnings, nil
 }
@@ -282,6 +308,9 @@ func (s *Service) MoveTask(ctx context.Context, p authz.Principal, taskID, story
 	if story.ID == t.StoryID {
 		return t, nil
 	}
+	if err := s.GuardReceiptsMoveTask(ctx, p, t, story); err != nil {
+		return nil, err
+	}
 	pid, err := s.Registry.Get(t.ProjectID)
 	if err != nil {
 		return nil, err
@@ -304,6 +333,9 @@ func (s *Service) MoveStory(ctx context.Context, p authz.Principal, storyID, epi
 	}
 	if epic.ID == story.EpicID {
 		return story, nil
+	}
+	if err := s.GuardReceiptsMoveStory(ctx, p, story, epic); err != nil {
+		return nil, err
 	}
 	pid, err := s.Registry.Get(story.ProjectID)
 	if err != nil {
@@ -490,6 +522,7 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 		r.ApproveURL = s.PlanURL(projectID)
 	}
 	stuck := planGraph(r, tasks, stories)
+	s.planHumanBriefs(ctx, r, projectID, tasks)
 
 	// Metadata drift: epics missing keys most of their sibling epics carry
 	// (e.g. capitalizable, jira_epic), often under a near-miss name instead.
@@ -605,6 +638,48 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 			countNoun(n, "ticket", "tickets"), pick(n, "its", "their"), pick(n, "it is", "they are"), joinIDs(stuck))
 	}
 	return r, nil
+}
+
+// planHumanBriefs warns about open human tickets without a brief written
+// for their person (human_without_brief), and open judgment tickets with no
+// decision doc (judgment_without_doc). Both are warnings: existing plans
+// aren't frozen by the brief rule.
+func (s *Service) planHumanBriefs(ctx context.Context, r *PlanReport, projectID int, tasks []domain.Task) {
+	var noBrief, noDoc []int
+	var docs map[int]bool
+	for _, t := range tasks {
+		if !t.IsHuman() || t.State == domain.TaskStateCompleted {
+			continue
+		}
+		if strings.TrimSpace(t.Description) == "" || strings.TrimSpace(t.AcceptanceCriteria) == "" {
+			noBrief = append(noBrief, t.ID)
+		}
+		if t.HumanReason == "judgment" {
+			if docs == nil {
+				var err error
+				if docs, err = s.Repo.DecisionDocTaskIDs(ctx, projectID); err != nil {
+					docs = map[int]bool{}
+				}
+			}
+			if !docs[t.ID] {
+				noDoc = append(noDoc, t.ID)
+			}
+		}
+	}
+	if len(noBrief) > 0 {
+		r.Issues = append(r.Issues, PlanIssue{
+			Kind: "human_without_brief", Severity: "warn", TaskIDs: noBrief,
+			Message: fmt.Sprintf("%d human ticket(s) have no brief for the person who does them (description or acceptance criteria is empty): %s.", len(noBrief), joinIDs(noBrief)),
+			Fix:     "Write each one's description (what the person must do, written for them) and acceptance criteria (what done means) with amp_update_task.",
+		})
+	}
+	if len(noDoc) > 0 {
+		r.Issues = append(r.Issues, PlanIssue{
+			Kind: "judgment_without_doc", Severity: "warn", TaskIDs: noDoc,
+			Message: fmt.Sprintf("%d judgment ticket(s) have no decision doc, so their owner gets no question or options to choose from: %s.", len(noDoc), joinIDs(noDoc)),
+			Fix:     "Give each an ask with amp_update_task (question, 2 to 4 options with consequences, a recommended option and why); AMP drafts its decision doc from it.",
+		})
+	}
 }
 
 // planGraph adds to r what the dependency graph of tasks (a whole project's
@@ -943,6 +1018,10 @@ type TaskSpec struct {
 	Metadata           domain.Metadata
 	Performer          string
 	HumanReason        string
+	// Ask: a judgment ticket's question and options (input only).
+	Ask *domain.Ask
+	// DecideBy: a person's ticket's decide-by date (#146).
+	DecideBy *time.Time
 }
 
 // HumanNeedsOwner refuses a human ticket nobody would do.
@@ -954,6 +1033,8 @@ type CreatedTask struct {
 	ID           int    `json:"id"`
 	State        string `json:"state"`
 	Dependencies []int  `json:"dependency_ids"`
+	// DecisionDoc: its ask rendered its decision doc.
+	DecisionDoc bool `json:"decision_doc,omitempty"`
 }
 
 // CreateTasks creates a batch of tickets with their dependency graph in one
@@ -985,6 +1066,15 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 		}
 		if o := strings.ToLower(strings.TrimSpace(sp.Owner)); perf == domain.PerformerHuman && (o == "none" || o == "unassigned") {
 			return nil, nil, authz.BadRequest("%q: %s", ref, HumanNeedsOwner)
+		}
+		if err := s.checkHumanBrief(p, perf, sp.Description, sp.AcceptanceCriteria, reason, sp.Ask, ref); err != nil {
+			return nil, nil, err
+		}
+		if err := domain.CheckDecideBy(perf, sp.DecideBy); err != nil {
+			return nil, nil, authz.BadRequest("%q: %v", ref, err)
+		}
+		if err := s.checkSuggestedDecideBy(p, nil, sp.DecideBy, false, time.Now()); err != nil {
+			return nil, nil, authz.BadRequest("%q: %v", ref, err)
 		}
 		specs[i].Performer, specs[i].HumanReason = perf, reason
 	}
@@ -1103,6 +1193,7 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 
 	ids := make([]int, len(specs))
 	out := make([]CreatedTask, len(specs))
+	tasks := make([]*domain.Task, len(specs))
 	for _, i := range order {
 		sp := specs[i]
 		deps := append([]int(nil), idDeps[i]...)
@@ -1125,12 +1216,12 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 				}
 			}
 		}
-		t, _, err := s.CreateTask(ctx, p, domain.CreateTaskRequest{
+		t, _, err := s.createTask(ctx, p, domain.CreateTaskRequest{
 			ProjectID: projectID, StoryID: sp.StoryID, Name: sp.Name, Description: sp.Description,
 			AcceptanceCriteria: sp.AcceptanceCriteria, Priority: sp.Priority, AssignedTo: sp.AssignedTo,
 			DependencyIDs: deps, StartAt: sp.StartAt, Metadata: meta,
-			Performer: sp.Performer, HumanReason: sp.HumanReason,
-		}, sp.Owner)
+			Performer: sp.Performer, HumanReason: sp.HumanReason, Ask: sp.Ask, DecideBy: sp.DecideBy,
+		}, sp.Owner, true)
 		if err != nil {
 			var made []string
 			for _, c := range out {
@@ -1142,9 +1233,21 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 		}
 		ids[i] = t.ID
 		out[i] = CreatedTask{Ref: sp.Ref, ID: t.ID, State: string(t.State), Dependencies: t.DependencyIDs}
+		tasks[i] = t
 	}
 
 	var warnings []string
+	// Decision docs last, so each lists the batch tickets that wait on it.
+	for i, sp := range specs {
+		if sp.Ask == nil {
+			continue
+		}
+		if s.draftDecisionDoc(ctx, p, tasks[i], sp.Ask) {
+			out[i].DecisionDoc = true
+		} else {
+			warnings = append(warnings, fmt.Sprintf("%q: %s", sp.Ref, DecisionDocWarning))
+		}
+	}
 	if len(specs) > 1 {
 		var loose []string
 		for i, sp := range specs {
@@ -1266,6 +1369,10 @@ func (s *Service) deleteTickets(ctx context.Context, p authz.Principal, projectI
 	if err := s.guardDeletedHumanGates(ctx, p, projectID, ids); err != nil {
 		return nil, err
 	}
+	// Off the web UI, a held ticket isn't deleted: it waits for a person (#126).
+	if err := s.refuseIfAnyHeld(ctx, p, ids, "task.delete"); err != nil {
+		return nil, err
+	}
 	dependents, err := s.Repo.Dependents(ctx, ids)
 	if err != nil {
 		return nil, err
@@ -1292,6 +1399,10 @@ func (s *Service) deleteTickets(ctx context.Context, p authz.Principal, projectI
 	}
 	s.Registry.System().Root.Send(pid, msg)
 	actor.Await(ctx, replyCh)
+	// Deleted tickets wait on nobody (#126).
+	if err := s.Repo.ClearTasksHeld(ctx, ids); err != nil {
+		slog.Warn("clear held receipts on delete", "task_ids", ids, "err", err)
+	}
 	s.ReconcileDependents(ctx, projectID, dependents, ids)
 	var kept []int
 	gone := map[int]bool{}

@@ -66,7 +66,12 @@ export function DependencyPicker({ tasks, selfId, value, onChange, disabled, onO
           <div className="flex items-center gap-1.5">
             <Plus size={12} className="text-ink-3" />
             <input value={query} onChange={e => setQuery(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter' && matches[0]) { e.preventDefault(); onChange([...value, matches[0].id]); setQuery('') } }}
+              onKeyDown={e => {
+                // Enter with a query picks the first match, or does nothing: it never saves the dialog around it.
+                if (e.key !== 'Enter' || !query.trim()) return
+                e.preventDefault()
+                if (matches[0]) { onChange([...value, matches[0].id]); setQuery('') }
+              }}
               placeholder="Add a ticket it waits on (name or #id)…"
               className="flex-1 bg-bg border border-line rounded-lg px-2.5 py-1.5 text-xs text-ink placeholder-ink-3 focus:outline-none focus:border-primary" />
           </div>

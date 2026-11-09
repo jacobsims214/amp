@@ -1,7 +1,7 @@
 /**
  * Helpers for HumanActions (components/human/HumanActions.tsx): which action a
  * ticket asks of a person, the kinds' labels and colours, and a done ticket's
- * merge status line (KB decisions/human-work-ux.md §2, §4, §5), and the one
+ * merge status line (v2/kb/working/human-work.md), and the one
  * line that says what a My work item needs from the person (needsLine).
  *
  * The Merge card's copy (why it's shown, where the target came from) lives in
@@ -9,7 +9,7 @@
  */
 import type { Task, WaitItem, WaitKind } from '../types'
 
-export type ActionKind = Exclude<WaitKind, 'approve'>
+export type ActionKind = Exclude<WaitKind, 'approve' | 'verify'>
 
 /** What a ticket asks of a person now, from the ticket alone (the drawer has no WaitItem). */
 export function actionKindOf(t: Pick<Task, 'state' | 'block_reason' | 'performer' | 'merge_state'>): ActionKind | null {
@@ -19,9 +19,9 @@ export function actionKindOf(t: Pick<Task, 'state' | 'block_reason' | 'performer
   return null
 }
 
-export const KIND_LABEL: Record<WaitKind, string> = { approve: 'Approve', answer: 'Answer', merge: 'Merge', start: 'Start', do: 'Do' }
+export const KIND_LABEL: Record<WaitKind, string> = { approve: 'Approve', answer: 'Answer', verify: 'Verify', merge: 'Merge', start: 'Start', do: 'Do' }
 export const KIND_COLOR: Record<WaitKind, string> = {
-  approve: 'var(--violet)', answer: 'var(--st-flag)', merge: 'var(--teal)', start: 'var(--warning)', do: 'var(--ink)',
+  approve: 'var(--violet)', answer: 'var(--st-flag)', verify: 'var(--warning)', merge: 'var(--teal)', start: 'var(--warning)', do: 'var(--ink)',
 }
 
 /**
@@ -99,6 +99,8 @@ export function needsLine(it: WaitItem & { task?: Pick<Task, 'description' | 'ac
       const waiting = it.holding_up?.length ?? 0
       return `Merge ${what}${waiting ? `, ${plural(waiting, 'ticket')} wait${waiting === 1 ? 's' : ''}` : ''}`
     }
+    case 'verify':
+      return `Couldn't verify #${it.task_id}${it.hold_reason ? `: ${it.hold_reason}` : ''}. Accept or reject it on the ticket`
     case 'start':
       return `Launch its run, or return #${it.task_id} to ready`
     case 'do': {

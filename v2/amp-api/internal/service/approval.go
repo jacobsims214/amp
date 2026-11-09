@@ -3,8 +3,11 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/mail"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/authz"
@@ -31,7 +34,7 @@ func (s *Service) link(path string) string {
 
 // PlanURL is where a person approves the plan: the project's My work tab
 // with the Approve view open on everything awaiting them (KB
-// decisions/human-work-ux.md: approval happens only in My work). Callers keep
+// v2/kb/working/human-work.md: approval happens only in My work). Callers keep
 // returning it as approve_url / plan_url; the old /project/:id/plan link still
 // works, because Flight plan links on to My work.
 func (s *Service) PlanURL(projectID int) string {
@@ -94,16 +97,47 @@ func (s *Service) approvalGate(ctx context.Context, p authz.Principal, t *domain
 // somebody other than the worker, or of a ticket no worker started, is
 // allowed but recorded as a closeout with the caller's reason. Human
 // tickets go through CompleteHumanTask.
+//
+// In a project that requires verification receipts (#126), a completion
+// below the minimum is held for a person instead (Closeout.Held): the
+// ticket stays as it was and its receipt says why.
 func (s *Service) CompleteTask(ctx context.Context, p authz.Principal, taskID int) (*domain.Task, error) {
-	t, _, err := s.CompleteTaskWithRun(ctx, p, taskID, nil, CompleteClaim{})
+	t, _, err := s.CompleteTaskReceipt(ctx, p, taskID)
 	return t, err
 }
 
+// CompleteTaskReceipt is CompleteTask that also says whether the
+// completion was held, and why.
+func (s *Service) CompleteTaskReceipt(ctx context.Context, p authz.Principal, taskID int) (*domain.Task, Closeout, error) {
+	t, closed, err := s.CompleteTaskWithReceipt(ctx, p, taskID, nil, CompleteClaim{}, nil)
+	if err != nil {
+		return nil, closed, err
+	}
+	s.FinalizeReceipt(ctx, p, taskID, nil, closed)
+	return t, closed, nil
+}
+
 // Closeout is what a completion recorded beyond the ticket: whether it was
-// a closeout (the caller wasn't the ticket's worker) and why.
+// a closeout (the caller wasn't the ticket's worker) and why; whether this
+// call moved the ticket into completed (not a repeat); and whether Require
+// held it for a person instead (#126), and why.
 type Closeout struct {
-	Closeout bool   `json:"closeout"`
-	Reason   string `json:"-"`
+	Closeout   bool   `json:"closeout"`
+	Reason     string `json:"-"`
+	Completed  bool   `json:"-"`
+	Held       bool   `json:"-"`
+	HoldReason string `json:"-"`
+	// plan is the completion's receipt, for FinalizeReceipt (nil: none).
+	plan *receiptPlan
+}
+
+// ReceiptStatus is the status the completion's receipt derives ("" when it
+// recorded none).
+func (c Closeout) ReceiptStatus() string {
+	if c.plan == nil {
+		return ""
+	}
+	return c.plan.status
 }
 
 // checkAgentCompletion applies the off-UI completion rules to agent ticket
@@ -217,8 +251,7 @@ func (s *Service) sendCompleteMerge(ctx context.Context, p authz.Principal, t *d
 	// A closeout of a ticket that isn't in progress is the one completion the
 	// actor would otherwise refuse off the UI: its prior work is what makes it
 	// one, and checkAgentCompletion has read it (AMP #2801).
-	closeoutOK := offUI && t.State != domain.TaskStateCompleted && !t.IsHuman() &&
-		t.State != domain.TaskStateInProgress && !(t.State == domain.TaskStateBlocked && hasOpenQuestion(t))
+	closeoutOK := s.closeoutOK(t, offUI)
 	if err := s.Registry.Send(t.ProjectID, &actor.MsgCompleteTask{
 		TaskID: t.ID, By: p.UserRef(), ByName: p.Label(), RequireStarted: offUI, RequireDeps: offUI,
 		MergeRequired: mergeRequired, MergeWhere: mergeWhere, DispatchID: dispatchID, CloseoutReason: closeoutReason,
@@ -231,6 +264,13 @@ func (s *Service) sendCompleteMerge(ctx context.Context, p authz.Principal, t *d
 		return reply, &authz.Error{Status: 409, Msg: reply.Err.Error()}
 	}
 	return reply, nil
+}
+
+// closeoutOK reports whether an off-UI completion of t that isn't in
+// progress may go through as a closeout (see sendCompleteMerge).
+func (s *Service) closeoutOK(t *domain.Task, offUI bool) bool {
+	return offUI && t.State != domain.TaskStateCompleted && !t.IsHuman() &&
+		t.State != domain.TaskStateInProgress && !(t.State == domain.TaskStateBlocked && hasOpenQuestion(t))
 }
 
 // SetTaskState overrides a ticket's state (amp_set_task_state). A person in
@@ -249,30 +289,70 @@ func (s *Service) SetTaskState(ctx context.Context, p authz.Principal, taskID in
 // the worker setting its own ticket's state, so a move to completed is the
 // worker's rather than a closeout (AMP #2801). Every other caller passes "".
 func (s *Service) SetTaskStateAs(ctx context.Context, p authz.Principal, taskID int, state domain.TaskState, reason, dispatchID string) (*domain.Task, error) {
+	t, _, err := s.SetTaskStateHeld(ctx, p, taskID, state, reason, dispatchID)
+	return t, err
+}
+
+// SetTaskStateHeld is SetTaskStateAs that also reports whether a move to
+// completed was held for a person instead (#126).
+func (s *Service) SetTaskStateHeld(ctx context.Context, p authz.Principal, taskID int, state domain.TaskState, reason, dispatchID string) (*domain.Task, bool, error) {
 	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskWork)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	// "scheduled:" is the reason the scheduler writes; a ticket is scheduled
 	// with amp_set_task_start_at, never by setting the reason by hand (that
 	// would also hide a question as a schedule).
 	if state == domain.TaskStateBlocked && strings.HasPrefix(strings.TrimSpace(reason), "scheduled:") {
-		return nil, authz.BadRequest("ticket %d: a block reason can't start with \"scheduled:\"; schedule a ticket with amp_set_task_start_at", taskID)
+		return nil, false, authz.BadRequest("ticket %d: a block reason can't start with \"scheduled:\"; schedule a ticket with amp_set_task_start_at", taskID)
+	}
+	// A held ticket waits for a person: off the web UI it isn't moved at all,
+	// back to ready and to completed included (#126).
+	if err := s.RefuseIfHeld(ctx, p, t, "task.state"); err != nil {
+		return nil, false, err
 	}
 	requireStarted, err := s.offUIStateGate(ctx, p, t, state, reason, dispatchID)
 	if err != nil {
 		s.auditTaskDenied(ctx, p, "task.state", t, err, map[string]any{"to": string(state)})
-		return nil, err
+		return nil, false, err
+	}
+	// Completing it records its receipt, and under Require one below the
+	// minimum holds it for a person instead (#126).
+	var plan *receiptPlan
+	if state == domain.TaskStateCompleted {
+		if plan, err = s.prepareReceipt(ctx, p, t, &ReceiptIn{DispatchID: dispatchID}); err != nil {
+			return nil, false, err
+		}
+	}
+	if plan != nil && plan.hold {
+		completed, err := s.holdCompletion(ctx, p, t, actor.MsgCompleteTask{RequireStarted: requireStarted, RequireDeps: !p.InUI(),
+			DispatchID: dispatchID}, plan)
+		if err != nil {
+			return nil, false, err
+		}
+		s.FinalizeReceipt(ctx, p, taskID, nil, Closeout{Held: !completed, Completed: completed, HoldReason: plan.reason, plan: plan})
+		cur, err := s.Repo.GetTask(ctx, taskID)
+		return cur, !completed, err
 	}
 	replyCh := make(chan actor.ReplySimple, 1)
 	if err := s.Registry.Send(t.ProjectID, &actor.MsgSetTaskState{
 		TaskID: taskID, State: state, Reason: reason, By: p.UserRef(), ByName: p.Label(),
 		RequireStarted: requireStarted, RequireDeps: !p.InUI(), DispatchID: dispatchID, InUI: p.InUI(), ReplyCh: replyCh,
 	}); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
-		return nil, &authz.Error{Status: 409, Msg: reply.Err.Error()}
+	reply := actor.Await(ctx, replyCh)
+	if reply.Err != nil {
+		return nil, false, &authz.Error{Status: 409, Msg: reply.Err.Error()}
+	}
+	if plan != nil && reply.Changed {
+		s.FinalizeReceipt(ctx, p, taskID, nil, Closeout{Completed: true, plan: plan})
+	} else if state != t.State {
+		// Moved by hand: a held ticket isn't waiting on a person any more
+		// (#126). A no-op "change" to the state it already has keeps it held.
+		if err := s.Repo.ClearTaskHeld(ctx, taskID); err != nil {
+			slog.Warn("clear held receipts", "task_id", taskID, "err", err)
+		}
 	}
 	if t.State == domain.TaskStateCompleted && state != domain.TaskStateCompleted {
 		// Reopened: the tickets after it re-read their dependencies, so none
@@ -285,7 +365,7 @@ func (s *Service) SetTaskStateAs(ctx context.Context, p authz.Principal, taskID 
 	if t.State != domain.TaskStateCompleted && state == domain.TaskStateCompleted {
 		// Done by this state change, not by a completion: it may have freed a
 		// linked merge step held by exactly this ticket (AMP #3009), the same
-		// way CompleteTaskWithRun does. A ticket that still waits on its own
+		// way CompleteTaskWithReceipt does. A ticket that still waits on its own
 		// merge holds its dependents, so this fires only when it holds nothing.
 		if cur, err := s.Repo.GetTask(ctx, taskID); err == nil && !domain.MergeGates(cur.MergeState) {
 			s.retriggerMergeStepsAfter(ctx, p, taskID)
@@ -293,10 +373,10 @@ func (s *Service) SetTaskStateAs(ctx context.Context, p authz.Principal, taskID 
 	}
 	// The actor may have kept it blocked on its dependencies.
 	if cur, err := s.Repo.GetTask(ctx, taskID); err == nil {
-		return cur, nil
+		return cur, false, nil
 	}
 	t.State = state
-	return t, nil
+	return t, false, nil
 }
 
 // offUIStateGate applies SetTaskState's rules for callers off the web UI
@@ -401,31 +481,136 @@ func (s *Service) checkRunOutcome(p authz.Principal, t *domain.Task, outcome str
 // person's ticket done without them. Agent work may become a person's ticket
 // from anywhere. The task actor re-checks atomically, and a refusal leaves
 // the ticket unchanged. Other actor errors come back as 400.
-func (s *Service) UpdateTask(ctx context.Context, p authz.Principal, t *domain.Task, req domain.UpdateTaskRequest) error {
+//
+// The brief rule (checkHumanBrief) runs only when the edit makes the ticket
+// human or judgment, or clears a brief field of a human ticket, so legacy
+// tickets stay editable. ask creates a judgment ticket's missing decision
+// doc; once it has one, ask is refused. The warnings say when the doc could
+// not be written (the rest of the edit is kept).
+func (s *Service) UpdateTask(ctx context.Context, p authz.Principal, t *domain.Task, req domain.UpdateTaskRequest) ([]string, error) {
 	req.TaskID = t.ID
 	// A merge_for link set here is checked against the ticket as the edit
 	// leaves it (performer included), before anything is written (AMP #3009).
 	if err := s.checkTaskMergeFor(ctx, t, req); err != nil {
-		return err
+		return nil, err
+	}
+	if err := s.checkUpdateBrief(ctx, p, t, req); err != nil {
+		return nil, err
+	}
+	clearsDecideBy := slices.ContainsFunc(req.Clear, func(c string) bool { return strings.EqualFold(strings.TrimSpace(c), "decide_by") })
+	if err := s.checkSuggestedDecideBy(p, t, req.DecideBy, clearsDecideBy, time.Now()); err != nil {
+		return nil, err
+	}
+	if err := s.GuardReceiptsUpdate(ctx, p, "task", t.ID, req.Metadata); err != nil {
+		return nil, err
 	}
 	keepHuman := ""
 	if !p.InUI() {
 		refusal := authz.UIOnly(fmt.Sprintf("Switching ticket %d (a person's ticket) to agent work", t.ID), s.TaskURL(t.ProjectID, t.ID))
 		if t.IsHuman() && strings.EqualFold(strings.TrimSpace(req.Performer), domain.PerformerAgent) {
-			return refusal
+			return nil, refusal
 		}
 		keepHuman = refusal.Error()
 	}
+	// The decide-by rule is re-checked by the task actor against the ticket
+	// as it is when written: only its person (the owner, in the web UI; anyone
+	// with auth off) moves or removes a date it already has.
+	suggestOnly, person := "", 0
+	if (req.DecideBy != nil || clearsDecideBy) && !(p.InUI() && !p.HasUser()) {
+		suggestOnly = fmt.Sprintf("Ticket %d's decide-by date is its person's (the ticket's owner): you can suggest a date only on a ticket that has none", t.ID)
+		if p.InUI() {
+			person = p.UserID
+		}
+	}
 	replyCh := make(chan actor.ReplySimple, 1)
-	if err := s.Registry.Send(t.ProjectID, &actor.MsgUpdateTask{Req: req, KeepHuman: keepHuman, ReplyCh: replyCh}); err != nil {
-		return err
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgUpdateTask{Req: req, KeepHuman: keepHuman, By: p.UserRef(), ByName: p.Label(),
+		DecideBySuggestOnly: suggestOnly, DecideByPerson: person, ReplyCh: replyCh}); err != nil {
+		return nil, err
 	}
 	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 		if keepHuman != "" && reply.Err.Error() == keepHuman {
-			return &authz.Error{Status: 403, Msg: keepHuman}
+			return nil, &authz.Error{Status: 403, Msg: keepHuman}
 		}
-		return &authz.Error{Status: 400, Msg: reply.Err.Error()}
+		if suggestOnly != "" && reply.Err.Error() == suggestOnly {
+			return nil, &authz.Error{Status: 403, Msg: suggestOnly}
+		}
+		return nil, &authz.Error{Status: 400, Msg: reply.Err.Error()}
 	}
 	s.ReconcileMergeMetadata(ctx, p, t.ProjectID, req.Metadata)
-	return nil
+	var warnings []string
+	if req.Ask != nil {
+		updated, err := s.Repo.GetTask(ctx, t.ID)
+		if err != nil {
+			updated = t
+		}
+		if !s.draftDecisionDoc(ctx, p, updated, req.Ask) {
+			warnings = append(warnings, DecisionDocWarning)
+		}
+	}
+	return warnings, nil
+}
+
+// checkUpdateBrief applies the brief rule to t as req leaves it (see
+// UpdateTask), and refuses an ask on a ticket that already has its doc.
+func (s *Service) checkUpdateBrief(ctx context.Context, p authz.Principal, t *domain.Task, req domain.UpdateTaskRequest) error {
+	// The ticket as the actor will leave it (TaskActor.handleUpdate).
+	performer, reason := t.Performer, t.HumanReason
+	if req.Performer != "" || req.HumanReason != "" {
+		pf := req.Performer
+		if pf == "" {
+			pf = t.Performer
+		}
+		np, nr, err := domain.NormalizePerformer(pf, req.HumanReason)
+		if err != nil {
+			return nil // the actor refuses it
+		}
+		if np == domain.PerformerHuman && strings.TrimSpace(req.HumanReason) == "" && t.HumanReason != "" {
+			nr = t.HumanReason
+		}
+		performer, reason = np, nr
+	}
+	clr, err := domain.ParseClears(req.Clear, domain.TaskClearable)
+	if err != nil {
+		return nil // the actor refuses it
+	}
+	desc := clr.Apply("description", req.Description, t.Description)
+	criteria := clr.Apply("acceptance_criteria", req.AcceptanceCriteria, t.AcceptanceCriteria)
+
+	// Who does it, or why: a change to either would strand a decision doc.
+	changesKind := performer != t.Performer || reason != t.HumanReason
+	var doc *domain.DecisionDoc
+	if req.Ask != nil || changesKind || (performer == domain.PerformerHuman && reason == "judgment") {
+		if doc, err = s.Repo.GetDecisionDoc(ctx, t.ID); err != nil {
+			return err
+		}
+	}
+	if doc != nil && changesKind {
+		// The doc is recorded only by Record decision on a judgment
+		// ticket: once a ticket has one it stays a person's judgment
+		// ticket (no repurpose, D11).
+		return &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionKindRefusal, s.TaskURL(t.ProjectID, t.ID))}
+	}
+	if req.Ask != nil && doc != nil {
+		if doc.Claimed() {
+			return &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionRecordedRefusal, s.TaskURL(t.ProjectID, t.ID))}
+		}
+		return &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionOptionsRefusal, s.TaskURL(t.ProjectID, t.ID))}
+	}
+
+	becomesHuman := performer == domain.PerformerHuman && !t.IsHuman()
+	becomesJudgment := performer == domain.PerformerHuman && reason == "judgment" && (!t.IsHuman() || t.HumanReason != "judgment")
+	// A clear empties the brief only when the field had text: the UI sends
+	// clear for every blank field, so a legacy ticket with no brief stays
+	// editable.
+	clearsBrief := performer == domain.PerformerHuman &&
+		((clr["description"] && strings.TrimSpace(t.Description) != "") ||
+			(clr["acceptance_criteria"] && strings.TrimSpace(t.AcceptanceCriteria) != ""))
+	if req.Ask == nil && !becomesHuman && !becomesJudgment && !clearsBrief {
+		return nil // legacy tickets stay editable
+	}
+	if req.Ask == nil && doc != nil {
+		// Its doc already holds its options: only the brief is checked.
+		return s.checkHumanBrief(p, performer, desc, criteria, "", nil, "")
+	}
+	return s.checkHumanBrief(p, performer, desc, criteria, reason, req.Ask, "")
 }

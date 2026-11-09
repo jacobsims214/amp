@@ -1,7 +1,7 @@
 import type { MergeAlertKind, MergeClassifier, Metadata, MergeStepFold, Run, Task, WaitItem } from '../types'
 
 /**
- * The merge signal on a done ticket (#2475, decisions/human-work-ux.md §4).
+ * The merge signal on a done ticket (#2475, v2/kb/working/human-work.md).
  * needed: done with an unmerged PR or pushed branch; its dependents wait.
  * abandoned: the PR was closed without merging; its dependents still wait.
  * Null when there's nothing to show (no merge needed, merged, or not done).

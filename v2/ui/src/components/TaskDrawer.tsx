@@ -12,6 +12,7 @@ import { mismatchedRef, ticketPath, ticketRef } from '../lib/ticketRef'
 import { useProjectPlan, type ProjectPlan } from '../hooks/useProjectPlan'
 import { HumanActions } from './human/HumanActions'
 import { HumanWork } from './human/HumanWork'
+import { DecidedUpstream } from './human/DecidedUpstream'
 import { mergeStatusText } from '../lib/humanActions'
 import { effectiveMetadata, integrationBranch, mergedIntoIntegration, waitsForMerge } from '../lib/merge'
 import { api } from '../api/client'
@@ -26,13 +27,16 @@ import { ApprovalTag } from './ApprovalTag'
 import { ConfirmDeleteModal } from './ConfirmDeleteModal'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
 import { activityActor, canPlanTask, canTakeOverTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
-import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata, HumanReason, Run } from '../types'
+import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata, HumanReason, Run, TaskReceipt } from '../types'
 import { DependencyPicker } from './DependencyPicker'
 import { MetadataEditor } from './MetadataEditor'
 import { metadataPatch } from '../lib/metadata'
 import { Markdown } from './ui/Markdown'
 import { RunsPanel } from './RunsPanel'
 import { StoryContext } from './StoryContext'
+import { CompletionReceipt } from './receipt/CompletionReceipt'
+import { latestRunWith } from '../lib/receipt'
+import { useSSE } from '../hooks/useSSE'
 
 interface Props {
   task: Task | null
@@ -183,6 +187,35 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
     if (prev != null && prev !== lastId.current && (searchParams.has('tab') || searchParams.has('run') || searchParams.has('event') || searchParams.has('ref'))) patchParams({ tab: null, run: null, event: null, ref: null })
   }, [task?.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // The ticket's runs, read once and shared by the receipt, the merge panel and
+  // the merge-gate note. Reread when the ticket's state or merge state changes.
+  const [runsFor, setRunsFor] = useState<{ taskId: number; runs: Run[] } | null>(null)
+  useEffect(() => {
+    if (!task) return
+    const id = task.id
+    let live = true
+    api.taskRuns(id).then(r => { if (live) setRunsFor({ taskId: id, runs: r.runs }) })
+      .catch(() => { if (live) setRunsFor(prev => prev?.taskId === id ? prev : { taskId: id, runs: [] }) })
+    return () => { live = false }
+  }, [task?.id, task?.state, task?.merge_state]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The ticket's verification receipt (#126), for the receipt and the
+  // header's "Requires receipt". Reread on its state, and on receipt.updated.
+  const [receiptFor, setReceiptFor] = useState<{ taskId: number; data: TaskReceipt | null } | null>(null)
+  const [receiptTick, setReceiptTick] = useState(0)
+  const agentTicket = !!task && !isHuman(task)
+  useEffect(() => {
+    if (!task || !agentTicket) return
+    const id = task.id
+    let live = true
+    api.getTaskReceipt(id).then(r => { if (live) setReceiptFor({ taskId: id, data: r }) })
+      .catch(() => { if (live) setReceiptFor(prev => prev?.taskId === id ? prev : { taskId: id, data: null }) })
+    return () => { live = false }
+  }, [task?.id, task?.state, agentTicket, receiptTick]) // eslint-disable-line react-hooks/exhaustive-deps
+  useSSE(task?.project_id ?? null, e => {
+    if (e.type === 'receipt.updated' && (e.payload as { task_id?: number } | undefined)?.task_id === task?.id) setReceiptTick(n => n + 1)
+  })
+
   useEffect(() => {
     if (!task) return
     const id = task.id
@@ -206,13 +239,24 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   useEffect(() => {
     if (!task) return
     const onKey = (e: KeyboardEvent) => {
-      if (!isPage && e.key === 'Escape' && !editing && !showDeleteConfirm) onClose()
+      if (!isPage && e.key === 'Escape' && !e.defaultPrevented && !editing && !showDeleteConfirm) onClose() // a page stays; a dialog above took the key
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [task, editing, showDeleteConfirm, onClose, isPage])
 
   const handleEditSave = async () => {
+    // A person's ticket needs its brief. Checked like the server: when the
+    // edit makes it a person's ticket or empties a brief field, so a legacy
+    // ticket without one can still be edited.
+    if (editForm.performer === 'human') {
+      const becomesHuman = !isHuman(task!)
+      const cleared = (!editForm.description.trim() && !!task!.description?.trim()) || (!editForm.acceptance_criteria.trim() && !!task!.acceptance_criteria?.trim())
+      if ((becomesHuman || cleared) && (!editForm.description.trim() || !editForm.acceptance_criteria.trim())) {
+        setEditError("A person's ticket needs a description (what they must do) and acceptance criteria (what done means).")
+        return
+      }
+    }
     setEditSaving(true)
     setEditError(null)
     try {
@@ -254,6 +298,11 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   // Editing the plan (text, dependencies, story) is wider than working it.
   const canPlan = canPlanTask(task, meId, myAccess)
   const history = log?.taskId === task.id ? log : null
+  const runs = runsFor?.taskId === task.id ? runsFor.runs : null
+  const receipt = receiptFor?.taskId === task.id ? receiptFor.data : undefined
+  const requiresReceipt = !isHuman(task) && receipt?.settings?.mode === 'require'
+  // A completed agent ticket shows its Done and merge lines in the receipt.
+  const agentReceipt = task.state === 'completed' && !isHuman(task)
   const view = focusView(location.pathname)
   const ticketHref = (id: number) => isPage ? ticketPageLink(task.project_id, id) : projectLink(task.project_id, view, id)
   const fullPageHref = ticketPageLink(task.project_id, task.id, new URLSearchParams([...searchParams].filter(([k]) => ['tab', 'run', 'event', 'ref'].includes(k))).toString())
@@ -417,21 +466,35 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
               ))}</span>
             </div>
           ) : null}
-          {task.state === 'completed' && task.completed_at && (
+          {/* A completed agent ticket's Done and merge lines live in its receipt below. */}
+          {!agentReceipt && task.state === 'completed' && task.completed_at && (
             <div className="flex items-center gap-1.5 text-xs text-success">
               <CheckCircle2 size={11} />
               <span>Done {relativeTime(task.completed_at)}</span>
             </div>
           )}
-          {mergeStatusText(task) && (
+          {!agentReceipt && mergeStatusText(task) && (
             <div className="flex items-center gap-1.5 text-xs" data-testid="merge-status"
               style={{ color: task.merge_state === 'merged' ? 'var(--success-ink)' : 'var(--teal)' }}>
               <GitMerge size={11} aria-hidden="true" />
               <span>{mergeStatusText(task)}</span>
             </div>
           )}
-          <MergeGateNote task={task} />
+          {requiresReceipt && (
+            <div className="flex items-center gap-1.5 text-xs text-warning-ink" data-testid="requires-receipt"
+              title="This project requires a verification receipt: below its minimum, a completion waits for a person to accept it">
+              <ShieldCheck size={11} aria-hidden="true" />
+              <span>Requires receipt</span>
+            </div>
+          )}
+          <MergeGateNote task={task} runs={runs} />
         </div>
+
+        {/* Everything below the header scrolls as one: a human ticket's panel
+            (the decision card with its actions) can be taller than the
+            viewport, and nested scroll areas would leave its actions out of
+            reach. The tabs stay pinned while their body scrolls under them. */}
+        <div className="flex-1 min-h-0 overflow-y-auto" data-testid="drawer-body">
 
         {/* Dispatched to an agent that hasn't started it (AMP #2801) */}
         {isNotStarted(task) && (
@@ -463,9 +526,12 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
 
         {/* Done with an unmerged PR: Mark merged / Not needed (or Reopen when the PR was closed) */}
         {task.state === 'completed' && (task.merge_state === 'needed' || task.merge_state === 'abandoned') && (
-          <MergePanel key={`merge-${task.id}`} task={task} canWork={canWork}
+          <MergePanel key={`merge-${task.id}`} task={task} canWork={canWork} runs={runs}
             onChanged={t => { if (t && onTaskUpdated) onTaskUpdated(t); else onRefresh?.() }} />
         )}
+
+        {/* What people decided on the tickets this one depends on */}
+        <DecidedUpstream key={`decided-${task.id}`} taskId={task.id} projectId={task.project_id} dependencyIds={task.dependency_ids ?? []} ticketHref={ticketHref} />
 
         {/* A person's own ticket: they start and finish it here */}
         {showHumanWork && (
@@ -473,6 +539,11 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
             canPlan={canPlan} onEdit={() => { startEdit(); setTabParam('details') }} ticketHref={ticketHref}
             onChanged={t => { if (onTaskUpdated) onTaskUpdated(t); else onRefresh?.() }} />
         )}
+
+        {/* Receipt v0: who did it, where the code is, how it was checked */}
+        <CompletionReceipt key={`receipt-${task.id}`} task={task} runs={runs} comments={history?.comments ?? null}
+          receipt={receipt} canWork={canWork}
+          onChanged={() => { setReceiptTick(n => n + 1); onRefresh?.() }} />
 
         {/* Mockups, diagrams and documents published to this ticket */}
         <TicketArtifacts projectId={task.project_id} taskId={task.id} />
@@ -491,7 +562,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
         />
 
         {/* Tabs */}
-        <div className="flex border-b border-line">
+        <div className="flex border-b border-line sticky top-0 z-10 bg-surface" data-testid="drawer-tabs">
           {(['history', 'details'] as const).map(t => (
             <button
               key={t}
@@ -509,7 +580,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
         </div>
 
         {/* Content */}
-        <div className={`flex-1 p-6 ${isPage ? '' : 'overflow-y-auto'}`}>
+        <div className="p-6" data-testid="drawer-tab-body">
           {editing && canPlan ? (
             <div className="space-y-4">
               <div>
@@ -518,28 +589,32 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
                   className={inputCls} />
               </div>
               <div>
-                <label className="text-xs font-medium text-ink-2 block mb-1.5">Description</label>
-                <textarea value={editForm.description} onChange={e => setEditForm(f => ({ ...f, description: e.target.value }))}
-                  rows={4} className={`${inputCls} resize-none`} />
+                <label htmlFor="edit-description" className="text-xs font-medium text-ink-2 block mb-1.5">Description{editForm.performer === 'human' ? ' *' : ''}</label>
+                <textarea id="edit-description" value={editForm.description} onChange={e => setEditForm(f => ({ ...f, description: e.target.value }))}
+                  rows={4} className={`${inputCls} resize-none`} aria-required={editForm.performer === 'human'}
+                  placeholder={editForm.performer === 'human' ? 'What the person must do, written for them' : undefined} />
               </div>
               <div>
-                <label className="text-xs font-medium text-ink-2 block mb-1.5">Acceptance Criteria</label>
-                <textarea value={editForm.acceptance_criteria} onChange={e => setEditForm(f => ({ ...f, acceptance_criteria: e.target.value }))}
-                  rows={3} className={`${inputCls} resize-none`} />
+                <label htmlFor="edit-criteria" className="text-xs font-medium text-ink-2 block mb-1.5">Acceptance Criteria{editForm.performer === 'human' ? ' *' : ''}</label>
+                <textarea id="edit-criteria" value={editForm.acceptance_criteria} onChange={e => setEditForm(f => ({ ...f, acceptance_criteria: e.target.value }))}
+                  rows={3} className={`${inputCls} resize-none`} aria-required={editForm.performer === 'human'}
+                  placeholder={editForm.performer === 'human' ? 'What done means, one item per line' : undefined} />
               </div>
               <div>
                 <label htmlFor="edit-performer" className="text-xs font-medium text-ink-2 block mb-1.5">Done by</label>
-                <select id="edit-performer" value={editForm.performer} disabled={task.state === 'in_progress'}
+                <select id="edit-performer" value={editForm.performer} disabled={task.state === 'in_progress' || !!task.has_decision_doc}
                   onChange={e => setEditForm(f => ({ ...f, performer: e.target.value as 'agent' | 'human' }))} className={inputCls}>
                   <option value="agent">An agent</option>
                   <option value="human">A person: its owner does it in AMP</option>
                 </select>
-                {task.state === 'in_progress' && <p className="text-[11.5px] text-ink-3 mt-1">Finish or stop the work before changing who does it.</p>}
+                {task.has_decision_doc
+                  ? <p className="text-[11.5px] text-ink-3 mt-1">Its decision is in its doc: record it there, or plan a new judgment ticket.</p>
+                  : task.state === 'in_progress' && <p className="text-[11.5px] text-ink-3 mt-1">Finish or stop the work before changing who does it.</p>}
               </div>
               {editForm.performer === 'human' ? (
                 <div>
                   <label htmlFor="edit-reason" className="text-xs font-medium text-ink-2 block mb-1.5">Why a person</label>
-                  <select id="edit-reason" value={editForm.human_reason}
+                  <select id="edit-reason" value={editForm.human_reason} disabled={!!task.has_decision_doc}
                     onChange={e => setEditForm(f => ({ ...f, human_reason: e.target.value as HumanReason }))} className={inputCls}>
                     {HUMAN_REASONS.map(r => <option key={r.value} value={r.value}>{r.label}: {r.hint.toLowerCase()}</option>)}
                   </select>
@@ -580,6 +655,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
           ) : (
             <HistorySkeleton />
           )}
+        </div>
         </div>
       </div>
 
@@ -726,7 +802,7 @@ const NOT_RECORDED_HINT = 'AMP has no person on record for this: it predates AMP
  * Who approved this ticket's plan (#2198), and for whom when it wasn't their
  * own: "Approved by Lee on behalf of Bob · Oct 22". An open ticket whose plan
  * nobody approved says so. Approval happens only in My work (KB
- * decisions/human-work-ux.md §2), so the drawer never approves: for the
+ * v2/kb/working/human-work.md), so the drawer never approves: for the
  * person's own ticket it links there, "Awaiting your approval → My work".
  */
 export function ApprovalLine({ task, people, meId }: { task: Task; people: Map<number, Person>; meId?: number }) {
@@ -1114,16 +1190,9 @@ function MetaItem({ label, value }: { label: string; value: string }) {
 }
 
 /** A done ticket waiting on its merge: the PR from its latest run, Mark merged / Not needed, or Reopen. */
-function MergePanel({ task, canWork, onChanged }: { task: Task; canWork: boolean; onChanged: (t: Task | null) => void }) {
-  const [pr, setPr] = useState<{ url?: string; branch?: string }>({})
-  useEffect(() => {
-    let live = true
-    api.taskRuns(task.id).then(({ runs }) => {
-      const r = [...runs].reverse().find(x => x.pr_url || x.branch)
-      if (live && r) setPr({ url: r.pr_url, branch: r.branch })
-    }).catch(() => {})
-    return () => { live = false }
-  }, [task.id])
+function MergePanel({ task, canWork, runs, onChanged }: { task: Task; canWork: boolean; runs: Run[] | null; onChanged: (t: Task | null) => void }) {
+  const r = runs ? latestRunWith(runs) : undefined
+  const pr = { url: r?.pr_url, branch: r?.branch }
   return (
     <div className="px-6 py-4 border-b border-line grid gap-2" style={{ background: 'color-mix(in srgb, var(--teal) 6%, var(--surface))', boxShadow: 'inset 3px 0 0 var(--teal)' }}>
       <span className="amp-label" style={{ color: 'var(--teal)' }}>Merge</span>
@@ -1136,9 +1205,8 @@ function MergePanel({ task, canWork, onChanged }: { task: Task; canWork: boolean
 // a done ticket whose run went to the integration branch (its dependents
 // don't wait; the merge to main comes later), and a ticket that starts when its
 // dependencies are done without waiting for their merge (waits_for_merge: false).
-function MergeGateNote({ task }: { task: Task }) {
+function MergeGateNote({ task, runs }: { task: Task; runs: Run[] | null }) {
   const [inherited, setInherited] = useState<Metadata | undefined>()
-  const [runs, setRuns] = useState<Run[]>([])
   const meta = useMemo(() => effectiveMetadata(inherited, task.metadata), [inherited, task.metadata])
   const branch = integrationBranch(meta)
   const wantRuns = task.state === 'completed' && !!branch
@@ -1149,16 +1217,8 @@ function MergeGateNote({ task }: { task: Task }) {
     return () => { live = false }
   }, [task.id])
 
-  useEffect(() => {
-    if (!wantRuns) return
-    let live = true
-    api.taskRuns(task.id).then(r => { if (live) setRuns(r.runs) }).catch(() => {})
-    return () => { live = false }
-  }, [task.id, wantRuns, task.merge_state])
-
-  // Runs are only read while they matter; otherwise ignore any stale ones
-  // (derived here rather than reset with setState inside the effect).
-  const into = mergedIntoIntegration(task, meta, wantRuns ? runs : [])
+  // Runs only matter for a done ticket with an integration branch.
+  const into = mergedIntoIntegration(task, meta, wantRuns ? runs ?? [] : [])
   const noWait = !waitsForMerge(meta) && task.state !== 'completed' && task.dependency_ids.length > 0
   if (!into && !noWait) return null
   return (

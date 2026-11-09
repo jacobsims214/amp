@@ -17,7 +17,7 @@ import (
 	"github.com/simstech/amp-api/internal/service"
 )
 
-// Merge-needed signal (AMP #2475, KB decisions/human-work-ux.md §4).
+// Merge-needed signal (AMP #2475, v2/kb/working/human-work.md).
 
 // mergeChain makes build -> deploy as alice and returns their ids.
 func mergeChain(t *testing.T, w *rbacWorld, name string) (build, deploy int) {
@@ -339,7 +339,7 @@ func TestMerge_HumanTicketBridge(t *testing.T) {
 		map[string]any{"ref": "build", "story_id": float64(w.s.storyID), "name": "Build it"},
 		map[string]any{"ref": "next", "story_id": float64(w.s.storyID), "name": "Next step", "depends_on": []any{"build"}},
 		map[string]any{"ref": "merge", "story_id": float64(w.s.storyID), "name": "Merge the PR", "performer": "human",
-			"human_reason": "review", "owner": w.bob.Email},
+			"human_reason": "review", "owner": w.bob.Email, "description": "What the person does", "acceptance_criteria": "Done when it is done"},
 	}})
 	ids := map[string]int{}
 	for _, c := range res["created"].([]any) {
@@ -370,7 +370,7 @@ func TestMerge_HumanTicketBridge(t *testing.T) {
 
 	// A human ticket alone with a PR link (nothing produced it) isn't queued.
 	solo := alice.call(t, "amp_create_tasks", map[string]any{"project_id": float64(w.s.projectID), "tasks": []any{
-		map[string]any{"ref": "solo", "story_id": float64(w.s.storyID), "name": "Ship it", "performer": "human", "human_reason": "external", "owner": w.bob.Email},
+		map[string]any{"ref": "solo", "story_id": float64(w.s.storyID), "name": "Ship it", "performer": "human", "human_reason": "external", "owner": w.bob.Email, "description": "What the person does", "acceptance_criteria": "Done when it is done"},
 	}})
 	soloID := int(solo["created"].([]any)[0].(map[string]any)["id"].(float64))
 	soloPR := "https://git.example/acme/pull/" + uniq("solo")

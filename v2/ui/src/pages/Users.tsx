@@ -47,13 +47,19 @@ export function Users() {
   const [newLogin, setNewLogin] = useState({ email: '', name: '', password: '' })
   const [resetPassword, setResetPassword] = useState('')
 
+  const localDev = !!me?.local_dev
   const reload = useCallback(() => {
     Promise.allSettled([api.listUsers(), authAdminApi.listCredentials()]).then(([u, c]) => {
       if (u.status === 'fulfilled') { setUsers(u.value); setError(null) } else setError(String(u.reason?.message ?? u.reason))
       if (c.status === 'fulfilled') { setCredentials(c.value); setCredError(null) }
-      else { setCredentials(null); setCredError('The sign-in service didn\'t answer, so password sign-ins can\'t be listed or changed right now.') }
+      else {
+        setCredentials(null)
+        setCredError(localDev
+          ? 'Sign-in is off on this AMP (local mode), so there are no password sign-ins to list or change. Turn sign-in on (set OIDC_ISSUER_URL) to manage them.'
+          : 'The sign-in service didn\'t answer, so password sign-ins can\'t be listed or changed right now.')
+      }
     }).finally(() => setLoading(false))
-  }, [])
+  }, [localDev])
   useEffect(() => { if (isAdmin) reload() }, [isAdmin, reload])
 
   const selected = users.find(u => u.id === selectedId) ?? null

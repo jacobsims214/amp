@@ -145,10 +145,19 @@ func (r *Repo) GetUserByID(ctx context.Context, id int) (*domain.User, error) {
 
 // ---- Orgs ----
 
-const orgCols = `o.id, o.name, o.slug, o.created_by, o.created_at`
+const orgCols = `o.id, o.name, o.slug, o.created_by, o.created_at, o.receipts_mode`
 
 func scanOrg(row rowScanner, o *domain.Org) error {
-	return row.Scan(&o.ID, &o.Name, &o.Slug, &o.CreatedBy, &o.CreatedAt)
+	return row.Scan(&o.ID, &o.Name, &o.Slug, &o.CreatedBy, &o.CreatedAt, &o.ReceiptsMode)
+}
+
+// SetOrgReceiptsMode sets an org's default verification receipts mode (#126).
+func (r *Repo) SetOrgReceiptsMode(ctx context.Context, id int, mode string) error {
+	tag, err := r.db.Exec(ctx, `UPDATE orgs SET receipts_mode = $1 WHERE id = $2`, mode, id)
+	if err == nil && tag.RowsAffected() == 0 {
+		return fmt.Errorf("org %d: %w", id, ErrNotFound)
+	}
+	return err
 }
 
 // CreateOrg creates an org; ownerID, when set, becomes its first owner.
@@ -203,7 +212,7 @@ func (r *Repo) ListOrgs(ctx context.Context, userID *int) ([]domain.Org, error) 
 		return nil, err
 	}
 	return collect(rows, func(row rowScanner, o *domain.Org) error {
-		return row.Scan(&o.ID, &o.Name, &o.Slug, &o.CreatedBy, &o.CreatedAt, &o.MyRole)
+		return row.Scan(&o.ID, &o.Name, &o.Slug, &o.CreatedBy, &o.CreatedAt, &o.ReceiptsMode, &o.MyRole)
 	})
 }
 

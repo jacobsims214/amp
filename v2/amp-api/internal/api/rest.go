@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -46,6 +47,8 @@ import (
 //	POST /api/tasks/:id/dispatch
 //	POST /api/tasks/:id/start      (a person starts their human ticket)
 //	POST /api/tasks/:id/complete
+//	GET  /api/tasks/:id/receipt, /receipts; POST /api/tasks/:id/receipt/accept|reject (receipts.go)
+//	GET  /api/projects/:id/receipts/summary (receipts.go)
 //	POST /api/tasks/:id/start_at
 //	GET  /api/runs/:id            a run, with its ticket's task_id, project_id, ref and url (404 when not visible)
 //	GET  /api/events              ← SSE stream (only events for projects you can see)
@@ -79,7 +82,11 @@ type RestHandler struct {
 }
 
 func NewRestHandler(registry *actor.Registry, repo *repository.Repo, h *hub.Hub, kbSvc *kb.Service) *RestHandler {
-	return &RestHandler{registry: registry, repo: repo, hub: h, kb: kbSvc, svc: service.New(repo, registry, kbSvc)}
+	svc := service.New(repo, registry, kbSvc)
+	if h != nil {
+		svc.Notify = h.Publish
+	}
+	return &RestHandler{registry: registry, repo: repo, hub: h, kb: kbSvc, svc: svc}
 }
 
 // principal resolves the caller, writing the error response if it can't.
@@ -155,6 +162,11 @@ func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("/api/trace/merged", h.traceMerged)
 	mux.HandleFunc("/api/metadata/", h.metadata)
 	mux.HandleFunc("/api/artifacts/", h.artifactSub)
+	mux.HandleFunc(ReceiptEvidencePrefix, h.receiptEvidence)
+	// Receipt evidence uploads: no session, the one-time token in the path
+	// is the credential (main leaves this prefix out of the auth
+	// middleware, #126).
+	mux.mux.HandleFunc(ReceiptUploadPrefix, h.receiptUpload)
 	// GitHub's deliveries: no AMP session, authenticated by their HMAC
 	// signature only (main leaves this prefix out of the auth middleware).
 	mux.mux.HandleFunc(GitHubHookPrefix, h.githubHook)
@@ -163,7 +175,8 @@ func (h *RestHandler) register(mux *deniedMux) {
 // ---- /api/me ----
 // Returns the caller's identity as resolved by the auth middleware.
 // Always 200 — when auth is disabled (local dev) this returns the
-// anonymous "local-dev" identity so the UI doesn't need special-casing.
+// "local-dev" identity (an AMP admin user once provisioned, #124) with
+// local_dev: true, so the UI doesn't need special-casing.
 func (h *RestHandler) me(w http.ResponseWriter, r *http.Request) {
 	ident, ok := auth.FromContext(r.Context())
 	if !ok {
@@ -209,7 +222,10 @@ func (h *RestHandler) me(w http.ResponseWriter, r *http.Request) {
 		resp["teams"] = teams
 	}
 	if ident.LocalDev {
+		// Auth is off: the Local Dev user, an admin (provisioned at
+		// startup, #124). local_dev lets the UI say sign-in is off.
 		resp["roles"] = []string{domain.RoleAdmin}
+		resp["local_dev"] = true
 	}
 	// What this AMP and the caller's orgs let the UI offer (additive: an old
 	// UI ignores it; a UI talking to an old API treats it as unavailable).
@@ -521,6 +537,10 @@ func (h *RestHandler) projects(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.OrgID, req.TeamID, req.CreatedBy = home.OrgID, home.TeamID, home.CreatedBy
+		if err := h.svc.GuardReceiptsNewProject(r.Context(), pr, req.OrgID, req.Metadata); err != nil {
+			fail(w, err, 400)
+			return
+		}
 		p, err := h.repo.CreateProject(r.Context(), req)
 		if err != nil {
 			fail(w, err, 500)
@@ -568,6 +588,8 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Off the web UI, receipts keys aren't imported (#126).
+		h.svc.StripImportedReceipts(pr, &bundle)
 		// Call ImportBundle to create the project hierarchy
 		newProject, err := h.repo.ImportBundle(r.Context(), bundle, newCode, newName, home)
 		if err != nil {
@@ -642,6 +664,10 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch parts[1] {
+	case "receipts":
+		h.projectReceiptSummary(w, r, pr, projectID, parts)
+		return
+
 	case "day-reports":
 		// GET ?date=YYYY-MM-DD&tz=…: everyone on the project and the report
 		// they saved for the day, narrowed to this project (the standup sheet).
@@ -893,7 +919,12 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			fail(w, authz.Forbidden("resetting a project requires project owner access"), 403)
 			return
 		}
-		// 1. Wipe postgres
+		// 1. Wipe postgres. Receipts have no FK to tasks: they and their
+		// evidence go first (#126).
+		if err := h.svc.DeleteProjectReceipts(r.Context(), projectID); err != nil {
+			jsonErr(w, err, 500)
+			return
+		}
 		if err := h.repo.ResetProject(r.Context(), projectID); err != nil {
 			jsonErr(w, err, 500)
 			return
@@ -1045,6 +1076,10 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			}
 			req.ProjectID = projectID
 			req.CreatedBy = pr.UserRef()
+			if err := h.svc.GuardReceiptsCreate(r.Context(), pr, "project", projectID, req.Metadata); err != nil {
+				fail(w, err, 400)
+				return
+			}
 			// Route through ProjectActor so EpicActor is spawned.
 			pid, err := h.registry.Get(projectID)
 			if err != nil {
@@ -1107,6 +1142,9 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				fail(w, err, 500)
 				return
+			}
+			if req.Ask != nil && !slices.Contains(warnings, service.DecisionDocWarning) {
+				h.publishDecision(task.ProjectID, task.ID, 1)
 			}
 			jsonOK(w, struct {
 				*domain.Task
@@ -1178,6 +1216,10 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			req.EpicID = epicID
+			if err := h.svc.GuardReceiptsUpdate(r.Context(), pr, "epic", epicID, req.Metadata); err != nil {
+				fail(w, err, 400)
+				return
+			}
 			if err := h.sendUpdate(epic.ProjectID, &actor.MsgUpdateEpic{Req: req, ReplyCh: make(chan actor.ReplySimple, 1)}); err != nil {
 				jsonErr(w, err, 400)
 				return
@@ -1232,6 +1274,10 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 			req.EpicID = epicID
 			req.ProjectID = epic.ProjectID
 			req.CreatedBy = pr.UserRef()
+			if err := h.svc.GuardReceiptsCreate(r.Context(), pr, "epic", epicID, req.Metadata); err != nil {
+				fail(w, err, 400)
+				return
+			}
 			// Route through ProjectActor → EpicActor so StoryActor is spawned.
 			pid, err := h.registry.Get(epic.ProjectID)
 			if err != nil {
@@ -1324,6 +1370,10 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.StoryID = storyID
+		if err := h.svc.GuardReceiptsUpdate(r.Context(), pr, "story", storyID, req.Metadata); err != nil {
+			fail(w, err, 400)
+			return
+		}
 		if err := h.sendUpdate(story.ProjectID, &actor.MsgUpdateStory{Req: req, ReplyCh: make(chan actor.ReplySimple, 1)}); err != nil {
 			jsonErr(w, err, 400)
 			return
@@ -1425,16 +1475,24 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			// Off the web UI, a person's ticket isn't switched to agent work.
-			if err := h.svc.UpdateTask(r.Context(), pr, task, req); err != nil {
+			warnings, err := h.svc.UpdateTask(r.Context(), pr, task, req)
+			if err != nil {
 				fail(w, err, 400)
 				return
+			}
+			if req.Ask != nil && len(warnings) == 0 {
+				h.publishDecision(task.ProjectID, taskID, 1)
 			}
 			updated, err := h.repo.GetTask(r.Context(), taskID)
 			if err != nil {
 				jsonErr(w, err, 500)
 				return
 			}
-			jsonOK(w, map[string]interface{}{"task": updated})
+			out := map[string]interface{}{"task": updated}
+			if len(warnings) > 0 {
+				out["warnings"] = warnings
+			}
+			jsonOK(w, out)
 
 		case http.MethodDelete:
 			if _, err := h.svc.DeleteTask(r.Context(), pr, task); err != nil {
@@ -1451,6 +1509,10 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch parts[1] {
+	case "receipt", "receipts":
+		h.taskReceipt(w, r, pr, taskID, parts)
+		return
+
 	case "merge":
 		// POST /tasks/{id}/merge {merge_commit?}: Mark merged (recorded once;
 		// a repeat returns the first record). POST /tasks/{id}/merge/not-needed:
@@ -1485,6 +1547,80 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonOK(w, rec)
 		return
+
+	case "decisions":
+		// GET: what people decided on this ticket's dependencies, and its own
+		// decision doc (null when it has none), without its versions.
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET required", 405)
+			return
+		}
+		ups, err := h.svc.UpstreamDecisions(r.Context(), pr, taskID)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		own, err := h.svc.OwnDecision(r.Context(), pr, taskID)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]any{"upstream": ups, "own": own})
+
+	case "decision":
+		// GET: the ticket's decision doc: the current version's options and
+		// markdown, and every version with its options. 404 without one.
+		// PUT /decision/doc {base_version, content, ask}: a person's edit,
+		// one new version. POST /decision/record {version, chosen_option,
+		// decision_text}: Record decision. Both are the web UI's only.
+		switch {
+		case r.Method == http.MethodGet && len(parts) == 2:
+			doc, err := h.svc.GetDecision(r.Context(), pr, taskID)
+			if err != nil {
+				fail(w, err, 500)
+				return
+			}
+			jsonOK(w, doc)
+		case r.Method == http.MethodPut && len(parts) == 3 && parts[2] == "doc":
+			var req service.SaveDecisionDocRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				jsonErr(w, err, 400)
+				return
+			}
+			doc, err := h.svc.SaveDecisionDoc(r.Context(), pr, taskID, req)
+			if err != nil {
+				fail(w, err, 500)
+				return
+			}
+			h.publishDecision(task.ProjectID, taskID, doc.CurrentVersion)
+			h.publishDecisionArtifact(r, doc.ArtifactID)
+			jsonOK(w, doc)
+		case r.Method == http.MethodPost && len(parts) == 3 && parts[2] == "record":
+			var req service.RecordDecisionRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				jsonErr(w, err, 400)
+				return
+			}
+			doc, err := h.svc.RecordDecision(r.Context(), pr, taskID, req)
+			if err != nil {
+				if doc != nil && doc.DecidedVersion != nil {
+					// The record claimed and then stopped: dependents already
+					// read the claim, and open drawers should show the retry.
+					h.publishDecision(task.ProjectID, taskID, *doc.DecidedVersion)
+				}
+				fail(w, err, 500)
+				return
+			}
+			version := doc.CurrentVersion
+			if doc.DecidedVersion != nil {
+				version = *doc.DecidedVersion
+			}
+			h.publishDecision(task.ProjectID, taskID, version)
+			h.publishDecisionArtifact(r, doc.ArtifactID)
+			jsonOK(w, doc)
+		default:
+			http.Error(w, "method not allowed", 405)
+		}
 
 	case "runs":
 		if r.Method == http.MethodPost {
@@ -1606,8 +1742,15 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		}
 		// A person in the web UI completes any ticket they can work; other
 		// callers (API tokens, MCP-audience tokens) only dispatched work.
-		if _, err := h.svc.CompleteTask(r.Context(), pr, taskID); err != nil {
+		t, closed, err := h.svc.CompleteTaskReceipt(r.Context(), pr, taskID)
+		if err != nil {
 			fail(w, err, 400)
+			return
+		}
+		if closed.Held {
+			// The project requires a verification receipt and this one is
+			// below its minimum: held for a person, who can Accept it now.
+			jsonOK(w, map[string]interface{}{"task_id": taskID, "state": t.State, "held": true, "reason": closed.HoldReason})
 			return
 		}
 		jsonOK(w, map[string]interface{}{"task_id": taskID, "state": "completed"})
@@ -1820,6 +1963,20 @@ func (h *RestHandler) runSub(w http.ResponseWriter, r *http.Request) {
 // needs. Reading and commenting need only project access; assign and
 // dispatch are checked in full by the service; everything else that changes
 // the ticket is "work" on it.
+// publishDecision tells open drawers a ticket's decision doc changed.
+func (h *RestHandler) publishDecision(projectID, taskID, version int) {
+	h.hub.Publish(domain.Event{Type: domain.EventDecisionUpdated, ProjectID: projectID,
+		Payload: map[string]any{"task_id": taskID, "version": version}, At: time.Now()})
+}
+
+// publishDecisionArtifact tells an open artifact page its decision doc
+// changed (a new version, or approved by Record decision).
+func (h *RestHandler) publishDecisionArtifact(r *http.Request, artifactID int) {
+	if a, err := h.repo.GetArtifact(r.Context(), artifactID); err == nil {
+		h.publishArtifactEvent(a)
+	}
+}
+
 func taskActionFor(method, sub string) authz.TaskAction {
 	switch {
 	case method == http.MethodGet, sub == "comments", sub == "history", sub == "runs", sub == "assign", sub == "dispatch", sub == "merge":

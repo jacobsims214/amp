@@ -84,6 +84,7 @@ The server links people to tickets this way (`TaskURL` in amp-api, and the
 | `user` | project My work | user id, whose My work to show | the viewer | link only |
 | `status` | Board | `ready`, `in_progress`, `done`, `waiting` | all states | push |
 | `q` | Board search; Trace query | text; on Trace a SHA, branch or PR URL, run on load | empty | Board: replace after a pause. Trace: push on submit |
+| `q` | My work; project My work | text matched against ticket refs (`#123` or `123`) and titles; on My work also the project name or code, which keeps all of that project's rows | empty | replace |
 | `epic` | Board, Graph | epic id | all epics | push |
 | `owner` | Board | `mine`, `unowned`, `all`, `<user id>` | `mine` | push |
 | `owner` | Graph | `mine` | everyone | replace |
@@ -100,6 +101,9 @@ The server links people to tickets this way (`TaskURL` in amp-api, and the
 | `user` | Day reports | user id: whose reports | you | push |
 | `day` | Day reports | `YYYY-MM-DD`: the day your report is built for | today | replace |
 | `open` | Day reports | `YYYY-MM-DD`: the saved report that's expanded, or `none` | the newest | replace |
+| `status`, `kind`, `expiry` | Artifacts | status as on Board but `in_review`, `changes_requested`, `approved`; kind `html`, `svg`, `image`, `markdown`, `pdf`, `text`; expiry `soon` (within 7 days) or `kept` | all | replace |
+| `q` | Artifacts | text matched against title, ticket ref and ticket name | empty | replace |
+| `sort` | Artifacts | `status` (waiting first), `updated` (recently updated first) or `ticket` (group by ticket) | `status` | replace |
 | `v` | Artifact | version number | latest | replace |
 | `org` | Portfolio | org id | last viewed, else your first | replace |
 | `launch` | any page (debug) | `full` or `short`: forces the launch animation | by timing | read only |

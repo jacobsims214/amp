@@ -93,8 +93,10 @@ export function ArtifactView() {
           </div>
         </section>
         <aside className="min-h-0 overflow-y-auto">
-          <ReviewPanel artifact={artifact} version={version} selected={selected} onReviewed={a => { setArtifact(a); pick(a.current_version); load() }} />
-          <RetentionPanel artifact={artifact} onChange={setArtifact} />
+          {artifact.role === 'decision' ? <DecisionDocPanel artifact={artifact} /> : <>
+            <ReviewPanel artifact={artifact} version={version} selected={selected} onReviewed={a => { setArtifact(a); pick(a.current_version); load() }} />
+            <RetentionPanel artifact={artifact} onChange={setArtifact} />
+          </>}
           {selected && (
             <div className="px-5 py-4 border-t border-line grid gap-1 text-[12.5px] text-ink-2">
               <span className="amp-label">Version {selected.version}</span>
@@ -140,6 +142,28 @@ function ActivityPanel({ artifactId, updatedAt }: { artifactId: number; updatedA
           )
         })}
       </ol>
+    </div>
+  )
+}
+
+/** A ticket's decision doc: it is edited and recorded on its ticket, and
+ *  Record decision (not a review) approves and keeps it, so the review and
+ *  retention controls aren't offered (docs/specs/human-decision-docs.md §3). */
+function DecisionDocPanel({ artifact }: { artifact: Artifact }) {
+  const decided = artifact.status === 'approved' && artifact.approved_version != null
+  return (
+    <div className="px-5 py-4 grid gap-2" data-testid="decision-doc-panel">
+      <span className="amp-label">Decision doc</span>
+      <p className="m-0 text-[13px] text-ink">
+        {decided
+          ? <>Decision recorded on v{artifact.approved_version}{artifact.reviewed_by_email ? <> by {artifact.reviewed_by_email}</> : null}
+              {artifact.reviewed_at ? <> · {when(artifact.reviewed_at)}</> : null}. It is read-only and kept.</>
+          : <>This is a ticket's decision doc. Its owner edits it and records the decision on the ticket; recording approves this version and keeps it.</>}
+      </p>
+      {artifact.task_id != null && (
+        <Link to={projectLink(artifact.project_id, 'board', artifact.task_id)} className="text-[12.5px] underline underline-offset-2 text-ink-2 hover:text-ink justify-self-start">
+          Open the ticket</Link>
+      )}
     </div>
   )
 }

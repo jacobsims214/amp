@@ -127,8 +127,11 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgCompleteTask:
-		closeout, err := a.handleComplete(ctx, msg)
-		msg.ReplyCh <- ReplyComplete{Task: ptrTask(a.withBlockedBy()), Closeout: closeout, Err: err}
+		was := a.task.State
+		closeout, fanned, err := a.handleComplete(ctx, msg)
+		changed := err == nil && was != domain.TaskStateCompleted && a.task.State == domain.TaskStateCompleted
+		reply := ReplyComplete{Task: ptrTask(a.withBlockedBy()), Closeout: closeout, Changed: changed, Err: err}
+		replyAfterFan(fanned, func() { msg.ReplyCh <- reply })
 
 	case *MsgClaimStart:
 		started, err := a.handleClaimStart(msg)
@@ -150,7 +153,7 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplyGetTask{Task: t, Err: err}
 
 	case *MsgUpdateTask:
-		err := a.handleUpdate(msg.Req, msg.KeepHuman)
+		err := a.handleUpdate(msg)
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgSetTaskState:
@@ -179,12 +182,21 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		if state != msg.State {
 			reason = "" // blocked on its dependencies: no reason of its own
 		}
+		was := a.task.State
 		err := a.handleSetState(state, reason, msg.By, msg.ByName)
-		msg.ReplyCh <- ReplySimple{Err: err}
+		msg.ReplyCh <- ReplySimple{Err: err,
+			Changed: err == nil && was != domain.TaskStateCompleted && a.task.State == domain.TaskStateCompleted}
 
 	case *MsgSetTaskStartAt:
 		err := a.handleSetTaskStartAt(msg.StartAt)
 		msg.ReplyCh <- ReplySimple{Err: err}
+
+	case *MsgMarkDecisionDoc:
+		if !a.task.HasDecisionDoc {
+			a.task.HasDecisionDoc = true
+			a.publish(domain.EventTaskUpdated, a.withBlockedBy())
+		}
+		msg.ReplyCh <- ReplySimple{}
 
 	case *MsgApproveTask:
 		msg.ReplyCh <- a.handleApprove(msg)
@@ -244,7 +256,8 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		a.checkUnblock(ctx)
 
 	case *MsgSetMergeState:
-		msg.ReplyCh <- a.handleSetMergeState(ctx, msg)
+		reply, fanned := a.handleSetMergeState(ctx, msg)
+		replyAfterFan(fanned, func() { msg.ReplyCh <- reply })
 
 	case *MsgScheduledUnblock:
 		// Timer fired — transition task from blocked to backlog
@@ -379,26 +392,50 @@ func (a *TaskActor) handleDispatch(msg *MsgDispatchTask, ctx actor.Context) erro
 	return nil
 }
 
+// handleHold holds a completion for a person (#126): the ticket keeps its
+// state (in progress, for a worker's completion), but its dispatch is over,
+// in the database too, so no worker holds it while it waits. The service
+// posts the "Couldn't verify, needs you" comment and finalizes the receipt.
+func (a *TaskActor) handleHold(msg *MsgCompleteTask) error {
+	if err := a.repo.ClearTaskDispatch(context.Background(), a.task.ID, false); err != nil {
+		return fmt.Errorf("db clear dispatch: %w", err)
+	}
+	a.task.DispatchID = ""
+	a.task.UpdatedAt = time.Now()
+	who := nameOr(msg.ByName, "agent")
+	if a.task.AgentID != "" && !msg.InUI {
+		who = a.task.AgentID
+	}
+	detail := "Completion held: couldn't verify, needs a person"
+	if r := strings.TrimSpace(msg.HoldReason); r != "" {
+		detail += ": " + r
+	}
+	a.logActivityBy(who, msg.By, "held", string(a.task.State), string(a.task.State), detail)
+	a.publish(domain.EventTaskUpdated, a.withBlockedBy())
+	a.log.Info("completion held")
+	return nil
+}
+
 // handleComplete completes the ticket. It returns whether the completion was
 // recorded as a closeout: a caller that isn't the ticket's worker (no
 // dispatch_id, or not the current one), or a ticket no worker ever started
 // (AMP #2801).
-func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (bool, error) {
+func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (bool, <-chan ReplySimple, error) {
 	by := msg.By
 	if a.task.State == domain.TaskStateCompleted {
 		// Idempotent. A repeat is the worker's only if it presents the
 		// dispatch that completed it, which the ticket no longer carries.
-		return !a.task.IsHuman(), nil
+		return !a.task.IsHuman(), nil, nil
 	}
 	if a.task.State != domain.TaskStateInProgress && !msg.CloseoutOK && msg.MergeStepFor == 0 {
 		if msg.RequireStarted {
-			return false, fmt.Errorf("task %d is %s: it was never dispatched, so it can't be completed off the web UI; dispatch it first, "+
+			return false, nil, fmt.Errorf("task %d is %s: it was never dispatched, so it can't be completed off the web UI; dispatch it first, "+
 				"or close it out with closeout_reason if its worker already finished it", a.task.ID, a.task.State)
 		}
 	}
 	if msg.RequireDeps {
 		if err := a.refuseOpenDeps("completed"); err != nil {
-			return false, err
+			return false, nil, err
 		}
 	}
 	// Closeout: the caller isn't the worker that was dispatched. A worker's
@@ -414,7 +451,7 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 	// (AMP #2908).
 	closeout := !msg.InUI && a.task.CompletionIsCloseout(msg.DispatchID, msg.CloseoutReason)
 	if msg.DispatchID != "" && !a.task.CurrentDispatch(msg.DispatchID) && a.task.DispatchID != "" {
-		return false, fmt.Errorf("task %d: dispatch %q is no longer current (the ticket was returned and re-dispatched as %q); "+
+		return false, nil, fmt.Errorf("task %d: dispatch %q is no longer current (the ticket was returned and re-dispatched as %q); "+
 			"re-read the ticket and use the dispatch_id in your prompt, or close it out with closeout_reason if you aren't its worker",
 			a.task.ID, msg.DispatchID, a.task.DispatchID)
 	}
@@ -432,15 +469,18 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 			a.task.StartedAt, a.task.StartedBy = &at, by
 		}
 	}
+	if msg.Hold {
+		return closeout, nil, a.handleHold(msg)
+	}
 	// A done ticket has no current dispatch, in the database too: a reload
 	// mustn't make the old token current again (AMP #2944).
 	if err := a.repo.ClearTaskDispatch(context.Background(), a.task.ID, false); err != nil {
-		return false, fmt.Errorf("db clear dispatch: %w", err)
+		return false, nil, fmt.Errorf("db clear dispatch: %w", err)
 	}
 	// Nor is it returned any more: a returned ticket closed out directly (or
 	// completed in the UI) leaves the returned list and loses its tag (AMP #2947).
 	if err := a.repo.ClearTaskReturn(context.Background(), a.task.ID); err != nil {
-		return false, fmt.Errorf("db clear return: %w", err)
+		return false, nil, fmt.Errorf("db clear return: %w", err)
 	}
 	a.task.ReturnedAt, a.task.ReturnedReason = nil, ""
 	now := time.Now()
@@ -450,7 +490,7 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 	a.task.DispatchID = ""
 
 	if err := a.saveState(domain.TaskStateCompleted, ""); err != nil {
-		return false, fmt.Errorf("db complete: %w", err)
+		return false, nil, fmt.Errorf("db complete: %w", err)
 	}
 	mergeWait := ""
 	if msg.MergeRequired {
@@ -458,7 +498,7 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 		// waiting until the merge is recorded (AMP #2475).
 		yes := true
 		if err := a.repo.SetTaskMerge(context.Background(), a.task.ID, &yes, domain.MergeNeeded, nil, ""); err != nil {
-			return closeout, fmt.Errorf("db merge needed: %w", err)
+			return closeout, nil, fmt.Errorf("db merge needed: %w", err)
 		}
 		a.task.MergeRequired, a.task.MergeState, a.task.MergedAt, a.task.MergeSource = true, domain.MergeNeeded, nil, ""
 		mergeWait = repository.MergeWaitDetail(a.task.ID, domain.MergeNeeded, msg.MergeWhere)
@@ -497,13 +537,15 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 	}
 	a.log.Info("completed", "closeout", closeout)
 
-	// Synchronously ask ProjectActor to fan MsgDepCompleted to ALL epics/stories/tasks.
-	// We WAIT for this to complete before returning, so that any caller who reads
-	// task state after MsgCompleteTask returns will see the unblocked state immediately.
+	// Ask ProjectActor to fan MsgDepCompleted to ALL epics/stories/tasks. The
+	// caller's reply waits for that fan-out (see replyAfterFan), so whoever
+	// reads task state after MsgCompleteTask returns sees the unblocked state
+	// immediately. This actor must not wait for it itself: the ProjectActor
+	// may be mid-request into this very task (collectAllTasks → epic → story
+	// → task), and the two would deadlock the whole project.
 	// With a merge needed the fan-out tells dependents why they still wait.
 	fanReplyCh := make(chan ReplySimple, 1)
 	ctx.Send(a.projectPID, &MsgFanDepCompleted{CompletedTaskID: a.task.ID, MergeWait: mergeWait, ReplyCh: fanReplyCh})
-	<-fanReplyCh
 	if msg.MergeRequired {
 		a.logActivity("system", "merge_needed", "", "", "Done; its work waits on a merge ("+nameOr(msg.MergeWhere, "pushed work")+
 			"), so the tickets that depend on it wait until the merge is recorded")
@@ -511,7 +553,7 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) (boo
 
 	// Then notify parent StoryActor for state rollup (async is fine for rollup).
 	ctx.Send(a.storyPID, &MsgTaskCompleted{TaskID: a.task.ID})
-	return closeout, nil
+	return closeout, fanReplyCh, nil
 }
 
 // handleClaimStart starts the ticket its worker was dispatched for
@@ -685,10 +727,17 @@ func (a *TaskActor) handleBlock(reason string, q *domain.Question, by *int) erro
 	return nil
 }
 
-func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest, keepHuman string) error {
+func (a *TaskActor) handleUpdate(msg *MsgUpdateTask) error {
+	req, keepHuman, by, byName := msg.Req, msg.KeepHuman, msg.By, msg.ByName
 	clr, err := domain.ParseClears(req.Clear, domain.TaskClearable)
 	if err != nil {
 		return err
+	}
+	// The repository reads req.Clear too: hand it the parsed, trimmed names,
+	// so " decide_by" can't clear the in-memory ticket but not the row.
+	req.Clear = clr.Fields()
+	if clr["decide_by"] && req.DecideBy != nil {
+		return fmt.Errorf("decide_by: set a date or clear it, not both")
 	}
 	// A person's ticket becomes agent work only by that choice in the web UI;
 	// otherwise an agent could flip it, dispatch it and complete it. Checked
@@ -698,25 +747,19 @@ func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest, keepHuman string)
 			return errors.New(keepHuman)
 		}
 	}
-	if req.Name != "" {
-		a.task.Name = req.Name
-	}
-	a.task.Description = clr.Apply("description", req.Description, a.task.Description)
-	a.task.AssignedTo = clr.Apply("assigned_to", req.AssignedTo, a.task.AssignedTo)
-	a.task.AgentID = clr.Apply("agent_id", req.AgentID, a.task.AgentID)
-	a.task.AcceptanceCriteria = clr.Apply("acceptance_criteria", req.AcceptanceCriteria, a.task.AcceptanceCriteria)
-	if req.Priority != "" {
-		a.task.Priority = req.Priority
-	}
+	// Every refusal below comes before the in-memory ticket changes, so a
+	// refused edit leaves the actor in step with the database.
+	//
 	// Who does it: switching is refused mid-work, so an agent's run or a
 	// person's work isn't cut off by the change.
 	prevPerformer := a.task.Performer
+	performer, humanReason := a.task.Performer, a.task.HumanReason
 	if req.Performer != "" || req.HumanReason != "" {
-		performer := req.Performer
-		if performer == "" {
-			performer = a.task.Performer
+		want := req.Performer
+		if want == "" {
+			want = a.task.Performer
 		}
-		p, reason, err := domain.NormalizePerformer(performer, req.HumanReason)
+		p, reason, err := domain.NormalizePerformer(want, req.HumanReason)
 		if err != nil {
 			return err
 		}
@@ -727,16 +770,52 @@ func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest, keepHuman string)
 			reason = a.task.HumanReason // keep the reason it had
 		}
 		req.Performer, req.HumanReason = p, reason
-		a.task.Performer, a.task.HumanReason = p, reason
+		performer, humanReason = p, reason
 	} else if clr["human_reason"] && a.task.IsHuman() {
 		return fmt.Errorf("a human ticket keeps a reason; set human_reason instead of clearing it")
 	}
-	a.task.UpdatedAt = time.Now()
+	// A decide-by date (#146): only on a person's ticket (as the edit leaves
+	// it) that isn't done.
+	setsDecideBy := req.DecideBy != nil || clr["decide_by"]
+	var decideBy *time.Time
+	if setsDecideBy {
+		if !clr["decide_by"] {
+			decideBy = req.DecideBy
+		}
+		if err := domain.CheckDecideBy(performer, decideBy); err != nil {
+			return err
+		}
+		// Re-checked here, against the ticket as it is now, so a person's
+		// date set (or an owner change) after the service's check still
+		// holds: a suggester only dates a ticket that has none.
+		if msg.DecideBySuggestOnly != "" && a.task.DecideBy != nil && !sameTime(a.task.DecideBy, decideBy) {
+			person := msg.DecideByPerson != 0 && a.task.OwnerUserID != nil && *a.task.OwnerUserID == msg.DecideByPerson
+			if !person {
+				return errors.New(msg.DecideBySuggestOnly)
+			}
+		}
+		if decideBy != nil && a.task.State == domain.TaskStateCompleted {
+			return fmt.Errorf("task %d is done: a decide-by date only applies to a ticket still waiting on its person", a.task.ID)
+		}
+	}
 
 	planned, err := a.repo.UpdateTaskPlanned(context.Background(), req)
 	if err != nil {
 		return fmt.Errorf("db update: %w", err)
 	}
+	// Written: now the in-memory ticket follows.
+	if req.Name != "" {
+		a.task.Name = req.Name
+	}
+	a.task.Description = clr.Apply("description", req.Description, a.task.Description)
+	a.task.AssignedTo = clr.Apply("assigned_to", req.AssignedTo, a.task.AssignedTo)
+	a.task.AgentID = clr.Apply("agent_id", req.AgentID, a.task.AgentID)
+	a.task.AcceptanceCriteria = clr.Apply("acceptance_criteria", req.AcceptanceCriteria, a.task.AcceptanceCriteria)
+	if req.Priority != "" {
+		a.task.Priority = req.Priority
+	}
+	a.task.Performer, a.task.HumanReason = performer, humanReason
+	a.task.UpdatedAt = time.Now()
 	// A change to what the ticket is (name, description, acceptance
 	// criteria) re-plans it, so the last plan approval no longer covers it.
 	// The database decides (Repo.UpdateTaskPlanned), on the same clock as
@@ -749,6 +828,19 @@ func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest, keepHuman string)
 			detail += ": " + a.task.HumanReason
 		}
 		a.logActivity("system", "performer_changed", "", "", detail)
+	}
+	// Only a changed date re-arms escalation (as in Repo.UpdateTaskPlanned):
+	// re-sending the same one keeps the escalation mark.
+	if setsDecideBy && !sameTime(a.task.DecideBy, decideBy) {
+		if byName == "" {
+			byName = "manager"
+		}
+		detail := "Decide-by date removed"
+		if decideBy != nil {
+			detail = "Decide by " + decideBy.UTC().Format("2006-01-02 15:04 UTC")
+		}
+		a.logActivityBy(byName, by, "decide_by_set", "", "", detail)
+		a.task.DecideBy, a.task.DecideByEscalatedAt = decideBy, nil
 	}
 	if req.Metadata != nil {
 		meta, err := a.repo.MergeMetadata(context.Background(), "task", a.task.ID, req.Metadata)
@@ -1219,7 +1311,7 @@ func (a *TaskActor) dependsOn(id int) bool {
 // ticket holding its dependents (merged, or not needed) releases them the
 // way completion does; one that starts holding them (a PR reported after
 // completion, an abandoned PR) makes them wait again.
-func (a *TaskActor) handleSetMergeState(ctx actor.Context, msg *MsgSetMergeState) ReplyMergeState {
+func (a *TaskActor) handleSetMergeState(ctx actor.Context, msg *MsgSetMergeState) (ReplyMergeState, <-chan ReplySimple) {
 	cur := a.task.MergeState
 	if cur == "" {
 		cur = domain.MergeNone
@@ -1231,7 +1323,7 @@ func (a *TaskActor) handleSetMergeState(ctx actor.Context, msg *MsgSetMergeState
 		}
 		if !ok {
 			t := a.withBlockedBy()
-			return ReplyMergeState{Task: &t}
+			return ReplyMergeState{Task: &t}, nil
 		}
 	}
 	required := a.task.MergeRequired
@@ -1240,7 +1332,7 @@ func (a *TaskActor) handleSetMergeState(ctx actor.Context, msg *MsgSetMergeState
 	}
 	if cur == msg.State && required == a.task.MergeRequired {
 		t := a.withBlockedBy()
-		return ReplyMergeState{Task: &t}
+		return ReplyMergeState{Task: &t}, nil
 	}
 	at, source := a.task.MergedAt, a.task.MergeSource
 	if msg.State == domain.MergeMerged {
@@ -1253,7 +1345,7 @@ func (a *TaskActor) handleSetMergeState(ctx actor.Context, msg *MsgSetMergeState
 		at, source = nil, ""
 	}
 	if err := a.repo.SetTaskMerge(context.Background(), a.task.ID, &required, msg.State, at, source); err != nil {
-		return ReplyMergeState{Err: fmt.Errorf("db merge state: %w", err)}
+		return ReplyMergeState{Err: fmt.Errorf("db merge state: %w", err)}, nil
 	}
 	done := a.task.State == domain.TaskStateCompleted
 	heldBefore := done && domain.MergeGates(cur)
@@ -1269,20 +1361,38 @@ func (a *TaskActor) handleSetMergeState(ctx actor.Context, msg *MsgSetMergeState
 	t := a.withBlockedBy()
 	a.publish(domain.EventTaskUpdated, t)
 
+	// As in handleComplete, the caller waits for the fan-out, never this actor.
+	var fan chan ReplySimple
 	switch {
 	case heldBefore && !heldAfter:
-		fan := make(chan ReplySimple, 1)
+		fan = make(chan ReplySimple, 1)
 		ctx.Send(a.projectPID, &MsgFanDepCompleted{CompletedTaskID: a.task.ID, ReplyCh: fan})
-		<-fan
 	case heldAfter:
 		// Newly held, or held for a new reason (an abandoned PR): dependents
 		// wait (again) and say why.
-		fan := make(chan ReplySimple, 1)
+		fan = make(chan ReplySimple, 1)
 		ctx.Send(a.projectPID, &MsgFanDepCompleted{CompletedTaskID: a.task.ID,
 			MergeWait: repository.MergeWaitDetail(a.task.ID, msg.State, msg.Where), ReplyCh: fan})
-		<-fan
 	}
-	return ReplyMergeState{Task: &t, Changed: true}
+	return ReplyMergeState{Task: &t, Changed: true}, fan
+}
+
+// replyAfterFan answers a caller once the ProjectActor has acknowledged a
+// dependency fan-out, without holding this actor's mailbox while it waits.
+// A TaskActor that blocks on its ProjectActor deadlocks the project whenever
+// the ProjectActor is itself waiting on this task (collectAllTasks for
+// amp_list_tasks, the board, waiting-on-people), and every later request for
+// the project then hangs. The fan-out only enqueues messages, so the
+// acknowledgement arrives as soon as the ProjectActor is free.
+func replyAfterFan(fan <-chan ReplySimple, reply func()) {
+	if fan == nil {
+		reply()
+		return
+	}
+	go func() {
+		<-fan
+		reply()
+	}()
 }
 
 func (a *TaskActor) publish(evtType domain.EventType, payload interface{}) {
@@ -1492,4 +1602,12 @@ func humanWorkDetail(verb string, by, owner *int) string {
 		return verb + " by its owner (human work)"
 	}
 	return verb + " (human work)"
+}
+
+// sameTime reports whether two optional times are the same instant.
+func sameTime(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(*b)
 }

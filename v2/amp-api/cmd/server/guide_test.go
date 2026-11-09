@@ -198,3 +198,34 @@ func TestGuide_MCP(t *testing.T) {
 		t.Fatalf("sources: %v", src)
 	}
 }
+
+// The SSO doc (#69) records the Cognito + Dex sign-in fixes and quotes
+// AMP's refusal sentences word for word, and troubleshooting links to it.
+func TestGuide_SSODoc(t *testing.T) {
+	read := func(p string) string {
+		b, err := os.ReadFile(filepath.Join(guideDir, p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	if !strings.Contains(read("troubleshooting.md"), "operations/sso-cognito-dex.md") {
+		t.Error("troubleshooting.md doesn't link operations/sso-cognito-dex.md")
+	}
+	sso := read("operations/sso-cognito-dex.md")
+	for _, want := range []string{
+		"openid", "userNameKey", "claimMapping", "--insecure-oidc-allow-unverified-email",
+		"cookie-domain", "admin-update-user-attributes",
+	} {
+		if !strings.Contains(sso, want) {
+			t.Errorf("operations/sso-cognito-dex.md lacks %q", want)
+		}
+	}
+	// The doc wraps lines; compare with whitespace collapsed.
+	flat := strings.Join(strings.Fields(sso), " ")
+	for _, r := range []auth.ProvisionRefusal{auth.RefusalUnverifiedEmail, auth.RefusalDomainNotAllowed, auth.RefusalNoEmail, auth.RefusalReservedIdentity} {
+		if !strings.Contains(flat, r.Message()) {
+			t.Errorf("operations/sso-cognito-dex.md doesn't quote the %s refusal: %q", r, r.Message())
+		}
+	}
+}

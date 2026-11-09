@@ -10,8 +10,8 @@ import (
 	"github.com/simstech/amp-api/internal/service"
 )
 
-// MCP's view of "Waiting on you" (AMP #2482, KB decisions/human-work-ux.md
-// §1 and §5): amp_list_tasks' waiting_on_people is built from WaitingOn
+// MCP's view of "Waiting on you" (AMP #2482, v2/kb/working/human-work.md):
+// amp_list_tasks' waiting_on_people is built from WaitingOn
 // (all four kinds, each with kind) plus coming_up; amp_get_plan's counts gain
 // waiting and questions; amp_list_unmerged gains merge_state and keeps
 // abandoned tickets. Every field older managers read stays.

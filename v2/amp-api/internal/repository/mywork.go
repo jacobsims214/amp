@@ -40,7 +40,14 @@ func (r *Repo) workTasks(ctx context.Context, where string, args ...any) ([]Work
 		}
 		out = append(out, w)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	ts := make([]*domain.Task, len(out))
+	for i := range out {
+		ts[i] = &out[i].Task
+	}
+	return out, r.markDecisionDocs(ctx, ts)
 }
 
 // OpenTasksOwnedBy lists unfinished tickets owned by any of the users, most

@@ -10,7 +10,7 @@ import (
 	"github.com/simstech/amp-api/internal/domain"
 )
 
-// ---- Owner backfill (KB decisions/human-work-ux.md §1, #2476) ----
+// ---- Owner backfill (v2/kb/working/human-work.md, #2476) ----
 //
 // "Mine" means owner_user_id = me and nothing else. Tickets a person created
 // without an owner used to count as theirs on the Board; this one-off sets

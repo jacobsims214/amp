@@ -1,5 +1,5 @@
 /**
- * The approval line on the Board and Flight plan (decisions/human-work-ux.md §2):
+ * The approval line on the Board and Flight plan (v2/kb/working/human-work.md):
  * read-only, one line. "N tickets await your approval → My work", linking to
  * the project's My work tab with the oldest of them focused. Approving happens
  * only in My work; these views are for reading the plan.

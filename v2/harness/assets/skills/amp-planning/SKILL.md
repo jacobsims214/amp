@@ -300,7 +300,33 @@ project → epic → story → ticket; it never needs re-approval):
     `Decide: Avalara or Stripe Tax`.
   - Acceptance criteria say what done means for a person: "release approved in the change
     log", "new key in the vault and the old one revoked".
-  - The description says what they need: the PR link or branch, what to check, where to do it.
+  - The description says what they need: the link, what to check, where to do it.
+- **The brief is required.** A human ticket of any reason needs a `description` (what the person
+  must do, written for them) and `acceptance_criteria` (what done means). Without them
+  `amp_create_tasks` refuses the batch, naming the ref and the missing fields
+  (`"rev": a human ticket needs a brief ...; missing: description, acceptance_criteria`), and
+  creates nothing.
+- **A decision (`human_reason: "judgment"`) also needs an `ask`**: the question, 2 to 4 options
+  each with its consequence, the option you recommend (`recommended`, a 0-based index) and why.
+  AMP validates it and drafts the ticket's **decision doc** from it; the person reads the options
+  there, picks one and writes their decision. The ask is input only: it isn't stored on the
+  ticket, and once the doc exists its options change only in AMP (`amp_update_task(ask=...)` is
+  refused then). `recommended` only marks a badge: never pre-decide for the person.
+  ```json
+  {"ref": "northstar", "story_id": 12, "name": "Decide: north-star metric", "performer": "human",
+   "human_reason": "judgment", "owner": "jacob@acme.com",
+   "description": "Pick the one metric we steer by for the next 90 days.",
+   "acceptance_criteria": "- Metric chosen\n- Target and floor set\n- Trial length confirmed",
+   "ask": {"question": "Which north-star metric do we commit to for the next 90 days?",
+           "options": [{"label": "A: Weekly active teams", "consequence": "Easy to measure; rewards seats over value"},
+                       {"label": "B: Activation rate (40%, floor 30%)", "consequence": "Needs the onboarding event (#41)"},
+                       {"label": "C: Net revenue retention", "consequence": "Lags 90 days; can't steer this quarter"}],
+           "recommended": 1, "recommendation_reason": "B is the only one we can move and measure inside the quarter.",
+           "evidence": ["artifact #1", "#3"]}}
+  ```
+  The tickets after it receive the person's decision in `upstream_decisions` (`amp_get_task`,
+  `amp_claim_task`). No agent records a decision: `amp_complete_task`, approving or unkeeping the
+  doc, and publishing to it are refused.
 - **Wire it both ways:**
   - it `depends_on` the agent work it needs (staging is deployed before anyone signs off);
   - the agent work after it `depends_on` it (the prod deploy waits for the sign-off).
@@ -316,7 +342,9 @@ Wave 3:  #33 Deploy quotes to prod         → amp-worker-backend   (blocked by 
 ```
 
 `amp_check_plan` lists every human ticket under `human_gates`, with how many open tickets wait on
-each (merges aren't in it; they aren't tickets). When one gate holds up most of the plan, say so when you present it. The user may want to
+each (merges aren't in it; they aren't tickets). It warns about an open human ticket with no brief
+(`human_without_brief`) and an open judgment ticket with no decision doc (`judgment_without_doc`;
+give it an ask with `amp_update_task`). When one gate holds up most of the plan, say so when you present it. The user may want to
 book that person's time, or move the step later.
 
 ---

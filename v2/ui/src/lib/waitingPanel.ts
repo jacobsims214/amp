@@ -1,5 +1,5 @@
 /**
- * Mission's "Waiting on people" panel (KB decisions/human-work-ux.md §3):
+ * Mission's "Waiting on people" panel (v2/kb/working/human-work.md):
  * how each person's waiting items read and where their row leads.
  *
  * The items come from the server (GET /projects/:id/waiting-on-people,
@@ -8,8 +8,8 @@
  */
 import type { PersonWaiting, WaitCounts, WaitKind } from '../types'
 
-export const WAIT_KINDS: WaitKind[] = ['approve', 'answer', 'merge', 'start', 'do']
-export const WAIT_KIND_LABEL: Record<WaitKind, string> = { approve: 'Approve', answer: 'Answer', merge: 'Merge', start: 'Start', do: 'Do' }
+export const WAIT_KINDS: WaitKind[] = ['approve', 'answer', 'verify', 'merge', 'start', 'do']
+export const WAIT_KIND_LABEL: Record<WaitKind, string> = { approve: 'Approve', answer: 'Answer', verify: 'Verify', merge: 'Merge', start: 'Start', do: 'Do' }
 
 /** The ticket ids that wait on one person (every ticket of their items). */
 export function ticketsWaitingOn(p: PersonWaiting | undefined): Set<number> {
@@ -35,7 +35,7 @@ export function idList(ids: number[]): string {
  * With nothing waiting: "3 coming up", or "" when there's nothing at all.
  */
 export function kindSummary(p: PersonWaiting): string {
-  const parts = WAIT_KINDS.filter(k => p.counts[k] > 0).map(k => {
+  const parts = WAIT_KINDS.filter(k => (p.counts[k] ?? 0) > 0).map(k => {
     const items = p.items.filter(it => it.kind === k)
     if (k === 'approve') {
       const n = items.reduce((s, it) => s + it.task_ids.length, 0)
@@ -49,7 +49,7 @@ export function kindSummary(p: PersonWaiting): string {
 
 /** The viewer's own counts in words for the strip: "Approve 1 · Answer 2", zeros left out. */
 export function countsSummary(c: WaitCounts): string {
-  return WAIT_KINDS.filter(k => c[k] > 0).map(k => `${WAIT_KIND_LABEL[k]} ${c[k]}`).join(' · ')
+  return WAIT_KINDS.filter(k => (c[k] ?? 0) > 0).map(k => `${WAIT_KIND_LABEL[k]} ${c[k]}`).join(' · ')
 }
 
 /**

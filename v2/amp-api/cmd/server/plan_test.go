@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	protoactor "github.com/asynkron/protoactor-go/actor"
 
 	"github.com/simstech/amp-api/internal/actor"
+	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/hub"
 	"github.com/simstech/amp-api/internal/mcp"
@@ -440,7 +442,7 @@ func TestPlan_ServerInstructions_CurrentMergeWorkflow(t *testing.T) {
 	raw, _ := json.Marshal(srv.HandleMessage(context.Background(), []byte(
 		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`)))
 	s := string(raw)
-	for _, want := range []string{"approve, answer, merge (Merge needed), start or do", "PEOPLE IN THE LOOP"} {
+	for _, want := range []string{"approve, answer, verify, merge (Merge needed), start or do", "PEOPLE IN THE LOOP"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("initialize response lacks %q", want)
 		}
@@ -454,7 +456,7 @@ func TestPlan_ServerInstructions_CurrentMergeWorkflow(t *testing.T) {
 // removed review-and-merge human ticket: WaitKinds is the source of truth,
 // and the instructions and the amp_create_tasks description follow it.
 func TestMCPText_NoStaleWaitingKindLists(t *testing.T) {
-	if got := strings.Join(service.WaitKinds, ", "); got != "approve, answer, merge, start, do" {
+	if got := strings.Join(service.WaitKinds, ", "); got != "approve, answer, verify, merge, start, do" {
 		t.Fatalf("WaitKinds = %q", got)
 	}
 	s := setupMCP(t)
@@ -683,4 +685,109 @@ func TestPlan_CheckPlanWarnsOnMetadataDrift(t *testing.T) {
 		return
 	}
 	t.Fatalf("no metadata_drift issue: %v", report["issues"])
+}
+
+// issueKinds maps a plan check's issues by kind.
+func issueKinds(t *testing.T, report map[string]interface{}) map[string]map[string]interface{} {
+	t.Helper()
+	out := map[string]map[string]interface{}{}
+	issues, _ := report["issues"].([]interface{})
+	for _, x := range issues {
+		m := x.(map[string]interface{})
+		out[m["kind"].(string)] = m
+	}
+	return out
+}
+
+// The brief rule (docs/specs/human-decision-docs.md §2): a human ticket of
+// any reason, on any channel, needs a description and acceptance criteria,
+// and a judgment ticket off the web UI needs an ask. Agent tickets, and edits
+// to legacy tickets that don't make them human or judgment, are unchanged.
+func TestPlan_HumanBriefRule(t *testing.T) {
+	w := newRBACWorld(t)
+	// A legacy judgment ticket from before the rule: no brief, no doc.
+	legacy, err := w.s.repo.CreateTask(context.Background(), domain.CreateTaskRequest{
+		ProjectID: w.s.projectID, EpicID: w.s.epicID, StoryID: w.s.storyID, Name: "Legacy call", Priority: "1",
+		Performer: domain.PerformerHuman, HumanReason: "judgment", OwnerUserID: &w.bob.User.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ra := newRestAs(t, w)
+	alice := w.s.as(w.alice)
+	pid, story := float64(w.s.projectID), float64(w.s.storyID)
+
+	// MCP: refused, naming the ref and what's missing.
+	msg := alice.callExpectError(t, "amp_create_tasks", map[string]interface{}{"project_id": pid, "tasks": []interface{}{
+		map[string]interface{}{"ref": "build", "story_id": story, "name": "Build"},
+		map[string]interface{}{"ref": "rev", "story_id": story, "name": "Review the copy", "performer": "human", "human_reason": "review", "owner": w.bob.Email},
+	}})
+	wantErr(t, msg, `"rev"`, "description, acceptance_criteria")
+	if strings.Contains(msg, `"build"`) {
+		t.Fatalf("the agent ticket was blamed: %q", msg)
+	}
+	msg = alice.callExpectError(t, "amp_create_tasks", map[string]interface{}{"project_id": pid, "tasks": []interface{}{
+		map[string]interface{}{"ref": "pick", "story_id": story, "name": "Pick a vendor", "performer": "human", "human_reason": "judgment",
+			"owner": w.bob.Email, "description": "d", "acceptance_criteria": "a"},
+	}})
+	wantErr(t, msg, `"pick"`, "missing: ask")
+	wantErr(t, alice.callExpectError(t, "amp_create_task", map[string]interface{}{"project_id": pid, "story_id": story, "name": "Call the bank",
+		"performer": "human", "human_reason": "external", "description": "d"}), "missing: acceptance_criteria")
+	// Nothing in a refused batch was created.
+	board := alice.call(t, "amp_list_tasks", map[string]interface{}{"project_id": pid, "owner": "any", "format": "full"})
+	if b := fmt.Sprint(board); strings.Contains(b, "Review the copy") || strings.Contains(b, "Pick a vendor") {
+		t.Fatalf("a refused batch created tickets: %s", b)
+	}
+
+	// An agent ticket with no brief is unchanged.
+	alice.call(t, "amp_create_task", map[string]interface{}{"project_id": pid, "story_id": story, "name": "Bare agent ticket"})
+
+	// The web UI: a person's judgment ticket without an ask is created (J3);
+	// the brief is still required.
+	base := fmt.Sprintf("/api/projects/%d/tasks", w.s.projectID)
+	ra.want(t, 200, "alice", http.MethodPost, base, map[string]interface{}{"story_id": w.s.storyID, "name": "Decide pricing",
+		"performer": "human", "human_reason": "judgment", "description": "d", "acceptance_criteria": "a", "owner": w.bob.Email})
+	if code, out := ra.do(t, "alice", http.MethodPost, base, map[string]interface{}{"story_id": w.s.storyID, "name": "Rack it",
+		"performer": "human", "human_reason": "physical", "owner": w.bob.Email}); code != 400 || !strings.Contains(fmt.Sprint(out), "description, acceptance_criteria") {
+		t.Fatalf("UI human ticket without a brief: %d %v", code, out)
+	}
+	// An API token is not the UI: the ask is required.
+	if code, out := ra.doVia(t, auth.ChannelToken, "alice", http.MethodPost, base, map[string]interface{}{"story_id": w.s.storyID, "name": "Decide pricing",
+		"performer": "human", "human_reason": "judgment", "description": "d", "acceptance_criteria": "a", "owner": w.bob.Email}); code != 400 ||
+		!strings.Contains(fmt.Sprint(out), "missing: ask") {
+		t.Fatalf("token judgment ticket without an ask: %d %v", code, out)
+	}
+
+	// Switching to human is checked; so is switching to judgment, and
+	// clearing a human ticket's brief.
+	bare := taskID(t, alice.call(t, "amp_create_task", map[string]interface{}{"project_id": pid, "story_id": story, "name": "Bare one"}))
+	wantErr(t, alice.callExpectError(t, "amp_update_task", map[string]interface{}{"task_id": float64(bare), "performer": "human", "human_reason": "access"}),
+		"missing: description, acceptance_criteria")
+	alice.call(t, "amp_update_task", map[string]interface{}{"task_id": float64(bare), "performer": "human", "human_reason": "access",
+		"description": "Rotate the key in the vendor console", "acceptance_criteria": "Old key revoked"})
+	wantErr(t, alice.callExpectError(t, "amp_update_task", map[string]interface{}{"task_id": float64(bare), "human_reason": "judgment"}), "missing: ask")
+	wantErr(t, alice.callExpectError(t, "amp_update_task", map[string]interface{}{"task_id": float64(bare), "clear": []interface{}{"description"}}), "missing: description")
+	if tk := planTask(t, alice, bare); tk["human_reason"] != "access" || tk["description"] != "Rotate the key in the vendor console" {
+		t.Fatalf("a refused update changed the ticket: %v", tk)
+	}
+	// A legacy ticket can still be renamed (by its owner).
+	w.s.as(w.bob).call(t, "amp_update_task", map[string]interface{}{"task_id": float64(legacy.ID), "name": "Legacy call (renamed)"})
+	// And in the web UI, whose edit form sends clear for every blank field.
+	ra.want(t, 200, "bob", http.MethodPatch, fmt.Sprintf("/api/tasks/%d", legacy.ID), map[string]interface{}{
+		"name": "Legacy call (renamed in the UI)", "clear": []interface{}{"description", "acceptance_criteria"}})
+	if tk := planTask(t, alice, legacy.ID); tk["name"] != "Legacy call (renamed in the UI)" {
+		t.Fatalf("UI rename of a legacy ticket: %v", tk["name"])
+	}
+
+	// The plan check warns about both, naming the legacy ticket.
+	issues := issueKinds(t, alice.call(t, "amp_check_plan", map[string]interface{}{"project_id": pid}))
+	for _, kind := range []string{"human_without_brief", "judgment_without_doc"} {
+		iss, ok := issues[kind]
+		if !ok || iss["severity"] != "warn" || !containsID(iss["task_ids"], legacy.ID) {
+			t.Fatalf("%s = %v (issues %v)", kind, iss, issues)
+		}
+	}
+	if containsID(issues["human_without_brief"]["task_ids"], bare) {
+		t.Fatalf("a ticket with its brief was flagged: %v", issues["human_without_brief"])
+	}
 }

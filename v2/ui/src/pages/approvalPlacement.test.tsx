@@ -1,4 +1,4 @@
-// Approving a plan happens only in the project's My work tab (decisions/human-work-ux.md §2).
+// Approving a plan happens only in the project's My work tab (v2/kb/working/human-work.md).
 // The Board and Flight plan show a one-line link there and offer no approve button.
 import { render, screen } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'

@@ -56,7 +56,7 @@ func TestHuman_GateCantBeRemovedOffTheUI(t *testing.T) {
 	// as a dependency and delete it.
 	res := alice.call(t, "amp_create_tasks", map[string]any{"project_id": float64(w.s.projectID), "tasks": []any{
 		map[string]any{"ref": "signoff", "story_id": float64(w.s.storyID), "name": "Sign off the quotes copy",
-			"performer": "human", "human_reason": "approval", "owner": w.bob.Email},
+			"performer": "human", "human_reason": "approval", "owner": w.bob.Email, "description": "What the person does", "acceptance_criteria": "Done when it is done"},
 	}})
 	signoff := int(res["created"].([]any)[0].(map[string]any)["id"].(float64))
 	after := mkIn(t, alice, w.s.storyID, "Publish the quotes copy", signoff)

@@ -15,11 +15,22 @@ import { GitHubHookPanel } from '../components/GitHubHookPanel'
 import { GitHubCredentialPanel } from '../components/GitHubCredentialPanel'
 import { AuditLogPanel } from '../components/AuditLogPanel'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
-import type { KBSource, Metadata, Org, Project, ProjectAccess } from '../types'
+import type { KBSource, Metadata, Org, Project, ProjectAccess, ProjectMember, ReceiptsMode } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
 import { LastApproved } from '../components/LastApproved'
 import { useProjectPeople } from '../hooks/useProjectPeople'
 import { projectLink } from '../lib/projectLink'
+import { SECTION_GUIDE } from '../lib/settingsGuide'
+
+/** A small worked example, collapsed until asked for. */
+function Example({ children }: { children: React.ReactNode }) {
+  return (
+    <details className="mt-3 text-[12px] text-ink-2">
+      <summary className="cursor-pointer select-none text-ink">Example</summary>
+      <div className="mt-1.5 leading-relaxed">{children}</div>
+    </details>
+  )
+}
 
 const slug = (t: string) => t.toLowerCase().replace(/[^a-z]+/g, '-')
 
@@ -28,7 +39,13 @@ function Section({ title, description, danger, children }: { title: string; desc
   return (
     <section id={slug(title)} className={`bg-surface border scroll-mt-6 ${danger ? 'border-danger' : 'border-line'}`}>
       <div className="px-5 pt-4 pb-3 border-b border-line">
-        <h2 className="m-0 text-[15px] font-semibold" style={{ color: danger ? 'var(--danger-ink)' : 'var(--ink)' }}>{title}</h2>
+        <div className="flex items-baseline justify-between gap-3">
+          <h2 className="m-0 text-[15px] font-semibold" style={{ color: danger ? 'var(--danger-ink)' : 'var(--ink)' }}>{title}</h2>
+          {SECTION_GUIDE[title] && (
+            <Link to={`/guide?doc=${SECTION_GUIDE[title]}`} className="text-[12px] text-ink underline underline-offset-2 whitespace-nowrap"
+              aria-label={`How ${title} works`}>How it works →</Link>
+          )}
+        </div>
         {description && <p className="m-0 mt-1 text-[12.5px] text-ink-2 leading-relaxed max-w-[68ch]">{description}</p>}
       </div>
       <div className="px-5 py-4">{children}</div>
@@ -53,7 +70,7 @@ export function ProjectSettings() {
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
   const canManage = canManageProject(myAccess)
-  const { people: approvalPeople } = useProjectPeople(pid)
+  const { people: approvalPeople, members } = useProjectPeople(pid)
   // The edited metadata; null until the user changes something.
   const [meta, setMeta] = useState<{ value: Metadata; error: string | null } | null>(null)
   const [metaSaving, setMetaSaving] = useState(false)
@@ -112,7 +129,7 @@ export function ProjectSettings() {
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-[200px_minmax(0,1fr)] gap-6 px-7 py-6 items-start">
         <nav className="hidden lg:grid gap-0.5 sticky top-6" aria-label="Settings sections">
           <span className="amp-label px-2.5 pb-2">Settings</span>
-          {['General', 'Plan approval', 'Merges', 'Dispatch watchdog', 'Metadata', 'Team access', 'Knowledge bases', 'Trash', ...(canManage ? ['GitHub token', 'GitHub merge webhook', 'Webhooks', 'Audit log', 'Danger zone'] : [])].map(t => (
+          {['General', 'Plan approval', 'Merges', 'Verification receipts', 'Dispatch watchdog', 'Decision escalation', 'Metadata', 'Team access', 'Knowledge bases', 'Trash', ...(canManage ? ['GitHub token', 'GitHub merge webhook', 'Webhooks', 'Audit log', 'Danger zone'] : [])].map(t => (
             <a key={t} href={`#${slug(t)}`} className="px-2.5 py-1.5 text-[13px] text-ink-2 hover:text-ink hover:bg-surface-3">{t}</a>
           ))}
         </nav>
@@ -206,9 +223,25 @@ export function ProjectSettings() {
                 </p>
               </Section>
 
+              <Section title="Verification receipts"
+                description="A receipt records how an agent checked its work and whether a person accepted it. Off: nothing is recorded or stored. Inform: receipts are shown, nothing waits. Require: tickets wait for a receipt or your Accept.">
+                <ReceiptsSetting project={project} org={org} pid={pid} canManage={canManage}
+                  onSaved={setProject} onError={setError} />
+              </Section>
+
               <Section title="Dispatch watchdog"
                 description="A ticket is dispatched before its worker starts it. A dispatched ticket no worker starts is flagged for its owner after the first timeout, and returned to ready after the second: the manager then dispatches it again, or asks you. 0 turns either off. A ticket a worker has started is never returned this way.">
                 <WatchdogMinutes project={project} pid={pid} canManage={canManage}
+                  onSaved={setProject} onError={setError} />
+                <Example>
+                  Flag after 10, return after 30: a ticket dispatched at 09:00 that no worker claims shows “Dispatched · not started” from 09:10
+                  and is back in ready at 09:30. A worker claims a ticket with <code className="text-ink">amp_claim_task</code>.
+                </Example>
+              </Section>
+
+              <Section title="Decision escalation"
+                description="A person's ticket can carry a decide-by date: My work shows it red once the date passes. With escalation on, a ticket still open this long after its date is escalated once: its person is reminded on the ticket, and if you choose, its priority goes up a step and it is handed to a backup decider. A new date starts it over. AMP never decides for anyone. Off (0) by default; only owners change it, in AMP.">
+                <DecisionEscalation project={project} pid={pid} canManage={canManage} members={members}
                   onSaved={setProject} onError={setError} />
               </Section>
 
@@ -226,6 +259,10 @@ export function ProjectSettings() {
                     {metaSaved && !metaPatch && <span className="text-xs text-success-ink">Saved</span>}
                   </div>
                 )}
+                <Example>
+                  <code className="text-ink">repo = github.com/org/repo</code>, <code className="text-ink">jira_board = PLAT</code>,{' '}
+                  <code className="text-ink">capitalizable = yes</code>. A ticket with its own <code className="text-ink">jira_board</code> overrides the project's.
+                </Example>
               </Section>
 
               <Section title="Team access" description="Teams reach the project through these links. Owner teams manage the project; member teams work in it.">
@@ -284,6 +321,10 @@ export function ProjectSettings() {
                 <Section title="Webhooks"
                   description="Send this project's ticket changes to another service or a Slack channel. Org admins can also add webhooks for every project in the org.">
                   <WebhooksPanel projectId={pid} canManage={canManage} />
+                  <Example>
+                    Pick the Slack format and paste a Slack incoming-webhook URL: AMP posts <code className="text-ink">{'{"text": "…"}'}</code> for each event you pick.
+                    The JSON format signs each POST with <code className="text-ink">X-AMP-Signature</code>.
+                  </Example>
                 </Section>
               )}
 
@@ -391,6 +432,188 @@ function WatchdogMinutes({ project, pid, canManage, onSaved, onError }: {
         <div className="flex items-center gap-3">
           <button type="button" onClick={save} disabled={bad || !dirty || saving} className="amp-btn amp-btn-primary">
             {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}Save watchdog
+          </button>
+          {saved && !dirty && <span className="text-xs text-success-ink">Saved</span>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+const MODE_LABEL: Record<ReceiptsMode, string> = { off: 'Off', inform: 'Inform', require: 'Require' }
+
+/**
+ * The project's verification receipts setting (#126): use the org's default
+ * (which it names), Off, Inform or Require, and Require's minimum level.
+ * Before saving Require it says how many agent tickets completed in the last
+ * 7 days would have been held. Read-only for anyone but project owners and
+ * org admins; the server refuses everyone else, agents included.
+ */
+export function ReceiptsSetting({ project, org, pid, canManage, onSaved, onError }: {
+  project: Project; org: Org | null; pid: number; canManage: boolean
+  onSaved: (p: Project) => void; onError: (m: string | null) => void
+}) {
+  const current = project.receipts_mode ?? ''
+  const [choice, setChoice] = useState<'' | ReceiptsMode>(current)
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+  const [wouldHold, setWouldHold] = useState<number | null>(null)
+  // The org's default comes from the project's receipts summary, which any
+  // member can read; the org itself (GET /api/orgs/:id) is only readable by
+  // org members, so a project owner outside the org would see "Off".
+  const [summaryOrgMode, setSummaryOrgMode] = useState<ReceiptsMode | null>(null)
+  useEffect(() => { setChoice(current) }, [current])
+  useEffect(() => {
+    let live = true
+    api.receiptSummary(pid).then(s => {
+      if (!live) return
+      setSummaryOrgMode(s.org_mode)
+      setWouldHold(s.would_hold_last_7_days)
+    }).catch(() => {})
+    return () => { live = false }
+  }, [pid, current])
+  const orgMode: ReceiptsMode = summaryOrgMode ?? org?.receipts_mode ?? 'off'
+  const effective: ReceiptsMode = choice === '' ? orgMode : choice
+  const becomesRequire = effective === 'require' && (current === '' ? orgMode : current) !== 'require'
+  const dirty = choice !== current
+
+  const save = async () => {
+    if (!dirty) return
+    setSaving(true); onError(null); setSaved(false)
+    try {
+      onSaved(await api.updateProjectSettings(pid, { receipts_mode: choice }))
+      setSaved(true)
+    } catch (e) {
+      onError(e instanceof Error ? e.message : 'Could not change the setting')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const options: { value: '' | ReceiptsMode; label: string }[] = [
+    { value: '', label: `Use org default (${MODE_LABEL[orgMode]})` },
+    { value: 'off', label: 'Off' },
+    { value: 'inform', label: 'Inform' },
+    { value: 'require', label: 'Require' },
+  ]
+  return (
+    <div className="grid gap-3" data-testid="receipts-setting">
+      <fieldset className="m-0 p-0 border-0 grid gap-1.5" disabled={!canManage}>
+        <legend className={labelCls}>Receipts</legend>
+        {options.map(o => (
+          <label key={o.value || 'org'} className="flex items-center gap-2.5 text-[13px] text-ink cursor-pointer select-none">
+            <input type="radio" name={`receipts-${pid}`} className="accent-[var(--ink)]" value={o.value}
+              checked={choice === o.value} onChange={() => { setChoice(o.value); setSaved(false) }} />
+            {o.label}
+          </label>
+        ))}
+      </fieldset>
+      {effective === 'require' && (
+        <div>
+          <label htmlFor={`receipts-min-${pid}`} className={labelCls}>Minimum level</label>
+          <select id={`receipts-min-${pid}`} className={inputCls} disabled value={project.receipts_min_level ?? 'self_checked'} onChange={() => {}}>
+            <option value="self_checked">Self-checked</option>
+            <option value="independently_verified">Independently verified (arrives with the verifier)</option>
+          </select>
+          <p className="m-0 mt-1 text-[12px] text-ink-2">A person's Accept always meets it.</p>
+        </div>
+      )}
+      {becomesRequire && dirty && wouldHold != null && (
+        <p role="status" data-testid="receipts-require-warning" className="m-0 text-[12px] text-warning-ink leading-relaxed">
+          {wouldHold === 0
+            ? 'No agent ticket completed in the last 7 days would have been held.'
+            : `${wouldHold} agent ticket${wouldHold === 1 ? '' : 's'} completed in the last 7 days would have been held for you. Held tickets show in My work, and Accept clears them.`}
+        </p>
+      )}
+      {canManage && (
+        <div className="flex items-center gap-3">
+          <button type="button" onClick={save} disabled={!dirty || saving} className="amp-btn amp-btn-primary">
+            {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}Save receipts setting
+          </button>
+          {saved && !dirty && <span className="text-xs text-success-ink">Saved</span>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Decision escalation (#146): how long after a ticket's decide-by date it is
+ * escalated (`decision_escalation_minutes`, 0 = off, the default), whether
+ * that raises its priority, and who it is handed to. Saved on the button.
+ */
+function DecisionEscalation({ project, pid, canManage, members, onSaved, onError }: {
+  project: Project; pid: number; canManage: boolean; members: ProjectMember[]
+  onSaved: (p: Project) => void; onError: (m: string | null) => void
+}) {
+  const minutes = project.decision_escalation_minutes ?? 0
+  const raise = project.decision_escalation_raise_priority ?? false
+  const backup = project.decision_backup_decider ?? 0
+  const [minText, setMinText] = useState(String(minutes))
+  const [raiseOn, setRaiseOn] = useState(raise)
+  const [backupId, setBackupId] = useState(backup)
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+  useEffect(() => { setMinText(String(minutes)); setRaiseOn(raise); setBackupId(backup) }, [minutes, raise, backup])
+
+  const minNum = /^\d+$/.test(minText.trim()) ? Number(minText.trim()) : null
+  const bad = minNum == null || minNum > 43200
+  const dirty = minNum !== minutes || raiseOn !== raise || backupId !== backup
+  const people = members.filter(m => m.kind !== 'agent' && !m.disabled)
+
+  const save = async () => {
+    if (bad || !dirty) return
+    setSaving(true); onError(null); setSaved(false)
+    try {
+      onSaved(await api.updateProjectSettings(pid, {
+        decision_escalation_minutes: minNum!, decision_escalation_raise_priority: raiseOn, decision_backup_decider: backupId,
+      }))
+      setSaved(true)
+    } catch (e) {
+      onError(e instanceof Error ? e.message : 'Could not change the setting')
+    } finally {
+      setSaving(false)
+    }
+  }
+  const off = minNum === 0
+
+  return (
+    <div className="grid gap-3">
+      <div className="grid gap-3 sm:grid-cols-2">
+        <div>
+          <label htmlFor="escalation-minutes" className={labelCls}>Escalate after the decide-by date by</label>
+          <div className="flex items-center gap-2">
+            <input id="escalation-minutes" className={inputCls} inputMode="numeric" disabled={!canManage}
+              value={minText} onChange={e => { setMinText(e.target.value); setSaved(false) }} />
+            <span className="text-[13px] text-ink-2 whitespace-nowrap">minutes</span>
+          </div>
+        </div>
+        <div>
+          <label htmlFor="escalation-backup" className={labelCls}>Backup decider</label>
+          <select id="escalation-backup" className={inputCls} disabled={!canManage || off} value={backupId}
+            onChange={e => { setBackupId(Number(e.target.value)); setSaved(false) }}>
+            <option value={0}>Nobody: keep it with its person</option>
+            {people.map(m => <option key={m.user_id} value={m.user_id}>{m.display_name || m.email}</option>)}
+          </select>
+        </div>
+      </div>
+      <label className="flex items-center gap-2 text-[13px] text-ink">
+        <input type="checkbox" checked={raiseOn} disabled={!canManage || off} onChange={e => { setRaiseOn(e.target.checked); setSaved(false) }} />
+        Raise its priority one step
+      </label>
+      {bad
+        ? <p role="alert" className="m-0 text-[12px] text-danger-ink">A whole number of minutes, 0 (off) to 43200 (30 days).</p>
+        : <p className="m-0 text-[12px] text-ink-2 leading-relaxed" data-testid="escalation-summary">
+          {off
+            ? 'Off: an overdue decision shows red on My work, and nobody is reminded.'
+            : `${minNum} min after its decide-by date, a ticket still open is escalated once: its person is reminded on the ticket` +
+              (raiseOn ? ', its priority goes up a step' : '') +
+              (backupId ? `, and it is handed to ${people.find(m => m.user_id === backupId)?.display_name || 'the backup decider'}` : '') + '.'}
+        </p>}
+      {canManage && (
+        <div className="flex items-center gap-3">
+          <button type="button" onClick={save} disabled={bad || !dirty || saving} className="amp-btn amp-btn-primary">
+            {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}Save escalation
           </button>
           {saved && !dirty && <span className="text-xs text-success-ink">Saved</span>}
         </div>

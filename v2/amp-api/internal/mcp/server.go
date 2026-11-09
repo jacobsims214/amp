@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -59,7 +60,11 @@ func NewServer(registry *actor.Registry, repo *repository.Repo, h *hub.Hub, kbSv
 		// One reindex per KB across every replica, not just this one.
 		kbSvc.SetReindexLock(repo.TryNamedLock)
 	}
-	return &Server{registry: registry, repo: repo, hub: h, kb: kbSvc, svc: service.New(repo, registry, kbSvc)}
+	svc := service.New(repo, registry, kbSvc)
+	if h != nil {
+		svc.Notify = h.Publish
+	}
+	return &Server{registry: registry, repo: repo, hub: h, kb: kbSvc, svc: svc}
 }
 
 // Register wires all MCP tools onto the provided MCPServer.
@@ -397,14 +402,18 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"story_id":            num("REQUIRED. Story ID — every ticket belongs to a story."),
 			"epic_id":             num("Optional. The story's epic (checked if given; otherwise taken from the story)."),
 			"name":                str("REQUIRED. Ticket name."),
-			"description":         str("REQUIRED. Full instructions for the worker agent."),
-			"acceptance_criteria": str("REQUIRED. Specific verifiable conditions that prove the ticket is done."),
+			"description":         str("REQUIRED. Full instructions for the worker agent. A human ticket's brief: what the person must do, written for them (required)."),
+			"acceptance_criteria": str("REQUIRED. Specific verifiable conditions that prove the ticket is done. On a human ticket, what done means for the person (required)."),
 			"dependency_ids":      arr("The ticket IDs this ticket needs finished first. Leave empty ONLY if it truly needs nothing — it will be dispatchable immediately."),
 			"priority":            str("Priority: 0=low, 1=normal (default), 2=high, 3=critical."),
 			"assigned_to":         str("REQUIRED. Who should work this ticket, e.g. 'amp-worker'. Set at planning time so the user can review before dispatch."),
 			"start_at":            str("Optional. ISO 8601 datetime (e.g. '2026-04-14T09:00:00Z') to schedule this ticket. It is held as blocked until then."),
 			"owner":               str("Optional. The AMP user who owns the ticket: omit for yourself, 'none' to leave it unassigned for anyone on the project to pick up, or a project member's email/id."),
 			"metadata":            obj("Optional. Key/value metadata for integrations, e.g. {\"jira_key\": \"PLAT-123\"}. Values: string, number, or boolean. Project, epic, and story metadata is inherited."),
+			"performer":           str(performerDesc),
+			"human_reason":        str("With performer 'human': why a person does it. " + humanReasonList() + "."),
+			"ask":                 askProp(),
+			"decide_by":           str(decideByDesc),
 		}), wrap(ctx, s.guard(authz.Member, s.createTask)))
 
 	mcp.AddTool(tool("amp_create_tasks",
@@ -414,7 +423,9 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"tickets are created in dependency order. Returns the ID created for each ref. Tickets not connected to "+
 			"anything are reported, since they can all start at once. A step only a person can do (a sign-off, prod "+
 			"access, a decision, someone outside the team) is a ticket too: performer 'human' with its "+
-			"owner as the person, wired into depends_on, so the agent tickets after it wait for them. "+
+			"owner as the person, wired into depends_on, so the agent tickets after it wait for them. A human ticket "+
+			"needs its brief (description and acceptance_criteria, written for the person); a judgment ticket also "+
+			"needs an ask, from which AMP drafts its decision doc. "+
 			"Merges: a ticket finished with a PR or pushed branch holds the tickets after it until the merge is recorded. "+
 			"Two metadata keys change that (inherited project -> epic -> story -> ticket; no re-approval): set "+
 			"integration_branch: '<branch>' on an epic or story whose work merges into an integration branch first, so its "+
@@ -431,8 +442,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 						"ref":                 str("REQUIRED. A short name for this ticket in the batch."),
 						"story_id":            num("REQUIRED. The story it belongs to."),
 						"name":                str("REQUIRED. Ticket name."),
-						"description":         str("REQUIRED. Full instructions for the worker agent."),
-						"acceptance_criteria": str("REQUIRED. Verifiable conditions that prove it's done."),
+						"description":         str("REQUIRED. Full instructions for the worker agent. A human ticket's brief: what the person must do, written for them (required)."),
+						"acceptance_criteria": str("REQUIRED. Verifiable conditions that prove it's done. On a human ticket, what done means for the person (required)."),
 						"depends_on": map[string]interface{}{
 							"type":        "array",
 							"description": "Refs of tickets in this batch, or IDs of existing tickets, that must finish first.",
@@ -443,8 +454,10 @@ func (s *Server) Register(mcp *server.MCPServer) {
 						"owner":        str("Optional: omit for yourself, 'none' for unassigned, or a project member."),
 						"start_at":     str("Optional. ISO 8601 datetime to schedule it; it's held until then."),
 						"metadata":     obj("Optional key/value metadata. waits_for_merge: false makes this ticket wait only for its dependencies to complete, not for their PRs to merge (use it on review tickets)."),
-						"performer":    str("Optional. 'agent' (default: dispatched to an agent) or 'human': its owner does it and marks it done in AMP; agents never dispatch it."),
+						"performer":    str(performerDesc),
 						"human_reason": str("With performer 'human': why a person does it. " + humanReasonList() + "."),
+						"ask":          askProp(),
+						"decide_by":    str(decideByDesc),
 					},
 					"required": []string{"ref", "story_id", "name"},
 				},
@@ -502,6 +515,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 
 	mcp.AddTool(tool("amp_get_task", "Read a ticket (task) by ID, with its effective_metadata (its project's, epic's, and story's metadata with its own on top). "+
 		"Add include for its comments (plan, progress, questions, answers), history (state changes, dispatches, who did what) and runs (model, tokens, branch, commit, PR). "+
+		"upstream_decisions is what people decided on the tickets it depends on: follow them. A judgment ticket with a decision doc has decision "+
+		"(the doc's current question, options and recommended index, its markdown, and what was decided once recorded). "+
 		"url is the ticket's web UI link (/t/<CODE>-<id>): quote it when you send a person to the ticket.",
 		props{
 			"task_id": num("REQUIRED. Task ID."),
@@ -535,9 +550,11 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"assigned_to":         str("Who should work this ticket — can be corrected by the user before dispatch."),
 			"agent_id":            str("Agent identifier — set at dispatch time, not plan time."),
 			"metadata":            obj(patchMetadataDesc),
-			"performer":           str("'agent' or 'human' (its owner does it in AMP). Not while it's in progress. 'human' -> 'agent' only in the AMP web UI."),
-			"human_reason":        str("Why a person does it. " + humanReasonList() + "."),
+			"performer":           str("'agent' or 'human' (its owner does it in AMP). Not while it's in progress. 'human' -> 'agent' only in the AMP web UI. Making it human needs its brief (description and acceptance_criteria)."),
+			"human_reason":        str("Why a person does it. " + humanReasonList() + ". Making it 'judgment' needs an ask."),
 			"clear":               strArr(clearDesc("description, acceptance_criteria, assigned_to, agent_id")),
+			"ask":                 askProp(),
+			"decide_by":           str(decideByDesc),
 		}), wrap(ctx, s.guard(authz.Member, s.updateTask)))
 
 	mcp.AddTool(tool("amp_claim_task",
@@ -578,13 +595,15 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		"history and runs, and takes closeout_reason (never dispatch a ticket just to complete it: close out a ready ticket with "+
 		"runs directly). Also record the run: the model you used, your token usage if your harness can tell you (opencode: "+
 		"amp_session_usage), and where the work is (branch, commit, PR, pushed, base_branch). AMP reports token spend and traces "+
-		"code back to tickets from these. A person's own human ticket is marked done by that person in AMP's web UI, not here.",
+		"code back to tickets from these. Where the project records verification receipts (amp_open_receipt's mode isn't off), pass "+
+		"receipt_id and checks[]; a project that requires them may hold the completion for a person (held: true): then stop, don't "+
+		"retry. A person's own human ticket is marked done by that person in AMP's web UI, not here.",
 		withRunProps(props{
 			"task_id":         num("REQUIRED. Task ID."),
 			"dispatch_id":     str("The dispatch_id you were dispatched with. Pass it: it is what makes this the worker's own completion rather than a closeout."),
 			"closeout_reason": str("Closing out a ticket that isn't your own work: why its worker couldn't finish it (connection lost, timed out, approved after the worker blocked). Without your current dispatch_id, a completion that gives one is always recorded as a closeout."),
 			"hours_worked":    num("Human tickets: the hours the person says they spent on it."),
-		})), wrap(ctx, s.guard(authz.Member, s.completeTask)))
+		}, receiptProps())), wrap(ctx, s.guard(authz.Member, s.completeTask)))
 	mcp.AddTool(tool("amp_report_run",
 		"Record an agent run on a ticket without changing its state: the model, token usage, and where the work went. "+
 			"Use it for a run that ended some other way (killed, abandoned, handed over), for usage you learn about afterwards "+
@@ -696,6 +715,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.guard(authz.Member, s.answerQuestion)))
 
 	s.registerArtifacts(mcp)
+	s.registerReceipts(mcp)
 	s.registerDesign(mcp)
 
 	mcp.AddTool(tool("amp_add_task_comment", "Post a comment to a task's log. Used by agents to report progress.",
@@ -949,6 +969,9 @@ func (s *Server) createProject(rctx context.Context, args map[string]interface{}
 		return nil, err
 	}
 	req.OrgID, req.TeamID, req.CreatedBy = home.OrgID, home.TeamID, home.CreatedBy
+	if err := s.svc.GuardReceiptsNewProject(rctx, caller(rctx).p, req.OrgID, req.Metadata); err != nil {
+		return nil, err
+	}
 	p, err := s.repo.CreateProject(context.Background(), req)
 	if err != nil {
 		return nil, err
@@ -1047,7 +1070,19 @@ func (s *Server) claimTask(rctx context.Context, args map[string]interface{}) (*
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]interface{}{"task": t, "phase": t.Phase, "next": claimNext(t), "url": s.ticketURL(rctx, t.ProjectID, t.ID)}
+	next := claimNext(t)
+	ups, err := s.svc.UpstreamDecisions(rctx, caller(rctx).p, taskID)
+	if err != nil {
+		// The claim stands; the worker just misses what was decided upstream.
+		slog.Error("amp_claim_task: upstream decisions", "task_id", taskID, "err", err)
+	}
+	if len(ups) > 0 {
+		next += upstreamDecisionsNext
+	}
+	out := map[string]interface{}{"task": t, "phase": t.Phase, "next": next, "url": s.ticketURL(rctx, t.ProjectID, t.ID)}
+	if len(ups) > 0 {
+		out["upstream_decisions"] = ups
+	}
 	if t.StartedAt != nil {
 		out["started_at"] = t.StartedAt
 		out["started_by"] = t.StartedBy
@@ -1204,6 +1239,9 @@ func (s *Server) createEpic(rctx context.Context, args map[string]interface{}) (
 		CreatedBy:   caller(rctx).p.UserRef(),
 		Metadata:    meta,
 	}
+	if err := s.svc.GuardReceiptsCreate(rctx, caller(rctx).p, "project", projectID, meta); err != nil {
+		return nil, err
+	}
 	// Route through ProjectActor so EpicActor is spawned and registered.
 	pid, err := s.registry.Get(projectID)
 	if err != nil {
@@ -1287,6 +1325,9 @@ func (s *Server) createStory(rctx context.Context, args map[string]interface{}) 
 		Priority:           optStr(args, "priority", "1"),
 		CreatedBy:          caller(rctx).p.UserRef(),
 	}
+	if err := s.svc.GuardReceiptsCreate(rctx, caller(rctx).p, "epic", epicID, meta); err != nil {
+		return nil, err
+	}
 	// Route through ProjectActor → EpicActor so StoryActor is spawned and registered.
 	pid, err := s.registry.Get(projectID)
 	if err != nil {
@@ -1353,6 +1394,14 @@ func (s *Server) createTask(rctx context.Context, args map[string]interface{}) (
 	if err != nil {
 		return nil, err
 	}
+	ask, err := optAsk(args)
+	if err != nil {
+		return nil, err
+	}
+	decideBy, err := optDecideBy(args)
+	if err != nil {
+		return nil, err
+	}
 	task, warnings, err := s.svc.CreateTask(rctx, caller(rctx).p, domain.CreateTaskRequest{
 		ProjectID:          projectID,
 		EpicID:             optInt(args, "epic_id", 0),
@@ -1365,11 +1414,24 @@ func (s *Server) createTask(rctx context.Context, args map[string]interface{}) (
 		DependencyIDs:      optIntSlice(args, "dependency_ids"),
 		StartAt:            startAt,
 		Metadata:           meta,
+		Performer:          optStr(args, "performer", ""),
+		HumanReason:        optStr(args, "human_reason", ""),
+		Ask:                ask,
+		DecideBy:           decideBy,
 	}, optStr(args, "owner", ""))
 	if err != nil {
 		return nil, err
 	}
+	if ask != nil && !slices.Contains(warnings, service.DecisionDocWarning) {
+		s.publishDecision(task.ProjectID, task.ID, 1)
+	}
 	return taskWithWarnings(task, warnings)
+}
+
+// publishDecision tells open drawers a ticket's decision doc changed.
+func (s *Server) publishDecision(projectID, taskID, version int) {
+	s.hub.Publish(domain.Event{Type: domain.EventDecisionUpdated, ProjectID: projectID,
+		Payload: map[string]any{"task_id": taskID, "version": version}, At: time.Now()})
 }
 
 // taskWithWarnings returns a task as before, with any planning warnings
@@ -1432,17 +1494,30 @@ func (s *Server) createTasks(rctx context.Context, args map[string]interface{}) 
 			}
 			startAt = &t
 		}
+		ask, err := optAsk(m)
+		if err != nil {
+			return nil, fmt.Errorf("tasks[%d]: %w", i, err)
+		}
+		decideBy, err := optDecideBy(m)
+		if err != nil {
+			return nil, fmt.Errorf("tasks[%d]: %w", i, err)
+		}
 		specs = append(specs, service.TaskSpec{
 			Ref: optStr(m, "ref", ""), StoryID: optInt(m, "story_id", 0), Name: optStr(m, "name", ""),
 			Description: optStr(m, "description", ""), AcceptanceCriteria: optStr(m, "acceptance_criteria", ""),
 			Priority: optStr(m, "priority", "1"), AssignedTo: optStr(m, "assigned_to", ""), Owner: optStr(m, "owner", ""),
 			DependsOn: deps, StartAt: startAt, Metadata: meta,
-			Performer: optStr(m, "performer", ""), HumanReason: optStr(m, "human_reason", ""),
+			Performer: optStr(m, "performer", ""), HumanReason: optStr(m, "human_reason", ""), Ask: ask, DecideBy: decideBy,
 		})
 	}
 	created, warnings, err := s.svc.CreateTasks(rctx, caller(rctx).p, projectID, specs)
 	if err != nil {
 		return nil, err
+	}
+	for _, c := range created {
+		if c.DecisionDoc {
+			s.publishDecision(projectID, c.ID, 1)
+		}
 	}
 	out := map[string]interface{}{"created": created, "count": len(created)}
 	if len(warnings) > 0 {
@@ -1677,7 +1752,7 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 		"quiet":             quiet,      // in progress with no activity for 15+ min: the worker likely died; check comments, close out or reset to backlog, re-dispatch
 		"not_started":       notStarted, // dispatched but no worker started it: start the worker now, or undo the dispatch
 		"returned":          returned,   // returned to ready because no worker started it; re-dispatch knowingly or ask the user
-		"waiting_on_people": people,     // Waiting on you: what each person must do next (kind approve, answer, merge, start, do); never dispatch these
+		"waiting_on_people": people,     // Waiting on you: what each person must do next (kind approve, answer, verify, merge, start, do); never dispatch these
 		"coming_up":         comingUp,   // people's human tickets not actionable yet (waiting on dependencies, a schedule or approval)
 		"count":             len(tasks),
 		"owner_filter":      view.Mode, // pass owner='unassigned' or 'any' to widen
@@ -1711,6 +1786,19 @@ func (s *Server) getTask(ctx context.Context, args map[string]interface{}) (*mcp
 		return nil, err
 	}
 	out := map[string]interface{}{"task": reply.Task, "effective_metadata": eff, "url": s.ticketURL(ctx, task.ProjectID, taskID)}
+	// What people decided on the tickets this one depends on, so the worker
+	// needs no extra call to learn it.
+	if ups, err := s.svc.UpstreamDecisions(ctx, caller(ctx).p, taskID); err != nil {
+		slog.Error("amp_get_task: upstream decisions", "task_id", taskID, "err", err)
+	} else if len(ups) > 0 {
+		out["upstream_decisions"] = ups
+	}
+	// A ticket's decision doc: its current options and markdown.
+	if reply.Task.HasDecisionDoc || reply.Task.HumanReason == "judgment" {
+		if doc, err := s.svc.OwnDecision(ctx, caller(ctx).p, taskID); err == nil && doc != nil {
+			out["decision"] = doc
+		}
+	}
 	limit := optInt(args, "limit", 30)
 	for _, inc := range optStrSlice(args, "include") {
 		switch inc {
@@ -1791,11 +1879,26 @@ func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
 	}
-	// A person's ticket isn't switched to agent work off the web UI.
-	if err := s.svc.UpdateTask(rctx, p, task, req); err != nil {
+	if req.Ask, err = optAsk(args); err != nil {
 		return nil, err
 	}
-	return jsonResult(map[string]interface{}{"task_id": taskID, "updated": true})
+	if req.DecideBy, err = optDecideBy(args); err != nil {
+		return nil, err
+	}
+	// A person's ticket isn't switched to agent work off the web UI.
+	warnings, err := s.svc.UpdateTask(rctx, p, task, req)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]interface{}{"task_id": taskID, "updated": true}
+	if req.Ask != nil && len(warnings) == 0 {
+		s.publishDecision(task.ProjectID, taskID, 1)
+		out["decision_doc"] = true
+	}
+	if len(warnings) > 0 {
+		out["warnings"] = warnings
+	}
+	return jsonResult(out)
 }
 
 func (s *Server) updateEpic(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -1821,6 +1924,9 @@ func (s *Server) updateEpic(rctx context.Context, args map[string]interface{}) (
 		Clear:       optStrSlice(args, "clear"),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
+		return nil, err
+	}
+	if err := s.svc.GuardReceiptsUpdate(rctx, caller(rctx).p, "epic", epicID, req.Metadata); err != nil {
 		return nil, err
 	}
 	replyCh := make(chan ReplySimple, 1)
@@ -1868,6 +1974,9 @@ func (s *Server) updateStory(rctx context.Context, args map[string]interface{}) 
 		Clear:              optStrSlice(args, "clear"),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
+		return nil, err
+	}
+	if err := s.svc.GuardReceiptsUpdate(rctx, caller(rctx).p, "story", storyID, req.Metadata); err != nil {
 		return nil, err
 	}
 	replyCh := make(chan ReplySimple, 1)
@@ -1973,11 +2082,40 @@ func (s *Server) completeTask(rctx context.Context, args map[string]interface{})
 	// service falls back to the run note for a closeout's reason itself.
 	claim := service.CompleteClaim{DispatchID: strings.TrimSpace(optStr(args, "dispatch_id", "")),
 		Reason: optStr(args, "closeout_reason", "")}
-	t, closed, err := s.svc.CompleteTaskWithRun(rctx, caller(rctx).p, taskID, &finish, claim)
+	// Its verification receipt (#126): checked before anything moves, so a
+	// malformed check or another ticket's receipt leaves the ticket open.
+	rin, err := receiptFromArgs(args, claim.DispatchID)
 	if err != nil {
 		return nil, err
 	}
+	t, closed, err := s.svc.CompleteTaskWithReceipt(rctx, caller(rctx).p, taskID, &finish, claim, rin)
+	if err != nil {
+		return nil, err
+	}
+	if closed.Held {
+		// Require held it: not done, and not an error, so the worker stops
+		// rather than retrying. The run is still recorded, and the receipt
+		// points at it.
+		out := map[string]interface{}{"task_id": taskID, "state": string(t.State), "held": true, "reason": closed.HoldReason,
+			"next": fmt.Sprintf("Stop. Ticket %d wasn't completed: this project requires a verification receipt and yours is below its "+
+				"minimum (%s). It waits for a person, who accepts it or sends it back, in the AMP web UI. Say why in your closing "+
+				"message; don't retry the completion.", taskID, closed.HoldReason)}
+		finish.Outcome = domain.RunCompleted
+		run, err := s.svc.RecordRun(rctx, caller(rctx).p, taskID, finish)
+		if err != nil {
+			out["run_error"] = err.Error()
+			s.svc.FinalizeReceipt(rctx, caller(rctx).p, taskID, nil, closed)
+		} else {
+			out["run"] = run
+			s.svc.FinalizeReceipt(rctx, caller(rctx).p, taskID, &run, closed)
+		}
+		return jsonResult(out)
+	}
 	out := map[string]interface{}{"task_id": taskID, "state": "completed", "next": completeNext(t, closed.Closeout)}
+	if st := closed.ReceiptStatus(); st != "" && closed.Completed {
+		out["receipt_status"] = st
+	}
+	var recorded *domain.Run
 	if closed.Closeout {
 		out["closeout"] = true
 		if closed.Reason != "" {
@@ -1997,17 +2135,22 @@ func (s *Server) completeTask(rctx context.Context, args map[string]interface{})
 		}
 		args["run_note"] = note
 		finish.Note = note
-		if _, err := s.svc.RecordRun(rctx, caller(rctx).p, taskID, finish); err != nil {
+		if run, err := s.svc.RecordRun(rctx, caller(rctx).p, taskID, finish); err != nil {
 			out["run_error"] = err.Error()
+		} else {
+			recorded = &run
 		}
 	} else if run, err := s.recordRunFromArgs(rctx, taskID, args, domain.RunCompleted); err != nil {
 		out["run_error"] = err.Error()
 	} else if run != nil {
 		out["run"] = run
+		recorded = run
 	}
 	if runs, err := s.repo.TaskRuns(rctx, taskID); err == nil && len(runs) > 0 {
 		out["run"] = runs[len(runs)-1]
 	}
+	// After the run is recorded, so the receipt points at it.
+	s.svc.FinalizeReceipt(rctx, caller(rctx).p, taskID, recorded, closed)
 	return jsonResult(out)
 }
 
@@ -2035,6 +2178,10 @@ func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*
 		return nil, err
 	}
 	if err := s.checkProjectNotArchived(context.Background(), task.ProjectID); err != nil {
+		return nil, err
+	}
+	// A held ticket waits for a person; a question doesn't release it (#126).
+	if err := s.svc.RefuseIfHeld(rctx, caller(rctx).p, task, "task.block"); err != nil {
 		return nil, err
 	}
 	replyCh := make(chan ReplySimple, 1)
@@ -2202,7 +2349,11 @@ func (s *Server) resetProject(rctx context.Context, args map[string]interface{})
 	if p.State == domain.ProjectStateArchived {
 		return nil, fmt.Errorf("⚠️  Project %d (%s) is archived. Restore it first with amp_restore_project before making changes.", p.ID, p.Name)
 	}
-	// 1. Wipe postgres
+	// 1. Wipe postgres. Receipts have no FK to tasks: they and their
+	// evidence go first (#126).
+	if err := s.svc.DeleteProjectReceipts(rctx, projectID); err != nil {
+		return nil, fmt.Errorf("reset project: %w", err)
+	}
 	if err := s.repo.ResetProject(context.Background(), projectID); err != nil {
 		return nil, fmt.Errorf("reset project: %w", err)
 	}
@@ -2296,7 +2447,7 @@ func (s *Server) setTaskState(rctx context.Context, args map[string]interface{})
 
 	// Through the service, which keeps agents from moving work forward by
 	// hand (see Service.SetTaskState), then the actor hierarchy.
-	updated, err := s.svc.SetTaskStateAs(rctx, caller(rctx).p, taskID, domain.TaskState(stateStr), reason,
+	updated, held, err := s.svc.SetTaskStateHeld(rctx, caller(rctx).p, taskID, domain.TaskState(stateStr), reason,
 		strings.TrimSpace(optStr(args, "dispatch_id", "")))
 	if err != nil {
 		return nil, err
@@ -2307,6 +2458,13 @@ func (s *Server) setTaskState(rctx context.Context, args map[string]interface{})
 		"to_state":   string(updated.State),
 		"reason":     reason,
 		"next":       stateNext(updated),
+	}
+	if held {
+		// Require held it for a person (#126): say so, so the caller stops.
+		out["held"] = true
+		out["next"] = fmt.Sprintf("Ticket %d wasn't completed: its project requires a verification receipt and this completion is "+
+			"below the minimum, so it waits for a person to accept it in the AMP web UI. Stop; don't retry.", taskID)
+		return jsonResult(out)
 	}
 	if string(updated.State) != stateStr {
 		// Moved back while a dependency is open: it waits on it.
@@ -2458,6 +2616,9 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 	if err != nil {
 		return nil, err
 	}
+	// Off the web UI, receipts keys aren't imported (the new project follows
+	// the org default until a person sets it, #126).
+	stripped := s.svc.StripImportedReceipts(caller(rctx).p, &bundle)
 	newProject, err := s.repo.ImportBundle(ctx, bundle, newCode, newName, home)
 	if err != nil {
 		return nil, fmt.Errorf("import bundle: %w", err)
@@ -2490,7 +2651,12 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 	// 4. Publish event for real-time UI updates
 	s.hub.Publish(domain.Event{Type: domain.EventProjectCreated, ProjectID: newProject.ID, Payload: newProject, At: time.Now()})
 
-	return jsonResult(map[string]interface{}{"project": newProject, "kb_docs_imported": imported, "kb_docs_failed": failed})
+	out := map[string]interface{}{"project": newProject, "kb_docs_imported": imported, "kb_docs_failed": failed}
+	if stripped > 0 {
+		out["receipts_keys_removed"] = stripped
+		out["note"] = "The bundle's verification receipts metadata wasn't imported: a person sets it in the AMP web UI."
+	}
+	return jsonResult(out)
 }
 
 // ---- Metadata ----
@@ -2521,6 +2687,67 @@ func optMetadataPatch(args map[string]interface{}) (domain.MetadataPatch, error)
 		return nil, err
 	}
 	return p, nil
+}
+
+// performerDesc is the performer field's help on the create tools.
+const performerDesc = "Optional. 'agent' (default: dispatched to an agent) or 'human': its owner does it and marks it done in AMP; agents never dispatch it. " +
+	"A human ticket needs description and acceptance_criteria written for the person; merges are not human tickets (a ticket finished with a PR is Merge needed)."
+
+// askProp is the ask field: input only, it drafts a judgment ticket's decision doc.
+func askProp() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"description": "A judgment ticket's ask: REQUIRED for performer 'human' with human_reason 'judgment' (refused on any other ticket). " +
+			"AMP validates it and drafts the ticket's decision doc from it; it is not stored on the ticket. The person picks an option " +
+			"there; recommended only marks a badge, it never chooses. After the doc exists, its options change only in AMP. Example: " +
+			`{"question":"Which north-star metric do we commit to for the next 90 days?","options":[{"label":"A: Weekly active teams",` +
+			`"consequence":"Easy to measure; rewards seats over value"},{"label":"B: Activation rate (40%, floor 30%)","consequence":` +
+			`"Needs the onboarding event (#41)"},{"label":"C: Net revenue retention","consequence":"Lags 90 days; can't steer this quarter"}],` +
+			`"recommended":1,"recommendation_reason":"B is the only one we can move and measure inside the quarter.","evidence":["artifact #1","#3"]}`,
+		"properties": map[string]interface{}{
+			"question": str("REQUIRED. What the person decides."),
+			"options": map[string]interface{}{
+				"type":        "array",
+				"description": "REQUIRED. 2 to 4 options, each {label, consequence}: its trade-offs or cost.",
+				"items": map[string]interface{}{"type": "object", "properties": map[string]interface{}{
+					"label": str("REQUIRED. e.g. 'B: Activation rate (40%, floor 30%)'."), "consequence": str("REQUIRED. Trade-offs, cost.")},
+					"required": []string{"label", "consequence"}},
+			},
+			"recommended":           num("REQUIRED. Index (0-based) of the option you recommend."),
+			"recommendation_reason": str("REQUIRED. Why that option."),
+			"evidence":              strArr("Optional. Links behind it: URLs, '#N' tickets, 'artifact #N'."),
+		},
+		"required": []string{"question", "options", "recommended", "recommendation_reason"},
+	}
+}
+
+// optAsk reads an optional ask object (or its JSON as a string).
+func optAsk(args map[string]interface{}) (*domain.Ask, error) {
+	v, ok := args["ask"]
+	if !ok || v == nil {
+		return nil, nil
+	}
+	var raw []byte
+	switch x := v.(type) {
+	case string:
+		if strings.TrimSpace(x) == "" {
+			return nil, nil
+		}
+		raw = []byte(x)
+	case map[string]interface{}:
+		b, err := json.Marshal(x)
+		if err != nil {
+			return nil, err
+		}
+		raw = b
+	default:
+		return nil, fmt.Errorf("ask must be an object {question, options, recommended, recommendation_reason, evidence}")
+	}
+	var ask domain.Ask
+	if err := json.Unmarshal(raw, &ask); err != nil {
+		return nil, fmt.Errorf("ask: %v", err)
+	}
+	return &ask, nil
 }
 
 // optNewMetadata reads the "metadata" argument for a new item.
@@ -3877,4 +4104,24 @@ func orEmpty(m map[domain.TaskState]int) map[domain.TaskState]int {
 		return map[domain.TaskState]int{}
 	}
 	return m
+}
+
+// decideByDesc describes the decide_by argument (#146).
+const decideByDesc = "Optional, for a person's ticket (performer 'human') only: when it should be decided by, ISO 8601 with a " +
+	"time zone (e.g. '2026-11-12T17:00:00Z'), in the future. Suggest one when a decision holds up other work. Once a ticket has one, " +
+	"only its person moves or removes it, in the AMP web UI. " +
+	"Past it, My Work shows the ticket overdue, and a project with escalation on reminds its person (it never decides for them)."
+
+// optDecideBy reads an optional decide_by (RFC 3339, so its zone is never
+// guessed).
+func optDecideBy(args map[string]interface{}) (*time.Time, error) {
+	v := strings.TrimSpace(optStr(args, "decide_by", ""))
+	if v == "" {
+		return nil, nil
+	}
+	t, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		return nil, fmt.Errorf("decide_by: use ISO 8601 with a time zone, e.g. 2026-11-12T17:00:00Z (%v)", err)
+	}
+	return &t, nil
 }

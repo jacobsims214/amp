@@ -32,6 +32,16 @@ phases 1, 4 and 5), with backups standing in for the old stack.
   - If you're an agent and find no backups configured, tell your person. It's the largest risk
     in an AMP install.
 
+## SeaweedFS + CNPG barmanObjectStore
+
+CNPG's continuous backup writes to S3-compatible storage. On your own hardware, run SeaweedFS
+(open source, Apache-2.0) and use its S3 gateway. Set `endpointURL` on the `barmanObjectStore`
+block to the gateway, and create a bucket for the backups. AMP's bundled SeaweedFS
+(`seaweedfs.enabled`, for receipt evidence) works too. Use its own bucket and credentials, and
+remember that backups stored inside the same cluster don't survive losing that cluster. Any
+S3-compatible endpoint works, including AWS S3 or Backblaze B2. The setup steps are tracked in
+#145.
+
 ## How much can be lost
 
 - **With CNPG continuous backup:** Postgres loses seconds. The KBs lose everything written since

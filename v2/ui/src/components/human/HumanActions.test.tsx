@@ -1,4 +1,4 @@
-// HumanActions (KB decisions/human-work-ux.md §2): each action and the API call it makes.
+// HumanActions (v2/kb/working/human-work.md): each action and the API call it makes.
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
@@ -384,6 +384,29 @@ describe('Do', () => {
     await userEvent.type(screen.getByLabelText(/hours spent/i), 'lots')
     expect(screen.getByRole('alert')).toHaveTextContent('Hours must be a number from 0 to 1000.')
     expect(screen.getByRole('button', { name: /^mark done$/i })).toBeDisabled()
+  })
+
+  it.each(['judgment', 'approval'] as const)('needs "Your decision" for a %s ticket and sends it as the note', async reason => {
+    render(<HumanActions task={task({ performer: 'human', human_reason: reason, state: 'in_progress' })} canAct />)
+    await userEvent.click(screen.getByRole('button', { name: /mark done…/i }))
+    expect(screen.getByLabelText('Your decision')).toBeRequired()
+    expect(screen.queryByLabelText(/what happened/i)).toBeNull()
+    await userEvent.click(screen.getByRole('button', { name: /^mark done$/i }))
+    expect(screen.getByRole('alert')).toHaveTextContent('Write what you decided')
+    expect(calls).toHaveLength(0)
+    await userEvent.type(screen.getByLabelText('Your decision'), 'Go with B')
+    expect(screen.queryByRole('alert')).toBeNull()
+    await userEvent.click(screen.getByRole('button', { name: /^mark done$/i }))
+    await waitFor(() => expect(calls).toHaveLength(1))
+    expect(calls[0].body).toEqual({ note: 'Go with B' })
+  })
+
+  it('keeps the note optional for other reasons', async () => {
+    render(<HumanActions task={task({ performer: 'human', human_reason: 'physical', state: 'in_progress' })} canAct />)
+    await userEvent.click(screen.getByRole('button', { name: /mark done…/i }))
+    expect(screen.getByLabelText(/what happened \(optional\)/i)).not.toBeRequired()
+    await userEvent.click(screen.getByRole('button', { name: /^mark done$/i }))
+    await waitFor(() => expect(calls).toHaveLength(1))
   })
 
   it('says what a waiting ticket waits on, with no buttons', () => {

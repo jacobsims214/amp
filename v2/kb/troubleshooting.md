@@ -30,6 +30,12 @@ reachable from the browser (with `npm run dev`, the UI proxies `/api` to `:3001`
 press Retry. If it keeps happening with AMP up, check that only a few AMP tabs are open: each tab
 holds one live-update connection, and browsers allow six per host over HTTP/1.1.
 
+## Signed in, but AMP says it didn't create your account
+
+Sign-in got past the identity provider, but AMP refused to make an AMP user. The message says why
+(email unverified, email domain not allowed and no invite, no email sent) and who can fix it. For
+a Cognito + Dex setup, `operations/sso-cognito-dex.md` goes through each cause and its fix.
+
 ## "Forbidden" on dispatch or complete
 
 The ticket isn't yours. AMP only lets the owner's agent run a ticket. Ask its owner, or have a

@@ -12,7 +12,7 @@ import (
 	"github.com/simstech/amp-api/internal/domain"
 )
 
-// ---- Merge signal (AMP #2475, KB decisions/human-work-ux.md §4) ----
+// ---- Merge signal (AMP #2475, v2/kb/working/human-work.md) ----
 //
 // A ticket that completes with a run carrying a PR or a pushed branch, in a
 // project that requires merges, is done with merge_state "needed": the
@@ -404,19 +404,37 @@ func (s *Service) ReconcileMergeMetadata(ctx context.Context, p authz.Principal,
 	s.reconcileMergeGated(ctx, projectID)
 }
 
-// CompleteTaskWithRun completes agent ticket taskID as CompleteTask does,
-// knowing the run that finished it: when that run leaves work waiting on a
+// CompleteTaskWithReceipt completes agent ticket taskID as CompleteTask
+// does, knowing the run that finished it: when that run leaves work waiting on a
 // merge (mergeGateFor), the ticket completes with merge_state "needed" and
 // its dependents keep waiting. The caller records the run afterwards.
 // complete carries the caller's claim to be the ticket's worker (the
 // dispatch_id it was given, if any) and, for a closeout, why.
-func (s *Service) CompleteTaskWithRun(ctx context.Context, p authz.Principal, taskID int, run *domain.Run, complete CompleteClaim) (*domain.Task, Closeout, error) {
+//
+// Its verification receipt (#126): in a project with receipts on, in (nil:
+// adopt the newest draft, no checks) decides the receipt, and under Require
+// a receipt below the minimum holds the ticket for a person instead of
+// completing it (Closeout.Held). The caller records the run, then calls
+// FinalizeReceipt with it and the Closeout.
+func (s *Service) CompleteTaskWithReceipt(ctx context.Context, p authz.Principal, taskID int, run *domain.Run, complete CompleteClaim, in *ReceiptIn) (*domain.Task, Closeout, error) {
+	if in == nil {
+		in = &ReceiptIn{DispatchID: complete.DispatchID}
+	}
+	return s.completeTask(ctx, p, taskID, run, complete, in)
+}
+
+func (s *Service) completeTask(ctx context.Context, p authz.Principal, taskID int, run *domain.Run, complete CompleteClaim, in *ReceiptIn) (*domain.Task, Closeout, error) {
 	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskWork)
 	if err != nil {
 		return nil, Closeout{}, err
 	}
 	if t.IsHuman() {
 		return nil, Closeout{}, authz.BadRequest("ticket %d is a person's ticket; they mark it done in AMP: %s", taskID, s.TaskURL(t.ProjectID, taskID))
+	}
+	// A held ticket waits for a person (#126): refused before any other
+	// check, so the refusal says so whoever calls and with whatever dispatch.
+	if err := s.RefuseIfHeld(ctx, p, t, "task.complete"); err != nil {
+		return nil, Closeout{}, err
 	}
 	if err := s.checkAgentCompletion(ctx, p, t, complete.DispatchID); err != nil {
 		s.auditTaskDenied(ctx, p, "task.complete", t, err, nil)
@@ -438,6 +456,20 @@ func (s *Service) CompleteTaskWithRun(ctx context.Context, p authz.Principal, ta
 			reason = strings.TrimSpace(run.Note)
 		}
 	}
+	plan, err := s.prepareReceipt(ctx, p, t, in)
+	if err != nil {
+		return nil, Closeout{}, err
+	}
+	if plan != nil && plan.hold {
+		offUI := !p.InUI()
+		completed, err := s.holdCompletion(ctx, p, t, actor.MsgCompleteTask{RequireStarted: offUI, RequireDeps: offUI,
+			DispatchID: complete.DispatchID, CloseoutReason: reason, CloseoutOK: s.closeoutOK(t, offUI)}, plan)
+		if err != nil {
+			return nil, Closeout{}, err
+		}
+		task, err := s.Repo.GetTask(ctx, taskID)
+		return task, Closeout{Closeout: closeout, Reason: reason, Held: !completed, Completed: completed, HoldReason: plan.reason, plan: plan}, err
+	}
 	reply, err := s.sendCompleteMerge(ctx, p, t, !p.InUI(), gate, where, complete.DispatchID, reason)
 	if err != nil {
 		return nil, Closeout{}, err
@@ -452,7 +484,7 @@ func (s *Service) CompleteTaskWithRun(ctx context.Context, p authz.Principal, ta
 		s.retriggerMergeStepsAfter(ctx, p, taskID)
 	}
 	task, err := s.Repo.GetTask(ctx, taskID)
-	return task, Closeout{Closeout: reply.Closeout, Reason: reason}, err
+	return task, Closeout{Closeout: reply.Closeout, Reason: reason, Completed: reply.Changed, plan: plan}, err
 }
 
 // CompleteClaim is how a caller presents itself to a completion: the
@@ -476,6 +508,10 @@ func (s *Service) setMergeState(ctx context.Context, p authz.Principal, t *domai
 	reply := actor.Await(ctx, replyCh)
 	if reply.Err != nil {
 		return reply, &authz.Error{Status: 409, Msg: reply.Err.Error()}
+	}
+	if reply.Changed && msg.State == domain.MergeMerged {
+		// Merged work's receipts and evidence are kept (#126, D13).
+		s.KeepReceipts(ctx, t.ID)
 	}
 	return reply, nil
 }

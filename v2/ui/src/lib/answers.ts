@@ -2,7 +2,7 @@ import type { AskOption, Task } from '../types'
 
 /**
  * Suggested answers for an agent's question (the Answer card's chips,
- * decisions/human-work-ux.md §2). Agents usually ask either-or questions:
+ * v2/kb/working/human-work.md). Agents usually ask either-or questions:
  * "Should I fall back to a 0600 file, or fail with a clear error?". The
  * options are read from the last question in the text. No guess is better
  * than a wrong one: anything that doesn't split cleanly gives no chips.

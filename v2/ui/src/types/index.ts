@@ -8,6 +8,8 @@ export interface Project {
   description: string
   state: 'active' | 'archived'
   org_id?: number | null
+  /** set on project lists: the org's name, even when the caller isn't a member */
+  org_name?: string
   created_by?: number | null
   /** any project member may reassign tickets that aren't in progress */
   open_reassign?: boolean
@@ -25,6 +27,116 @@ export interface Project {
   not_started_flag_minutes?: number
   /** a dispatched ticket no worker starts is returned to ready after this many minutes; 0 = off (AMP #2801) */
   not_started_return_minutes?: number
+  /** verification receipts (#126): '' uses the org's default */
+  receipts_mode?: '' | ReceiptsMode
+  /** what a Require ticket must reach before it completes */
+  receipts_min_level?: ReceiptMinLevel
+  /** a person's ticket this many minutes past its decide_by is escalated once; 0 = off, the default (#146) */
+  decision_escalation_minutes?: number
+  /** the escalation also raises the ticket's priority one step (#146) */
+  decision_escalation_raise_priority?: boolean
+  /** the escalation hands the ticket to this user; null = nobody (#146) */
+  decision_backup_decider?: number | null
+}
+
+// ---- Verification receipts (#126) ----
+
+export type ReceiptsMode = 'off' | 'inform' | 'require'
+export type ReceiptMinLevel = 'self_checked' | 'independently_verified'
+export type VerificationStatus = 'unverified' | 'self_checked' | 'independently_verified' | 'human_accepted'
+
+export interface Receipt {
+  id: number
+  task_id: number
+  project_id: number
+  run_id?: number
+  state: 'draft' | 'final'
+  mode: 'inform' | 'require'
+  held: boolean
+  agent_id: string
+  summary: string
+  files_changed: { path: string; added: number; removed: number }[]
+  commit_sha: string
+  tree_sha: string
+  branch: string
+  base_branch: string
+  pr_url: string
+  kept: boolean
+  created_at: string
+  finalized_at?: string
+}
+
+export interface ReceiptCheck {
+  id: number
+  receipt_id: number
+  role: 'worker' | 'verifier' | 'human'
+  kind: 'command' | 'test' | 'ci' | 'visual' | 'manual' | 'verdict'
+  verdict: 'pass' | 'fail' | 'cant_tell'
+  criterion_ref: string
+  command?: string
+  exit_code?: number
+  duration_ms?: number
+  note?: string
+  evidence_key?: string
+  checked_by: string
+  user_id?: number
+  created_at: string
+}
+
+export interface ReceiptEvidence {
+  id: number
+  receipt_id: number
+  key: string
+  name: string
+  /** the revision it was recorded on */
+  tree_sha?: string
+  content_type: string
+  bytes: number
+  sha256?: string
+  duration_ms?: number
+  frames?: number
+  status: 'pending' | 'stored' | 'expired'
+  created_at: string
+  stored_at?: string
+  /** when unkept evidence is (or was) deleted; unset once kept (merged or accepted) */
+  expires_at?: string
+}
+
+export interface ReceiptSettings {
+  mode: ReceiptsMode
+  min_level: ReceiptMinLevel
+  /** the project's own value ('' = the org's) */
+  project_mode: '' | ReceiptsMode
+  org_mode: ReceiptsMode
+}
+
+export interface ReceiptView {
+  receipt: Receipt
+  checks: ReceiptCheck[]
+  evidence: ReceiptEvidence[]
+  status: VerificationStatus
+  held: boolean
+  /** why a held receipt is below its minimum */
+  hold_reason?: string
+}
+
+/** GET /api/tasks/:id/receipt: the latest final receipt, or receipt: null. */
+export type TaskReceipt =
+  | (ReceiptView & { attempts: number; settings: ReceiptSettings })
+  | { receipt: null; mode: ReceiptsMode; settings: ReceiptSettings }
+
+export interface ReceiptSummaryRow {
+  task_id: number
+  status: VerificationStatus
+  held: boolean
+  has_media: boolean
+  /** why a held one waits for a person */
+  reason?: string
+}
+
+export interface ReceiptSummary extends ReceiptSettings {
+  tasks: ReceiptSummaryRow[]
+  would_hold_last_7_days: number
 }
 
 export interface Epic {
@@ -133,6 +245,10 @@ export interface Task {
   waiting_detail?: string
   /** free-form key/value data for integrations (its own, not inherited) */
   metadata?: Metadata
+  /** it has a decision doc: its decision is recorded on the doc (Record decision), never by Mark done (#125) */
+  has_decision_doc?: boolean
+  /** a person's ticket's decide-by date (RFC 3339): set by the person or suggested by an agent (#146) */
+  decide_by?: string
   created_at: string
   updated_at: string
 }
@@ -433,6 +549,8 @@ export interface SSEEvent {
     | 'epic.updated'
     | 'story.updated'
     | 'artifact.updated'
+    | 'receipt.updated'
+    | 'decision.updated'
   project_id?: number
   payload?: unknown
   at?: string
@@ -498,6 +616,8 @@ export interface UpdateTaskRequest {
   assigned_to?: string
   priority?: string
   start_at?: string | null
+  /** a person's ticket's decide-by date (RFC 3339); clear: ['decide_by'] removes it (#146) */
+  decide_by?: string
   metadata?: MetadataPatch
   /** Fields to blank; an empty value otherwise means "keep". */
   clear?: string[]
@@ -515,6 +635,12 @@ export interface Me {
   teams?: { id: number; name: string; org_id: number; role: string }[]
   kind?: UserKind
   via_token?: boolean
+  /**
+   * Sign-in is off on this AMP (no OIDC_ISSUER_URL): every request is the
+   * Local Dev user, an AMP admin provisioned at startup (#124). Absent on
+   * older APIs and with sign-in on.
+   */
+  local_dev?: boolean
   /** Feature flags for this caller. Absent on older APIs (treat as unavailable). */
   capabilities?: {
     remote_control?: { available: boolean; org_ids?: number[]; reason?: string | null }
@@ -794,6 +920,8 @@ export interface Org {
   slug: string
   created_by: number | null
   created_at: string
+  /** the org's default verification receipts mode (#126) */
+  receipts_mode?: ReceiptsMode
   /** caller's role in the org; "" when not a member (e.g. a global admin browsing) */
   my_role?: OrgRole | ''
 }
@@ -899,15 +1027,17 @@ export interface MyWork {
   flags_truncated?: boolean
 }
 
-// ---- Waiting on you (service.WaitingOn; KB decisions/human-work-ux.md §1) ----
+// ---- Waiting on you (service.WaitingOn; v2/kb/working/human-work.md) ----
 
-export type WaitKind = 'approve' | 'answer' | 'merge' | 'start' | 'do'
+export type WaitKind = 'approve' | 'answer' | 'verify' | 'merge' | 'start' | 'do'
 
-/** Waiting is approve + answer + merge + start + do; coming_up is shown, never counted. */
+/** Waiting is approve + answer + verify + merge + start + do; coming_up is shown, never counted. */
 export interface WaitCounts {
   waiting: number
   approve: number
   answer: number
+  /** a completion Require holds for you: its receipt is below the minimum (#126); absent from older servers */
+  verify?: number
   merge: number
   /** a ticket of yours dispatched to an agent that no worker has started (AMP #2801) */
   start: number
@@ -919,6 +1049,25 @@ export interface WaitCounts {
 export interface MyWorkCounts {
   counts: WaitCounts
   projects: Record<string, WaitCounts>
+}
+
+/** One step of the Get started checklist: done (and since when), and the project it's about. */
+export interface GettingStartedStep {
+  done: boolean
+  at?: string
+  project_id?: number
+  /** How the agent connected: mcp, harness (AMP Harness) or token (an API token). */
+  client?: string
+  /** The ticket the step's link goes to: the one carrying the first receipt. */
+  task_id?: number
+}
+
+/** GET /api/my-work/getting-started (#128, plus the receipt step #149 owes it). */
+export interface GettingStarted {
+  agent: GettingStartedStep
+  project: GettingStartedStep
+  plan: GettingStartedStep
+  receipt: GettingStartedStep
 }
 
 /** One item in a person's Waiting on people row: a ticket, or for approve, an epic's tickets awaiting them. */
@@ -968,11 +1117,18 @@ export interface WaitItem extends MergeClassifier {
   performer?: string
   human_reason?: string
   owner_user_id?: number
+  /** the ticket has a decision doc: it is decided in its drawer, not by Mark done (#125) */
+  has_decision_doc?: boolean
+  /** a person's ticket's decide-by date (RFC 3339), and whether it has passed (#146) */
+  decide_by?: string
+  overdue?: boolean
   epic_id?: number
   epic_name?: string
   /** approve: how many tickets await */
   count?: number
   question?: string
+  /** verify: why the receipt is below its minimum (#126) */
+  hold_reason?: string
   merge_state?: string
   pr_url?: string
   branch?: string
@@ -980,7 +1136,7 @@ export interface WaitItem extends MergeClassifier {
   /** start: the agent it was dispatched to, and how long it has waited (AMP #2801) */
   agent_id?: string
   not_started_minutes?: number
-  /** merge: open tickets that depend on it directly */
+  /** merge, do, answer: open tickets downstream of it, transitively */
   holding_up?: number[]
   /**
    * merge (AMP #3011): the branch the merge would land on, as a run reported it.
@@ -1116,6 +1272,8 @@ export interface Run {
   cost_usd?: number
   branch?: string
   commit?: string
+  /** the branch the work is meant to merge into */
+  base_branch?: string
   pr_url?: string
   pushed?: boolean
   merged?: boolean
@@ -1300,6 +1458,8 @@ export interface Artifact {
   expires_at: string | null
   expiry_dismissed_at: string | null
   url?: string
+  /** 'decision' for a ticket's decision doc */
+  role?: string
 }
 
 export interface ArtifactVersion {
@@ -1503,9 +1663,76 @@ export interface ProjectMyWork {
   read_only: boolean
   kinds: WaitKind[]
   counts: WaitCounts
-  items: Record<WaitKind, ProjectWaitItem[]>
+  /** verify is absent from servers that predate receipts (#126) */
+  items: Record<Exclude<WaitKind, 'verify'>, ProjectWaitItem[]> & { verify?: ProjectWaitItem[] }
   coming_up: ProjectWaitItem[]
   done_today: DoneItem[]
   agents: { project_id: number; in_progress: number; ready: number; waiting: number; done_today: number }
   day: string
+}
+
+/** What a person decided on a completed human ticket that another ticket depends on (GET /tasks/:id/decisions). */
+export interface UpstreamDecision {
+  task_id: number
+  name: string
+  human_reason: string
+  /** the note, or option + decided text */
+  decision: string
+  option?: string
+  doc_url?: string
+  version?: number
+  decided_by: number | null
+  decided_by_name: string
+  decided_at: string
+}
+
+/** One answer a person can choose on a judgment ticket (the agent questions of #130 reuse it). */
+export interface AskOption {
+  label: string
+  consequence: string
+}
+
+/** A decision doc version's options: its stored metadata. */
+export interface DecisionAsk {
+  question: string
+  options: AskOption[]
+  /** index into options; only marks a badge, never chooses */
+  recommended: number
+}
+
+/** A judgment ticket's ask as tool input (it drafts the doc; not stored on the ticket). */
+export interface Ask extends DecisionAsk {
+  recommendation_reason: string
+  evidence?: string[]
+}
+
+export interface DecisionDocVersion {
+  version: number
+  author_kind: 'person' | 'agent'
+  text: string
+  ask: DecisionAsk | null
+  created_by: number | null
+  created_at: string
+}
+
+/** A judgment ticket's decision doc (GET /tasks/:id/decision, and /decisions' own). */
+export interface DecisionDoc {
+  task_id: number
+  artifact_id: number
+  doc_url?: string
+  current_version: number
+  /** who wrote the current version */
+  author_kind: 'person' | 'agent'
+  /** the current version's options */
+  ask: DecisionAsk | null
+  /** the current version's markdown (prose only) */
+  text: string
+  decided_version: number | null
+  chosen_option: number | null
+  decision_text?: string
+  decided_by: number | null
+  decided_by_name?: string
+  recording_started_at: string | null
+  decided_at: string | null
+  versions?: DecisionDocVersion[]
 }

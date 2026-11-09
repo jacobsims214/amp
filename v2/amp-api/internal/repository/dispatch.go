@@ -168,6 +168,11 @@ type NotStartedTicket struct {
 // NotStarted lists a project's in-progress tickets with no started_at,
 // dispatched at least minAge ago, oldest dispatch first. minAge 0 lists all
 // of them (the watchdog's own scan).
+// heldByReceipt matches a ticket (as tasks) held for a person by its
+// verification receipt (#126): in progress with no dispatch, and a held
+// receipt. The watchdog never returns one: only a person releases it.
+const heldByReceipt = `(tasks.dispatch_id = '' AND EXISTS (SELECT 1 FROM task_receipts hr WHERE hr.task_id = tasks.id AND hr.held))`
+
 func (r *Repo) NotStarted(ctx context.Context, projectID int, minAge time.Duration) ([]NotStartedTicket, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT id, project_id, name, COALESCE(agent_id, ''), dispatched_at, dispatch_id,
@@ -175,6 +180,7 @@ func (r *Repo) NotStarted(ctx context.Context, projectID int, minAge time.Durati
 		  FROM tasks
 		 WHERE project_id = $1 AND state = 'in_progress' AND started_at IS NULL
 		   AND COALESCE(dispatched_at, updated_at) <= NOW() - $2::float8 * interval '1 second'
+		   AND NOT `+heldByReceipt+`
 		 ORDER BY COALESCE(dispatched_at, updated_at), id`, projectID, minAge.Seconds())
 	if err != nil {
 		return nil, err
@@ -198,6 +204,7 @@ func (r *Repo) ProjectsWithNotStartedTickets(ctx context.Context) ([]int, error)
 	rows, err := r.db.Query(ctx, `
 		SELECT DISTINCT project_id FROM tasks
 		 WHERE state = 'in_progress' AND started_at IS NULL AND dispatched_at IS NOT NULL
+		   AND NOT `+heldByReceipt+`
 		 ORDER BY project_id`)
 	if err != nil {
 		return nil, err

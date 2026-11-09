@@ -35,8 +35,10 @@ are derived on read, so nothing about a ticket's state means something new to an
 ## People and agents
 
 - Every ticket has an **owner**: a person. The ticket is theirs whichever agent works it.
-- A person's **manager agent** (in their own harness: Claude Code, opencode, …) plans and runs
-  that person's tickets, calling AMP's MCP tools with that person's token.
+- A person's **manager agent** (in their own harness: AMP Harness, Claude Code, opencode, …) plans
+  and runs that person's tickets, calling AMP's MCP tools as that person. It is `amp-manager` in
+  AMP Harness and the plugins; the web UI calls it your manager agent everywhere and links to
+  `setup/connect-your-agent.md`, which says how to set it up.
 - **Workers** are subagents the manager starts for one ticket each. They read the ticket, do the
   work, comment as they go, and complete or block it with a run record.
 - AMP enforces ownership: only the owner (or their agent) can dispatch, work and complete a

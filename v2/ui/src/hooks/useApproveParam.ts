@@ -17,7 +17,7 @@ export function formatApprove(set: ApproveSet): string {
 }
 
 /**
- * The Approve view's route state in My work (KB decisions/human-work-ux.md §2):
+ * The Approve view's route state in My work (v2/kb/working/human-work.md):
  * `/project/:id/my-work?approve=<epic id>[,<epic id>…]&focus=<ticket id>`.
  *
  * - `open(set, focus?)` pushes a history entry, so Back returns to the list.

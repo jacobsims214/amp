@@ -210,6 +210,11 @@ func (s *Service) DeleteUser(ctx context.Context, p authz.Principal, userID int)
 	if !p.Super {
 		return authz.Forbidden("only global admins can delete users")
 	}
+	if p.HasUser() && userID == p.UserID {
+		// As deactivating yourself is refused; for the Local Dev user (#124)
+		// it would also leave every request on a deleted user until restart.
+		return authz.BadRequest("you can't delete your own account; ask another global admin")
+	}
 	u, err := s.Repo.GetUserByID(ctx, userID)
 	if err != nil {
 		return authz.NotFound("user %d not found", userID)

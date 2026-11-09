@@ -6,6 +6,7 @@ import { tokens, usd } from '../lib/usage'
 import { commitURL, sessionPath } from '../lib/runLinks'
 import { runPath } from '../lib/ticketRef'
 import { Markdown } from './ui/Markdown'
+import { safeUrl } from '../lib/safeUrl'
 
 const OUTCOME: Record<Run['outcome'], string> = {
   completed: 'var(--st-done)', blocked: 'var(--st-flag)', progress: 'var(--st-prog)', abandoned: 'var(--ink-3)',
@@ -90,9 +91,9 @@ export function RunsPanel({ taskId, refreshKey, focusRunId = null }: { taskId: n
                 {r.cost_usd != null && <span>{usd(r.cost_usd)}</span>}
                 {(r.branch || r.commit) && <span>{r.branch || '?'}{r.commit ? <> @ {commit
                   ? <a href={commit} target="_blank" rel="noreferrer" className="underline underline-offset-2 hover:text-ink">{r.commit.slice(0, 9)}</a>
-                  : r.commit.slice(0, 9)}</> : ''}{r.pushed === false ? ' · not pushed' : r.pushed ? ' · pushed' : ''}</span>}
+                  : r.commit.slice(0, 9)}</> : ''}{r.base_branch ? ` → ${r.base_branch}` : ''}{r.pushed === false ? ' · not pushed' : r.pushed ? ' · pushed' : ''}</span>}
                 {r.merged && <span className="text-success-ink">merged</span>}
-                {r.pr_url && <a href={r.pr_url} target="_blank" rel="noreferrer" className="underline underline-offset-2 hover:text-ink">PR</a>}
+                {r.pr_url && safeUrl(r.pr_url) && <a href={safeUrl(r.pr_url)} target="_blank" rel="noreferrer" className="underline underline-offset-2 hover:text-ink">PR</a>}
                 {/* /sessions/ is its own page (strict CSP, no sidebar): a full page load. */}
                 {session && <a href={session} className="underline underline-offset-2 hover:text-ink">Open session</a>}
               </span>

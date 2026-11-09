@@ -1,4 +1,4 @@
-// The Approve view (artifact #24 v2, KB decisions/human-work-ux.md §2).
+// The Approve view (artifact #24 v2, v2/kb/working/human-work.md).
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'

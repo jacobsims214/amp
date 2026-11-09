@@ -77,7 +77,22 @@ func artifactContentType(kind string, content []byte) (string, error) {
 // PublishArtifact stores an artifact, or a new version of one, and notes it
 // on its ticket. Anyone who can work the ticket may publish to it; without a
 // ticket, any project member. A new version goes back into review.
+//
+// A decision doc changes only in AMP: publishing to one is refused, for any
+// caller.
 func (s *Service) PublishArtifact(ctx context.Context, p authz.Principal, req PublishArtifactRequest) (*domain.Artifact, error) {
+	if req.ArtifactID != 0 {
+		doc, link, err := s.decisionArtifact(ctx, p, req.ArtifactID)
+		if err != nil {
+			return nil, err
+		}
+		if doc != nil {
+			if doc.Claimed() {
+				return nil, &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionRecordedRefusal, link)}
+			}
+			return nil, authz.Forbidden(decisionPublishRefusal, link)
+		}
+	}
 	if len(req.Content) == 0 {
 		return nil, authz.BadRequest("content is empty")
 	}
@@ -221,7 +236,22 @@ func (s *Service) ListArtifacts(ctx context.Context, p authz.Principal, projectI
 // awaitsArtifactReview), the verdict answers it, so the ticket goes back to
 // ready for the next dispatch. Blocked on anything else, the ticket stays
 // blocked and the verdict is only noted on it.
+//
+// A decision doc is approved and kept by Record decision, never reviewed:
+// an agent approving one is told only a person records a decision, and
+// anyone else is told Record decision does it. These run before the agent
+// checks, so agent accounts get the same refusals.
 func (s *Service) ReviewArtifact(ctx context.Context, p authz.Principal, id, version int, approve bool, note string) (*domain.Artifact, error) {
+	doc, link, err := s.decisionArtifact(ctx, p, id)
+	if err != nil {
+		return nil, err
+	}
+	if doc != nil {
+		if approve && !p.InUI() {
+			return nil, authz.Forbidden(decisionPersonOnlyRefusal, link)
+		}
+		return nil, &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionReviewRefusal, link)}
+	}
 	if p.Agent {
 		return nil, authz.Forbidden("agent accounts can't review artifacts; a person approves or asks for changes")
 	}
@@ -315,7 +345,18 @@ func (s *Service) artifactExpiry() time.Time { return time.Now().Add(s.artifactR
 // expire again, no sooner than a full retention period from now. A person on
 // the project decides; agent accounts can't, and agents should only do it when
 // their person asks.
+//
+// A decision doc is kept from creation and can't be unkept (any caller).
 func (s *Service) KeepArtifact(ctx context.Context, p authz.Principal, id int, keep bool) (*domain.Artifact, error) {
+	if !keep {
+		doc, link, err := s.decisionArtifact(ctx, p, id)
+		if err != nil {
+			return nil, err
+		}
+		if doc != nil {
+			return nil, &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionReviewRefusal, link)}
+		}
+	}
 	if p.Agent {
 		return nil, authz.Forbidden("agent accounts can't keep artifacts; a person decides what to keep")
 	}

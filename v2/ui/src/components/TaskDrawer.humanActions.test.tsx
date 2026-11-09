@@ -1,5 +1,5 @@
 // The TaskDrawer uses HumanActions for Answer, Merge and Do, and never
-// approves: approval is a link to My work (KB decisions/human-work-ux.md §2).
+// approves: approval is a link to My work (v2/kb/working/human-work.md).
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
@@ -51,6 +51,14 @@ describe('TaskDrawer human actions', () => {
     expect(link).toHaveAttribute('href', '/project/2/my-work?focus=5')
     expect(screen.queryByRole('button', { name: /approve/i })).toBeNull()
     expect(screen.queryByText(/approve in flight plan/i)).toBeNull()
+  })
+
+  it('shows a completed agent ticket\'s Done and merge lines once, in its receipt', async () => {
+    open(task({ state: 'completed', completed_at: '2026-10-27T11:00:00Z', merge_state: 'needed', approved_at: '2026-10-27T10:30:00Z', approved_by: 9 }))
+    expect(await screen.findByTestId('completion-receipt')).toBeInTheDocument()
+    expect(screen.getAllByTestId('merge-status')).toHaveLength(1)
+    expect(within(screen.getByTestId('completion-receipt')).getByTestId('merge-status')).toHaveTextContent('Done · Merge needed')
+    await waitFor(() => expect(within(screen.getByTestId('completion-receipt')).getByTestId('receipt-code')).toHaveTextContent('fix/mine'))
   })
 
   it('shows "Done · Merge needed" and records the merge, reporting an earlier record', async () => {

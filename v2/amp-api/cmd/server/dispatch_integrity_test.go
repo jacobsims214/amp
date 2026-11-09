@@ -458,9 +458,12 @@ func TestDispatchIntegrity_WatchdogReturnsUnstartedTicket(t *testing.T) {
 	dispatchClaims(t, s, dead)
 	ageDispatch(t, s, dead, 31)
 
+	// The sweep covers every project in the (shared) test database, so
+	// tickets other tests left dispatched more than 30 minutes ago are
+	// returned too: at least this one.
 	n, err := svc.SweepNotStarted(ctx, allowAll)
-	if err != nil || n != 1 {
-		t.Fatalf("sweep: returned %d, err %v; want 1", n, err)
+	if err != nil || n < 1 {
+		t.Fatalf("sweep: returned %d, err %v; want at least 1", n, err)
 	}
 	task, _ := s.repo.GetTask(ctx, dead)
 	if task.State != domain.TaskStateBacklog {

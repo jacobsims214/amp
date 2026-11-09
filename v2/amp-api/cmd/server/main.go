@@ -29,6 +29,7 @@ import (
 	"github.com/simstech/amp-api/internal/kb"
 	"github.com/simstech/amp-api/internal/mcp"
 	"github.com/simstech/amp-api/internal/queue"
+	"github.com/simstech/amp-api/internal/receipts"
 	"github.com/simstech/amp-api/internal/relayctl"
 	"github.com/simstech/amp-api/internal/repository"
 	"github.com/simstech/amp-api/internal/reqctx"
@@ -142,6 +143,18 @@ func main() {
 	if err != nil {
 		slog.Error("failed to initialize auth verifier", "err", err)
 		os.Exit(1)
+	}
+	// With auth off, the local-dev identity is a real AMP user, an admin of
+	// the Default org (#124). With auth on, that user is never created, and
+	// one left by an auth-off boot is deactivated (ProvisionLocalDev).
+	if u, err := verifier.ProvisionLocalDev(ctx); err != nil {
+		if verifier.Enabled() {
+			slog.Error("auth on: deactivating the Local Dev user failed", "err", err)
+		} else {
+			slog.Error("auth off: provisioning the Local Dev user failed; My work, tokens and agent accounts won't work", "err", err)
+		}
+	} else if u != nil {
+		slog.Info("auth off: every request is the Local Dev user, an AMP admin", "user_id", u.ID, "email", u.Email)
 	}
 
 	// ---- 2. SSE hub ----
@@ -328,6 +341,11 @@ func main() {
 	// in the background, so a slow or unreachable GitHub can never slow a page.
 	mergeFacts := githubFactsCoordinator(repo)
 	mcpTools.SetMergeFacts(mergeFacts)
+	// Verification receipt evidence (#126): the local store under
+	// RECEIPT_DIR, or S3 (RECEIPT_STORE=s3). If it can't start, amp-api
+	// keeps running: evidence calls say why, and visual checks can't count.
+	evidence := receiptStoreFromEnv()
+	mcpTools.SetReceiptStore(evidence)
 	mcpSrv := newMCPServer(mcpTools)
 
 	// Token audience (RFC 8707 / MCP 2026-07-28 "token audience binding").
@@ -378,6 +396,7 @@ func main() {
 	restHandler.SetAppURL(appPublicURL())
 	restHandler.SetArtifactRetention(artifactRetention())
 	restHandler.SetMergeFacts(mergeFacts)
+	restHandler.SetReceiptStore(evidence)
 	// ---- 6a. Remote control (epic 165) ----
 	// The relay itself is its own service, amp-relay (cmd/relay): amp-api
 	// serves none of its routes (/relay/, /api/sessions). It keeps the org
@@ -400,7 +419,15 @@ func main() {
 	go restHandler.RunArtifactPurge(context.Background(), time.Hour)
 	// Trash rows (deleted tickets, epics, stories) past the 30-day retention
 	// are deleted. Idempotent, so every replica can run it.
-	go service.New(repo, registry, kbSvc).RunTrashPurge(context.Background(), time.Hour)
+	// It deletes purged tickets' receipt evidence first.
+	trashSvc := service.New(repo, registry, kbSvc)
+	trashSvc.Evidence = evidence
+	go trashSvc.RunTrashPurge(context.Background(), time.Hour)
+	// Unkept receipt evidence past RECEIPT_RETENTION_DAYS is deleted
+	// hourly, on one replica at a time (advisory lock).
+	sweepSvc := service.New(repo, registry, kbSvc)
+	sweepSvc.Evidence = evidence
+	go sweepSvc.RunReceiptSweep(ctx, time.Hour, repo.TryNamedLock)
 
 	// Audit log integrity (#2429): sign each chain's head hourly, and
 	// delete entries past AUDIT_RETENTION_DAYS daily through the anchored
@@ -423,6 +450,7 @@ func main() {
 	// A dispatched ticket nobody starts is returned to ready after its
 	// project's not_started_return_minutes (AMP #2801). One replica at a
 	// time (advisory lock); the state change goes through the project actor.
+	// The same tick escalates overdue decisions (decide_by, #146).
 	go service.New(repo, registry, kbSvc).RunDispatchWatchdog(ctx, service.WatchdogInterval, repo.TryNamedLock)
 
 	// Health check (unauthenticated, used by k8s probes)
@@ -522,11 +550,14 @@ func envOrDefault(key, def string) string {
 // authExceptHealth applies the auth verifier to every path except /health
 // and /ready, which k8s liveness/readiness probes hit unauthenticated, and
 // GitHub's webhook deliveries (api.GitHubHookPrefix), which carry no AMP
-// session and are authenticated by their HMAC signature instead.
+// session and are authenticated by their HMAC signature instead, and
+// receipt evidence uploads (api.ReceiptUploadPrefix), whose one-time token
+// in the path is the credential.
 func authExceptHealth(v *auth.Verifier, next http.Handler) http.Handler {
 	authed := v.Middleware(next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" || r.URL.Path == "/ready" || strings.HasPrefix(r.URL.Path, api.GitHubHookPrefix) {
+		if r.URL.Path == "/health" || r.URL.Path == "/ready" || strings.HasPrefix(r.URL.Path, api.GitHubHookPrefix) ||
+			strings.HasPrefix(r.URL.Path, api.ReceiptUploadPrefix) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -589,6 +620,53 @@ func appPublicURL() string {
 		return strings.TrimSuffix(strings.TrimSuffix(u, "/"), "/mcp")
 	}
 	return ""
+}
+
+// receiptStoreFromEnv opens the receipt evidence store: RECEIPT_STORE
+// (local, the default, or s3; receipts.ConfigFromEnv has the s3 settings),
+// RECEIPT_DIR (local; default data/receipts), RECEIPT_MAX_BYTES (default
+// 200 MiB) and RECEIPT_RETENTION_DAYS (default 90; <= 0 means the default).
+// A store that can't start is logged and left out, never fatal. For s3 the
+// bucket is created if missing; a store that can't be reached yet (still
+// starting) is kept and tried again at the first upload, but one that
+// refuses the credentials is left out like a bad config.
+func receiptStoreFromEnv() *service.EvidenceStore {
+	e := &service.EvidenceStore{MaxBytes: receipts.DefaultMaxBytes, Retention: receipts.DefaultRetentionDays * 24 * time.Hour}
+	if n, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("RECEIPT_MAX_BYTES")), 10, 64); err == nil && n > 0 {
+		e.MaxBytes = n
+	}
+	if d, err := strconv.Atoi(strings.TrimSpace(os.Getenv("RECEIPT_RETENTION_DAYS"))); err == nil && d > 0 {
+		e.Retention = time.Duration(d) * 24 * time.Hour
+	}
+	unavailable := func(err error) *service.EvidenceStore {
+		slog.Error("receipt evidence store unavailable: evidence uploads are refused and visual checks can't count", "err", err)
+		e.Err = err.Error()
+		return e
+	}
+	cfg, err := receipts.ConfigFromEnv(os.Getenv)
+	if err != nil {
+		return unavailable(err)
+	}
+	store, err := receipts.New(cfg)
+	if err != nil {
+		return unavailable(err)
+	}
+	where := []any{"backend", "local", "dir", envOrDefault("RECEIPT_DIR", receipts.DefaultDir)}
+	if s3, ok := store.(*receipts.S3); ok {
+		where = []any{"backend", "s3", "endpoint", s3.Endpoint(), "bucket", s3.Bucket()}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err := s3.Ready(ctx)
+		cancel()
+		if err != nil && receipts.AuthError(err) {
+			return unavailable(err)
+		}
+		if err != nil {
+			slog.Warn("receipt evidence store not reachable yet: tried again at the first upload", append(where, "err", err)...)
+		}
+	}
+	e.Store = store
+	slog.Info("receipt evidence store", append(where, "max_bytes", e.MaxBytes, "retention_days", int(e.Retention.Hours()/24))...)
+	return e
 }
 
 // artifactRetention is how long an artifact lives after its last version

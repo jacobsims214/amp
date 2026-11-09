@@ -648,6 +648,9 @@ func (s *Service) MoveProjectToOrg(ctx context.Context, p authz.Principal, proje
 	if proj.OrgID != nil && *proj.OrgID == orgID && ownerTeamID == 0 {
 		return nil, nil, authz.BadRequest("the project is already in that org")
 	}
+	if err := s.guardReceiptsOrgMove(ctx, p, proj, orgID); err != nil {
+		return nil, nil, err
+	}
 	removed, err := s.Repo.MoveProjectToOrg(ctx, projectID, orgID, ownerTeamID)
 	if err != nil {
 		return nil, nil, err

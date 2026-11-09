@@ -2,13 +2,14 @@ package repository
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/simstech/amp-api/internal/domain"
 )
 
-// Waiting on you (AMP #2478, KB decisions/human-work-ux.md §1). These
+// Waiting on you (AMP #2478, v2/kb/working/human-work.md). These
 // queries fetch the candidate tickets; service.WaitingOn classifies them, so
 // every view (the project's My work tab, the top-level summary, the badge
 // counts) reads one definition.
@@ -22,7 +23,15 @@ type WaitTask struct {
 	// NotStartedFlagMinutes: a dispatched ticket no worker started is the
 	// owner's to act on once it has waited this long (0: never, AMP #2801).
 	NotStartedFlagMinutes int `json:"-"`
+	// Held: Require holds its completion for a person (#126): in progress,
+	// no dispatch, its latest receipt final and held.
+	Held bool `json:"-"`
 }
+
+// heldSQL is true for ticket t (alias) held for a person (#126): in
+// progress with no dispatch, and its latest final receipt held.
+const heldSQL = `(%[1]s.state = 'in_progress' AND %[1]s.dispatch_id = '' AND %[1]s.performer <> 'human' AND COALESCE((SELECT r.held FROM task_receipts r
+	WHERE r.task_id = %[1]s.id AND r.state = 'final' ORDER BY r.id DESC LIMIT 1), FALSE))`
 
 // qualifiedTaskCols is taskCols with each column read from alias w.
 var qualifiedTaskCols = func() string {
@@ -38,11 +47,14 @@ var qualifiedTaskCols = func() string {
 // whose plan approval targets them (owner, else creator: Task.ApprovalOwner),
 // their own tickets blocked with a question, their own completed tickets
 // whose merge is needed or abandoned, and their own human tickets not yet
-// done. Each comes with its dependency ids.
+// done, and tickets Require holds for a person (#126) that are theirs or
+// nobody's (WaitingOn gives an unowned one to the project's owners). Each
+// comes with its dependency ids.
 func (r *Repo) WaitingCandidates(ctx context.Context, userID int, projectIDs []int) ([]WaitTask, error) {
 	rows, err := r.db.Query(ctx, `SELECT `+qualifiedTaskCols+`, p.code, p.name, p.require_plan_approval, p.require_merge,
 		p.not_started_flag_minutes,
-		COALESCE((SELECT array_agg(d.depends_on ORDER BY d.depends_on) FROM task_dependencies d WHERE d.task_id = w.id), '{}')
+		COALESCE((SELECT array_agg(d.depends_on ORDER BY d.depends_on) FROM task_dependencies d WHERE d.task_id = w.id), '{}'),
+		`+fmt.Sprintf(heldSQL, "w")+`
 		FROM (SELECT * FROM tasks
 		       WHERE ($2::int[] IS NULL OR project_id = ANY($2))
 		         AND (
@@ -52,6 +64,7 @@ func (r *Repo) WaitingCandidates(ctx context.Context, userID int, projectIDs []i
 		           OR (owner_user_id = $1 AND state = 'completed' AND merge_state IN ('needed', 'abandoned'))
 		           OR (owner_user_id = $1 AND state = 'in_progress' AND started_at IS NULL AND performer <> 'human')
 		           OR (owner_user_id = $1 AND performer = 'human' AND state <> 'completed')
+		           OR ((owner_user_id = $1 OR owner_user_id IS NULL) AND `+fmt.Sprintf(heldSQL, "tasks")+`)
 		         )) w
 		JOIN projects p ON p.id = w.project_id
 		WHERE p.state <> 'archived'
@@ -64,12 +77,19 @@ func (r *Repo) WaitingCandidates(ctx context.Context, userID int, projectIDs []i
 	for rows.Next() {
 		var w WaitTask
 		t := &w.Task
-		if err := rows.Scan(append(taskFields(t), &w.ProjectCode, &w.ProjectName, &w.RequirePlanApproval, &w.RequireMerge, &w.NotStartedFlagMinutes, &t.DependencyIDs)...); err != nil {
+		if err := rows.Scan(append(taskFields(t), &w.ProjectCode, &w.ProjectName, &w.RequirePlanApproval, &w.RequireMerge, &w.NotStartedFlagMinutes, &t.DependencyIDs, &w.Held)...); err != nil {
 			return nil, err
 		}
 		out = append(out, w)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	ts := make([]*domain.Task, len(out))
+	for i := range out {
+		ts[i] = &out[i].Task
+	}
+	return out, r.markDecisionDocs(ctx, ts)
 }
 
 // DepSummary is a ticket named as a dependency or dependent of another.
@@ -388,6 +408,38 @@ func (r *Repo) ActiveProjectRefs(ctx context.Context, ids []int) ([]ProjectRef, 
 			return nil, err
 		}
 		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// OpenDownstream maps each of ids to the open (not completed) tickets
+// downstream of it, transitively, by id. A completed ticket in between does
+// not cut the chain: the same count as MCP's waiting_on_people. Do and answer
+// items state it as what they hold up (#125); a Merge card states
+// TrueWaiters instead, which is direct and leaves out what the merge doesn't
+// hold.
+func (r *Repo) OpenDownstream(ctx context.Context, ids []int) (map[int][]int, error) {
+	out := map[int][]int{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := r.db.Query(ctx, `WITH RECURSIVE down(root, id) AS (
+			SELECT d.depends_on, d.task_id FROM task_dependencies d WHERE d.depends_on = ANY($1)
+			UNION
+			SELECT down.root, d.task_id FROM down JOIN task_dependencies d ON d.depends_on = down.id
+		)
+		SELECT down.root, down.id FROM down JOIN tasks t ON t.id = down.id
+		WHERE t.state <> 'completed' ORDER BY down.root, down.id`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var root, task int
+		if err := rows.Scan(&root, &task); err != nil {
+			return nil, err
+		}
+		out[root] = append(out[root], task)
 	}
 	return out, rows.Err()
 }

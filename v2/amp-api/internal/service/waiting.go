@@ -13,7 +13,7 @@ import (
 	"github.com/simstech/amp-api/internal/repository"
 )
 
-// Waiting on you (AMP #2478, KB decisions/human-work-ux.md §1 and §3).
+// Waiting on you (AMP #2478, KB docs/specs/human-decision-docs.md, v2/kb/working/human-work.md).
 //
 // WaitingOn is the one definition of what waits on a person. Every view
 // reads it: the project's My work tab (ProjectMyWork), the top-level
@@ -26,6 +26,9 @@ import (
 //     per epic, with the tickets and their count.
 //   - answer: a ticket they own, blocked with a question (a block reason
 //     that isn't "scheduled:…").
+//   - verify: an agent ticket whose completion the project's Require
+//     receipts setting holds for a person (#126): "Couldn't verify, needs
+//     you". Its owner's, or with no owner, each project owner's.
 //   - merge: a ticket they own, completed, merge_state needed or abandoned.
 //   - start: a ticket they own, dispatched to an agent, that no worker has
 //     started (in_progress with no started_at: AMP #2801). Their worker was
@@ -41,13 +44,14 @@ import (
 const (
 	WaitApprove = "approve"
 	WaitAnswer  = "answer"
+	WaitVerify  = "verify"
 	WaitMerge   = "merge"
 	WaitStart   = "start"
 	WaitDo      = "do"
 )
 
 // WaitKinds is the display order of the kinds.
-var WaitKinds = []string{WaitApprove, WaitAnswer, WaitMerge, WaitStart, WaitDo}
+var WaitKinds = []string{WaitApprove, WaitAnswer, WaitVerify, WaitMerge, WaitStart, WaitDo}
 
 // WaitCounts counts what waits on a person. Waiting is the sum of the kinds;
 // ComingUp is shown but never part of Waiting.
@@ -55,7 +59,9 @@ type WaitCounts struct {
 	Waiting int `json:"waiting"`
 	Approve int `json:"approve"`
 	Answer  int `json:"answer"`
-	Merge   int `json:"merge"`
+	// Verify: a held completion waiting on the person's Accept or Reject.
+	Verify int `json:"verify"`
+	Merge  int `json:"merge"`
 	// Start: a ticket of theirs dispatched to an agent that no worker has
 	// started (AMP #2801). Nothing is wrong with the ticket; its worker was
 	// never launched.
@@ -70,6 +76,8 @@ func (c *WaitCounts) add(kind string) {
 		c.Approve++
 	case WaitAnswer:
 		c.Answer++
+	case WaitVerify:
+		c.Verify++
 	case WaitMerge:
 		c.Merge++
 	case WaitStart:
@@ -105,6 +113,13 @@ type WaitItem struct {
 	Performer   string    `json:"performer,omitempty"`
 	HumanReason string    `json:"human_reason,omitempty"`
 	OwnerUserID *int      `json:"owner_user_id,omitempty"`
+	// HasDecisionDoc: the ticket's decision is recorded on its doc, in the
+	// ticket's drawer, not by Mark done (Task.HasDecisionDoc).
+	HasDecisionDoc bool `json:"has_decision_doc,omitempty"`
+	// DecideBy: a person's ticket's decide-by date, and Overdue once it has
+	// passed (#146). Overdue Do items sort first, the earliest date first.
+	DecideBy *time.Time `json:"decide_by,omitempty"`
+	Overdue  bool       `json:"overdue,omitempty"`
 
 	// approve
 	EpicID   int    `json:"epic_id,omitempty"`
@@ -112,6 +127,8 @@ type WaitItem struct {
 	Count    int    `json:"count,omitempty"`
 	// answer
 	Question string `json:"question,omitempty"`
+	// verify: why the receipt is below its minimum
+	HoldReason string `json:"hold_reason,omitempty"`
 	// start: the agent it was dispatched to, and how long it has waited
 	AgentID           string `json:"agent_id,omitempty"`
 	NotStartedMinutes int    `json:"not_started_minutes,omitempty"`
@@ -155,10 +172,12 @@ type WaitItem struct {
 	// classified against, for the card's repo chip. "" when it could not be
 	// read: never a guess.
 	DefaultBranch string `json:"default_branch,omitempty"`
-	// HoldingUp: the open tickets that wait for this merge and actually need
-	// it, so the count on the card is what the action unblocks. A dependent
-	// with waits_for_merge: false is in NotWaiting: it started when the work
-	// completed, so it is named but never counted.
+	// HoldingUp: on a merge item, the open tickets that wait for this merge
+	// and actually need it, so the count on the card is what the action
+	// unblocks. A dependent with waits_for_merge: false is in NotWaiting: it
+	// started when the work completed, so it is named but never counted. On a
+	// do or answer item, the open tickets downstream of it, transitively (the
+	// same count as MCP's waiting_on_people, #125).
 	HoldingUp  []int `json:"holding_up,omitempty"`
 	NotWaiting []int `json:"not_waiting,omitempty"`
 	// TrackedBy: the plan's human merge step for this PR (its merge_for names
@@ -208,6 +227,7 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 	approve := map[epicKey]*WaitItem{}
 	var approveOrder []epicKey
 	var merges, comingDeps []int
+	now := time.Now()
 	add := func(it WaitItem) {
 		if it.Kind == "coming_up" {
 			w.ComingUp = append(w.ComingUp, it)
@@ -219,16 +239,36 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 		t := &c.Task
 		it := WaitItem{Kind: kind, Key: fmt.Sprintf("task:%d", t.ID), ProjectID: t.ProjectID, ProjectCode: c.ProjectCode,
 			ProjectName: c.ProjectName, TaskID: t.ID, TaskIDs: []int{t.ID}, Name: t.Name, State: string(t.State), Since: since,
-			Performer: t.Performer, HumanReason: t.HumanReason, OwnerUserID: t.OwnerUserID, EpicID: t.EpicID}
+			Performer: t.Performer, HumanReason: t.HumanReason, OwnerUserID: t.OwnerUserID, EpicID: t.EpicID,
+			HasDecisionDoc: t.HasDecisionDoc, DecideBy: t.DecideBy, Overdue: t.DecisionOverdue(now)}
 		if opt.detail {
 			cp := *t
 			it.Task = &cp
 		}
 		return it
 	}
+	// Held tickets nobody owns are each project owner's (#126).
+	ownerOf := map[int]bool{}
+	ownsProject := func(projectID int) bool {
+		if v, ok := ownerOf[projectID]; ok {
+			return v
+		}
+		lvl, err := s.Authz.ProjectLevel(ctx, authz.Principal{UserID: userID}, projectID)
+		ownerOf[projectID] = err == nil && lvl >= authz.Owner
+		return ownerOf[projectID]
+	}
 	for i := range cands {
 		c := &cands[i]
 		t := &c.Task
+		if c.Held {
+			if (t.OwnerUserID != nil && *t.OwnerUserID == userID) || (t.OwnerUserID == nil && ownsProject(t.ProjectID)) {
+				it := single(c, WaitVerify, t.UpdatedAt)
+				it.AgentID = t.AgentID
+				it.HoldReason = s.heldReason(ctx, t)
+				add(it)
+			}
+			continue
+		}
 		awaits := t.State != domain.TaskStateCompleted && !t.Approved()
 		if c.RequirePlanApproval && awaits {
 			if who := t.ApprovalOwner(); who != nil && *who == userID {
@@ -349,6 +389,27 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 		w.Items, w.ComingUp = dedupFoldedSteps(w.Items, w.ComingUp)
 	}
 
+	// What waits on each do and answer item: the open tickets downstream of
+	// it, transitively (the same count as MCP's waiting_on_people, #125). A
+	// merge item's count comes from fillMergeItems above (TrueWaiters).
+	var holdIDs []int
+	for _, it := range w.Items {
+		if it.Kind == WaitDo || it.Kind == WaitAnswer {
+			holdIDs = append(holdIDs, it.TaskID)
+		}
+	}
+	if len(holdIDs) > 0 {
+		deps, err := s.Repo.OpenDownstream(ctx, holdIDs)
+		if err != nil {
+			return nil, err
+		}
+		for i := range w.Items {
+			if it := &w.Items[i]; it.Kind == WaitDo || it.Kind == WaitAnswer {
+				it.HoldingUp = deps[it.TaskID]
+			}
+		}
+	}
+
 	// Coming up: which dependencies still hold each one.
 	if opt.detail && len(comingDeps) > 0 {
 		sums, err := s.Repo.DepSummaries(ctx, comingDeps)
@@ -373,11 +434,22 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 		}
 	}
 
-	rank := map[string]int{WaitApprove: 0, WaitAnswer: 1, WaitMerge: 2, WaitStart: 3, WaitDo: 4}
+	rank := map[string]int{WaitApprove: 0, WaitAnswer: 1, WaitVerify: 2, WaitMerge: 3, WaitStart: 4, WaitDo: 5}
 	sort.SliceStable(w.Items, func(i, j int) bool {
 		a, b := w.Items[i], w.Items[j]
 		if rank[a.Kind] != rank[b.Kind] {
 			return rank[a.Kind] < rank[b.Kind]
+		}
+		// Do items: overdue decisions first, the longest overdue first
+		// (#146); then the ones holding up the most work.
+		if a.Kind == WaitDo && a.Overdue != b.Overdue {
+			return a.Overdue
+		}
+		if a.Kind == WaitDo && a.Overdue && !a.DecideBy.Equal(*b.DecideBy) {
+			return a.DecideBy.Before(*b.DecideBy)
+		}
+		if a.Kind == WaitDo && len(a.HoldingUp) != len(b.HoldingUp) {
+			return len(a.HoldingUp) > len(b.HoldingUp)
 		}
 		if !a.Since.Equal(b.Since) {
 			return a.Since.Before(b.Since)

@@ -12,12 +12,8 @@ import { Link } from 'react-router-dom'
 import { ChevronRight, LogIn, TriangleAlert, UserX } from 'lucide-react'
 import type { NoMyWork } from '../../lib/myWorkAccess'
 import { projectLink } from '../../lib/projectLink'
+import { signInAgainUrl } from '../../lib/session'
 
-/** Sign in, then come back here (oauth2-proxy's start URL, as AuthProvider uses). */
-function signInHref(): string {
-  const here = window.location.pathname + window.location.search
-  return `/oauth2/start?rd=${encodeURIComponent(here)}`
-}
 
 export function MyWorkUnavailable({ reason, projectId, email }: { reason: NoMyWork; projectId?: number; email?: string }) {
   const local = reason === 'local-dev'
@@ -34,16 +30,16 @@ export function MyWorkUnavailable({ reason, projectId, email }: { reason: NoMyWo
       </h2>
       <p className="m-0 text-[13.5px] text-ink-2 leading-normal max-w-[64ch]">
         {local
-          ? 'This AMP runs without sign-in (local development). Everyone is the shared Local Dev identity, which is not an AMP user, so no plan, question or merge can be waiting on you. Nothing has been counted, so no counts are shown.'
+          ? 'This AMP runs without sign-in (local development), and amp-api could not set up its Local Dev user at startup, so there is no AMP user for a plan, question or merge to wait on. Nothing has been counted, so no counts are shown.'
           : `My work is one person's list, and this session has no AMP user${email ? ` (you are signed in as ${email})` : ''}: the account may not be invited to this AMP, its email domain may not be allowed, or its email isn't verified. Nothing has been counted, so no counts are shown.`}
       </p>
       <ul className="m-0 pl-5 grid gap-1 text-[13px] text-ink-2 leading-normal list-disc">
         {!local && <li>Ask an AMP admin to invite this email, or sign in with the account you use for AMP; this page then shows your list.</li>}
         <li>To see what is waiting right now, open the Board: every ticket is there, and its panel has the actions.</li>
-        {local && <li>To get a My work of your own, run AMP with sign-in on (set <code className="amp-num text-[12px]">OIDC_ISSUER_URL</code>) and sign in.</li>}
+        {local && <li>Check amp-api's startup log for why the Local Dev user wasn't set up, then restart it; or run AMP with sign-in on (set <code className="amp-num text-[12px]">OIDC_ISSUER_URL</code>) and sign in.</li>}
       </ul>
       <div className="flex flex-wrap gap-2.5 mt-1">
-        {!local && <a href={signInHref()} className="amp-btn amp-btn-primary amp-btn-sm inline-flex items-center gap-1.5"><LogIn size={14} aria-hidden="true" />Sign in</a>}
+        {!local && <a href={signInAgainUrl()} className="amp-btn amp-btn-primary amp-btn-sm inline-flex items-center gap-1.5"><LogIn size={14} aria-hidden="true" />Sign in</a>}
         <Link to={board.to} className="amp-btn amp-btn-sm inline-flex items-center gap-1">{board.label}<ChevronRight size={14} aria-hidden="true" /></Link>
       </div>
     </section>

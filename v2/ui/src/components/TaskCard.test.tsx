@@ -2,7 +2,7 @@ import { cleanup, render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { TaskCard } from './TaskCard'
 import { mergeBadge, mergeWait } from '../lib/merge'
-import type { Task } from '../types'
+import type { ReceiptSummaryRow, Task } from '../types'
 
 const task = (over: Partial<Task> = {}): Task => ({
   id: 2471, project_id: 3, epic_id: 1, story_id: 1, name: 'Build it', description: '', acceptance_criteria: '',
@@ -130,5 +130,35 @@ describe('TaskCard question text (#133)', () => {
     card(task({ state: 'blocked', block_reason: '**Pick** [one](https://x)' }))
     expect(screen.getByText('Pick one')).toBeInTheDocument()
     expect(screen.queryByText(/\*\*|\[one\]/)).toBeNull()
+  })
+})
+
+describe('TaskCard verification badge (#126)', () => {
+  const row = (over: Partial<ReceiptSummaryRow> = {}): ReceiptSummaryRow => ({ task_id: 2471, status: 'self_checked', held: false, has_media: false, ...over })
+  const withReceipt = (t: Task, r?: ReceiptSummaryRow) => render(<TaskCard task={t} onClick={() => {}} receipt={r} />)
+
+  it('shows the status on a completed agent ticket, and says it in the label', () => {
+    withReceipt(task(), row())
+    expect(screen.getByTestId('verification-badge')).toHaveAttribute('data-status', 'self_checked')
+    expect(screen.getByRole('button', { name: /Done · Self-checked/ })).toBeInTheDocument()
+  })
+  it('reads Accepted once a person accepted it, with the media icon', () => {
+    withReceipt(task(), row({ status: 'human_accepted', has_media: true }))
+    expect(screen.getByTestId('verification-badge')).toHaveTextContent('Accepted')
+    expect(screen.getByTestId('verification-media')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Accepted, with media/ })).toBeInTheDocument()
+  })
+  it('shows an amber "needs you" on a held ticket still in progress', () => {
+    withReceipt(task({ state: 'in_progress', agent_id: 'w' }), row({ status: 'unverified', held: true }))
+    expect(screen.getByTestId('verification-badge')).toHaveAttribute('data-status', 'held')
+    expect(screen.getByRole('button', { name: /Couldn't verify, needs you/ })).toBeInTheDocument()
+  })
+  it('shows nothing without a receipt, on a person\'s ticket, or on an open ticket that isn\'t held', () => {
+    withReceipt(task())
+    expect(screen.queryByTestId('verification-badge')).toBeNull()
+    withReceipt(task({ id: 9, performer: 'human' }), row({ task_id: 9 }))
+    expect(screen.queryByTestId('verification-badge')).toBeNull()
+    withReceipt(task({ id: 10, state: 'in_progress' }), row({ task_id: 10 }))
+    expect(screen.queryByTestId('verification-badge')).toBeNull()
   })
 })
