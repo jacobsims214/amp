@@ -59,6 +59,22 @@ export interface Story {
   updated_at: string
 }
 
+/**
+ * One answer a person can choose (the human-decisions spec's AskOption, #125;
+ * agent questions reuse it, #130). consequence is '' when the agent gave none.
+ */
+export interface AskOption {
+  label: string
+  consequence: string
+}
+
+/** An agent question's options (#130): the question itself is the ticket's block_reason. */
+export interface TaskQuestion {
+  options: AskOption[]
+  /** index into options; only marks a badge, never chooses */
+  recommended?: number | null
+}
+
 export interface Task {
   id: number
   project_id: number
@@ -76,6 +92,8 @@ export interface Task {
   dispatched_at?: string
   completed_at?: string
   block_reason?: string
+  /** the options an agent gave with its question (#130); absent for a question in words only */
+  question?: TaskQuestion | null
   start_at?: string       // RFC3339 UTC timestamp for scheduled tasks
   created_by?: number | null     // AMP user who created the ticket (null for legacy rows)
   owner_user_id?: number | null  // the one human owner; null = unassigned ("pool")
@@ -340,6 +358,13 @@ export interface KBDoc {
   chunk_index: number
   chunk_text: string
   updated_at: number
+  /** unix seconds; absent for docs only the search index has (e.g. the AMP guide) */
+  created_at?: number
+  /** when an agent last read the doc (amp_kb_get, or a search hit), unix seconds; absent if never */
+  last_read_at?: number
+  last_read_by?: string
+  /** agent reads counted, at most one per reader per 10 minutes */
+  read_count?: number
   annotations?: KBAnnotation[]
 }
 
@@ -354,6 +379,13 @@ export interface KBDocSummary {
   tags: string[]
   author: string
   updated_at: number
+  /** unix seconds; absent for docs only the search index has (e.g. the AMP guide) */
+  created_at?: number
+  /** when an agent last read the doc (amp_kb_get, or a search hit), unix seconds; absent if never */
+  last_read_at?: number
+  last_read_by?: string
+  /** agent reads counted, at most one per reader per 10 minutes */
+  read_count?: number
 }
 
 export interface KBSearchResult {
@@ -361,6 +393,12 @@ export interface KBSearchResult {
   title: string
   tags: string[]
   excerpt: string
+  /** the whole matched chunk; the excerpt is its first 120 characters */
+  chunk_text?: string
+  /** position of the matched chunk within the doc */
+  chunk_index?: number
+  /** semantic similarity in [0,1]; present when the hit came from the vector half of a hybrid search */
+  vector_score?: number
   author: string
   updated_at: number
   score: number

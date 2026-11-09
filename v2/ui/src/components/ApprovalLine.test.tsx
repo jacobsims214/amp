@@ -24,8 +24,12 @@ describe('ApprovalLine (ticket drawer)', () => {
   it('says when it was approved on the owner\'s behalf', () => {
     expect(text(task({ approved_at: '2026-10-22T11:00:00Z', approved_by: 7 }), 7)).toContain('Approved by Lee Lead (you) on behalf of Bob Builder')
   })
-  it('credits the upgrade when no person is recorded', () => {
-    expect(text(task({ approved_at: '2026-10-22T11:00:00Z', approved_by: null }))).toContain('Approved by the AMP upgrade')
+  it('says no approver is recorded when none is, without guessing who (#129)', () => {
+    for (const me of [9, undefined]) {
+      const t = text(task({ approved_at: '2026-10-22T11:00:00Z', approved_by: null }), me)
+      expect(t).toContain('Approved (approver not recorded)')
+      expect(t).not.toMatch(/upgrade|local dev/)
+    }
   })
   it('links your own awaiting ticket to My work and never approves in the drawer', () => {
     expect(text(task(), 9)).toContain('Plan not approved yet.Awaiting your approval')

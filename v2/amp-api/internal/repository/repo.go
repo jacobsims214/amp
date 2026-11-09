@@ -169,7 +169,7 @@ const taskCols = `id, project_id, epic_id, story_id, name, description, acceptan
 	assigned_to, agent_id, dispatched_at, completed_at, block_reason, start_at, created_by, owner_user_id, metadata, created_at, updated_at,
 	performer, human_reason, ready_at, planned_at, approved_at, approved_by, approved_for,
 	merge_required, merge_state, merged_at, merge_source,
-	dispatch_id, started_at, started_by, returned_at, returned_reason`
+	dispatch_id, started_at, started_by, returned_at, returned_reason, block_question`
 
 // taskFields are the scan targets for taskCols, in order.
 func taskFields(t *domain.Task) []any {
@@ -182,7 +182,7 @@ func taskFields(t *domain.Task) []any {
 		&t.CreatedAt, &t.UpdatedAt,
 		&t.Performer, &t.HumanReason, &t.ReadyAt, &t.PlannedAt, &t.ApprovedAt, &t.ApprovedBy, &t.ApprovedFor,
 		&t.MergeRequired, &t.MergeState, &t.MergedAt, &t.MergeSource,
-		&t.DispatchID, &t.StartedAt, &t.StartedBy, &t.ReturnedAt, &t.ReturnedReason,
+		&t.DispatchID, &t.StartedAt, &t.StartedBy, &t.ReturnedAt, &t.ReturnedReason, &t.Question,
 	}
 }
 
@@ -690,14 +690,36 @@ func (r *Repo) ListStoriesByProject(ctx context.Context, projectID int) ([]domai
 // SetTaskState records a task's state. completed_at is stamped when the
 // task completes (kept if it already was) and cleared when it leaves
 // completed, so reports read it from the database, not actor memory.
+//
+// Any state change ends a question's options (block_question, #130): a block
+// with options sets them again right after (SetTaskQuestion).
 func (r *Repo) SetTaskState(ctx context.Context, taskID int, state domain.TaskState, blockReason string) error {
 	_, err := r.db.Exec(ctx,
-		`UPDATE tasks SET state = $1, block_reason = $2, updated_at = NOW(),
+		`UPDATE tasks SET state = $1, block_reason = $2, block_question = NULL, updated_at = NOW(),
 		   completed_at = CASE WHEN $1 = 'completed' THEN COALESCE(completed_at, NOW()) END,
 		   ready_at = CASE WHEN $1 = 'backlog' AND state <> 'backlog' THEN NOW() ELSE ready_at END
 		 WHERE id = $3`,
 		state, blockReason, taskID,
 	)
+	return err
+}
+
+// BlockTask blocks a ticket on a question: its state, the question
+// (block_reason) and the question's options (#130; nil for none) in one
+// statement, so a block never lands without the options it was given.
+func (r *Repo) BlockTask(ctx context.Context, taskID int, reason string, q *domain.Question) error {
+	_, err := r.db.Exec(ctx,
+		`UPDATE tasks SET state = 'blocked', block_reason = $1, block_question = $2, updated_at = NOW(), completed_at = NULL
+		 WHERE id = $3`,
+		reason, q, taskID,
+	)
+	return err
+}
+
+// SetTaskQuestion records (or with nil clears) the options of a ticket's
+// open question (#130).
+func (r *Repo) SetTaskQuestion(ctx context.Context, taskID int, q *domain.Question) error {
+	_, err := r.db.Exec(ctx, `UPDATE tasks SET block_question = $1 WHERE id = $2`, q, taskID)
 	return err
 }
 

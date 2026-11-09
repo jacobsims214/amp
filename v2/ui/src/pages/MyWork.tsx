@@ -24,6 +24,7 @@ import { remoteAvailable, useRemote } from '../remote/remote-context'
 import { projectLink } from '../lib/projectLink'
 import { isNoUserError, noMyWorkReason } from '../lib/myWorkAccess'
 import { MyWorkLoadError, MyWorkUnavailable } from '../components/human/MyWorkUnavailable'
+import { Markdown } from '../components/ui/Markdown'
 
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone
 const ymd = (d: Date) => d.toLocaleDateString('en-CA', { timeZone: TZ })
@@ -395,7 +396,7 @@ export function MyWork() {
                         <span key={k}><b className="amp-num text-[16px] font-normal text-ink">{draft.data.stats[k]}</b> <span className="text-ink-2">{l}</span></span>
                       ))}
                     </div>
-                    {draft.summary && <p className="m-0 text-ink-2 leading-relaxed">{draft.summary}</p>}
+                    {draft.summary && <div data-testid="day-summary"><Markdown size="compact">{draft.summary}</Markdown></div>}
                   </div>
                 ) : <p className="m-0 px-4 py-3 text-[13px] text-ink-2">No activity yet today.</p>}
               </Panel>

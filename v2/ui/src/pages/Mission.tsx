@@ -23,6 +23,7 @@ import { useBoardData } from '../hooks/useBoardData'
 import { useAuth } from '../hooks/useAuth'
 import { useProjectPeople } from '../hooks/useProjectPeople'
 import { ProjectNav } from '../components/ProjectNav'
+import { usePlanApproval } from '../hooks/usePlanApproval'
 import { TaskDrawer } from '../components/TaskDrawer'
 import { Panel, Readouts } from '../components/ui/PageHeader'
 import { StateBar, StateDot } from '../components/ui/StateTag'
@@ -198,6 +199,7 @@ export function Mission() {
   const pid = Number(projectId)
   const { epics, stories, tasks, loading, error, refresh, applyTask } = useBoardData(pid)
   const { members, myAccess, openReassign, people } = useProjectPeople(pid)
+  const approval = usePlanApproval(pid)
   const { me, loading: authLoading } = useAuth()
   const waitCounts = useWaitCounts()
   // No AMP user (sign-in off, or signed out): the server's counts are all
@@ -420,7 +422,8 @@ export function Mission() {
       </div>
 
       <TaskDrawer task={selected} onClose={() => setSelectedId(null)} onRefresh={refresh}
-        members={members} meId={me?.user_id} myAccess={myAccess} openReassign={openReassign} onTaskUpdated={applyTask} />
+        members={members} meId={me?.user_id} myAccess={myAccess} openReassign={openReassign} onTaskUpdated={applyTask}
+        requireApproval={!!approval.project?.require_plan_approval} />
     </div>
   )
 }

@@ -4,7 +4,9 @@
  * work cards and the TaskDrawer both use it, so a ticket opened from the
  * Board offers the same buttons as My work.
  *
- * - Answer: the question as a quote, suggested-answer chips, a text box, Send answer.
+ * - Answer: the question as a quote, then the agent's options as one-tap
+ *   choices with its recommendation marked and an "Other" answer (#130), or,
+ *   for a question in words only, suggested-answer chips; a text box, Send answer.
  * - Merge: one action for one PR (approved artifact #27 v2, AMP #3011's
  *   contract). Review PR ↗ always; Mark merged only where it does something —
  *   never on a closed PR, never while the plan's folded step is still gated,
@@ -25,7 +27,7 @@
 import { useState } from 'react'
 import { Check, ExternalLink, GitMerge, Loader2, Play, RotateCcw, Send } from 'lucide-react'
 import { api } from '../../api/client'
-import { suggestAnswers } from '../../lib/answers'
+import { questionOptions, suggestAnswers } from '../../lib/answers'
 import { safeUrl } from '../../lib/safeUrl'
 import { actionKindOf, type ActionKind } from '../../lib/humanActions'
 import {
@@ -107,11 +109,19 @@ const Spin = () => <Loader2 size={11} className="animate-spin" aria-hidden="true
 
 function AnswerAction({ task, canAct, askedBy, onChanged }: HumanActionsProps) {
   const [answer, setAnswer] = useState('')
+  // The agent's option the person picked, or 'other' for their own answer (#130).
+  const [choice, setChoice] = useState<number | 'other' | null>(null)
   const { busy, error, run } = useRun(onChanged)
-  const chips = suggestAnswers(task.block_reason)
+  const structured = questionOptions(task)
+  // The text is only guessed at when the agent gave no options.
+  const chips = structured ? [] : suggestAnswers(task.block_reason)
   const id = `answer-${task.id}`
-  const send = () => run('send', () => api.answerFlag(task.id, answer.trim()))
-    .then(ok => { if (ok) setAnswer('') })
+  const picked = typeof choice === 'number' ? choice : undefined
+  const canSend = picked != null || !!answer.trim()
+  // The label goes with the index, so a question that changed since this was shown is refused, not misanswered.
+  const send = () => run('send', () => api.answerFlag(task.id, answer.trim(),
+    picked != null && structured ? { index: picked, label: structured.options[picked].label } : undefined))
+    .then(ok => { if (ok) { setAnswer(''); setChoice(null) } })
   return (
     <div className="grid gap-2.5" data-action="answer">
       <span className="amp-label" style={{ color: 'var(--danger-ink)' }}>{askedBy || task.agent_id || task.assigned_to || 'An agent'} asked</span>
@@ -122,6 +132,10 @@ function AnswerAction({ task, canAct, askedBy, onChanged }: HumanActionsProps) {
       {!canAct ? (
         <span className="text-[12px] text-ink-2">Only people who can work this ticket can answer it.</span>
       ) : <>
+        {structured && (
+          <QuestionChoices name={`q-${task.id}`} options={structured.options} recommended={structured.recommended}
+            choice={choice} onChoose={setChoice} />
+        )}
         {chips.length > 0 && (
           <div className="flex flex-wrap gap-1.5" role="group" aria-label="Suggested answers">
             {chips.map(c => (
@@ -130,18 +144,58 @@ function AnswerAction({ task, canAct, askedBy, onChanged }: HumanActionsProps) {
             ))}
           </div>
         )}
-        <label htmlFor={id} className="amp-label">Your answer</label>
-        <textarea id={id} className="amp-input min-h-[64px] resize-y" value={answer} onChange={e => setAnswer(e.target.value)}
-          placeholder="The agent picks this up on its next run" />
+        <label htmlFor={id} className="amp-label">{picked != null ? 'Add a note (optional)' : 'Your answer'}</label>
+        <textarea id={id} className="amp-input min-h-[64px] resize-y" value={answer}
+          onChange={e => { setAnswer(e.target.value); if (structured && choice == null) setChoice('other') }}
+          placeholder={picked != null ? 'Anything the agent should know about this choice' : 'The agent picks this up on its next run'} />
         {error && <span role="alert" className="text-[12px] text-danger-ink">{error}</span>}
         <div className="flex gap-2 flex-wrap">
-          <button type="button" className="amp-btn amp-btn-primary amp-btn-sm" disabled={!!busy || !answer.trim()} onClick={send}>
+          <button type="button" className="amp-btn amp-btn-primary amp-btn-sm" disabled={!!busy || !canSend} onClick={send}>
             {busy === 'send' ? <Spin /> : <Send size={12} aria-hidden="true" />}Send answer</button>
           <button type="button" className="amp-btn amp-btn-ghost amp-btn-sm" disabled={!!busy} title="Unblock without a comment"
             onClick={() => run('unblock', () => api.answerFlag(task.id, ''))}>
             {busy === 'unblock' && <Spin />}Unblock only</button>
         </div>
       </>}
+    </div>
+  )
+}
+
+/**
+ * The agent's options as radio choices (#130): its recommendation is marked
+ * but never preselected (choosing is the person's click), and "Other" takes
+ * the person's own answer from the text box.
+ */
+function QuestionChoices({ name, options, recommended, choice, onChoose }: {
+  name: string
+  options: { label: string; consequence: string }[]
+  recommended: number | null
+  choice: number | 'other' | null
+  onChoose: (c: number | 'other') => void
+}) {
+  const row = (checked: boolean) =>
+    `flex items-start gap-2 px-2.5 py-2 border cursor-pointer text-[13px] ${checked ? 'border-ink bg-surface' : 'border-line bg-surface hover:border-ink'}`
+  return (
+    <div role="radiogroup" aria-label="Choose an answer" className="grid gap-1.5" data-testid="question-options">
+      {options.map((o, i) => (
+        <label key={i} className={row(choice === i)} style={{ borderRadius: 'var(--radius)' }}>
+          <input type="radio" name={name} className="mt-[3px] accent-[var(--ink)]" checked={choice === i} onChange={() => onChoose(i)} />
+          <span className="grid gap-0.5 min-w-0">
+            <span className="flex items-center gap-2 flex-wrap">
+              <span className="font-medium text-ink">{o.label}</span>
+              {i === recommended && (
+                <span className="font-label text-[9.5px] font-semibold uppercase tracking-[0.1em] px-1 py-[2px] border border-success text-success-ink"
+                  title="The agent recommends this one; you choose">Recommended</span>
+              )}
+            </span>
+            {o.consequence && <span className="text-[12px] text-ink-2 leading-snug">{o.consequence}</span>}
+          </span>
+        </label>
+      ))}
+      <label className={row(choice === 'other')} style={{ borderRadius: 'var(--radius)' }}>
+        <input type="radio" name={name} className="mt-[3px] accent-[var(--ink)]" checked={choice === 'other'} onChange={() => onChoose('other')} />
+        <span className="text-ink-2">Other: write your own answer below</span>
+      </label>
     </div>
   )
 }

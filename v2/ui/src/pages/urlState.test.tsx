@@ -93,10 +93,10 @@ describe('Board filters in the URL', () => {
     expect(url()).toBe('/project/3/board')
   })
 
-  it('clicking "Waiting & questions" pushes status=waiting, and a reload keeps it', async () => {
+  it('clicking "Waiting on other tickets" pushes status=waiting, and a reload keeps it', async () => {
     const user = userEvent.setup()
     const router = renderAt('/project/3/board?focus=11')
-    await user.click(await screen.findByRole('button', { name: /Waiting & questions/ }))
+    await user.click(await screen.findByRole('button', { name: /Waiting on other tickets/ }))
     expect(url()).toBe('/project/3/board?focus=11&status=waiting')
     expect(router.state.historyAction).toBe('PUSH')
     expect(card(11)).toHaveClass('opacity-35')
@@ -106,7 +106,7 @@ describe('Board filters in the URL', () => {
     const shared = url()!
     cleanup()
     renderAt(shared)
-    expect(await screen.findByRole('button', { name: /Waiting & questions/ })).toHaveAttribute('aria-pressed', 'true')
+    expect(await screen.findByRole('button', { name: /Waiting on other tickets/ })).toHaveAttribute('aria-pressed', 'true')
     expect(card(11)).toHaveClass('opacity-35')
     expect(card(12)).not.toHaveClass('opacity-35')
     // ?focus= works alongside the filter.

@@ -3,6 +3,7 @@ import { AlertTriangle, CheckCircle2, Loader2, Wrench } from 'lucide-react'
 import { api } from '../api/client'
 import { CrudModal } from './CrudModal'
 import type { PlanReport, Task } from '../types'
+import { Markdown } from './ui/Markdown'
 
 const ISSUE_TITLE: Record<string, string> = {
   isolated: 'Not connected to anything',
@@ -11,6 +12,10 @@ const ISSUE_TITLE: Record<string, string> = {
   no_context: 'No project context in the KB',
   coupled_gate: "One ticket joins different people's work",
   metadata_drift: "Epics' metadata doesn't match",
+  awaiting_approval: 'Waiting for plan approval',
+  human_without_owner: "A person's ticket has no owner",
+  unlinked_merge_step: 'Merge step not linked to its PR',
+  duplicate_merge_step: 'Two merge steps for one PR',
 }
 
 // The plan check: AMP runs the dependency graph, so before dispatching it's
@@ -49,12 +54,15 @@ export function PlanCheckModal({ projectId, tasks, onOpenTask, onClose }: {
             {report.ok
               ? <CheckCircle2 size={15} className="text-success mt-0.5 flex-shrink-0" />
               : <AlertTriangle size={15} className="text-warning-ink mt-0.5 flex-shrink-0" />}
-            <p className="text-sm text-ink leading-relaxed">{report.summary}</p>
+            <div className="min-w-0" data-testid="plan-summary"><Markdown size="compact" projectId={projectId}>{report.summary}</Markdown></div>
           </div>
           {report.issues.map((iss, i) => (
             <div key={i} className="rounded-xl p-3 space-y-2" style={{ background: 'var(--bg)', border: '1px solid var(--line)' }}>
-              <div className="text-xs font-semibold text-warning-ink">{ISSUE_TITLE[iss.kind] ?? iss.kind}</div>
-              <p className="text-xs text-ink-2 leading-relaxed">{iss.message}</p>
+              <div className={`text-xs font-semibold ${iss.severity === 'warn' ? 'text-warning-ink' : 'text-danger-ink'}`}>
+                {ISSUE_TITLE[iss.kind] ?? iss.kind.replace(/_/g, ' ')}
+                <span className="ml-1.5 font-label text-[10px] tracking-[0.12em]">{iss.severity === 'warn' ? 'WARN' : 'NO-GO'}</span>
+              </div>
+              <Markdown size="compact" projectId={projectId}>{iss.message}</Markdown>
               {iss.task_ids && iss.task_ids.length > 0 && (
                 <div className="flex flex-wrap gap-1.5 max-h-32 overflow-y-auto">{iss.task_ids.map(chip)}</div>
               )}

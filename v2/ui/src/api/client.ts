@@ -340,8 +340,14 @@ export const api = {
     post<{ task: Task }>(`/tasks/${taskId}/complete`, done).then(r => r.task),
   /** Answer an agent's flag (a ticket blocked with a reason): posts the
    *  answer as a comment and puts the ticket back to ready (or waiting). */
-  answerFlag: (taskId: number, answer: string) =>
-    post<{ task: Task }>(`/tasks/${taskId}/unblock`, { answer }).then(r => r.task),
+  /**
+   * Answer a question. option chooses one of its options (#130), answer then
+   * being a note: its index and the label shown, so the server refuses (409)
+   * if the question changed since it was read.
+   */
+  answerFlag: (taskId: number, answer: string, option?: { index: number; label: string }) =>
+    post<{ task: Task }>(`/tasks/${taskId}/unblock`,
+      option == null ? { answer } : { answer, option: option.index, option_label: option.label }).then(r => r.task),
 
   // Export
   exportProject: async (projectId: number): Promise<{ blob: Blob; filename: string }> => {

@@ -272,3 +272,21 @@ func TestPurgeTrashRemovesOldKBDocs(t *testing.T) {
 		t.Errorf("restore of a doc still in the trash: %+v, %v", doc, err)
 	}
 }
+
+// A search hit carries its whole matched chunk next to the 120-char excerpt,
+// so the Library can show the passage behind the hit.
+func TestSearchReturnsChunkText(t *testing.T) {
+	s, _, sc := storedService(t)
+	ctx := context.Background()
+	long := "Quokka handling notes. " + strings.Repeat("the quokka is a small marsupial. ", 20)
+	if _, err := s.WriteDoc(ctx, sc, "quokka.md", "Quokkas", long, "me", nil, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Search(ctx, sc, "marsupial", nil, 10, 0, 0)
+	if err != nil || len(res) == 0 {
+		t.Fatalf("search: %d hits, err %v", len(res), err)
+	}
+	if len(res[0].ChunkText) <= len(res[0].Excerpt) || !strings.Contains(res[0].ChunkText, "marsupial") {
+		t.Errorf("chunk_text %d chars vs excerpt %d: want the whole chunk", len(res[0].ChunkText), len(res[0].Excerpt))
+	}
+}

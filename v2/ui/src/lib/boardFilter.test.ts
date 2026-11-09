@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_FILTER, parseBoardFilter, serializeBoardFilter, type FilterState } from './boardFilter'
+import { boardStatus, DEFAULT_FILTER, parseBoardFilter, serializeBoardFilter, type FilterState } from './boardFilter'
 import { patchParams } from '../hooks/useSearchParamState'
 
 const roundTrip = (f: FilterState) => parseBoardFilter(patchParams(new URLSearchParams(), serializeBoardFilter(f)))
@@ -14,7 +14,8 @@ describe('board filter in the URL', () => {
     [{ state: 'backlog' }, 'status=ready'],
     [{ state: 'in_progress' }, 'status=in_progress'],
     [{ state: 'completed' }, 'status=done'],
-    [{ state: 'blocked' }, 'status=waiting'],
+    [{ state: 'waiting' }, 'status=waiting'],
+    [{ state: 'question' }, 'status=question'],
     [{ query: 'north star' }, 'q=north+star'],
     [{ epicId: 4 }, 'epic=4'],
     [{ owner: 'everyone' }, 'owner=all'],
@@ -27,7 +28,7 @@ describe('board filter in the URL', () => {
   })
 
   it('round-trips every field at once', () => {
-    const f: FilterState = { query: 'x', state: 'blocked', epicId: 2, owner: 9 }
+    const f: FilterState = { query: 'x', state: 'question', epicId: 2, owner: 9 }
     expect(roundTrip(f)).toEqual(f)
   })
 
@@ -37,5 +38,14 @@ describe('board filter in the URL', () => {
 
   it('accepts owner=everyone as an alias of all', () => {
     expect(parseBoardFilter(new URLSearchParams('owner=everyone')).owner).toBe('everyone')
+  })
+})
+
+describe('boardStatus (#129)', () => {
+  it('splits a person\'s question from waiting on other tickets', () => {
+    expect(boardStatus({ state: 'blocked', block_reason: 'HubSpot or Pipedrive?' })).toBe('question')
+    expect(boardStatus({ state: 'blocked', block_reason: '', blocked_by_ids: [3] })).toBe('waiting')
+    expect(boardStatus({ state: 'blocked', block_reason: 'scheduled:2026-12-01T00:00:00Z' })).toBeNull()
+    expect(boardStatus({ state: 'backlog' })).toBe('backlog')
   })
 })
