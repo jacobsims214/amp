@@ -1,5 +1,5 @@
 /**
- * Mission's "Waiting on people" panel (KB decisions/human-work-ux.md §3):
+ * Mission's "Waiting on people" panel (v2/kb/working/human-work.md):
  * how each person's waiting items read and where their row leads.
  *
  * The items come from the server (GET /projects/:id/waiting-on-people,

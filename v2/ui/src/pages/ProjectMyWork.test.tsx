@@ -1,4 +1,4 @@
-// The project's My work tab (KB decisions/human-work-ux.md §2, artifact #23)
+// The project's My work tab (v2/kb/working/human-work.md, artifact #23)
 // and the landing rule (/project/:id opens My work when something waits on you).
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
@@ -579,6 +579,82 @@ describe('My work tab: what each item needs from you', () => {
     expect(brief).toHaveAttribute('open')
     expect(within(brief).getByText('Pick the Q1 targets. Options are in the planning doc.')).toBeVisible()
     expect(within(brief).getByText('Three targets recorded')).toBeVisible()
+  })
+
+  it('a Do card says "blocks N · waiting Xd" once, in the order the server sorts by it', async () => {
+    const d = myWork('busy')
+    const days = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString()
+    // The server sorts Do items by what they block, then age (§4, D9).
+    d.items.do = [
+      { ...doItem(), key: 'task:2482', task_id: 2482, task_ids: [2482], name: 'Pick the vendor', since: days(3), holding_up: [41, 42, 43, 44, 45],
+        task: task(2482, { performer: 'human', human_reason: 'access' }) },
+      { ...doItem(), key: 'task:2483', task_id: 2483, task_ids: [2483], name: 'Rotate keys', since: days(5), holding_up: [46],
+        state: 'in_progress', task: task(2483, { performer: 'human', human_reason: 'access', state: 'in_progress' }) },
+      { ...doItem(), since: days(4), holding_up: [] },
+    ]
+    data = d
+    at('/project/2/my-work')
+    const list = await screen.findByRole('region', { name: 'Waiting on you' })
+    const doKeys = Array.from(list.querySelectorAll('[data-item-key]')).map(e => e.getAttribute('data-item-key')).filter(k => ['task:2482', 'task:2483', 'task:2481'].includes(k!))
+    expect(doKeys).toEqual(['task:2482', 'task:2483', 'task:2481'])
+    const card = (key: string) => document.querySelector(`[data-item-key="${key}"]`) as HTMLElement
+    expect(within(card('task:2482')).getByText('blocks 5 · waiting 3d')).toBeInTheDocument()
+    expect(within(card('task:2483')).getByText('blocks 1 · waiting 5d')).toBeInTheDocument()
+    expect(within(card('task:2481')).getByText('Nothing waits on it · waiting 4d')).toBeInTheDocument()
+    // The age is said once: no separate "Started …" / "Ready … ago".
+    for (const k of ['task:2482', 'task:2483', 'task:2481']) {
+      expect(card(k).textContent).not.toMatch(/(Started|Ready) \d+[mhd] ago/)
+      expect(card(k).textContent!.match(/waiting \d+d/g)).toHaveLength(1)
+    }
+  })
+
+  it('a Do card shows its decide-by date: red "Overdue" once passed, with the date in the reader\'s zone (#146)', async () => {
+    const d = myWork('busy')
+    const hours = (n: number) => new Date(Date.now() + n * 3_600_000).toISOString()
+    // The server flags overdue and puts it first; the card only shows it.
+    d.items.do = [
+      { ...doItem(), key: 'task:2482', task_id: 2482, task_ids: [2482], name: 'Pick the vendor', decide_by: hours(-3), overdue: true,
+        task: task(2482, { performer: 'human', human_reason: 'judgment', decide_by: hours(-3) }) },
+      { ...doItem(), decide_by: hours(50), task: task(2481, { performer: 'human', human_reason: 'judgment', decide_by: hours(50) }) },
+      { ...doItem(), key: 'task:2483', task_id: 2483, task_ids: [2483], name: 'Rotate keys',
+        task: task(2483, { performer: 'human', human_reason: 'access' }) },
+    ]
+    data = d
+    at('/project/2/my-work')
+    await screen.findByRole('region', { name: 'Waiting on you' })
+    const card = (key: string) => document.querySelector(`[data-item-key="${key}"]`) as HTMLElement
+    const late = within(card('task:2482')).getByTestId('decide-by-chip')
+    expect(late).toHaveTextContent('Overdue · 3h')
+    expect(late).toHaveAttribute('data-overdue', 'true')
+    expect(within(card('task:2482')).getByText(/^Decide by /)).toBeInTheDocument()
+    const soon = within(card('task:2481')).getByTestId('decide-by-chip')
+    expect(soon).toHaveTextContent('Decide in 2d')
+    expect(soon).not.toHaveAttribute('data-overdue')
+    expect(within(card('task:2483')).queryByTestId('decide-by-chip')).toBeNull()
+  })
+
+  it('a Do card for a ticket with a decision doc links to its drawer, with no Mark done', async () => {
+    data = withDo({ description: 'Pick the metric.', has_decision_doc: true })
+    data.items.do[0].has_decision_doc = true
+    const router = at('/project/2/my-work')
+    await screen.findByRole('region', { name: 'Waiting on you' })
+    const card = document.querySelector('[data-item-key="task:2481"]') as HTMLElement
+    expect(within(card).queryByRole('button', { name: /mark done/i })).toBeNull()
+    expect(within(card).getByRole('button', { name: 'Start' })).toBeInTheDocument()
+    const decide = within(card).getByRole('link', { name: /decide in the ticket/i })
+    expect(decide).toHaveAttribute('href', '/project/2/board?focus=2481')
+    await userEvent.click(decide)
+    expect(router.state.location.pathname + router.state.location.search).toBe('/project/2/board?focus=2481')
+  })
+
+  it('the item\'s has_decision_doc is enough, even when its ticket lacks it', async () => {
+    data = withDo({ description: 'Pick the metric.' })
+    data.items.do[0].has_decision_doc = true
+    at('/project/2/my-work')
+    await screen.findByRole('region', { name: 'Waiting on you' })
+    const card = document.querySelector('[data-item-key="task:2481"]') as HTMLElement
+    expect(within(card).queryByRole('button', { name: /mark done/i })).toBeNull()
+    expect(within(card).getByRole('link', { name: /decide in the ticket/i })).toBeInTheDocument()
   })
 
   it('a ticket with no description says so, with no brief to show', async () => {

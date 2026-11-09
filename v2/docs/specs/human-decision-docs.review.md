@@ -110,7 +110,7 @@ The three rounds didn't converge. zoom-out failed every round on scope and propo
 - `DecisionCard` and `OptionPicker` are built once, in Phase 2. Phase 3 adds edit, provenance and Record to the same card (D16).
 - "Decided means" has one source: the acceptance criteria. It is not in the doc markdown (D15).
 - Options have one stored source: structured `AskOption[]` metadata (`artifact_versions.decision_ask`) on each doc version, written by the card's option editor, validated on every write and frozen by Record; the markdown is prose only. `ask` is tool input that seeds v1, and the `tasks.ask` column is dropped (D14). Per coordinator review, options are not parsed from headings. `judgment_without_ask` is renamed `judgment_without_doc`.
-- Proportion: ~8,800 → ~5,300 words. `decision_notes`, `accepted_by`, presence and the `amp_decision_*` tools leave v1 with the follow-up. Migrations go from four files to one (`043_decision_docs.sql`).
+- Proportion: ~8,800 → ~5,300 words. `decision_notes`, `accepted_by`, presence and the `amp_decision_*` tools leave v1 with the follow-up. Migrations go from four files to one (`046_decision_docs.sql`, first numbered 043).
 
 **Open questions answered (By: human):**
 | Was | Decision | Spec |

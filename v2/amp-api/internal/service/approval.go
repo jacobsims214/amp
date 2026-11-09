@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/mail"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/authz"
@@ -32,7 +34,7 @@ func (s *Service) link(path string) string {
 
 // PlanURL is where a person approves the plan: the project's My work tab
 // with the Approve view open on everything awaiting them (KB
-// decisions/human-work-ux.md: approval happens only in My work). Callers keep
+// v2/kb/working/human-work.md: approval happens only in My work). Callers keep
 // returning it as approve_url / plan_url; the old /project/:id/plan link still
 // works, because Flight plan links on to My work.
 func (s *Service) PlanURL(projectID int) string {
@@ -460,34 +462,136 @@ func (s *Service) checkRunOutcome(p authz.Principal, t *domain.Task, outcome str
 // person's ticket done without them. Agent work may become a person's ticket
 // from anywhere. The task actor re-checks atomically, and a refusal leaves
 // the ticket unchanged. Other actor errors come back as 400.
-func (s *Service) UpdateTask(ctx context.Context, p authz.Principal, t *domain.Task, req domain.UpdateTaskRequest) error {
+//
+// The brief rule (checkHumanBrief) runs only when the edit makes the ticket
+// human or judgment, or clears a brief field of a human ticket, so legacy
+// tickets stay editable. ask creates a judgment ticket's missing decision
+// doc; once it has one, ask is refused. The warnings say when the doc could
+// not be written (the rest of the edit is kept).
+func (s *Service) UpdateTask(ctx context.Context, p authz.Principal, t *domain.Task, req domain.UpdateTaskRequest) ([]string, error) {
 	req.TaskID = t.ID
 	// A merge_for link set here is checked against the ticket as the edit
 	// leaves it (performer included), before anything is written (AMP #3009).
 	if err := s.checkTaskMergeFor(ctx, t, req); err != nil {
-		return err
+		return nil, err
+	}
+	if err := s.checkUpdateBrief(ctx, p, t, req); err != nil {
+		return nil, err
+	}
+	clearsDecideBy := slices.ContainsFunc(req.Clear, func(c string) bool { return strings.EqualFold(strings.TrimSpace(c), "decide_by") })
+	if err := s.checkSuggestedDecideBy(p, t, req.DecideBy, clearsDecideBy, time.Now()); err != nil {
+		return nil, err
 	}
 	if err := s.GuardReceiptsUpdate(ctx, p, "task", t.ID, req.Metadata); err != nil {
-		return err
+		return nil, err
 	}
 	keepHuman := ""
 	if !p.InUI() {
 		refusal := authz.UIOnly(fmt.Sprintf("Switching ticket %d (a person's ticket) to agent work", t.ID), s.TaskURL(t.ProjectID, t.ID))
 		if t.IsHuman() && strings.EqualFold(strings.TrimSpace(req.Performer), domain.PerformerAgent) {
-			return refusal
+			return nil, refusal
 		}
 		keepHuman = refusal.Error()
 	}
+	// The decide-by rule is re-checked by the task actor against the ticket
+	// as it is when written: only its person (the owner, in the web UI; anyone
+	// with auth off) moves or removes a date it already has.
+	suggestOnly, person := "", 0
+	if (req.DecideBy != nil || clearsDecideBy) && !(p.InUI() && !p.HasUser()) {
+		suggestOnly = fmt.Sprintf("Ticket %d's decide-by date is its person's (the ticket's owner): you can suggest a date only on a ticket that has none", t.ID)
+		if p.InUI() {
+			person = p.UserID
+		}
+	}
 	replyCh := make(chan actor.ReplySimple, 1)
-	if err := s.Registry.Send(t.ProjectID, &actor.MsgUpdateTask{Req: req, KeepHuman: keepHuman, ReplyCh: replyCh}); err != nil {
-		return err
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgUpdateTask{Req: req, KeepHuman: keepHuman, By: p.UserRef(), ByName: p.Label(),
+		DecideBySuggestOnly: suggestOnly, DecideByPerson: person, ReplyCh: replyCh}); err != nil {
+		return nil, err
 	}
 	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 		if keepHuman != "" && reply.Err.Error() == keepHuman {
-			return &authz.Error{Status: 403, Msg: keepHuman}
+			return nil, &authz.Error{Status: 403, Msg: keepHuman}
 		}
-		return &authz.Error{Status: 400, Msg: reply.Err.Error()}
+		if suggestOnly != "" && reply.Err.Error() == suggestOnly {
+			return nil, &authz.Error{Status: 403, Msg: suggestOnly}
+		}
+		return nil, &authz.Error{Status: 400, Msg: reply.Err.Error()}
 	}
 	s.ReconcileMergeMetadata(ctx, p, t.ProjectID, req.Metadata)
-	return nil
+	var warnings []string
+	if req.Ask != nil {
+		updated, err := s.Repo.GetTask(ctx, t.ID)
+		if err != nil {
+			updated = t
+		}
+		if !s.draftDecisionDoc(ctx, p, updated, req.Ask) {
+			warnings = append(warnings, DecisionDocWarning)
+		}
+	}
+	return warnings, nil
+}
+
+// checkUpdateBrief applies the brief rule to t as req leaves it (see
+// UpdateTask), and refuses an ask on a ticket that already has its doc.
+func (s *Service) checkUpdateBrief(ctx context.Context, p authz.Principal, t *domain.Task, req domain.UpdateTaskRequest) error {
+	// The ticket as the actor will leave it (TaskActor.handleUpdate).
+	performer, reason := t.Performer, t.HumanReason
+	if req.Performer != "" || req.HumanReason != "" {
+		pf := req.Performer
+		if pf == "" {
+			pf = t.Performer
+		}
+		np, nr, err := domain.NormalizePerformer(pf, req.HumanReason)
+		if err != nil {
+			return nil // the actor refuses it
+		}
+		if np == domain.PerformerHuman && strings.TrimSpace(req.HumanReason) == "" && t.HumanReason != "" {
+			nr = t.HumanReason
+		}
+		performer, reason = np, nr
+	}
+	clr, err := domain.ParseClears(req.Clear, domain.TaskClearable)
+	if err != nil {
+		return nil // the actor refuses it
+	}
+	desc := clr.Apply("description", req.Description, t.Description)
+	criteria := clr.Apply("acceptance_criteria", req.AcceptanceCriteria, t.AcceptanceCriteria)
+
+	// Who does it, or why: a change to either would strand a decision doc.
+	changesKind := performer != t.Performer || reason != t.HumanReason
+	var doc *domain.DecisionDoc
+	if req.Ask != nil || changesKind || (performer == domain.PerformerHuman && reason == "judgment") {
+		if doc, err = s.Repo.GetDecisionDoc(ctx, t.ID); err != nil {
+			return err
+		}
+	}
+	if doc != nil && changesKind {
+		// The doc is recorded only by Record decision on a judgment
+		// ticket: once a ticket has one it stays a person's judgment
+		// ticket (no repurpose, D11).
+		return &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionKindRefusal, s.TaskURL(t.ProjectID, t.ID))}
+	}
+	if req.Ask != nil && doc != nil {
+		if doc.Claimed() {
+			return &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionRecordedRefusal, s.TaskURL(t.ProjectID, t.ID))}
+		}
+		return &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionOptionsRefusal, s.TaskURL(t.ProjectID, t.ID))}
+	}
+
+	becomesHuman := performer == domain.PerformerHuman && !t.IsHuman()
+	becomesJudgment := performer == domain.PerformerHuman && reason == "judgment" && (!t.IsHuman() || t.HumanReason != "judgment")
+	// A clear empties the brief only when the field had text: the UI sends
+	// clear for every blank field, so a legacy ticket with no brief stays
+	// editable.
+	clearsBrief := performer == domain.PerformerHuman &&
+		((clr["description"] && strings.TrimSpace(t.Description) != "") ||
+			(clr["acceptance_criteria"] && strings.TrimSpace(t.AcceptanceCriteria) != ""))
+	if req.Ask == nil && !becomesHuman && !becomesJudgment && !clearsBrief {
+		return nil // legacy tickets stay editable
+	}
+	if req.Ask == nil && doc != nil {
+		// Its doc already holds its options: only the brief is checked.
+		return s.checkHumanBrief(p, performer, desc, criteria, "", nil, "")
+	}
+	return s.checkHumanBrief(p, performer, desc, criteria, reason, req.Ask, "")
 }

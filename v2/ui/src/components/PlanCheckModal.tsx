@@ -11,6 +11,9 @@ const ISSUE_TITLE: Record<string, string> = {
   no_context: 'No project context in the KB',
   coupled_gate: "One ticket joins different people's work",
   metadata_drift: "Epics' metadata doesn't match",
+  human_without_owner: "A person's ticket has no owner",
+  human_without_brief: "A person's ticket has no brief",
+  judgment_without_doc: 'A decision has no decision doc',
 }
 
 // The plan check: AMP runs the dependency graph, so before dispatching it's

@@ -19,7 +19,7 @@ import (
 	"github.com/simstech/amp-api/internal/service"
 )
 
-// Inbound GitHub merge webhook (AMP #2479, KB decisions/human-work-ux.md §4).
+// Inbound GitHub merge webhook (AMP #2479, v2/kb/working/human-work.md).
 
 const testRepo = "acme/app"
 

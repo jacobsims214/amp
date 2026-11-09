@@ -15,7 +15,7 @@ import { GitHubHookPanel } from '../components/GitHubHookPanel'
 import { GitHubCredentialPanel } from '../components/GitHubCredentialPanel'
 import { AuditLogPanel } from '../components/AuditLogPanel'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
-import type { KBSource, Metadata, Org, Project, ProjectAccess, ReceiptsMode } from '../types'
+import type { KBSource, Metadata, Org, Project, ProjectAccess, ProjectMember, ReceiptsMode } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
 import { LastApproved } from '../components/LastApproved'
 import { useProjectPeople } from '../hooks/useProjectPeople'
@@ -70,7 +70,7 @@ export function ProjectSettings() {
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
   const canManage = canManageProject(myAccess)
-  const { people: approvalPeople } = useProjectPeople(pid)
+  const { people: approvalPeople, members } = useProjectPeople(pid)
   // The edited metadata; null until the user changes something.
   const [meta, setMeta] = useState<{ value: Metadata; error: string | null } | null>(null)
   const [metaSaving, setMetaSaving] = useState(false)
@@ -129,7 +129,7 @@ export function ProjectSettings() {
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-[200px_minmax(0,1fr)] gap-6 px-7 py-6 items-start">
         <nav className="hidden lg:grid gap-0.5 sticky top-6" aria-label="Settings sections">
           <span className="amp-label px-2.5 pb-2">Settings</span>
-          {['General', 'Plan approval', 'Merges', 'Verification receipts', 'Dispatch watchdog', 'Metadata', 'Team access', 'Knowledge bases', 'Trash', ...(canManage ? ['GitHub token', 'GitHub merge webhook', 'Webhooks', 'Audit log', 'Danger zone'] : [])].map(t => (
+          {['General', 'Plan approval', 'Merges', 'Verification receipts', 'Dispatch watchdog', 'Decision escalation', 'Metadata', 'Team access', 'Knowledge bases', 'Trash', ...(canManage ? ['GitHub token', 'GitHub merge webhook', 'Webhooks', 'Audit log', 'Danger zone'] : [])].map(t => (
             <a key={t} href={`#${slug(t)}`} className="px-2.5 py-1.5 text-[13px] text-ink-2 hover:text-ink hover:bg-surface-3">{t}</a>
           ))}
         </nav>
@@ -237,6 +237,12 @@ export function ProjectSettings() {
                   Flag after 10, return after 30: a ticket dispatched at 09:00 that no worker claims shows “Dispatched · not started” from 09:10
                   and is back in ready at 09:30. A worker claims a ticket with <code className="text-ink">amp_claim_task</code>.
                 </Example>
+              </Section>
+
+              <Section title="Decision escalation"
+                description="A person's ticket can carry a decide-by date: My work shows it red once the date passes. With escalation on, a ticket still open this long after its date is escalated once: its person is reminded on the ticket, and if you choose, its priority goes up a step and it is handed to a backup decider. A new date starts it over. AMP never decides for anyone. Off (0) by default; only owners change it, in AMP.">
+                <DecisionEscalation project={project} pid={pid} canManage={canManage} members={members}
+                  onSaved={setProject} onError={setError} />
               </Section>
 
               <Section title="Metadata"
@@ -523,6 +529,91 @@ export function ReceiptsSetting({ project, org, pid, canManage, onSaved, onError
         <div className="flex items-center gap-3">
           <button type="button" onClick={save} disabled={!dirty || saving} className="amp-btn amp-btn-primary">
             {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}Save receipts setting
+          </button>
+          {saved && !dirty && <span className="text-xs text-success-ink">Saved</span>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Decision escalation (#146): how long after a ticket's decide-by date it is
+ * escalated (`decision_escalation_minutes`, 0 = off, the default), whether
+ * that raises its priority, and who it is handed to. Saved on the button.
+ */
+function DecisionEscalation({ project, pid, canManage, members, onSaved, onError }: {
+  project: Project; pid: number; canManage: boolean; members: ProjectMember[]
+  onSaved: (p: Project) => void; onError: (m: string | null) => void
+}) {
+  const minutes = project.decision_escalation_minutes ?? 0
+  const raise = project.decision_escalation_raise_priority ?? false
+  const backup = project.decision_backup_decider ?? 0
+  const [minText, setMinText] = useState(String(minutes))
+  const [raiseOn, setRaiseOn] = useState(raise)
+  const [backupId, setBackupId] = useState(backup)
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+  useEffect(() => { setMinText(String(minutes)); setRaiseOn(raise); setBackupId(backup) }, [minutes, raise, backup])
+
+  const minNum = /^\d+$/.test(minText.trim()) ? Number(minText.trim()) : null
+  const bad = minNum == null || minNum > 43200
+  const dirty = minNum !== minutes || raiseOn !== raise || backupId !== backup
+  const people = members.filter(m => m.kind !== 'agent' && !m.disabled)
+
+  const save = async () => {
+    if (bad || !dirty) return
+    setSaving(true); onError(null); setSaved(false)
+    try {
+      onSaved(await api.updateProjectSettings(pid, {
+        decision_escalation_minutes: minNum!, decision_escalation_raise_priority: raiseOn, decision_backup_decider: backupId,
+      }))
+      setSaved(true)
+    } catch (e) {
+      onError(e instanceof Error ? e.message : 'Could not change the setting')
+    } finally {
+      setSaving(false)
+    }
+  }
+  const off = minNum === 0
+
+  return (
+    <div className="grid gap-3">
+      <div className="grid gap-3 sm:grid-cols-2">
+        <div>
+          <label htmlFor="escalation-minutes" className={labelCls}>Escalate after the decide-by date by</label>
+          <div className="flex items-center gap-2">
+            <input id="escalation-minutes" className={inputCls} inputMode="numeric" disabled={!canManage}
+              value={minText} onChange={e => { setMinText(e.target.value); setSaved(false) }} />
+            <span className="text-[13px] text-ink-2 whitespace-nowrap">minutes</span>
+          </div>
+        </div>
+        <div>
+          <label htmlFor="escalation-backup" className={labelCls}>Backup decider</label>
+          <select id="escalation-backup" className={inputCls} disabled={!canManage || off} value={backupId}
+            onChange={e => { setBackupId(Number(e.target.value)); setSaved(false) }}>
+            <option value={0}>Nobody: keep it with its person</option>
+            {people.map(m => <option key={m.user_id} value={m.user_id}>{m.display_name || m.email}</option>)}
+          </select>
+        </div>
+      </div>
+      <label className="flex items-center gap-2 text-[13px] text-ink">
+        <input type="checkbox" checked={raiseOn} disabled={!canManage || off} onChange={e => { setRaiseOn(e.target.checked); setSaved(false) }} />
+        Raise its priority one step
+      </label>
+      {bad
+        ? <p role="alert" className="m-0 text-[12px] text-danger-ink">A whole number of minutes, 0 (off) to 43200 (30 days).</p>
+        : <p className="m-0 text-[12px] text-ink-2 leading-relaxed" data-testid="escalation-summary">
+          {off
+            ? 'Off: an overdue decision shows red on My work, and nobody is reminded.'
+            : `${minNum} min after its decide-by date, a ticket still open is escalated once: its person is reminded on the ticket` +
+              (raiseOn ? ', its priority goes up a step' : '') +
+              (backupId ? `, and it is handed to ${people.find(m => m.user_id === backupId)?.display_name || 'the backup decider'}` : '') + '.'}
+        </p>}
+      {canManage && (
+        <div className="flex items-center gap-3">
+          <button type="button" onClick={save} disabled={bad || !dirty || saving} className="amp-btn amp-btn-primary">
+            {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}Save escalation
           </button>
           {saved && !dirty && <span className="text-xs text-success-ink">Saved</span>}
         </div>

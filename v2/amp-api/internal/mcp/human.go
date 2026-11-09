@@ -17,7 +17,7 @@ import (
 const HumanStaleAfter = 48 * time.Hour
 
 // PersonWait is one item in amp_list_tasks' waiting_on_people ("Waiting on
-// you", KB decisions/human-work-ux.md §1 and §5): something a person has to
+// you", v2/kb/working/human-work.md): something a person has to
 // do next, of one of six kinds (approve, answer, verify, merge, start, do), or, in
 // coming_up, a human ticket of theirs that isn't actionable yet.
 //
@@ -34,6 +34,10 @@ type PersonWait struct {
 	WaitingHours int    `json:"waiting_hours"`
 	HoldingUp    []int  `json:"holding_up,omitempty"` // open tickets that can't start until it's done (transitively)
 	Stale        bool   `json:"stale,omitempty"`      // do: no activity for HumanStaleAfter
+	// DecideBy / Overdue: a person's ticket's decide-by date and whether it
+	// has passed (#146). Overdue do items come first.
+	DecideBy *time.Time `json:"decide_by,omitempty"`
+	Overdue  bool       `json:"overdue,omitempty"`
 
 	Kind        string    `json:"kind"`     // approve | answer | verify | merge | start | do | coming_up
 	TaskIDs     []int     `json:"task_ids"` // every ticket in the item (approve: all awaiting in the epic)
@@ -216,7 +220,8 @@ func (s *Server) waitingOnPeople(ctx context.Context, projectID int, all, view [
 			continue
 		}
 		items = append(items, s.personWait(service.WaitItem{Kind: service.WaitDo, Key: fmt.Sprintf("task:%d", t.ID), TaskID: t.ID,
-			TaskIDs: []int{t.ID}, Name: t.Name, State: string(t.State), Since: since, HumanReason: t.HumanReason}, nil, "nobody", holding))
+			TaskIDs: []int{t.ID}, Name: t.Name, State: string(t.State), Since: since, HumanReason: t.HumanReason,
+			DecideBy: t.DecideBy, Overdue: t.DecisionOverdue(time.Now())}, nil, "nobody", holding))
 	}
 
 	rank := map[string]int{service.WaitApprove: 0, service.WaitAnswer: 1, service.WaitMerge: 2, service.WaitStart: 3, service.WaitDo: 4}
@@ -224,6 +229,9 @@ func (s *Server) waitingOnPeople(ctx context.Context, projectID int, all, view [
 		a, b := items[i], items[j]
 		if rank[a.Kind] != rank[b.Kind] {
 			return rank[a.Kind] < rank[b.Kind]
+		}
+		if a.Overdue != b.Overdue {
+			return a.Overdue // overdue decisions first (#146)
 		}
 		if !a.Since.Equal(b.Since) {
 			return a.Since.Before(b.Since)
@@ -267,7 +275,8 @@ func (s *Server) waitingOnPeople(ctx context.Context, projectID int, all, view [
 // personWait turns one WaitingOn item into its waiting_on_people entry.
 func (s *Server) personWait(it service.WaitItem, owner *int, ownerEmail string, holding func(int) []int) PersonWait {
 	p := PersonWait{ID: it.TaskID, Name: it.Name, Reason: it.HumanReason, Owner: ownerEmail, Kind: it.Kind,
-		TaskIDs: it.TaskIDs, OwnerUserID: owner, Since: it.Since, WaitingHours: int(time.Since(it.Since).Hours())}
+		TaskIDs: it.TaskIDs, OwnerUserID: owner, Since: it.Since, WaitingHours: int(time.Since(it.Since).Hours()),
+		DecideBy: it.DecideBy, Overdue: it.Overdue}
 	if p.Reason == "" {
 		p.Reason = it.Kind
 	}

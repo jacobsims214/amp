@@ -73,6 +73,10 @@ func claimNext(t *domain.Task) string {
 		t.ID, t.DispatchID, t.ID, t.ID, t.DispatchID, t.ID, t.DispatchID)
 }
 
+// upstreamDecisionsNext is added to a claim's next when people decided
+// something on a ticket this one depends on.
+const upstreamDecisionsNext = " Decisions people made that this ticket depends on are in upstream_decisions; follow them."
+
 // completeNext: what the caller does now that the ticket is done. A
 // closeout says so plainly, so a manager doesn't read it as its worker's.
 func completeNext(t *domain.Task, closeout bool) string {

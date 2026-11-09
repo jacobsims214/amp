@@ -42,6 +42,17 @@ the page's address, so you can share or bookmark a view. Each card links to the 
 to, and its **v2**-style version number opens the version history. Cards that expire within a week
 have a one-click **Keep**.
 
+## Decision docs
+
+A judgment ticket's decision doc is a markdown artifact too (docs/specs/human-decision-docs.md),
+with its own rules. Each version stores the doc's markdown and its options together, and says
+who wrote it: the version AMP drafted from the agent's ask is the agent's, an edit is the
+person's. It changes only through the ticket's decision card in the web UI: **Edit doc** writes
+a new version, and **Record decision** approves the version decided on and completes the ticket.
+Publishing a version to it, reviewing it and letting it expire are refused, for agents and people
+alike, and its artifact page shows the decision instead of Approve and Keep. It is kept from the
+start and never expires. Once recorded it is read-only.
+
 ## Keeping or letting go
 
 Artifacts don't pile up: each one is deleted 45 days after its last version (the server's

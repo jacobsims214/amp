@@ -280,7 +280,19 @@ type MsgUpdateTask struct {
 	// ticket to agent work. The task actor checks it atomically with the
 	// update; a string so it survives remote encoding.
 	KeepHuman string
-	ReplyCh   chan ReplySimple
+	// By/ByName: who made the change, for the history entries it writes
+	// (a decide-by date, #146). Empty ByName reads as "manager".
+	By     *int
+	ByName string
+	// DecideBySuggestOnly, when set, is the refusal for a caller who may only
+	// suggest a decide-by date (#146): the task actor refuses (with this
+	// message) moving or removing a date the ticket already has, checked
+	// atomically with the write. DecideByPerson exempts the ticket's person:
+	// the caller's user ID, honoured only while it is still the ticket's
+	// owner. Empty means unrestricted (the person with auth off, escalation).
+	DecideBySuggestOnly string
+	DecideByPerson      int
+	ReplyCh             chan ReplySimple
 }
 
 type MsgAddComment struct {
@@ -324,6 +336,13 @@ type MsgSetTaskState struct {
 type MsgSetTaskStartAt struct {
 	TaskID  int
 	StartAt *time.Time
+	ReplyCh chan ReplySimple
+}
+
+// MsgMarkDecisionDoc tells a task's actor that its decision doc now exists
+// (Task.HasDecisionDoc): the service drafted it after the ticket was saved.
+type MsgMarkDecisionDoc struct {
+	TaskID  int
 	ReplyCh chan ReplySimple
 }
 

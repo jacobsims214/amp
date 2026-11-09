@@ -201,7 +201,8 @@ func TestMergeCard_FoldedStepReadinessAndNoDuplicate(t *testing.T) {
 		map[string]any{"ref": "build", "story_id": float64(story), "name": "build"},
 		map[string]any{"ref": "review", "story_id": float64(story), "name": "review the code"},
 		map[string]any{"ref": "merge", "story_id": float64(story), "name": "Merge PR: card",
-			"performer": "human", "human_reason": "review", "owner": w.alice.Email,
+			"performer": "human", "human_reason": "review", "description": "Review the PR and merge it", "acceptance_criteria": "The PR is merged",
+			"owner":      w.alice.Email,
 			"depends_on": []any{"build", "review"}, "metadata": map[string]any{domain.MetaMergeFor: "build"}},
 		map[string]any{"ref": "deploy", "story_id": float64(story), "name": "deploy", "depends_on": []any{"merge"}},
 	}})
@@ -329,7 +330,8 @@ func TestMergeCard_MCPWaitingOnPeopleCarriesTheContract(t *testing.T) {
 		map[string]any{"ref": "build", "story_id": float64(story), "name": "build",
 			"metadata": map[string]any{}},
 		map[string]any{"ref": "merge", "story_id": float64(story), "name": "Merge PR: mcp",
-			"performer": "human", "human_reason": "review", "owner": w.alice.Email,
+			"performer": "human", "human_reason": "review", "description": "Review the PR and merge it", "acceptance_criteria": "The PR is merged",
+			"owner":      w.alice.Email,
 			"depends_on": []any{"build"}, "metadata": map[string]any{domain.MetaMergeFor: "build"}},
 		map[string]any{"ref": "optout", "story_id": float64(story), "name": "reads the PR", "depends_on": []any{"build"}},
 	}})

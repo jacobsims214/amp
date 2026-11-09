@@ -18,7 +18,7 @@ const backfillOwnersUsage = `usage: amp-api backfill-owners [-apply] [-project I
 Sets owner_user_id = created_by on open (not completed), unowned tickets
 created by a person (users.kind = 'human', not deactivated); tickets created
 by agent accounts are left alone. "Mine" means owner_user_id = me, so this keeps
-those tickets in their creator's My work (KB decisions/human-work-ux.md §1).
+those tickets in their creator's My work (v2/kb/working/human-work.md).
 
 Dry run by default: prints how many tickets each project would change and
 changes nothing. -apply changes them in one transaction and writes one audit

@@ -26,6 +26,7 @@ const members: ProjectMember[] = [
 const access = 'member' as unknown as ProjectAccess
 
 let projectTasks: Task[] = []
+let upstream: unknown[] = []
 let listTasksCalls = 0
 let historyRows: ActivityLog[] = []
 let historyHangs = false
@@ -40,6 +41,8 @@ const server = setupServer(
   http.get('*/api/tasks/:id/comments', () => historyHangs ? hold({ comments: [] }) : HttpResponse.json({ comments: [] })),
   http.get('*/api/tasks/:id/runs', () => HttpResponse.json({ runs: [], usage: { runs: 0 } })),
   http.get('*/api/projects/2/artifacts', () => HttpResponse.json({ artifacts: [] })),
+  http.get('*/api/tasks/:id/decisions', () => HttpResponse.json({ upstream, own: null })),
+  http.get('*/api/tasks/:id/decision', () => HttpResponse.json({ error: 'ticket has no decision doc' }, { status: 404 })),
   http.get('*/api/*', () => HttpResponse.json({})),
 )
 class FakeEventSource { onmessage = null; onerror = null; addEventListener() {} removeEventListener() {} close() {} }
@@ -51,7 +54,7 @@ afterEach(async () => {
   held.forEach(r => r()); held = []
   await waitFor(() => expect(inFlight).toBe(0))
   server.resetHandlers()
-  projectTasks = []; listTasksCalls = 0; historyRows = []; historyHangs = false
+  projectTasks = []; upstream = []; listTasksCalls = 0; historyRows = []; historyHangs = false
 })
 afterAll(() => { server.close(); vi.unstubAllGlobals() })
 
@@ -75,6 +78,21 @@ describe('human ticket brief', () => {
     expect(tabButton('details')).toHaveAttribute('aria-pressed', 'true')
     // Details doesn't repeat the brief the panel already leads with.
     expect(screen.queryByText('Description')).toBeNull()
+  })
+
+  it('scrolls everything below the header as one, so a tall human panel keeps its actions in reach', () => {
+    open(human({ description: 'd', acceptance_criteria: 'a' }))
+    const body = screen.getByTestId('drawer-body')
+    // One scroll container that may shrink below its content (a flex child needs min-h-0).
+    expect(body).toHaveClass('flex-1', 'min-h-0', 'overflow-y-auto')
+    expect(body).toContainElement(panel())
+    expect(body).toContainElement(screen.getByTestId('drawer-tabs'))
+    expect(body).toContainElement(screen.getByTestId('drawer-tab-body'))
+    // No nested scroller under it: the tab body grows, and the tabs stay pinned.
+    expect(screen.getByTestId('drawer-tab-body')).not.toHaveClass('overflow-y-auto')
+    expect(screen.getByTestId('drawer-tabs')).toHaveClass('sticky', 'top-0')
+    // The header stays out of it.
+    expect(body).not.toContainElement(screen.getByRole('button', { name: /close/i }))
   })
 
   it('shows acceptance criteria as checklist rows', () => {
@@ -121,6 +139,30 @@ describe('human ticket brief', () => {
     expect(row).toHaveTextContent('Publish targets · Pat Planner')
     expect(row).not.toHaveTextContent('Already done')
     expect(row).not.toHaveTextContent('Unrelated')
+  })
+
+  it('shows what was decided upstream, linking the ticket that decided it', async () => {
+    upstream = [{ task_id: 34, name: 'Confirm: north-star targets', human_reason: 'judgment', decision: 'Go with B; keep trial at 14 days',
+      decided_by: 9, decided_by_name: 'Jacob', decided_at: '2026-10-30T10:00:00Z' }]
+    open(task({ id: 41, name: 'Build scorecard', dependency_ids: [34] }), '/project/2/board?focus=41')
+    const strip = await screen.findByTestId('decided-upstream')
+    expect(strip).toHaveTextContent('Decided upstream')
+    expect(strip).toHaveTextContent('Decided by Jacob on #34')
+    expect(strip).toHaveTextContent('Go with B; keep trial at 14 days')
+    expect(within(strip).getByRole('link', { name: '#34' })).toHaveAttribute('href', '/project/2/board?focus=34')
+  })
+
+  it('says Done by for a reason that is not a decision, and shows no strip without one', async () => {
+    upstream = [{ task_id: 12, name: 'Rotate key', human_reason: 'physical', decision: 'Rotated', decided_by: 9, decided_by_name: 'Jo', decided_at: '2026-10-30T10:00:00Z' }]
+    const { unmount } = render(<div />)
+    unmount()
+    open(task({ id: 41, dependency_ids: [12] }), '/project/2/board?focus=41')
+    expect(await screen.findByTestId('decided-upstream')).toHaveTextContent('Done by Jo on #12')
+    cleanup()
+    upstream = []
+    open(task({ id: 42, dependency_ids: [12] }), '/project/2/board?focus=42')
+    await waitFor(() => expect(inFlight).toBe(0))
+    expect(screen.queryByTestId('decided-upstream')).toBeNull()
   })
 
   it('says when nothing waits on it, and where it sits', async () => {

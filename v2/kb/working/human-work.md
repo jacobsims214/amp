@@ -90,6 +90,13 @@ project, and every action happens in place:
 - **Start**: the ticket, the agent it went to and how long ago, and **Return to ready** to clear
   the dispatch and dispatch it again. Leaving it alone returns it by itself.
 - **Do**: **Start**, then **Mark done…**, which takes a note, a link and the hours you spent.
+  Each card says **blocks N · waiting Xd** (or **Nothing waits on it · waiting Xd**), where N is
+  every open ticket downstream of it, and the Do cards are sorted by that count, most first.
+  A ticket past its **decide-by date** (below) comes before all of them, the longest overdue
+  first, with a red **Overdue · 3h** chip; one with a date still ahead says **Decide in 2d**, and
+  the card gives the date in your own time zone. Answer and Merge items count the same way. A judgment ticket with a decision doc offers
+  **Start** and **Decide in the ticket**, which opens its panel: it is recorded there, on the
+  doc, never by Mark done.
 
 Next to the list: **Coming up** (with what each ticket waits on), **Your agents here** (counts,
 linking to the Board), and **Done today**. When nothing waits on you, the tab says you're clear.
@@ -128,11 +135,82 @@ on them.
 - **Its owner does it in AMP**, in their My work tab (or the ticket panel):
   1. Click **Start**.
   2. When you're done, click **Mark done…**. You can add a note, a link and the hours you
-     actually spent.
+     actually spent. On a **Judgment** or **Approval** ticket the note is **Your decision** and
+     it's required ("Write what you decided"): the ticket is a decision others wait on.
 
   Only you can mark it done, and only in the web UI. Your manager agent can't record it for
   you (`amp_complete_task` on a human ticket is refused over MCP); if you tell it you've done
   it, it gives you the link.
+- **Your note reaches whoever waits on it.** Marking a ticket done posts the note as a comment on
+  it, "Decision by <name>: …" for a judgment or approval, "Done by <name>: …" for the other
+  reasons (nothing when the note is empty). Every ticket that depends on it then gets the note
+  with no extra call:
+  - the ticket panel shows **Decided upstream** ("Decided by Jacob on #34: …", linking to #34);
+  - an agent's `amp_get_task` and `amp_claim_task` carry it as `upstream_decisions`, and the claim
+    tells the worker to follow it. Only direct dependencies are included: a ticket that is done
+    and has a note, or one whose decision doc's record is under way (Record decision has claimed
+    it), which is included before the ticket is done. An open panel refreshes when a dependency's
+    decision changes.
+- **A decision opens as a decision doc.** A judgment ticket planned by an agent comes with an
+  **ask**: a question, 2 to 4 options with what each costs, the option the agent recommends and
+  why. AMP drafts the ticket's decision doc from it (a markdown artifact, kept, never expiring).
+  The ticket panel shows it as a card: the **Question**, the **Options** with the recommended one
+  marked **Recommended** (nothing is chosen for you), **Something else**, the doc's context,
+  trade-offs and reasoning, and **Decided means** (the acceptance criteria).
+  - **Who wrote what.** The agent's lines and options have a coloured rule on the left and an
+    "Agent" tag when you hover; the lines and options you changed have no mark.
+  - The card's header says **blocks N · waiting Xd**, as on the My work card.
+  - **Edit doc** opens the doc's markdown (with a preview) and the option editor: 2 to 4 options,
+    each with a label and what it costs, and which one is recommended. **Save** writes both as one
+    new version. If the doc changed in another tab meanwhile, your draft stays and AMP says "The
+    doc changed in another tab. Reload to see it". A doc keeps at most 100 versions. You can edit
+    the doc while the ticket still waits on its dependencies, to prepare the decision; recording
+    waits until they're done. A new version clears the option you had picked, since the options
+    may have changed.
+  - **Record decision.** Pick an option (or **Accept recommendation**, or **Something else**),
+    write **Your decision** and click **Record decision**. AMP freezes the version you decided on
+    (its text and its options), approves and keeps it, marks the ticket done and posts "Decision
+    by <name>: <option> — <your decision>" with a link to that version (just "<option>" when your
+    decision only repeats its label, as after Accept recommendation). The tickets that wait on
+    it receive the option as it reads on that version, your text and the version number. Mark
+    done isn't offered on a ticket with a doc. If recording stops part way, the card says
+    "Recording didn't finish" after a minute; **Retry** finishes it with what you sent.
+  - **After recording** the card reads "Decided by <name> · vN · <date>" and the doc is
+    read-only. There is no reopening: to change your mind, plan a new judgment ticket that depends
+    on this one and says what it supersedes.
+
+  The doc changes only in AMP, in the web UI, by a person who can work the ticket (its owner, a
+  project lead or owner, or anyone on an unassigned ticket): an agent can't
+  publish to it, edit it, approve or unkeep it, or record the decision (it is told "Only a person
+  records a decision, in AMP: <link>"). A judgment ticket you make yourself in the web UI has no
+  doc; you write your decision when you mark it done. Once a ticket has a doc, who does it and
+  why are fixed: changing its **Done by** or reason is refused ("This ticket's decision is in its
+  doc; record it there or plan a new judgment ticket: <link>"), from the web UI and over MCP.
+- **A decide-by date.** A person's ticket can say when it should be decided by. The agent that
+  plans a decision can suggest one (`decide_by`, ISO 8601 with a time zone, on `amp_create_tasks`,
+  `amp_create_task` or `amp_update_task`): it must be at least an hour ahead, and only on a ticket
+  that has none. Moving or removing a date is the person's (the ticket's owner), in the web UI:
+  over MCP it's refused, and so is anyone else's change in the web UI or REST, a lead's or the
+  ticket's creator's included (they too can only suggest a first date an hour or more ahead). Its
+  person sets, changes or removes it on the decision card (**Set a date**, **Change**, **Remove**), or over REST
+  (`PATCH /api/tasks/{id}` with `decide_by`, or `clear: ["decide_by"]`). The card reads "Decide by
+  Thu, Nov 12, 5:00 PM EST · in 2d", in your time zone, and turns red once it passes ("3h
+  overdue"); My work flags it and puts it first. Each change is on the ticket's history. Only a
+  person's ticket has one (an agent's ticket is refused), and a done ticket can't get one.
+  - **Escalation when overdue** is per project, in **Settings › Decision escalation**, and off
+    (0) by default. With it on, a ticket still open that many minutes after its date is escalated
+    **once**: AMP comments on the ticket that the decision is overdue and whom it waits on, and,
+    if the project chose them, raises its priority one step and hands it to the **backup
+    decider**. Only a ticket its person can act on now is escalated: one still waiting on
+    dependencies, a schedule or plan approval, or with a decision being recorded, waits until it
+    can be (its date stands). A ticket its person has started stays with them (reminded, not
+    handed over), and so does any ticket when the backup decider has left the project or been
+    disabled. The ticket's history says what was done (`decision_escalated`), and the audit log
+    has `task.decision_overdue` (delivered to webhooks). A new date starts it over; saving the same
+    date again doesn't. Only project
+    owners change these settings, in the web UI; agents can't. Escalation always reaches a person:
+    AMP never records the decision or picks the recommended option.
+  - `amp_list_tasks`' `waiting_on_people` items carry `decide_by` and `overdue` too.
 - **It's never flagged as quiet.** People work in days, not the minutes an agent takes. It shows as
   **stale** after two days with no activity.
 
@@ -174,8 +252,13 @@ A good human ticket:
 
 Managers plan these with `amp_create_tasks`: `performer: "human"`, a `human_reason`, and `owner`
 set to the person. A human ticket must have an owner; the plan check calls one without an owner a
-NO-GO, since nobody would ever do it. `amp_check_plan` lists every human ticket under
-`human_gates`, with how much work waits on each.
+NO-GO, since nobody would ever do it. It must also have its **brief**: a description and acceptance
+criteria written for the person. A ticket without them is refused, from any agent and in the web
+UI (the new-ticket and edit forms mark both required for a person's ticket); older tickets without
+one stay editable and get a plan-check warning (`human_without_brief`). An agent's judgment ticket
+also needs an **ask**, which drafts its decision doc (above); one without a doc gets
+`judgment_without_doc`. `amp_check_plan` lists every human ticket under `human_gates`, with how
+much work waits on each.
 
 Older projects may still have unlinked "review and merge" human tickets. They keep working exactly
 as before: marking one done with the PR link also records that PR as merged on the tickets that
@@ -198,7 +281,9 @@ recorded by github") and no run is recorded for its owner.
     checklist when they're written as a list). When both are empty it says **The planner left no
     instructions**, names who to ask, and offers **Edit** to whoever can change the plan;
   - **Unblocks N**: the open tickets that depend on it, each a link, or **Nothing waits on this**;
-  - for its owner, **Start** and **Mark done…**.
+  - for its owner, **Start** and **Mark done…**; on a judgment ticket with a decision doc, the
+    decision card (Edit doc, Record decision) in place of the checklist and Mark done….
+- **Artifacts:** the **Decisions** filter lists recorded decision docs.
 
   The rules (agents never pick it up or mark it done) are in the heading's tooltip.
   - To change who does it: **Edit → Done by** (an agent or a person). You can't change it while

@@ -10,7 +10,7 @@ import (
 	"github.com/simstech/amp-api/internal/domain"
 )
 
-// Waiting on people (AMP #2496, KB decisions/human-work-ux.md §1 and §3):
+// Waiting on people (AMP #2496, v2/kb/working/human-work.md):
 // what the project waits on each person for, from the one definition
 // (WaitingOn) run for everyone with work in it. Mission's "Waiting on
 // people" panel (GET /api/projects/{id}/waiting-on-people) and MCP's
@@ -89,6 +89,9 @@ type PersonWaitItem struct {
 	EpicID   int       `json:"epic_id,omitempty"`   // approve
 	EpicName string    `json:"epic_name,omitempty"` // approve
 	Since    time.Time `json:"since"`
+	// DecideBy / Overdue: a person's ticket's decide-by date (#146).
+	DecideBy *time.Time `json:"decide_by,omitempty"`
+	Overdue  bool       `json:"overdue,omitempty"`
 }
 
 // ProjectWaitingOnPeople is what projectID waits on each person for.
@@ -121,7 +124,7 @@ func (s *Service) ProjectWaitingOnPeople(ctx context.Context, p authz.Principal,
 			if ids == nil {
 				ids = []int{}
 			}
-			item := PersonWaitItem{Kind: it.Kind, TaskIDs: ids, Since: it.Since}
+			item := PersonWaitItem{Kind: it.Kind, TaskIDs: ids, Since: it.Since, DecideBy: it.DecideBy, Overdue: it.Overdue}
 			if it.Kind == WaitApprove {
 				item.EpicID, item.EpicName = it.EpicID, it.EpicName
 			}

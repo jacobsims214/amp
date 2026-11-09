@@ -11,7 +11,16 @@ import { projectLink } from '../lib/projectLink'
 import type { Artifact, ArtifactKind, ArtifactStatus } from '../types'
 import { ManagerAgent } from '../components/ManagerAgent'
 
-const FILTERS: (ArtifactStatus | 'all')[] = ['all', 'in_review', 'changes_requested', 'approved']
+type Filter = ArtifactStatus | 'all' | 'decisions'
+
+/** 'decisions': recorded decision docs (role decision, approved by Record decision); there is no separate decision log. */
+const FILTERS: Filter[] = ['all', 'in_review', 'changes_requested', 'approved', 'decisions']
+
+function matches(a: Artifact, f: Filter): boolean {
+  if (f === 'all') return true
+  if (f === 'decisions') return a.role === 'decision' && a.status === 'approved'
+  return a.status === f
+}
 const KINDS = Object.keys(KIND_LABEL) as ArtifactKind[]
 const EXPIRY_LABEL: Record<ExpiryFilter, string> = { all: 'Any expiry', soon: 'Expiring soon', kept: 'Kept' }
 
@@ -19,7 +28,7 @@ const EXPIRY_LABEL: Record<ExpiryFilter, string> = { all: 'Any expiry', soon: 'E
 function choiceParam<T extends string>(def: T, allowed: readonly T[]): ParamCodec<T> {
   return { default: def, parse: raw => (allowed.includes(raw as T) ? (raw as T) : def), serialize: v => v }
 }
-const statusParam = choiceParam<ArtifactStatus | 'all'>('all', FILTERS)
+const statusParam = choiceParam<Filter>('all', FILTERS)
 const kindParam = choiceParam<ArtifactKind | 'all'>('all', ['all', ...KINDS])
 const expiryParam = choiceParam<ExpiryFilter>('all', ['all', 'soon', 'kept'])
 type SortKey = 'status' | 'updated' | 'ticket'
@@ -46,7 +55,7 @@ export function Artifacts() {
   const shown = useMemo(() => {
     const rank: Record<ArtifactStatus, number> = { in_review: 0, changes_requested: 1, approved: 2 }
     const needle = q.trim().toLowerCase()
-    return (list ?? []).filter(a => filter === 'all' || a.status === filter)
+    return (list ?? []).filter(a => matches(a, filter))
       .filter(a => kind === 'all' || a.kind === kind)
       .filter(a => expiry === 'all' || expiryBucket(a) === expiry)
       .filter(a => !needle || [a.title, a.task_ref, a.task_name].some(t => t?.toLowerCase().includes(needle)))
@@ -84,7 +93,7 @@ export function Artifacts() {
           {FILTERS.map(f => (
             <button key={f} type="button" onClick={() => setFilter(f)} aria-pressed={filter === f}
               className={`font-label text-[10.5px] font-semibold uppercase tracking-[0.12em] px-2.5 py-2 border-l border-line first:border-l-0 cursor-pointer ${filter === f ? 'bg-ink text-on-ink' : 'bg-surface text-ink-2 hover:text-ink'}`}>
-              {f === 'all' ? 'All' : STATUS_LABEL[f]}
+              {f === 'all' ? 'All' : f === 'decisions' ? 'Decisions' : STATUS_LABEL[f]}
             </button>
           ))}
         </div>
@@ -115,7 +124,9 @@ export function Artifacts() {
           <div className="flex justify-center py-16"><Loader2 size={20} className="animate-spin text-ink-2" /></div>
         ) : shown.length === 0 ? (
           <div className="amp-panel p-8 max-w-[640px] grid gap-2">
-            <h2 className="amp-heading m-0 text-[17px]">{list.length ? 'No artifacts match these filters' : 'No artifacts yet'}</h2>
+            <h2 className="amp-heading m-0 text-[17px]">
+              {filter === 'decisions' && list.length ? 'No recorded decisions yet' : list.length ? 'No artifacts match these filters' : 'No artifacts yet'}
+            </h2>
             <p className="m-0 text-[13px] text-ink-2 leading-relaxed">
               Artifacts are what agents make for you to look at before code: UI mockups, prototypes, diagrams, images and documents.
               Ask your <ManagerAgent /> to put a design step in the plan, or have any agent call <code>amp_publish_artifact</code>.

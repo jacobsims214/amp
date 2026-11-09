@@ -4,7 +4,7 @@ import type {
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
-  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, GitHubCredentialInfo, GitHubCredentialChange, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
+  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, GitHubCredentialInfo, GitHubCredentialChange, Run, Usage, UpstreamDecision, DecisionAsk, DecisionDoc, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
   ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork, MyWorkCounts, PeopleWaiting,
   GettingStarted, ReceiptsMode, ReceiptMinLevel, ReceiptSummary, ReceiptView, TaskReceipt,
 } from '../types'
@@ -75,7 +75,7 @@ const userRef = (user: string | number) => String(user)
 export const api = {
   listProjects: () => get<{ projects: Project[] }>('/projects').then(r => r.projects),
   getProject: (id: number) => get<{ project: Project }>(`/projects/${id}`).then(r => r.project),
-  updateProjectSettings: (id: number, settings: { name?: string; description?: string; open_reassign?: boolean; require_plan_approval?: boolean; require_merge?: boolean; not_started_flag_minutes?: number; not_started_return_minutes?: number; receipts_mode?: '' | ReceiptsMode; receipts_min_level?: ReceiptMinLevel; metadata?: Record<string, string | number | boolean | null> }) =>
+  updateProjectSettings: (id: number, settings: { name?: string; description?: string; open_reassign?: boolean; require_plan_approval?: boolean; require_merge?: boolean; not_started_flag_minutes?: number; not_started_return_minutes?: number; receipts_mode?: '' | ReceiptsMode; receipts_min_level?: ReceiptMinLevel; decision_escalation_minutes?: number; decision_escalation_raise_priority?: boolean; decision_backup_decider?: number; metadata?: Record<string, string | number | boolean | null> }) =>
     patch<{ project: Project }>(`/projects/${id}`, settings).then(r => r.project),
   createProject: (req: CreateProjectRequest) => post<Project>('/projects', req),
   archiveProject: (id: number) => post<Project>(`/projects/${id}/archive`),
@@ -324,6 +324,20 @@ export const api = {
   /** A person marks their human ticket done, with what they want on the record. */
   completeHumanTask: (taskId: number, done: { note?: string; pr_url?: string; hours_worked?: number }) =>
     post<{ task: Task }>(`/tasks/${taskId}/complete`, done).then(r => r.task),
+  /** What people decided on this ticket's dependencies, and its own decision doc (null without one). */
+  getTaskDecisions: (taskId: number) =>
+    get<{ upstream: UpstreamDecision[] | null; own: DecisionDoc | null }>(`/tasks/${taskId}/decisions`)
+      .then(r => ({ upstream: r.upstream ?? [], own: r.own ?? null })),
+  /** A ticket's decision doc with every version and its options (404 without one). */
+  getTaskDecision: (taskId: number) =>
+    get<DecisionDoc>(`/tasks/${taskId}/decision`),
+  /** A person's edit of a decision doc: its markdown and options as one new
+   *  version, made on base_version (409 when the doc changed meanwhile). */
+  saveDecisionDoc: (taskId: number, body: { base_version: number; content: string; ask: DecisionAsk }) =>
+    put<DecisionDoc>(`/tasks/${taskId}/decision/doc`, body),
+  /** Record decision: freezes the version, completes the ticket, and posts the decision. */
+  recordDecision: (taskId: number, body: { version: number; chosen_option: number | null; decision_text: string }) =>
+    post<DecisionDoc>(`/tasks/${taskId}/decision/record`, body),
   /** Answer an agent's flag (a ticket blocked with a reason): posts the
    *  answer as a comment and puts the ticket back to ready (or waiting). */
   answerFlag: (taskId: number, answer: string) =>

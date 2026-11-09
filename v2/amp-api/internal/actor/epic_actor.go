@@ -128,6 +128,9 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 	case *MsgSetTaskStartAt:
 		a.routeToStory(ctx, msg.TaskID, msg)
 
+	case *MsgMarkDecisionDoc:
+		a.routeToStory(ctx, msg.TaskID, msg)
+
 	case *MsgApproveTask:
 		a.routeToStory(ctx, msg.TaskID, msg)
 

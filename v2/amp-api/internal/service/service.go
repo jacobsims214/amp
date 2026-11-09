@@ -65,6 +65,18 @@ type Service struct {
 	// Evidence is the receipt evidence store (#126; nil: not configured,
 	// so evidence calls are refused and visual checks can't count).
 	Evidence *EvidenceStore
+	// DecisionDocFault, when set, is called before a decision doc is written
+	// and fails the write with its error. Tests use it to force the "ticket
+	// created, doc not" path.
+	DecisionDocFault func(taskID int) error
+	// DecisionRunFault, when set, is called before Record decision writes
+	// its run and fails that step with its error. Tests use it to force the
+	// "claimed, run not written" path and its retry.
+	DecisionRunFault func(taskID int) error
+	// DecisionCompleteFault, when set, is called before Record decision
+	// completes the ticket and fails that step with its error. Tests use it
+	// to force a refusal (a 4xx), which releases the claim.
+	DecisionCompleteFault func(taskID int) error
 }
 
 func New(repo *repository.Repo, registry *actor.Registry, kbSvc *kb.Service) *Service {
@@ -599,9 +611,10 @@ func planApprovalGate(proj *domain.Project, lookupErr error, t *domain.Task, pla
 func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectID int, u domain.ProjectSettings) (*domain.Project, error) {
 	if u.Name == nil && u.Description == nil && u.OpenReassign == nil && u.RequirePlanApproval == nil && u.RequireMerge == nil &&
 		u.NotStartedFlagMinutes == nil && u.NotStartedReturnMinutes == nil && u.Metadata == nil &&
-		u.ReceiptsMode == nil && u.ReceiptsMinLevel == nil {
+		u.ReceiptsMode == nil && u.ReceiptsMinLevel == nil && !u.ChangesEscalation() {
 		return nil, authz.BadRequest("nothing to change: pass name, description, open_reassign, require_plan_approval, require_merge, " +
-			"not_started_flag_minutes, not_started_return_minutes, or metadata")
+			"not_started_flag_minutes, not_started_return_minutes, decision_escalation_minutes, decision_escalation_raise_priority, " +
+			"decision_backup_decider, or metadata")
 	}
 	if _, _, err := u.Metadata.Split(); err != nil {
 		return nil, authz.BadRequest("%s", err.Error())
@@ -627,6 +640,9 @@ func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectI
 	if err := s.GuardReceiptsUpdate(ctx, p, "project", projectID, u.Metadata); err != nil {
 		return nil, err
 	}
+	if err := s.checkEscalationSettings(ctx, p, projectID, u); err != nil {
+		return nil, err
+	}
 	// Turning plan approval off lets agents start work nobody approved, so
 	// only a person in the web UI can. Turning it on is fine from anywhere.
 	if u.RequirePlanApproval != nil && !*u.RequirePlanApproval {
@@ -644,7 +660,8 @@ func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectI
 			TargetName: proj.Name, Summary: "changed project settings", Details: map[string]any{"name": u.Name, "description_changed": u.Description != nil,
 				"open_reassign": u.OpenReassign, "require_plan_approval": u.RequirePlanApproval, "require_merge": u.RequireMerge,
 				"receipts_mode": u.ReceiptsMode, "receipts_min_level": u.ReceiptsMinLevel,
-				"metadata": u.Metadata, "channel": p.Channel},
+				"decision_escalation_minutes": u.DecisionEscalationMinutes, "decision_escalation_raise_priority": u.DecisionEscalationRaisePriority,
+				"decision_backup_decider": u.DecisionBackupDecider, "metadata": u.Metadata, "channel": p.Channel},
 			After: projectSettingsOf(proj)}
 		if prevErr == nil {
 			e.Before = projectSettingsOf(prev)
@@ -792,7 +809,9 @@ func projectSettingsOf(p *domain.Project) map[string]any {
 	}
 	m := map[string]any{"name": p.Name, "description_length": len(p.Description), "open_reassign": p.OpenReassign,
 		"require_plan_approval": p.RequirePlanApproval, "require_merge": p.RequireMerge,
-		"receipts_mode": p.ReceiptsMode, "receipts_min_level": p.ReceiptsMinLevel}
+		"receipts_mode": p.ReceiptsMode, "receipts_min_level": p.ReceiptsMinLevel,
+		"decision_escalation_minutes": p.DecisionEscalationMinutes, "decision_escalation_raise_priority": p.DecisionEscalationRaisePriority,
+		"decision_backup_decider": p.DecisionBackupDecider}
 	if len(p.Metadata) > 0 {
 		md := make(map[string]any, len(p.Metadata))
 		for k, v := range p.Metadata {

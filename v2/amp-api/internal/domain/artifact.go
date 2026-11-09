@@ -59,6 +59,9 @@ type Artifact struct {
 	ExpiryDismissedAt *time.Time `json:"expiry_dismissed_at"`
 	// URL is where people view it in AMP (set when the server knows its address).
 	URL string `json:"url,omitempty"`
+	// Role is "decision" for a ticket's decision doc (ArtifactRoleDecision),
+	// empty otherwise.
+	Role string `json:"role,omitempty"`
 }
 
 // ArtifactVersion is one version's metadata; Content is loaded only on request.
@@ -72,5 +75,9 @@ type ArtifactVersion struct {
 	CreatedBy      *int      `json:"created_by"`
 	CreatedByEmail string    `json:"created_by_email,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
-	Content        []byte    `json:"-"`
+	// AuthorKind is who wrote it, from its write path: "person" or "agent".
+	AuthorKind string `json:"author_kind"`
+	// DecisionAsk is a decision doc version's options (nil for other artifacts).
+	DecisionAsk *DecisionAsk `json:"decision_ask,omitempty"`
+	Content     []byte       `json:"-"`
 }

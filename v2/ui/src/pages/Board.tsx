@@ -305,6 +305,11 @@ export function Board() {
   const handleTaskCreate = async () => {
     if (!taskCreateModal) return
     if (!taskForm.name.trim()) { setNameMissing(true); document.getElementById('dialog-name')?.focus(); return }
+    // A person's ticket needs its brief, written for them (the server checks too).
+    if (taskForm.performer === 'human' && (!taskForm.description.trim() || !taskForm.acceptance_criteria.trim())) {
+      setTaskError("A person's ticket needs a description (what they must do) and acceptance criteria (what done means).")
+      return
+    }
     setTaskSaving(true)
     setTaskError(null)
     try {
@@ -833,10 +838,14 @@ export function Board() {
               <input id="dialog-name" autoFocus value={taskForm.name} onChange={e => { setTaskForm(f => ({ ...f, name: e.target.value })); setNameMissing(false) }}
                 aria-invalid={nameMissing} aria-describedby={nameMissing ? 'dialog-name-error' : undefined} className={inputCls} placeholder="Task name" />
               <FieldError id="dialog-name-error">{nameMissing && 'Give it a name.'}</FieldError></div>
-            <div><label className={labelCls}>Description</label>
-              <textarea value={taskForm.description} onChange={e => setTaskForm(f => ({ ...f, description: e.target.value }))} rows={3} className={`${inputCls} resize-none`} /></div>
-            <div><label className={labelCls}>Acceptance Criteria</label>
-              <textarea value={taskForm.acceptance_criteria} onChange={e => setTaskForm(f => ({ ...f, acceptance_criteria: e.target.value }))} rows={3} className={`${inputCls} resize-none`} /></div>
+            <div><label htmlFor="new-description" className={labelCls}>Description{taskForm.performer === 'human' ? ' *' : ''}</label>
+              <textarea id="new-description" value={taskForm.description} onChange={e => setTaskForm(f => ({ ...f, description: e.target.value }))} rows={3} className={`${inputCls} resize-none`}
+                required={taskForm.performer === 'human'} aria-required={taskForm.performer === 'human'}
+                placeholder={taskForm.performer === 'human' ? 'What the person must do, written for them' : undefined} /></div>
+            <div><label htmlFor="new-criteria" className={labelCls}>Acceptance Criteria{taskForm.performer === 'human' ? ' *' : ''}</label>
+              <textarea id="new-criteria" value={taskForm.acceptance_criteria} onChange={e => setTaskForm(f => ({ ...f, acceptance_criteria: e.target.value }))} rows={3} className={`${inputCls} resize-none`}
+                required={taskForm.performer === 'human'} aria-required={taskForm.performer === 'human'}
+                placeholder={taskForm.performer === 'human' ? 'What done means, one item per line' : undefined} /></div>
             <div><label className={labelCls}>Owner</label>
               <select value={taskForm.owner} onChange={e => setTaskForm(f => ({ ...f, owner: e.target.value }))} className={inputCls}>
                 <option value="">Me</option>

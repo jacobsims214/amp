@@ -42,7 +42,8 @@ func mergeStepChain(t *testing.T, w *rbacWorld, name, owner string) (build, step
 	res := w.s.as(w.alice).call(t, "amp_create_tasks", map[string]any{"project_id": float64(w.s.projectID), "tasks": []any{
 		map[string]any{"ref": "build", "story_id": float64(w.s.storyID), "name": name + " build"},
 		map[string]any{"ref": "merge", "story_id": float64(w.s.storyID), "name": "Merge PR: " + name,
-			"performer": "human", "human_reason": "review", "owner": owner, "depends_on": []any{"build"},
+			"performer": "human", "human_reason": "review", "description": "Review the PR and merge it", "acceptance_criteria": "The PR is merged",
+			"owner": owner, "depends_on": []any{"build"},
 			"metadata": map[string]any{domain.MetaMergeFor: "build"}},
 		map[string]any{"ref": "deploy", "story_id": float64(w.s.storyID), "name": name + " deploy", "depends_on": []any{"merge"}},
 	}})
@@ -79,8 +80,9 @@ func mustTask(t *testing.T, w *rbacWorld, id int) *domain.Task {
 // service, the way amp_update_task and the web UI do.
 func linkStep(t *testing.T, w *rbacWorld, taskID int, v any) error {
 	t.Helper()
-	return service.New(w.s.repo, w.s.reg, w.s.kb).UpdateTask(context.Background(), uiPrincipal(w.alice),
+	_, err := service.New(w.s.repo, w.s.reg, w.s.kb).UpdateTask(context.Background(), uiPrincipal(w.alice),
 		mustTask(t, w, taskID), domain.UpdateTaskRequest{Metadata: domain.MetadataPatch{domain.MetaMergeFor: v}})
+	return err
 }
 
 // A merge recorded from outside (GitHub's webhook, CI, Mark merged) completes
@@ -726,14 +728,16 @@ func TestMergeStep_BatchMergeForRejectedBeforeAnythingIsCreated(t *testing.T) {
 	}
 	step := func(ref, forRef string) map[string]any {
 		return map[string]any{"ref": ref, "story_id": float64(ms.storyID), "name": "Merge PR: " + ref,
-			"performer": "human", "human_reason": "review", "owner": w.bob.Email,
+			"performer": "human", "human_reason": "review", "description": "Review the PR and merge it", "acceptance_criteria": "The PR is merged",
+			"owner":    w.bob.Email,
 			"metadata": map[string]any{domain.MetaMergeFor: forRef}}
 	}
 	build := map[string]any{"ref": "build", "story_id": float64(ms.storyID), "name": "build"}
 	// A step listed before the ticket its ref names: no dependency edge, so
 	// the creation order puts the step first.
 	forward := map[string]any{"ref": "forward", "story_id": float64(ms.storyID), "name": "Merge PR: forward",
-		"performer": "human", "human_reason": "review", "owner": w.bob.Email,
+		"performer": "human", "human_reason": "review", "description": "Review the PR and merge it", "acceptance_criteria": "The PR is merged",
+		"owner":    w.bob.Email,
 		"metadata": map[string]any{domain.MetaMergeFor: "later"}}
 	later := map[string]any{"ref": "later", "story_id": float64(ms.storyID), "name": "later"}
 
@@ -799,7 +803,8 @@ func TestMergeStep_BatchMergeForMessageMatchesTheCheck(t *testing.T) {
 	base := func(ref string, v any) map[string]any {
 		return map[string]any{"project_id": float64(ms.projectID), "tasks": []any{map[string]any{
 			"ref": ref, "story_id": float64(ms.storyID), "name": "Merge PR: msg",
-			"performer": "human", "human_reason": "review", "owner": w.bob.Email,
+			"performer": "human", "human_reason": "review", "description": "Review the PR and merge it", "acceptance_criteria": "The PR is merged",
+			"owner":    w.bob.Email,
 			"metadata": map[string]any{domain.MetaMergeFor: v}}}}
 	}
 	// A number, its digits, and "#N" all name a ticket id, and all work.

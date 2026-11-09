@@ -1,14 +1,19 @@
 /**
- * The project's My work tab, `/project/:id/my-work` (KB decisions/human-work-ux.md
+ * The project's My work tab, `/project/:id/my-work` (v2/kb/working/human-work.md
  * §2, mockup artifact #23 "Project › My work"; the Approve card and view are
  * artifact #24 v2). The one place a person acts on this project: approve a
  * plan, answer a question, record a merge, start or finish their own ticket.
  *
  * - Readouts: Waiting on you (red above 0), Approve, Answer, Merge, Do, and
  *   Coming up (shown, never counted) or Cleared today.
- * - One list of items, approve → answer → merge → do, oldest first within each
- *   kind (the server's order). Approve items are ApproveCards that open the
- *   Approve view in place (`?approve=`); the rest carry HumanActions.
+ * - One list of items, approve → answer → verify → merge → do, in the server's order:
+ *   oldest first within each kind, and Do items by what they block, then age.
+ *   A Do card says "blocks N · waiting Xd" (or "Nothing waits on it ·
+ *   waiting Xd"); one with a decision doc links to its drawer to decide.
+ *   A decide-by date shows as a chip ("Decide in 2d", red "Overdue · 3h")
+ *   and the date in the reader's zone; overdue Do items come first (#146).
+ *   Approve items are ApproveCards that open the Approve view in place
+ *   (`?approve=`); the rest carry HumanActions.
  * - Side panels: Coming up with what each waits on, Your agents here (links to
  *   the Board), Done today.
  * - Empty: "You're clear in <project>." Done: "You cleared N things today."
@@ -39,6 +44,8 @@ import { reasonLabel } from '../lib/human'
 import { KIND_LABEL, needsLine } from '../lib/humanActions'
 import { startItemText } from '../lib/dispatchState'
 import { mergeCardState } from '../lib/merge'
+import { waitLine } from '../lib/decisions'
+import { describeDecideBy } from '../lib/decideBy'
 import { projectLink } from '../lib/projectLink'
 import { refreshWaitCounts } from '../lib/waitCounts'
 import { isNoUserError, noMyWorkReason } from '../lib/myWorkAccess'
@@ -375,10 +382,21 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
     meta.push(it.merge_state === 'abandoned' ? `PR closed ${ago(it.since)}` : `Done ${ago(it.completed_at ?? it.since)}${t?.agent_id ? ` by ${t.agent_id}` : ''}`)
   }
   if (kind === 'do') {
-    meta.push(`${it.state === 'in_progress' ? 'Started' : 'Ready'} ${ago(it.since)}`)
+    // One line, as the spec words it (D9); the server sorts Do items by it.
+    meta.push(waitLine(it.holding_up?.length ?? 0, it.since))
     meta.push(reasonLabel(it.human_reason ?? t?.human_reason))
   }
+  // A ticket with a decision doc is decided in its drawer, not by Mark done.
+  const hasDoc = !!(it.has_decision_doc || t?.has_decision_doc)
+  const actionTask = t && hasDoc && !t.has_decision_doc ? { ...t, has_decision_doc: true } : t
   if (kind === 'start') meta.push(startItemText(it))
+  // A decide-by date (#146): the chip says how far off or overdue it is, and
+  // the meta line the date in the reader's own zone. The server flags it
+  // overdue and sorts it first; this only shows it.
+  const decide = describeDecideBy(it.decide_by ?? t?.decide_by)
+  const overdue = !!(it.overdue || decide?.overdue)
+  if (decide) meta.push(`Decide by ${decide.absolute}`)
+  // main's receipt verification (#126): a held claim shows how long it has waited.
   if (kind === 'verify') meta.push(`Held ${ago(it.since)}${it.agent_id ? `, finished by ${it.agent_id}` : ''}`)
   return (
     <>
@@ -390,19 +408,27 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
           <span className="it-id">#{it.task_id}</span>
           {kind === 'do' && <span className="amp-label border border-line px-1.5 py-1 leading-none">{it.state === 'in_progress' ? 'In progress' : 'Ready'}</span>}
           {kind === 'start' && <span className="amp-label border px-1.5 py-1 leading-none" style={{ borderColor: 'var(--warning)', color: 'var(--warning-ink)' }}>Not started</span>}
+          {decide && (
+            <span className={`amp-label border px-1.5 py-1 leading-none${overdue ? '' : ' border-line'}`} data-testid="decide-by-chip"
+              data-overdue={overdue || undefined} title={decide.absolute}
+              style={overdue ? { borderColor: 'var(--danger)', color: 'var(--danger-ink)' } : undefined}>
+              {overdue ? `Overdue · ${decide.relative.replace(/ overdue$/, '')}` : `Decide ${decide.relative}`}</span>
+          )}
         </div>
         <p className="m-0 mt-1 text-[13.5px] leading-snug text-ink" data-needs="">{needsLine(it)}</p>
         <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[12.5px] text-ink-2">{meta.map(m => <span key={m}>{m}</span>)}</div>
         {kind === 'do' && t && <Brief task={t} />}
         <div className="mt-3">
+          {/* main's receipt verification (#126) first: accepting or rejecting a
+              held claim is that item's whole action, never a decision-doc chore. */}
           {kind === 'verify'
             ? <Link to={projectLink(pid, 'board', it.task_id)} className="amp-btn amp-btn-sm">Open #{it.task_id} to accept or reject</Link>
-            : t ? <HumanActions task={t} kind={kind} canAct={!readOnly} prUrl={it.pr_url} branch={it.branch}
+            : actionTask ? <HumanActions task={actionTask} kind={kind} canAct={!readOnly} prUrl={it.pr_url} branch={it.branch}
               baseBranch={it.base_branch} targetSource={it.target_source}
               holdingUp={it.holding_up} notWaiting={it.not_waiting} trackedBy={it.tracked_by}
               alert={it.alert} alertReason={it.alert_reason} rule={it.rule} reviewUrl={it.review_url}
               defaultBranch={it.default_branch}
-              minutes={it.not_started_minutes} onChanged={() => onChanged()} />
+              minutes={it.not_started_minutes} decideHref={hasDoc ? projectLink(pid, 'board', it.task_id) : undefined} onChanged={() => onChanged()} />
             : <span className="text-[12.5px] text-ink-2">{it.question ?? ''}</span>}
         </div>
       </article>

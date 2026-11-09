@@ -12,7 +12,7 @@ import (
 
 // Fields each kind of update can clear. Names and priorities can't be blank.
 var (
-	TaskClearable  = []string{"description", "acceptance_criteria", "assigned_to", "agent_id", "human_reason"}
+	TaskClearable  = []string{"description", "acceptance_criteria", "assigned_to", "agent_id", "human_reason", "decide_by"}
 	EpicClearable  = []string{"description"}
 	StoryClearable = []string{"description", "acceptance_criteria"}
 )
@@ -31,6 +31,16 @@ func ParseClears(fields []string, allowed []string) (Clears, error) {
 		c[f] = true
 	}
 	return c, nil
+}
+
+// Fields is the cleared field names, sorted.
+func (c Clears) Fields() []string {
+	out := make([]string, 0, len(c))
+	for f := range c {
+		out = append(out, f)
+	}
+	slices.Sort(out)
+	return out
 }
 
 // Apply returns the new value of a text field: blank when cleared, value

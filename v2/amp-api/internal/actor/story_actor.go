@@ -177,7 +177,8 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 			return
 		}
 		replyCh := make(chan ReplySimple, 1)
-		ctx.Send(pid, &MsgUpdateTask{Req: msg.Req, KeepHuman: msg.KeepHuman, ReplyCh: replyCh})
+		ctx.Send(pid, &MsgUpdateTask{Req: msg.Req, KeepHuman: msg.KeepHuman, By: msg.By, ByName: msg.ByName,
+			DecideBySuggestOnly: msg.DecideBySuggestOnly, DecideByPerson: msg.DecideByPerson, ReplyCh: replyCh})
 		msg.ReplyCh <- <-replyCh
 
 	case *MsgSetTaskState:
@@ -193,6 +194,14 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- <-replyCh
 
 	case *MsgSetTaskStartAt:
+		pid, ok := a.tasks[msg.TaskID]
+		if !ok {
+			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("task %d not found in story %d", msg.TaskID, a.story.ID)}
+			return
+		}
+		ctx.Send(pid, msg)
+
+	case *MsgMarkDecisionDoc:
 		pid, ok := a.tasks[msg.TaskID]
 		if !ok {
 			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("task %d not found in story %d", msg.TaskID, a.story.ID)}

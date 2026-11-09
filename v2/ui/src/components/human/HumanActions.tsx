@@ -1,6 +1,6 @@
 /**
  * HumanActions: every action a person takes on their work, in one component
- * (KB decisions/human-work-ux.md §2, mockup artifact #23). The project's My
+ * (v2/kb/working/human-work.md, mockup artifact #23). The project's My
  * work cards and the TaskDrawer both use it, so a ticket opened from the
  * Board offers the same buttons as My work.
  *
@@ -17,13 +17,17 @@
  *   Merges are recorded once: a repeat says who recorded it first ("already
  *   merged, recorded by github at …"), and so does the linked step when one is
  *   folded in.
- * - Do: Start, and Mark done… with an inline note, link and hours.
+ * - Do: Start, and Mark done… with an inline note, link and hours. A ticket
+ *   with a decision doc is decided on its doc, in its drawer (Record
+ *   decision): Do offers Start and "Decide in the ticket", never Mark done,
+ *   which the server refuses for it.
  *
  * Approval is not here: it happens only in My work's Approve view
  * (ApproveCard / ApproveView). The drawer links there instead.
  */
 import { useState } from 'react'
-import { Check, ExternalLink, GitMerge, Loader2, Play, RotateCcw, Send } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { ArrowRight, Check, ExternalLink, GitMerge, Loader2, Play, RotateCcw, Send } from 'lucide-react'
 import { api } from '../../api/client'
 import { suggestAnswers } from '../../lib/answers'
 import { safeUrl } from '../../lib/safeUrl'
@@ -68,6 +72,8 @@ export interface HumanActionsProps {
   askedBy?: string
   /** do: the owner's name, for "Only <name> starts and finishes it" */
   ownerName?: string
+  /** do, a ticket with a decision doc: where it is decided (its drawer) */
+  decideHref?: string
   /** called with the updated ticket (or null when only a merge record came back) */
   onChanged?: (t: Task | null, note?: string) => void
 }
@@ -371,7 +377,7 @@ function StartAction({ task, canAct, minutes, onChanged }: HumanActionsProps) {
 
 // ---- Do ----
 
-function DoAction({ task, canAct, ownerName, onChanged }: HumanActionsProps) {
+function DoAction({ task, canAct, ownerName, decideHref, onChanged }: HumanActionsProps) {
   const [finishing, setFinishing] = useState(false)
   const [note, setNote] = useState('')
   const [link, setLink] = useState('')
@@ -379,22 +385,44 @@ function DoAction({ task, canAct, ownerName, onChanged }: HumanActionsProps) {
   const { busy, error, run } = useRun(onChanged)
   const hoursNum = hours.trim() === '' ? undefined : Number(hours)
   const hoursBad = hoursNum !== undefined && (Number.isNaN(hoursNum) || hoursNum < 0 || hoursNum > 1000)
+  // A judgment or approval ticket is a decision others wait on: the note is the decision.
+  const decision = task.human_reason === 'judgment' || task.human_reason === 'approval'
+  const [noteMissing, setNoteMissing] = useState(false)
   if (task.state === 'completed') return null
   if (task.state === 'blocked') {
     return <span className="text-[12.5px] text-ink-2" data-action="do">Waiting on #{(task.blocked_by_ids?.length ? task.blocked_by_ids : task.dependency_ids).join(', #')} before it can start.</span>
   }
   if (!canAct) return <span className="text-[12.5px] text-ink-2" data-action="do">Only {ownerName || 'its owner'} starts and finishes it.</span>
+  if (task.has_decision_doc) {
+    // Its decision is recorded on its doc; Mark done would be refused.
+    return (
+      <div className="flex gap-2 flex-wrap items-center" data-action="do">
+        {task.state === 'backlog' && (
+          <button type="button" className="amp-btn amp-btn-sm" disabled={!!busy} onClick={() => run('start', () => api.startHumanTask(task.id))}>
+            {busy === 'start' ? <Spin /> : <Play size={12} aria-hidden="true" />}Start</button>
+        )}
+        {decideHref
+          ? <Link to={decideHref} className="amp-btn amp-btn-primary amp-btn-sm ml-auto">Decide in the ticket<ArrowRight size={12} aria-hidden="true" /></Link>
+          : <span className="text-[12.5px] text-ink-2 ml-auto">Record the decision on its doc, in the ticket.</span>}
+        {error && <span role="alert" className="text-[12px] text-danger-ink w-full">{error}</span>}
+      </div>
+    )
+  }
   if (finishing) {
     return (
       <form className="grid gap-2" data-action="do" onSubmit={e => {
         e.preventDefault()
         if (hoursBad) return
+        if (decision && !note.trim()) { setNoteMissing(true); return }
         run('done', () => api.completeHumanTask(task.id, { note: note.trim() || undefined, pr_url: link.trim() || undefined, hours_worked: hoursNum }))
           .then(ok => { if (ok) setFinishing(false) })
       }}>
-        <label htmlFor={`done-note-${task.id}`} className="amp-label">What happened (optional)</label>
-        <textarea id={`done-note-${task.id}`} className="amp-input min-h-[56px] resize-y" value={note} onChange={e => setNote(e.target.value)}
-          placeholder="Anything the next person should know" />
+        <label htmlFor={`done-note-${task.id}`} className="amp-label">{decision ? 'Your decision' : 'What happened (optional)'}</label>
+        <textarea id={`done-note-${task.id}`} className="amp-input min-h-[56px] resize-y" value={note}
+          onChange={e => { setNote(e.target.value); setNoteMissing(false) }}
+          aria-required={decision} aria-invalid={noteMissing}
+          placeholder={decision ? 'What you decided. The tickets waiting on this receive it' : 'Anything the next person should know'} />
+        {noteMissing && <span role="alert" className="text-[12px] text-danger-ink">Write what you decided</span>}
         <div className="grid grid-cols-[1fr_110px] gap-2">
           <div className="grid gap-1">
             <label htmlFor={`done-link-${task.id}`} className="amp-label">Link (optional)</label>

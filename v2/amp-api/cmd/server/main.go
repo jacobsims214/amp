@@ -450,6 +450,7 @@ func main() {
 	// A dispatched ticket nobody starts is returned to ready after its
 	// project's not_started_return_minutes (AMP #2801). One replica at a
 	// time (advisory lock); the state change goes through the project actor.
+	// The same tick escalates overdue decisions (decide_by, #146).
 	go service.New(repo, registry, kbSvc).RunDispatchWatchdog(ctx, service.WatchdogInterval, repo.TryNamedLock)
 
 	// Health check (unauthenticated, used by k8s probes)

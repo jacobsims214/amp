@@ -152,7 +152,7 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplyGetTask{Task: t, Err: err}
 
 	case *MsgUpdateTask:
-		err := a.handleUpdate(msg.Req, msg.KeepHuman)
+		err := a.handleUpdate(msg)
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgSetTaskState:
@@ -189,6 +189,13 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 	case *MsgSetTaskStartAt:
 		err := a.handleSetTaskStartAt(msg.StartAt)
 		msg.ReplyCh <- ReplySimple{Err: err}
+
+	case *MsgMarkDecisionDoc:
+		if !a.task.HasDecisionDoc {
+			a.task.HasDecisionDoc = true
+			a.publish(domain.EventTaskUpdated, a.withBlockedBy())
+		}
+		msg.ReplyCh <- ReplySimple{}
 
 	case *MsgApproveTask:
 		msg.ReplyCh <- a.handleApprove(msg)
@@ -713,10 +720,17 @@ func (a *TaskActor) handleBlock(reason string, by *int) error {
 	return nil
 }
 
-func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest, keepHuman string) error {
+func (a *TaskActor) handleUpdate(msg *MsgUpdateTask) error {
+	req, keepHuman, by, byName := msg.Req, msg.KeepHuman, msg.By, msg.ByName
 	clr, err := domain.ParseClears(req.Clear, domain.TaskClearable)
 	if err != nil {
 		return err
+	}
+	// The repository reads req.Clear too: hand it the parsed, trimmed names,
+	// so " decide_by" can't clear the in-memory ticket but not the row.
+	req.Clear = clr.Fields()
+	if clr["decide_by"] && req.DecideBy != nil {
+		return fmt.Errorf("decide_by: set a date or clear it, not both")
 	}
 	// A person's ticket becomes agent work only by that choice in the web UI;
 	// otherwise an agent could flip it, dispatch it and complete it. Checked
@@ -726,25 +740,19 @@ func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest, keepHuman string)
 			return errors.New(keepHuman)
 		}
 	}
-	if req.Name != "" {
-		a.task.Name = req.Name
-	}
-	a.task.Description = clr.Apply("description", req.Description, a.task.Description)
-	a.task.AssignedTo = clr.Apply("assigned_to", req.AssignedTo, a.task.AssignedTo)
-	a.task.AgentID = clr.Apply("agent_id", req.AgentID, a.task.AgentID)
-	a.task.AcceptanceCriteria = clr.Apply("acceptance_criteria", req.AcceptanceCriteria, a.task.AcceptanceCriteria)
-	if req.Priority != "" {
-		a.task.Priority = req.Priority
-	}
+	// Every refusal below comes before the in-memory ticket changes, so a
+	// refused edit leaves the actor in step with the database.
+	//
 	// Who does it: switching is refused mid-work, so an agent's run or a
 	// person's work isn't cut off by the change.
 	prevPerformer := a.task.Performer
+	performer, humanReason := a.task.Performer, a.task.HumanReason
 	if req.Performer != "" || req.HumanReason != "" {
-		performer := req.Performer
-		if performer == "" {
-			performer = a.task.Performer
+		want := req.Performer
+		if want == "" {
+			want = a.task.Performer
 		}
-		p, reason, err := domain.NormalizePerformer(performer, req.HumanReason)
+		p, reason, err := domain.NormalizePerformer(want, req.HumanReason)
 		if err != nil {
 			return err
 		}
@@ -755,16 +763,52 @@ func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest, keepHuman string)
 			reason = a.task.HumanReason // keep the reason it had
 		}
 		req.Performer, req.HumanReason = p, reason
-		a.task.Performer, a.task.HumanReason = p, reason
+		performer, humanReason = p, reason
 	} else if clr["human_reason"] && a.task.IsHuman() {
 		return fmt.Errorf("a human ticket keeps a reason; set human_reason instead of clearing it")
 	}
-	a.task.UpdatedAt = time.Now()
+	// A decide-by date (#146): only on a person's ticket (as the edit leaves
+	// it) that isn't done.
+	setsDecideBy := req.DecideBy != nil || clr["decide_by"]
+	var decideBy *time.Time
+	if setsDecideBy {
+		if !clr["decide_by"] {
+			decideBy = req.DecideBy
+		}
+		if err := domain.CheckDecideBy(performer, decideBy); err != nil {
+			return err
+		}
+		// Re-checked here, against the ticket as it is now, so a person's
+		// date set (or an owner change) after the service's check still
+		// holds: a suggester only dates a ticket that has none.
+		if msg.DecideBySuggestOnly != "" && a.task.DecideBy != nil && !sameTime(a.task.DecideBy, decideBy) {
+			person := msg.DecideByPerson != 0 && a.task.OwnerUserID != nil && *a.task.OwnerUserID == msg.DecideByPerson
+			if !person {
+				return errors.New(msg.DecideBySuggestOnly)
+			}
+		}
+		if decideBy != nil && a.task.State == domain.TaskStateCompleted {
+			return fmt.Errorf("task %d is done: a decide-by date only applies to a ticket still waiting on its person", a.task.ID)
+		}
+	}
 
 	planned, err := a.repo.UpdateTaskPlanned(context.Background(), req)
 	if err != nil {
 		return fmt.Errorf("db update: %w", err)
 	}
+	// Written: now the in-memory ticket follows.
+	if req.Name != "" {
+		a.task.Name = req.Name
+	}
+	a.task.Description = clr.Apply("description", req.Description, a.task.Description)
+	a.task.AssignedTo = clr.Apply("assigned_to", req.AssignedTo, a.task.AssignedTo)
+	a.task.AgentID = clr.Apply("agent_id", req.AgentID, a.task.AgentID)
+	a.task.AcceptanceCriteria = clr.Apply("acceptance_criteria", req.AcceptanceCriteria, a.task.AcceptanceCriteria)
+	if req.Priority != "" {
+		a.task.Priority = req.Priority
+	}
+	a.task.Performer, a.task.HumanReason = performer, humanReason
+	a.task.UpdatedAt = time.Now()
 	// A change to what the ticket is (name, description, acceptance
 	// criteria) re-plans it, so the last plan approval no longer covers it.
 	// The database decides (Repo.UpdateTaskPlanned), on the same clock as
@@ -777,6 +821,19 @@ func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest, keepHuman string)
 			detail += ": " + a.task.HumanReason
 		}
 		a.logActivity("system", "performer_changed", "", "", detail)
+	}
+	// Only a changed date re-arms escalation (as in Repo.UpdateTaskPlanned):
+	// re-sending the same one keeps the escalation mark.
+	if setsDecideBy && !sameTime(a.task.DecideBy, decideBy) {
+		if byName == "" {
+			byName = "manager"
+		}
+		detail := "Decide-by date removed"
+		if decideBy != nil {
+			detail = "Decide by " + decideBy.UTC().Format("2006-01-02 15:04 UTC")
+		}
+		a.logActivityBy(byName, by, "decide_by_set", "", "", detail)
+		a.task.DecideBy, a.task.DecideByEscalatedAt = decideBy, nil
 	}
 	if req.Metadata != nil {
 		meta, err := a.repo.MergeMetadata(context.Background(), "task", a.task.ID, req.Metadata)
@@ -1494,4 +1551,12 @@ func (a *TaskActor) releaseFromSchedule(why string) error {
 	a.publish(domain.EventTaskUnblocked, a.withBlockedBy())
 	a.logActivity("system", "unblocked", "blocked", "backlog", why)
 	return nil
+}
+
+// sameTime reports whether two optional times are the same instant.
+func sameTime(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(*b)
 }
