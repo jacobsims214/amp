@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useMemo, type ReactNode } from 'react'
 import ReactMarkdown, { type Components, type Options } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { ExternalLink } from 'lucide-react'
@@ -47,7 +47,8 @@ export function Markdown({ children, size = 'doc', projectId }: { children: stri
   const doc = size === 'doc'
   const body = doc ? 'text-sm leading-7' : 'text-[13px] leading-6'
   const gap = doc ? 'mb-4' : 'mb-2.5'
-  const components: Components = {
+  // Stable between renders: new element types would remount the subtree and wipe DOM-applied marks (e.g. the Library's match highlight).
+  const components: Components = useMemo(() => ({
     h1: ({ children }) => doc
       ? <h1 className="amp-heading text-[22px] text-ink mt-8 mb-3 pb-2 border-b border-line first:mt-0">{children}</h1>
       : <h3 className="text-[14px] font-semibold text-ink mt-4 mb-1.5 first:mt-0">{children}</h3>,
@@ -79,7 +80,7 @@ export function Markdown({ children, size = 'doc', projectId }: { children: stri
     table: ({ children }) => <div className={`overflow-x-auto ${gap}`}><table className="w-full text-sm border-collapse">{children}</table></div>,
     th: ({ children }) => <th className="amp-label text-left px-3 py-2 bg-surface-2 border-b border-line">{children}</th>,
     td: ({ children }) => <td className="px-3 py-2 text-ink-2 text-sm border-b border-line">{children}</td>,
-  }
+  }), [doc, body, gap])
   const plugins: Options['remarkPlugins'] = project != null && project !== ''
     ? [remarkGfm, [remarkTicketRefs, { projectId: project }]]
     : [remarkGfm]
