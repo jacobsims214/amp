@@ -35,6 +35,7 @@ import { PriorityMark } from '../components/ui/PriorityMark'
 import { displayState, STATE_LABEL, STATE_VAR, type DisplayState } from '../lib/ticketState'
 import type { PlanIssue, PlanReport, Task } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
+import { Markdown } from '../components/ui/Markdown'
 
 /** Each ticket's stage (dependency depth) and the plan's critical path. */
 function planShape(tasks: Task[]) {
@@ -82,6 +83,11 @@ const ISSUE_TITLE: Record<string, string> = {
   no_context: 'Context in the KB',
   coupled_gate: "People's work kept apart",
   metadata_drift: 'Epics carry the same metadata',
+  // Shown only when the check reports them (#129): not GO rows of their own.
+  awaiting_approval: 'Plan approved',
+  human_without_owner: "Every person's ticket has an owner",
+  unlinked_merge_step: 'Merge steps linked to their PR',
+  duplicate_merge_step: 'One merge step per PR',
 }
 
 function Chip({ t, state, crit, lit, sel, dim, onClick }: {
@@ -165,12 +171,14 @@ export function FlightPlan() {
   const pollOrder = ['isolated', 'wide_start', 'empty_stories', 'no_context', 'coupled_gate', 'metadata_drift']
   const pollRow = (kind: string, okDetail: string) => {
     const issue: PlanIssue | undefined = issueByKind.get(kind)
-    const stamp = pollOrder.indexOf(kind) * 90
+    const stamp = Math.max(0, pollOrder.indexOf(kind)) * 90
     return (
-      <div key={kind} className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 px-4 py-2.5 border-t border-line first:border-t-0">
-        <span className="text-[13px] text-ink">{ISSUE_TITLE[kind]}</span>
+      <div key={kind} className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 px-4 py-2.5 border-t border-line first:border-t-0" data-check={kind}>
+        <span className="text-[13px] text-ink">{ISSUE_TITLE[kind] ?? kind.replace(/_/g, ' ')}</span>
         <Verdict key={`${poll}-${kind}`} ok={!issue} warn={issue?.severity === 'warn'} stampDelay={stamp} />
-        <span className="col-span-2 text-[11.5px] text-ink-2 leading-snug">{issue ? issue.message : okDetail}</span>
+        {issue
+          ? <div className="col-span-2"><Markdown size="compact" projectId={pid}>{issue.message}</Markdown></div>
+          : <span className="col-span-2 text-[11.5px] text-ink-2 leading-snug">{okDetail}</span>}
         {issue?.task_ids && issue.task_ids.length > 0 && (
           <span className="col-span-2 flex flex-wrap gap-1">
             {issue.task_ids.slice(0, 18).map(id => (
@@ -296,13 +304,17 @@ export function FlightPlan() {
                 {pollRow('no_context', 'The project KB explains what this is and why the plan looks like this.')}
                 {pollRow('coupled_gate', "No single ticket makes one person's next work wait on another's.")}
                 {pollRow('metadata_drift', 'Every epic has the metadata keys the others use, so reports roll it up.')}
+                {/* Everything else the check found (approval still owed, a person's ticket with no owner, merge
+                    steps): listed too, so the panel never says GO over a problem the check reported (#129). */}
+                {(report.issues ?? []).filter(i => !pollOrder.includes(i.kind)).map(i => i.kind)
+                  .filter((k, n, all) => all.indexOf(k) === n).map(k => pollRow(k, ''))}
                 <div className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 px-4 py-2.5 border-t border-line">
                   <span className="text-[13px] text-ink">No stuck tickets</span><Verdict key={`${poll}-stuck`} ok stampDelay={pollOrder.length * 90} />
                   <span className="col-span-2 text-[11.5px] text-ink-2">{report.repaired_task_ids?.length
                     ? `Repaired ${report.repaired_task_ids.length} blocked on finished work: #${report.repaired_task_ids.join(', #')}`
                     : 'Nothing is blocked on finished work.'}</span>
                 </div>
-                <p className="m-0 px-4 py-2.5 border-t border-line text-[11.5px] text-ink-3">{report.summary}</p>
+                <div className="px-4 py-2.5 border-t border-line" data-testid="plan-summary"><Markdown size="compact" projectId={pid}>{report.summary}</Markdown></div>
               </>}
             </Panel>
 
@@ -311,7 +323,8 @@ export function FlightPlan() {
       </div>
 
       <TaskDrawer task={opened} onClose={() => setOpenId(null)} onRefresh={refresh}
-        members={members} meId={me?.user_id} myAccess={myAccess} openReassign={openReassign} onTaskUpdated={applyTask} />
+        members={members} meId={me?.user_id} myAccess={myAccess} openReassign={openReassign} onTaskUpdated={applyTask}
+        requireApproval={!!approval.project?.require_plan_approval} />
     </div>
   )
 }
@@ -340,7 +353,7 @@ function FragmentRows({ epicName, epicPriority, count, cols, children }: {
             <span className="amp-bands-v h-[14px]" aria-hidden="true" />
             <span className="font-label text-[11.5px] font-semibold uppercase tracking-[0.14em] text-ink">{epicName}</span>
             <PriorityMark priority={epicPriority} />
-            <span className="amp-num text-[10.5px] text-ink-3">{count} tickets</span>
+            <span className="amp-num text-[10.5px] text-ink-3">{count} {count === 1 ? 'ticket' : 'tickets'}</span>
           </span>
         </td>
       </tr>

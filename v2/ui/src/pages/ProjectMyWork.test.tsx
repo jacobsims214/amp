@@ -549,3 +549,14 @@ describe('My work tab: what each item needs from you', () => {
     expect(card.querySelector('details')).toBeNull()
   })
 })
+
+describe('My work: an agent question with options (#130)', () => {
+  it('shows the options as choices, the recommended one marked', async () => {
+    const it0 = data.items.answer[0]
+    data.items.answer[0] = { ...it0, task: { ...it0.task!, question: { options: [{ label: 'Fall back to a 0600 file', consequence: 'Works in QA' }, { label: 'Fail with a clear error', consequence: '' }], recommended: 1 } } }
+    at('/project/2/my-work')
+    const group = await screen.findByRole('radiogroup', { name: 'Choose an answer' })
+    expect(within(group).getByRole('radio', { name: /Fail with a clear error/ }).closest('label')).toHaveTextContent('Recommended')
+    expect(within(group).getByRole('radio', { name: /Fall back/ }).closest('label')).not.toHaveTextContent('Recommended')
+  })
+})

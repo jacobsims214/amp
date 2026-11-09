@@ -4,7 +4,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { api } from '../api/client'
 import { LOAD_TIMEOUT_MS } from '../lib/timeout'
 import { DayReports } from './DayReports'
-import type { Member } from '../types'
+import type { DayReport, DayReportItem, Member } from '../types'
 
 vi.mock('../hooks/useAuth', () => ({ useAuth: () => ({ me: { user_id: 5 } }) }))
 
@@ -102,5 +102,24 @@ describe('DayReports Velocity panel', () => {
     await act(async () => {})
     expect(screen.getByText('No completed tickets to chart yet.')).toBeInTheDocument()
     expect(screen.getByText('No saved reports in the last 30 days.')).toBeInTheDocument()
+  })
+})
+
+describe('DayReports question markdown (#133)', () => {
+  const stats = { completed: 0, started: 0, created: 0, in_progress: 0, blocked: 1, projects: 1 }
+  const report: DayReport = {
+    user_id: 6, user_email: 'ada@example.com', user_name: 'Ada', day: '2026-11-04', tz: 'UTC', summary: '', saved: true, markdown: '',
+    data: { completed: [], started: [], created: [], in_progress: [], touched: [], stats, generated_at: '2026-11-04T18:00:00Z',
+      blocked: [{ task_id: 7, project_id: 2, project_name: 'AMP', ref: '#7', name: 'Import', epic_name: 'E', story_name: 'S', block_reason: '**Pick** one' } as DayReportItem] },
+  }
+
+  it('renders a blocked item\'s question with the shared markdown', async () => {
+    vi.spyOn(api, 'reportPeople').mockResolvedValue([{ user_id: 6, display_name: 'Ada' } as Member])
+    vi.spyOn(api, 'velocity').mockImplementation(never)
+    vi.spyOn(api, 'dayReports').mockResolvedValue([report])
+    render(<MemoryRouter><DayReports /></MemoryRouter>)
+    await act(async () => {})
+    await act(async () => { fireEvent.click(screen.getByText('Ada')) })
+    expect(screen.getByTestId('day-question').querySelector('strong')).toHaveTextContent('Pick')
   })
 })

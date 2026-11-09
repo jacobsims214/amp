@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sort"
 	"strings"
@@ -398,6 +399,51 @@ type HumanGate struct {
 // than half the open work, usually means dependencies are missing.
 const readyFanoutThreshold = 4
 
+// countNoun is "1 ticket" or "3 tickets".
+func countNoun(n int, one, many string) string {
+	return fmt.Sprintf("%d %s", n, pick(n, one, many))
+}
+
+// pick is one for n == 1, many otherwise.
+func pick[T any](n int, one, many T) T {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// kbContextIssue is the plan check's "Context in the KB" finding, or nil when
+// the project KB holds docs: an empty KB is a blocking no_context issue, and
+// a KB AMP can't read (none configured, or an error reading it) is a warning,
+// since nothing shows the plan's context is written down (#129).
+func (s *Service) kbContextIssue(ctx context.Context, projectID int) *PlanIssue {
+	if s.KB == nil {
+		return &PlanIssue{
+			Kind: "no_context", Severity: "warn",
+			Message: "This AMP has no knowledge base configured, so nothing shows the decisions behind this plan are written down anywhere but the session that made it.",
+			Fix:     "Configure the KB (Typesense) for this AMP, then write architecture/project-overview.md and the decisions/ docs with amp_kb_write.",
+		}
+	}
+	n, err := s.KB.CountDocs(ctx, kb.Project(projectID))
+	if err != nil {
+		// The cause (hosts, paths) stays in the server log, not the report.
+		slog.Error("plan check: read project KB", "project_id", projectID, "err", err)
+		return &PlanIssue{
+			Kind: "no_context", Severity: "warn",
+			Message: "AMP couldn't read the project knowledge base, so it can't tell whether the context behind this plan is written down.",
+			Fix:     "Check that the KB (Typesense) is reachable, then run the check again.",
+		}
+	}
+	if n > 0 {
+		return nil
+	}
+	return &PlanIssue{
+		Kind:    "no_context",
+		Message: "The project knowledge base is empty. The decisions behind this plan exist only in the session that made it.",
+		Fix:     "Write architecture/project-overview.md (what this is, the stack, how it's laid out) and a doc per decision the user made under decisions/ (what, why, when) with amp_kb_write.",
+	}
+}
+
 // CheckPlan reviews a project's tickets and dependencies: isolated tickets,
 // too much that can start at once, empty stories, and tickets stuck blocked
 // on dependencies that are all done (which it repairs).
@@ -498,14 +544,28 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 
 	// A plan with an empty project KB: the decisions behind it live only in
 	// the planner's session, and the next session or engineer starts blind.
-	if r.OpenTasks > 0 && s.KB != nil {
-		if n, err := s.KB.CountDocs(ctx, kb.Project(projectID)); err == nil && n == 0 {
-			r.Issues = append(r.Issues, PlanIssue{
-				Kind:    "no_context",
-				Message: "The project knowledge base is empty. The decisions behind this plan exist only in the session that made it.",
-				Fix:     "Write architecture/project-overview.md (what this is, the stack, how it's laid out) and a doc per decision the user made under decisions/ (what, why, when) with amp_kb_write.",
-			})
+	// A KB AMP can't read is no evidence of context: it's a warning, never a
+	// GO (#129).
+	if r.OpenTasks > 0 {
+		if iss := s.kbContextIssue(ctx, projectID); iss != nil {
+			r.Issues = append(r.Issues, *iss)
 		}
+	}
+
+	// Tickets nobody has approved yet: the plan can't be called done while a
+	// person still has to approve it. A warning, not NO-GO: the planner can't
+	// approve (only a person in the web UI can), and a fresh plan always
+	// waits for that (#129). Only when the project requires approval: there
+	// nothing waits on it.
+	if n := len(r.AwaitingApproval); n > 0 && r.RequirePlanApproval {
+		msg := fmt.Sprintf("%s %s for a person to approve the plan: %s. %s",
+			countNoun(n, "ticket", "tickets"), pick(n, "waits", "wait"), joinIDs(r.AwaitingApproval),
+			pick(n, "It can't be dispatched until then.", "They can't be dispatched until then."))
+		r.Issues = append(r.Issues, PlanIssue{
+			Kind: "awaiting_approval", Severity: "warn", TaskIDs: r.AwaitingApproval,
+			Message: msg,
+			Fix:     "Its owner approves it in AMP's My work (" + r.ApproveURL + "); a project lead can approve on their behalf. Agents can't approve.",
+		})
 	}
 
 	// Blocked by dependencies that are all done: left stuck by older versions
@@ -522,8 +582,8 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 			r.OK = false
 		}
 	}
-	r.Summary = fmt.Sprintf("%d tickets (%d open), %d dependencies, %d ready to dispatch now, longest chain %d.",
-		r.Tasks, r.OpenTasks, r.Dependencies, len(r.ReadyNow), r.LongestChain)
+	r.Summary = fmt.Sprintf("%s (%d open), %s, %d ready to dispatch now, longest chain %d.",
+		countNoun(r.Tasks, "ticket", "tickets"), r.OpenTasks, countNoun(r.Dependencies, "dependency", "dependencies"), len(r.ReadyNow), r.LongestChain)
 	warns := 0
 	for _, iss := range r.Issues {
 		if iss.Severity == "warn" {
@@ -534,13 +594,15 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 	case r.OK && warns == 0:
 		r.Summary += " No problems found."
 	case r.OK:
-		r.Summary += fmt.Sprintf(" No blocking problems; %d warning(s) worth a look.", warns)
+		r.Summary += fmt.Sprintf(" No blocking problems; %s worth a look.", countNoun(warns, "warning", "warnings"))
 	}
 	if n := len(r.HumanGates); n > 0 {
-		r.Summary += fmt.Sprintf(" %d step(s) are done by people (human_gates); the work after them waits for them.", n)
+		r.Summary += fmt.Sprintf(" %s done by people (human_gates); the work after %s waits for %s.",
+			pick(n, "1 step is", fmt.Sprintf("%d steps are", n)), pick(n, "it", "them"), pick(n, "it", "them"))
 	}
-	if len(stuck) > 0 {
-		r.Summary += fmt.Sprintf(" Repaired %d ticket(s) stuck blocked although all their dependencies are done; they are ready now: %s.", len(stuck), joinIDs(stuck))
+	if n := len(stuck); n > 0 {
+		r.Summary += fmt.Sprintf(" Repaired %s stuck blocked although all %s dependencies are done; %s ready now: %s.",
+			countNoun(n, "ticket", "tickets"), pick(n, "its", "their"), pick(n, "it is", "they are"), joinIDs(stuck))
 	}
 	return r, nil
 }
@@ -1238,11 +1300,46 @@ func (s *Service) deleteTickets(ctx context.Context, p authz.Principal, projectI
 // the ticket goes back to ready, or to waiting if it still depends on
 // unfinished work.
 func (s *Service) AnswerQuestion(ctx context.Context, p authz.Principal, taskID int, answer string) (*domain.Task, error) {
+	return s.AnswerWithOption(ctx, p, taskID, answer, nil, "")
+}
+
+// AnswerWithOption answers a ticket's question, choosing one of its options
+// when option is set (#130): the answer posted is "Chose: <label>" with any
+// note after it, so the agent receives the option itself. Without option
+// it's AnswerQuestion.
+//
+// The caller sends the label it showed with the index: the question may have
+// changed since (a new block with other options), and an index alone would
+// then choose an option the person never saw. A label that no longer matches
+// the stored option is refused with 409.
+func (s *Service) AnswerWithOption(ctx context.Context, p authz.Principal, taskID int, answer string, option *int, label string) (*domain.Task, error) {
 	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskWork)
 	if err != nil {
 		return nil, err
 	}
+	if option != nil {
+		if !openQuestion(t) {
+			return nil, authz.BadRequest("ticket %d has no open question: only a ticket blocked with a reason (amp_block_task) can be answered", taskID)
+		}
+		if t.Question == nil || len(t.Question.Options) == 0 {
+			return nil, authz.BadRequest("ticket %d's question has no options to choose from: answer it in words", taskID)
+		}
+		label = strings.TrimSpace(label)
+		if label == "" {
+			return nil, authz.BadRequest("option_label is required with option: the label of the option that was chosen, so an answer never lands on a question that changed")
+		}
+		stored, err := t.Question.Choose(*option)
+		if err != nil || !strings.EqualFold(strings.TrimSpace(stored), label) {
+			return nil, &authz.Error{Status: 409, Msg: fmt.Sprintf("The question on ticket %d changed since it was shown: %q is no longer one of its options. Reload the ticket and choose again.", taskID, label)}
+		}
+		answer = domain.ChosenAnswer(stored, answer)
+	}
 	return s.answer(ctx, p, t, answer)
+}
+
+// openQuestion reports whether t is blocked on a question a person answers.
+func openQuestion(t *domain.Task) bool {
+	return t.State == domain.TaskStateBlocked && t.BlockReason != "" && !strings.HasPrefix(t.BlockReason, "scheduled:")
 }
 
 // answerAttribution is how an answer is recorded: by the person in the web
@@ -1259,7 +1356,7 @@ func answerAttribution(p authz.Principal) (author, detail string) {
 // answer posts answer on t (already checked) and sends it back to ready.
 func (s *Service) answer(ctx context.Context, p authz.Principal, t *domain.Task, answer string) (*domain.Task, error) {
 	taskID := t.ID
-	if t.State != domain.TaskStateBlocked || t.BlockReason == "" || strings.HasPrefix(t.BlockReason, "scheduled:") {
+	if !openQuestion(t) {
 		return nil, authz.BadRequest("ticket %d has no open question: only a ticket blocked with a reason (amp_block_task) can be answered", taskID)
 	}
 	author, detail := answerAttribution(p)

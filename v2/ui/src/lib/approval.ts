@@ -66,6 +66,17 @@ export function ticketApproved(t: Pick<Task, 'created_at' | 'approved_at'> & { p
 }
 
 /**
+ * The board's "Needs approval" (#129): a ready ticket that isn't dispatched
+ * only because nobody has approved its current plan. That holds only when
+ * the project requires approval before dispatch (require_plan_approval) and
+ * the ticket is otherwise ready: one in progress, waiting, scheduled or done
+ * isn't held by approval, so it gets no tag.
+ */
+export function needsApproval(t: Pick<Task, 'state' | 'created_at' | 'approved_at'> & { planned_at?: string }, requireApproval: boolean): boolean {
+  return requireApproval && t.state === 'backlog' && !ticketApproved(t)
+}
+
+/**
  * Open tickets whose current plan nobody has approved, oldest plan first.
  * Approval is per ticket since #2198 (domain.Task.Approved); the project's
  * plan_approved_at is only when it was last approved, and gates nothing.

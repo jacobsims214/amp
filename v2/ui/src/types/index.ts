@@ -59,6 +59,22 @@ export interface Story {
   updated_at: string
 }
 
+/**
+ * One answer a person can choose (the human-decisions spec's AskOption, #125;
+ * agent questions reuse it, #130). consequence is '' when the agent gave none.
+ */
+export interface AskOption {
+  label: string
+  consequence: string
+}
+
+/** An agent question's options (#130): the question itself is the ticket's block_reason. */
+export interface TaskQuestion {
+  options: AskOption[]
+  /** index into options; only marks a badge, never chooses */
+  recommended?: number | null
+}
+
 export interface Task {
   id: number
   project_id: number
@@ -76,6 +92,8 @@ export interface Task {
   dispatched_at?: string
   completed_at?: string
   block_reason?: string
+  /** the options an agent gave with its question (#130); absent for a question in words only */
+  question?: TaskQuestion | null
   start_at?: string       // RFC3339 UTC timestamp for scheduled tasks
   created_by?: number | null     // AMP user who created the ticket (null for legacy rows)
   owner_user_id?: number | null  // the one human owner; null = unassigned ("pool")

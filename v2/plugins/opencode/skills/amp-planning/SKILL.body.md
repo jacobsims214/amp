@@ -526,7 +526,9 @@ Run `amp_check_plan(project_id)` after creating the tickets and before presentin
 dispatching anything. When tickets await approval it also returns `approve_url`, the link you
 give the user (see "Stop after presenting"). It reports tickets connected to nothing (`isolated`), too much work that
 can start at once (`wide_start` — usually missing dependencies), and empty stories. Fix what it
-finds, then run it again. A warning on `amp_create_tasks` about missing
+finds, then run it again. Two warnings are for the person, not for you, so don't loop on them:
+`awaiting_approval` (they approve in My work; you can't) and a `no_context` warning that AMP
+couldn't read its KB (an empty KB is NO-GO, and that one you fix with `amp_kb_write`). A warning on `amp_create_tasks` about missing
 dependencies means the same thing: decide now, not after dispatch.
 
 ### Fix the plan in place — never delete and re-create

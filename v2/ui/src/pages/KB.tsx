@@ -12,6 +12,7 @@ import { ProjectNav } from '../components/ProjectNav'
 import type { KBDoc, KBDocSummary, KBInfo, KBRef, KBScope, KBSearchResult, KBSource, KBTagCount } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
 import { useSearchParam } from '../hooks/useSearchParam'
+import { softBreaks } from '../lib/brief'
 
 // What each kind of KB is for; shown on team and org KB pages and in the editor.
 const SCOPE_PURPOSE: Record<KBScope, string> = {
@@ -1013,7 +1014,7 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
                         )}
                       </div>
                     </div>
-                    <p className={`leading-relaxed whitespace-pre-wrap ${ann.is_resolved ? 'text-ink-3' : 'text-ink-2'}`}>{ann.text}</p>
+                    <div className={ann.is_resolved ? 'opacity-60' : undefined} data-testid="kb-annotation"><Markdown size="compact">{softBreaks(ann.text)}</Markdown></div>
                     {ann.is_resolved && ann.resolved_by && (
                       <p className="text-[10px] text-ink-3 mt-1.5">
                         Resolved by {ann.resolved_by}{ann.resolved_at ? ` · ${relTime(ann.resolved_at)}` : ''}
