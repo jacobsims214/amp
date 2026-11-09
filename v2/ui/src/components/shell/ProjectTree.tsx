@@ -114,7 +114,28 @@ export function ProjectTree({ projects, orgs, currentId, search, waitIn }: Props
     )
   }
 
-  if (projects.length === 0) return null
+  // Before the project list answers there is nothing to draw a tree from, but the
+  // sidebar must not pop in and shift the layout (#132). With a project in the
+  // route we can draw its group straight away from the route alone, so keep the
+  // scaffolding of the eventual tree instead of nothing.
+  if (projects.length === 0) {
+    const id = Number(currentId)
+    if (currentId == null || Number.isNaN(id)) return null
+    return (
+      <>
+        <div className="amp-label px-2.5 pt-5 pb-2">Project</div>
+        <ul className="flex flex-col">
+          {PROJECT_VIEWS.map(v => (
+            <li key={v.label}>
+              <NavLink to={viewLink(id, v.view, '')} className={a => `${navCls(a)} pl-2`}>
+                {v.icon}{v.label}
+              </NavLink>
+            </li>
+          ))}
+        </ul>
+      </>
+    )
+  }
   return (
     <>
       <div className="amp-label px-2.5 pt-5 pb-2">Projects</div>

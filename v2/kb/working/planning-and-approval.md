@@ -63,7 +63,17 @@ Good tickets:
     criteria. New ones are refused at creation; this catches older tickets.
   - `judgment_without_doc`: an open judgment ticket with no decision doc, so its owner has no
     question or options. Give it an ask with `amp_update_task`; AMP drafts the doc from it.
+  - `awaiting_approval`: in a project that requires plan approval, tickets nobody has approved
+    yet, by ID. A person approves them in My work (`approve_url`); agents can't, so it is a
+    warning for the person, not NO-GO, and not something the planner fixes. While any wait, the
+    summary never says "No problems found".
+  - `no_context` as a warning: AMP has no KB configured, or couldn't read it. A KB AMP can't
+    read is never a GO.
 - **GO** otherwise.
+
+Flight plan and the Board's **Check plan** list every issue the check returns, including the
+ones without a row of their own (`awaiting_approval`, `human_without_owner`, the merge-step
+warnings).
 
 It also lists `human_gates`: each open human ticket and how many tickets wait on it.
 

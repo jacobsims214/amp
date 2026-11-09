@@ -14,7 +14,9 @@ let tasks: Task[] = []
 const createEpic = vi.fn((...args: unknown[]) => { void args; return Promise.resolve({}) })
 const createStory = vi.fn((...args: unknown[]) => { void args; return Promise.resolve({}) })
 
-vi.mock('../hooks/useSSE', () => ({ useSSE: () => 'connected' }))
+// The board store subscribes to /api/events for live updates (#132), so the double
+// needs subscribeSSE too; it returns an unsubscribe fn like the real one.
+vi.mock('../hooks/useSSE', () => ({ useSSE: () => 'connected', subscribeSSE: () => () => {} }))
 vi.mock('../hooks/usePlanApproval', () => ({
   usePlanApproval: () => ({ project: null, approving: false, error: null, notice: null, approve: vi.fn() }),
 }))
@@ -23,6 +25,8 @@ vi.mock('../api/client', () => ({
     get: (_t, name) => (...args: unknown[]) => {
       if (name === 'listEpics') return Promise.resolve(epics)
       if (name === 'listTasks') return Promise.resolve(tasks)
+      // Must be nullish (not []) so fetchBoard falls back to per-epic listStories.
+      if (name === 'listProjectStories') return Promise.resolve(null)
       if (name === 'listStories') return Promise.resolve(stories.filter(s => s.epic_id === args[0]))
       if (name === 'listProjectMembers') return Promise.resolve({ members: [], my_access: 'lead' })
       if (name === 'getProject') return Promise.resolve({ id: 3, metadata: {} })

@@ -28,6 +28,7 @@ import { OwnersEditor } from '../components/OwnersEditor'
 import { TeamAccessModal } from '../components/TeamAccessModal'
 import { api } from '../api/client'
 import { withClears } from '../lib/clear'
+import { boardStatus } from '../lib/boardFilter'
 import { lookupPerson, ownerFilterNarrows, peopleById, personName, taskMatchesOwner, type Person } from '../lib/people'
 import type { Task, TaskState, Epic, Story, ProjectMember, ProjectAccess, Metadata, HumanReason } from '../types'
 import { HUMAN_REASONS } from '../lib/human'
@@ -193,8 +194,7 @@ export function Board() {
   const q = filter.query.toLowerCase()
   const filteredTasks = useMemo(() => {
     return ownerTasks.filter(t => {
-      const displayState = isScheduledTask(t) ? 'scheduled' : t.state
-      if (filter.state && displayState !== filter.state) return false
+      if (filter.state && boardStatus(t) !== filter.state) return false
       if (filter.epicId !== null && t.epic_id !== filter.epicId) return false
       if (q) {
         const story = stories.find(s => s.id === t.story_id)
@@ -219,6 +219,8 @@ export function Board() {
     backlog:     filteredTasks.filter(t => t.state === 'backlog').length,
     in_progress: filteredTasks.filter(t => t.state === 'in_progress').length,
     blocked:     filteredTasks.filter(t => t.state === 'blocked' && !isScheduledTask(t)).length,
+    question:    filteredTasks.filter(t => boardStatus(t) === 'question').length,
+    waiting:     filteredTasks.filter(t => boardStatus(t) === 'waiting').length,
     completed:   filteredTasks.filter(t => t.state === 'completed').length,
     total:       filteredTasks.length,
   }), [filteredTasks])
@@ -480,7 +482,16 @@ export function Board() {
                 >
                   <i className="inline-block w-2 h-2" style={{ background: col.color }} aria-hidden="true" />
                   <span className="font-label text-[11px] font-semibold uppercase tracking-[0.14em] text-ink">{col.label}</span>
-                  <span className="amp-num text-[11px] text-ink-3 ml-auto">{counts[col.state as keyof typeof counts]}</span>
+                  {col.state === 'blocked' ? (
+                    // One column, two waits (#129): a person's questions (red) and tickets waiting on others (grey).
+                    <span className="amp-num text-[11px] text-ink-3 ml-auto inline-flex items-center gap-2"
+                      title={`${counts.question} needing a person (questions), ${counts.waiting} waiting on other tickets`}>
+                      <span className="inline-flex items-center gap-1" style={{ color: 'var(--danger-ink)' }}><i className="inline-block w-1.5 h-1.5" style={{ background: 'var(--st-flag)' }} aria-hidden="true" />{counts.question}</span>
+                      <span className="inline-flex items-center gap-1"><i className="inline-block w-1.5 h-1.5" style={{ background: 'var(--st-wait)' }} aria-hidden="true" />{counts.waiting}</span>
+                    </span>
+                  ) : (
+                    <span className="amp-num text-[11px] text-ink-3 ml-auto">{counts[col.state as keyof typeof counts]}</span>
+                  )}
                 </div>
               ))}
             </div>
@@ -688,6 +699,7 @@ export function Board() {
                                         isScheduled={col.state === 'scheduled'}
                                         owner={lookupPerson(people, task.owner_user_id)}
                                         notStartedFlagMinutes={notStartedFlagMinutes}
+                                        requireApproval={!!approval.project?.require_plan_approval}
                                         receipt={receipts.byTask.get(task.id)}
                                       />
                                     ))}
@@ -720,6 +732,7 @@ export function Board() {
         openReassign={openReassign}
         onTaskUpdated={applyTask}
         notStartedFlagMinutes={notStartedFlagMinutes}
+        requireApproval={!!approval.project?.require_plan_approval}
       />
 
       {planCheckOpen && (

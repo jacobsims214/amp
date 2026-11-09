@@ -234,12 +234,20 @@ Recommendation: [what you'd do and why, if you have a view]
 Done so far: [what's already in place, so the next worker doesn't redo it]
 """, author="amp-worker")
 
-amp_block_task(task_id=YOUR_TASK_ID, dispatch_id="<your dispatch ID>", reason="[the question in one line, with the options]")
+amp_block_task(task_id=YOUR_TASK_ID, dispatch_id="<your dispatch ID>", reason="[the question in one line]",
+               options=[{"label": "[choice A]", "consequence": "[its trade-off]"},
+                        {"label": "[choice B]", "consequence": "[its trade-off]"}],
+               recommended=[0-based index of the one you'd pick, if you have a view])
 ```
 
 The `reason` is what people see in AMP as the question to answer, so make it stand on its own:
 "Avalara or Stripe Tax? Both work in the sandbox; Stripe is cheaper under 10k invoices a month."
 — not "blocked" or "see comments".
+
+When the question is a choice, give the choices as `options` (2 to 4, each a short `label` and an
+optional `consequence`) and the one you recommend as `recommended`. The person then answers with
+one tap, and the answer comment you read next time starts `Chose: <label>`. Leave both out for an
+open question; a question without options works as before.
 
 Pass your `dispatch_id` too if you have one: it says which run stopped. It is never required —
 the block starts the ticket by itself when your plugin doesn't claim — and it never changes the
@@ -382,7 +390,7 @@ tell you your usage, still report the model and (in git) the git fields. The sam
 amp_claim_task {task_id, dispatch_id}   ← FIRST, if your prompt has a dispatch ID: starts the ticket
 amp_get_task {task_id, include: ["comments"]}   ← read before starting; answers to questions are in the comments
 amp_add_task_comment {task_id, body, author}
-amp_block_task {task_id, dispatch_id?, reason, …run fields}   ← only to ask a person a question (Step 5)
+amp_block_task {task_id, dispatch_id?, reason, options?, recommended?, …run fields}   ← only to ask a person a question (Step 5)
 amp_open_receipt {task_id, dispatch_id, summary?, files_changed?}   ← before completing; mode "off" means skip the receipt fields
 amp_add_evidence {receipt_id, dispatch_id, tree_sha, commit?, files: [{name, bytes, sha256, duration_ms?, frames?}]}   ← one-time upload URLs for a visual check's evidence
 amp_complete_task {task_id, dispatch_id, model?, input_tokens?, output_tokens?, cache_read_tokens?, cost_usd?, branch?, commit?, pushed?, pr_url?, base_branch?, receipt_id?, checks?}

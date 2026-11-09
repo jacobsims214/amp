@@ -37,7 +37,7 @@ function SetupSteps({ url, info }: { url: string; info: GitHubHookInfo }) {
   )
 }
 
-function Deliveries({ projectId, deliveries }: { projectId: number; deliveries: GitHubHookDelivery[] }) {
+function Deliveries({ deliveries }: { deliveries: GitHubHookDelivery[] }) {
   const [all, setAll] = useState(false)
   if (deliveries.length === 0) {
     return <p className="m-0 text-[12.5px] text-ink-3">No deliveries yet. GitHub sends a ping when the webhook is added.</p>
@@ -54,7 +54,7 @@ function Deliveries({ projectId, deliveries }: { projectId: number; deliveries: 
               {d.result}
               {(d.task_ids?.length ?? 0) > 0 && (
                 <> {d.task_ids!.map((id, i) => (
-                  <span key={id}>{i > 0 && ', '}<Link to={`/project/${projectId}/board?focus=${id}`} className="text-ink underline underline-offset-2">#{id}</Link></span>
+                  <span key={id}>{i > 0 && ', '}<Link to={`/t/${id}`} className="text-ink underline underline-offset-2">#{id}</Link></span>
                 ))}</>
               )}
             </span>
@@ -170,7 +170,7 @@ export function GitHubHookPanel({ projectId }: { projectId: number }) {
               <h3 className="amp-label m-0">Recent deliveries</h3>
               <button type="button" className={quietBtnCls} onClick={load} aria-label="Refresh deliveries"><RefreshCw size={12} /></button>
             </div>
-            <Deliveries projectId={projectId} deliveries={deliveries} />
+            <Deliveries deliveries={deliveries} />
           </div>
 
           <div className="flex flex-wrap items-center gap-2 pt-1">

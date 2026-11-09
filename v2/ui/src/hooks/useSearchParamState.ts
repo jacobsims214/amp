@@ -91,6 +91,16 @@ export function flagParam(def: boolean, on = '1', off = '0'): ParamCodec<boolean
   }
 }
 
+/** One of a fixed set of values; anything else reads as the default. */
+export function enumParam<T extends string>(values: readonly T[], def: T, push = false): ParamCodec<T> {
+  return { default: def, parse: raw => (values.includes(raw as T) ? raw as T : def), serialize: v => v, push }
+}
+
+/** A calendar day, `YYYY-MM-DD`; anything else reads as the default. */
+export function dayParam(def: string): ParamCodec<string> {
+  return { default: def, parse: raw => (/^\d{4}-\d{2}-\d{2}$/.test(raw) && !Number.isNaN(Date.parse(raw)) ? raw : def), serialize: v => v }
+}
+
 /** A comma-separated set of positive integer ids, e.g. `open=12,34`. */
 export const idListParam: ParamCodec<number[]> = {
   default: [],

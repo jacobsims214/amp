@@ -47,3 +47,14 @@ folder.
 
 `amp_kb_status` shows stale docs, open annotations and tag spread. The KB curator agent keeps
 things tidy: merges duplicates, fixes paths, resolves folded-in annotations.
+
+Project, team and org docs record when they were created, when they were last updated, and when
+an agent last read them, who, and how many reads have been counted. A read counts when
+`amp_kb_get` returns the doc or `amp_kb_search` returns a chunk of it. The same agent reading
+the same doc again within 10 minutes isn't counted again, even if other agents read it in between. People reading in the Library are
+never counted. `amp_kb_get` and `amp_kb_list` return these as `created_at`, `updated_at`,
+`last_read_at`, `last_read_by` and `read_count`. The AMP guide doesn't track them.
+
+In the Library, a doc's header shows *Created · Updated* and *Last read by <agent> <when>*, and
+each doc in the list shows its read count. To find docs to prune or merge, sort the list by
+**Least read** or **Stale (oldest update)**. The sort is saved in the URL as `?sort=`.

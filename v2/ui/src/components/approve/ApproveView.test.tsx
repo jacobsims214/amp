@@ -190,3 +190,19 @@ describe('ApproveCard', () => {
   })
 })
 
+
+describe('ApproveView story context (#133)', () => {
+  it('a story with a description shows it as markdown under its header, folded until opened', async () => {
+    plan = busyPlan()
+    plan.stories[0] = { ...plan.stories[0], description: 'The **goal**: one backend for My work' }
+    render(<View />)
+    const story = await screen.findByRole('group', { name: 'Story 413: Build: backend' })
+    const toggle = within(story).getByRole('button', { name: 'About this story' })
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    expect(story.querySelector('strong')).toBeNull()
+    await userEvent.click(toggle)
+    expect(story.querySelector('strong')).toHaveTextContent('goal')
+    // A story without one has no toggle.
+    expect(within(screen.getByRole('group', { name: 'Story 414: Build: frontend' })).queryByRole('button', { name: 'About this story' })).toBeNull()
+  })
+})

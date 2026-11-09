@@ -24,6 +24,7 @@ import { useAuth } from '../hooks/useAuth'
 import { useProjectPeople } from '../hooks/useProjectPeople'
 import { ProjectNav } from '../components/ProjectNav'
 import { ManagerAgent } from '../components/ManagerAgent'
+import { usePlanApproval } from '../hooks/usePlanApproval'
 import { TaskDrawer } from '../components/TaskDrawer'
 import { Panel, Readouts } from '../components/ui/PageHeader'
 import { useReceiptSummary } from '../hooks/useReceiptSummary'
@@ -40,7 +41,8 @@ import { noMyWorkReason, type NoMyWork } from '../lib/myWorkAccess'
 import { projectCounts, refreshWaitCounts, useWaitCounts } from '../lib/waitCounts'
 import { needsMerge } from '../lib/merge'
 import { countsSummary, kindSummary, panelOrder, personLink, ticketsWaitingOn } from '../lib/waitingPanel'
-import { BandLoader } from '../components/brand/BandLoader'
+import { Skeleton, SkeletonReadouts, SkeletonRegion } from '../components/ui/Skeleton'
+import { useDelayedFlag } from '../hooks/useDelayedFlag'
 
 function ago(iso?: string | null): string {
   if (!iso) return ''
@@ -199,6 +201,7 @@ export function Mission() {
   const pid = Number(projectId)
   const { epics, stories, tasks, loading, error, refresh, applyTask } = useBoardData(pid)
   const { members, myAccess, openReassign, people } = useProjectPeople(pid)
+  const approval = usePlanApproval(pid)
   const { me, loading: authLoading } = useAuth()
   const waitCounts = useWaitCounts()
   // No AMP user (sign-in off, or signed out): the server's counts are all
@@ -293,8 +296,19 @@ export function Mission() {
   const finished = epicRows.filter(r => r.rank === 4 && r.list.length > 0)
   const ownersOf = (ids?: number[]) => (ids ?? []).map(id => lookupPerson(people, id)?.name).filter(Boolean).join(', ')
 
-  if (loading && !tasks.length) {
-    return <div className="flex items-center justify-center h-full"><BandLoader label="Loading mission" /></div>
+  // First load (tier 1, KB design/loading.md): the header now, skeletons
+  // shaped like the readouts and the epic list after 250 ms.
+  const firstLoad = loading && !tasks.length
+  const showSkeleton = useDelayedFlag(firstLoad, undefined, 400)
+  if (firstLoad || showSkeleton && !tasks.length) {
+    return (
+      <div className="flex flex-col min-h-full">
+        <ProjectNav projectId={pid} currentView="mission" />
+        <div className="p-7 pt-5 grid gap-4">
+          {showSkeleton && <MissionSkeleton />}
+        </div>
+      </div>
+    )
   }
 
   // Agents are profiles in each person's harness, so count the people they work for.
@@ -420,7 +434,25 @@ export function Mission() {
       </div>
 
       <TaskDrawer task={selected} onClose={() => setSelectedId(null)} onRefresh={refresh}
-        members={members} meId={me?.user_id} myAccess={myAccess} openReassign={openReassign} onTaskUpdated={applyTask} />
+        members={members} meId={me?.user_id} myAccess={myAccess} openReassign={openReassign} onTaskUpdated={applyTask}
+        requireApproval={!!approval.project?.require_plan_approval} />
     </div>
+  )
+}
+
+/** Mission before its first load: the readout row and five epic rows, in their places. */
+function MissionSkeleton() {
+  return (
+    <SkeletonRegion label="Loading mission" className="grid gap-4">
+      <SkeletonReadouts cells={6} />
+      <div aria-hidden="true" className="amp-panel">
+        {Array.from({ length: 5 }, (_, i) => (
+          <div key={i} className="px-4 py-3 grid gap-2 border-t border-line-sub first:border-t-0">
+            <Skeleton w="40%" h={12} />
+            <Skeleton w="100%" h={6} />
+          </div>
+        ))}
+      </div>
+    </SkeletonRegion>
   )
 }

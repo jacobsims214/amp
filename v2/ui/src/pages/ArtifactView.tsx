@@ -100,7 +100,7 @@ export function ArtifactView() {
           {selected && (
             <div className="px-5 py-4 border-t border-line grid gap-1 text-[12.5px] text-ink-2">
               <span className="amp-label">Version {selected.version}</span>
-              {selected.note && <p className="m-0 text-ink">{selected.note}</p>}
+              {selected.note && <Markdown size="compact" projectId={artifact.project_id ?? undefined}>{selected.note}</Markdown>}
               <span>{selected.created_by_email || 'Someone'} · {when(selected.created_at)} · {size(selected.size_bytes)} · {KIND_LABEL[artifact.kind]}</span>
             </div>
           )}

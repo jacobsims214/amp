@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/simstech/amp-api/internal/authz"
@@ -67,7 +68,58 @@ func (s *Service) recordRun(ctx context.Context, p authz.Principal, t *domain.Ta
 		return domain.Run{}, authz.BadRequest("commit must be at least 7 characters of the SHA")
 	}
 	run.Commit = strings.ToLower(run.Commit)
+	run.SessionID = strings.TrimSpace(run.SessionID)
+	if !validSessionID(run.SessionID) {
+		return domain.Run{}, authz.BadRequest("session_id must be a remote session id: up to 128 letters, digits, '-', '_' or '.'")
+	}
 	return s.Repo.AddRun(ctx, run)
+}
+
+// validSessionID accepts an empty id (no session) or one that is safe in a
+// /sessions/<id> link.
+func validSessionID(id string) bool {
+	if len(id) > 128 {
+		return false
+	}
+	for _, c := range id {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+// RunView is one run with where it belongs: its ticket's ref and the
+// ticket's canonical link, so /r/<run id> can open the ticket at the run.
+type RunView struct {
+	Run       domain.Run `json:"run"`
+	TaskID    int        `json:"task_id"`
+	ProjectID int        `json:"project_id"`
+	Ref       string     `json:"ref"`
+	URL       string     `json:"url"`
+}
+
+// GetRun returns a run for anyone who can see its ticket. A run that
+// doesn't exist, whose ticket was deleted, or that the caller can't see is
+// "not found" alike, so its existence doesn't leak.
+func (s *Service) GetRun(ctx context.Context, p authz.Principal, runID int64) (RunView, error) {
+	run, err := s.Repo.GetRun(ctx, runID)
+	if err != nil {
+		return RunView{}, authz.NotFound("run %d not found", runID)
+	}
+	t, _, err := s.LoadTask(ctx, p, run.TaskID, authz.TaskRead)
+	if err != nil {
+		return RunView{}, authz.NotFound("run %d not found", runID)
+	}
+	code := ""
+	if proj, err := s.Repo.GetProject(ctx, t.ProjectID); err == nil && proj != nil {
+		code = proj.Code
+	}
+	ref := domain.TaskRef(code, t.ID)
+	if code == "" {
+		ref = strconv.Itoa(t.ID)
+	}
+	return RunView{Run: run, TaskID: t.ID, ProjectID: t.ProjectID, Ref: ref, URL: s.TicketURL(code, t.ID)}, nil
 }
 
 // TaskRuns lists a ticket's runs for anyone who can see the ticket.

@@ -54,8 +54,14 @@ Opening a project lands on **My work** when something there waits on you, and on
 otherwise. Every project page that shows tickets takes `?focus=<ticket id>` to open on one
 ticket, and switching views keeps it. A focus link to a ticket in another project goes there;
 one to a ticket you can't see says so. Board filters (`status`, `q`, `epic`, `owner`, `done`),
-the Graph's selected node (`sel`, `chain`) and Trace queries (`q`, `open`) are in the URL too, so
-copy the address bar to share exactly what you see.
+the Graph's selected node (`sel`, `chain`), Trace queries (`q`, `open`), the Portfolio range and
+Day reports' person, day and open report (`user`, `day`, `open`) are in the URL too, so copy the
+address bar to share exactly what you see. Every ticket also has a short link that
+works from anywhere, `/t/<CODE>-<id>` (for example `/t/BA-34`, or just `/t/34`): it opens the
+ticket on its project's Board. A run has one too, `/r/<run id>`, which opens its ticket with that
+run highlighted. The drawer's **Open full page** button (and `/t/<CODE>-<id>?view=page`) opens the
+ticket as a full page at `/project/<id>/ticket/<ticket id>`: the same sections in a wide column,
+with **Back to board** to return to the drawer.
 
 - **Mission** — the project at a glance, for everyone. It informs and has no action buttons:
   - a **Waiting on you** strip with your counts by kind and a link to My work (or "Nothing waits
@@ -71,17 +77,36 @@ copy the address bar to share exactly what you see.
   in place (`working/human-work.md`). Its badge is the number waiting on you here. Approving opens
   the Approve view (`working/planning-and-approval.md`).
 - **Board** — tickets by state. Filter by person (**Mine** is the tickets you own; **Unowned**
-  finds the rest), epic or text. A done ticket whose PR isn't merged shows **Merge needed**.
-  **Hand over …** moves the filtered tickets to someone else with a reason.
+  finds the rest), epic or text. Status filters split the two kinds of wait: **Needs a person**
+  (an agent's question, red, `status=question`) and **Waiting on other tickets** (dependencies or
+  a merge, grey, `status=waiting`); the Waiting column's header counts each. A ticket nobody has
+  approved yet shows **Needs approval** on its card and in its drawer, and the drawer's State
+  uses the same words as its badge (Ready, Waiting, Question …). A done ticket whose PR isn't
+  merged shows **Merge needed**.
+  **Hand over …** moves the filtered tickets to someone else with a reason. A ticket's drawer
+  has **Story context** under its story (on Details): the story's description and acceptance
+  criteria and the epic's description, as the planner wrote them. The Approve view has the same
+  for each story (**About this story**).
 - **Flight plan** — the plan as epics, stories and tickets in order, and the plan check verdict
   (GO / WARN / NO-GO). It's for reading: when tickets await your approval it says so and links
   to My work.
 - **Graph** — the dependency graph.
+- Text people and agents write (descriptions, questions, comments, day-report summaries, KB
+  annotations, artifact version notes, the plan check) is rendered as markdown everywhere it
+  has room; one-line and clamped places (a card's question, a Graph node, a project card) show
+  its words without the markdown syntax. A link to another AMP page opens in-app (a preview
+  instead is proposed in `design/link-previews.md`).
 - **Reports** — progress, velocity, people (with who each person is blocked by), the standup
   sheet, tokens and cost by model, epic, person and metadata, with a Markdown export.
 - **Artifacts** — mockups, diagrams and other pages agents published for review
   (`working/artifacts.md`).
 - **Library** — the project's knowledge base, plus links to the team and org KBs and this guide.
+  The search box matches titles and doc text, not just titles. Each hit shows a short excerpt (what
+  agents get from `amp_kb_search`) and any annotation summary; "Show passage" opens the whole matched
+  chunk with its score and chunk number (the box scrolls rather than growing). Opening a hit
+  scrolls to and highlights the matched passage in the doc (this is not in the address bar, so a copied link opens the doc without it). Drag the sidebar's right
+  edge to widen it; the width is remembered in the browser. A doc with annotations shows a count
+  link beside its details and lists them in a panel above the text (the list scrolls past a few).
 - **Settings** — general (including which org the project is in), plan approval, merges (whether
   dependents wait for merges), metadata, team access, knowledge bases, trash (restore deleted
   tickets), and for owners the GitHub token and the GitHub merge webhook, then webhooks, the audit

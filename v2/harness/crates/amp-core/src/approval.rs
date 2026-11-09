@@ -76,9 +76,10 @@ pub struct Refusal {
     /// The link the server gave (absolute, or relative when AMP has no public URL). Untrusted:
     /// show it as text; build clickable links from the instance's own URL helpers.
     pub link: Option<String>,
-    /// `/project/{id}/…` in the link.
+    /// `/project/{id}/…` in the link (a canonical `/t/` link names no project).
     pub project_id: Option<i64>,
-    /// `?task={id}` in the link, or the "ticket N" a plan-gate refusal names.
+    /// `/t/{id}` or `/t/{CODE}-{id}` in the link (AMP #131), `?task={id}` (older AMPs), or the
+    /// "ticket N" a plan-gate refusal names.
     pub ticket_id: Option<i64>,
     /// The server approves per ticket (#2198): the refusal is about one ticket, approved by its
     /// owner (or a project lead on their behalf), not by whoever approves the plan.
@@ -106,7 +107,7 @@ pub fn refusal(text: &str) -> Option<Refusal> {
     let project_id = link.as_deref().and_then(|l| number_after(l, "/project/"));
     let ticket_id = link
         .as_deref()
-        .and_then(|l| number_after(l, "task="))
+        .and_then(|l| ticket_in_link(l).or_else(|| number_after(l, "task=")))
         .or_else(|| gate.then(|| ticket_named(text)).flatten());
     // The approval page: My work (`/project/N/my-work?approve=all`, #2495), or Flight plan
     // (`/project/N/plan`) from an AMP older than My work.
@@ -177,13 +178,37 @@ fn ticket_named(text: &str) -> Option<i64> {
 fn find_link(text: &str) -> Option<String> {
     text.split_whitespace()
         .find(|w| {
-            w.starts_with("http://") || w.starts_with("https://") || w.starts_with("/project/")
+            w.starts_with("http://")
+                || w.starts_with("https://")
+                || w.starts_with("/project/")
+                || w.starts_with("/t/")
         })
         .map(|w| {
             w.trim_end_matches(['.', ',', ';', ')', '"', '\''])
                 .to_owned()
         })
         .filter(|w| !w.is_empty())
+}
+
+/// The ticket a canonical link opens: `/t/34` or `/t/BA-34` (the trailing number; ids are
+/// global), relative or absolute. None for any other link.
+fn ticket_in_link(link: &str) -> Option<i64> {
+    let start = link.find("/t/")? + "/t/".len();
+    let r: String = link[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '%')
+        .collect();
+    let digits = r.rsplit('-').next()?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Whether the server's link is a canonical ticket link (`/t/…`, AMP #131): the web UI finds
+/// the ticket's project by itself.
+pub fn is_ticket_link(link: &str) -> bool {
+    ticket_in_link(link).is_some()
 }
 
 fn number_after(text: &str, prefix: &str) -> Option<i64> {
@@ -447,6 +472,7 @@ mod tests {
         assert_eq!(r.ticket_id, Some(9));
         assert!(!r.per_ticket);
 
+        // What an AMP before #131 sent.
         let human = "amp_complete_task: Marking ticket 41 (a person's ticket) done is done by a \
              person in the AMP web UI, not by an agent or over MCP: \
              https://amp.test/project/2/board?task=41. Stop and ask your person to do it there.";
@@ -454,6 +480,22 @@ mod tests {
         assert_eq!(r.kind, RefusalKind::PersonInUi);
         assert_eq!((r.project_id, r.ticket_id), (Some(2), Some(41)));
         assert!(!r.per_ticket);
+
+        // What the server sends now (#131): the canonical /t/ link, relative or absolute.
+        for link in ["/t/41", "https://amp.test/t/41", "https://amp.test/t/BA-41"] {
+            let human = format!(
+                "amp_complete_task: Marking ticket 41 (a person's ticket) done is done by a \
+                 person in the AMP web UI, not by an agent or over MCP: {link}. Stop and ask your \
+                 person to do it there."
+            );
+            let r = refusal(&human).unwrap();
+            assert_eq!(r.kind, RefusalKind::PersonInUi);
+            assert_eq!((r.project_id, r.ticket_id), (None, Some(41)), "{link}");
+            assert_eq!(r.link.as_deref(), Some(link));
+            assert!(is_ticket_link(link));
+        }
+        assert!(!is_ticket_link("/project/2/plan"));
+        assert!(!is_ticket_link("/t/tmp"));
 
         // #2198: per-ticket approval.
         let dispatch = "tool error: amp_dispatch_task: tools/call amp_dispatch_task: Mcp error: \

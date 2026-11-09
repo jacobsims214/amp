@@ -581,6 +581,50 @@ func TestPlan_CheckPlanWantsContext(t *testing.T) {
 	}
 }
 
+// The plan check reflects real state (#129): a KB it can't read is never a
+// GO, a ticket waiting on approval is an item to deal with, and one ticket is
+// "1 ticket".
+func TestPlan_CheckPlanIsHonest(t *testing.T) {
+	s := setupMCP(t)
+	id := mkIn(t, s, s.storyID, "only ticket")
+	// With approval off nothing waits on it, so it isn't an item.
+	if off := s.call(t, "amp_check_plan", map[string]interface{}{"project_id": float64(s.projectID)}); strings.Contains(fmt.Sprint(off["issues"]), "awaiting_approval") {
+		t.Fatalf("approval off, yet the check lists awaiting_approval: %v", off["issues"])
+	}
+	on := true
+	if _, err := s.repo.UpdateProject(context.Background(), s.projectID, domain.ProjectSettings{RequirePlanApproval: &on}); err != nil {
+		t.Fatal(err)
+	}
+	report := s.call(t, "amp_check_plan", map[string]interface{}{"project_id": float64(s.projectID)})
+	issues := map[string]map[string]interface{}{}
+	for _, iss := range report["issues"].([]interface{}) {
+		m := iss.(map[string]interface{})
+		issues[m["kind"].(string)] = m
+	}
+	sum := report["summary"].(string)
+	if !strings.HasPrefix(sum, "1 ticket (1 open), 0 dependencies,") {
+		t.Fatalf("summary should count one ticket in the singular: %q", sum)
+	}
+	if strings.Contains(sum, "No problems found") {
+		t.Fatalf("summary says no problems while a ticket waits on approval: %q", sum)
+	}
+	aw := issues["awaiting_approval"]
+	if aw == nil || aw["severity"] != "warn" || !strings.Contains(fmt.Sprint(aw["task_ids"]), fmt.Sprint(id)) ||
+		!strings.HasPrefix(aw["message"].(string), "1 ticket waits for a person to approve the plan") {
+		t.Fatalf("pending approval isn't listed: %v", report["issues"])
+	}
+	ctx := issues["no_context"]
+	if ctx == nil {
+		t.Fatalf("a KB nobody wrote to (or none at all) reads as GO: %v", report["issues"])
+	}
+	if s.kb == nil && ctx["severity"] != "warn" {
+		t.Fatalf("no KB configured: want a no_context warning, got %v", ctx)
+	}
+	if s.kb != nil && ctx["severity"] == "warn" {
+		t.Fatalf("an empty KB is NO-GO, not a warning: %v", ctx)
+	}
+}
+
 // A gate that joins different people's work is flagged as a warning: it
 // doesn't make the plan NO-GO, but it says whose work waits on whose.
 func TestPlan_CheckPlanWarnsOnCoupledGate(t *testing.T) {

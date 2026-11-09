@@ -190,7 +190,11 @@ type Task struct {
 	DispatchedAt *time.Time `json:"dispatched_at,omitempty"`
 	CompletedAt  *time.Time `json:"completed_at,omitempty"`
 	BlockReason  string     `json:"block_reason,omitempty"`
-	StartAt      *time.Time `json:"start_at,omitempty"`
+	// Question is the options (and the recommended one) an agent gave with
+	// its question (#130); nil for a question asked in words only. It lives
+	// as long as BlockReason's question: any state change clears it.
+	Question *Question  `json:"question,omitempty"`
+	StartAt  *time.Time `json:"start_at,omitempty"`
 	// CreatedBy is the AMP user who created the ticket (nil for legacy rows).
 	CreatedBy *int `json:"created_by"`
 	// OwnerUserID is the one AMP user who owns the work; nil = unassigned,

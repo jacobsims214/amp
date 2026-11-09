@@ -143,7 +143,7 @@ func TestAgentsCompleteOnlyDispatchedWork(t *testing.T) {
 	pid := w.s.projectID
 	a := mkIn(t, alice, w.s.storyID, "never dispatched")
 
-	wantErr(t, alice.callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(a)}), "never dispatched", fmt.Sprintf("task=%d", a))
+	wantErr(t, alice.callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(a)}), "never dispatched", fmt.Sprintf("/t/%d", a))
 	wantErr(t, alice.callExpectError(t, "amp_set_task_state", map[string]any{"task_id": float64(a), "state": "completed"}), "never dispatched")
 	wantErr(t, alice.callExpectError(t, "amp_set_task_state", map[string]any{"task_id": float64(a), "state": "in_progress"}), "amp_dispatch_task")
 	wantErr(t, alice.callExpectError(t, "amp_report_run", map[string]any{"task_id": float64(a), "outcome": "completed", "model": "m"}), "never dispatched")
@@ -373,7 +373,7 @@ func TestHumanTicketsBecomeAgentWorkOnlyInTheUI(t *testing.T) {
 	ra := newRestAs(t, w)
 	bob := w.s.as(w.bob)
 	_, review, _ := humanChain(t, w)
-	link := fmt.Sprintf("/project/%d/board?task=%d", w.s.projectID, review)
+	link := fmt.Sprintf("/t/%d", review)
 	path := fmt.Sprintf("/api/tasks/%d", review)
 	stillHuman := func(when string) {
 		t.Helper()

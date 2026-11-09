@@ -9,6 +9,7 @@ import { useEffect, useRef, type CSSProperties } from 'react'
 import { ChevronDown, ChevronRight, Check } from 'lucide-react'
 import { afterChips, canTick, chipIds, outsideState, type EpicSection, type PlanModel, type SelectionEffect, type StorySection } from '../../lib/approvePlan'
 import type { PlanTicket } from '../../types'
+import { StoryContext } from '../StoryContext'
 
 export interface OutlineProps {
   model: PlanModel
@@ -136,6 +137,12 @@ function StoryBlock(p: OutlineProps & { story: StorySection; ups: Set<number>; d
         </span>
         <SpanTrack steps={model.steps} from={s.firstStep} to={s.lastStep} />
       </div>
+      {/* The story's goal, as the planner wrote it, folded by default (#133). */}
+      {showRows && s.story.description?.trim() && (
+        <div className="px-4 py-1.5">
+          <StoryContext story={{ description: s.story.description }} label="About this story" />
+        </div>
+      )}
       {showRows && visible.map(id => <Row key={id} {...p} id={id} />)}
     </div>
   )

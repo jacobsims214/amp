@@ -299,6 +299,21 @@ describe('top-level My work: no zeros when there is nothing to count', () => {
   })
 })
 
+describe('My work day-report panel (#133)', () => {
+  afterEach(() => server.resetHandlers())
+  it('renders the summary as markdown: a list is a list', async () => {
+    server.use(http.get('*/api/day-reports/draft', () => HttpResponse.json({ report: {
+      user_id: 7, user_email: 'jo@example.com', user_name: 'Jo', day: '2026-11-05', tz: 'UTC', summary: '- a\n- b', saved: false, markdown: '',
+      data: { completed: [], started: [], created: [], in_progress: [], blocked: [], touched: [], generated_at: '',
+        stats: { completed: 1, started: 0, created: 0, in_progress: 0, blocked: 0, projects: 1 } } } })))
+    renderMyWork()
+    const summary = await screen.findByTestId('day-summary')
+    const list = summary.querySelector('ul')
+    expect(list).not.toBeNull()
+    expect(list!.querySelectorAll('li')).toHaveLength(2)
+  })
+})
+
 // The Get started checklist (#128) sits where the queue will be, on an empty
 // My work, until every step that can be done here is done. Its fourth step,
 // seeing a receipt, arrived with verification receipts (#149).

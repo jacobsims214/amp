@@ -8,6 +8,7 @@ import { useAuth } from '../../hooks/useAuth'
 import { remoteAvailable, useRemote } from '../../remote/remote-context'
 import type { Project } from '../../types'
 import { refreshWaitCounts, useWaitCounts } from '../../lib/waitCounts'
+import { primeProjects } from '../../lib/projectCache'
 import { badged, navCls } from './nav'
 import { Badge } from './Badge'
 import { ProjectTree } from './ProjectTree'
@@ -36,7 +37,9 @@ export function AppShell() {
   // Refresh the list when moving around (a project may have been created,
   // renamed, or archived on the page just left).
   useEffect(() => {
-    api.listProjects().then(setProjects).catch(() => setProjects([]))
+    api.listProjects()
+      .then(list => { setProjects(list); primeProjects(list) })
+      .catch(() => setProjects([]))
     refreshWaitCounts()
   }, [location.pathname])
   const wait = useWaitCounts()

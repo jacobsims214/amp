@@ -41,9 +41,28 @@ func (s *Service) PlanURL(projectID int) string {
 	return s.link(fmt.Sprintf("/project/%d/my-work?approve=all", projectID))
 }
 
-// TaskURL opens the ticket on its project's board.
+// TaskURL is a ticket's canonical link, /t/<id>: the web UI looks the
+// ticket up and opens it on its project's board (its drawer open), wherever
+// the ticket lives. projectID is kept for callers; the link doesn't need it.
+// Old /project/:id/board?task= links still resolve.
 func (s *Service) TaskURL(projectID, taskID int) string {
-	return s.link(fmt.Sprintf("/project/%d/board?task=%d", projectID, taskID))
+	_ = projectID
+	return s.link(fmt.Sprintf("/t/%d", taskID))
+}
+
+// TicketURL is TaskURL with the ticket's human ref, /t/<CODE>-<id> (BA-34),
+// when the project's code is known; /t/<id> when it isn't.
+func (s *Service) TicketURL(projectCode string, taskID int) string {
+	if strings.TrimSpace(projectCode) == "" {
+		return s.TaskURL(0, taskID)
+	}
+	return s.link("/t/" + domain.TaskRef(strings.TrimSpace(projectCode), taskID))
+}
+
+// RunURL is a run's canonical link, /r/<run id>: the web UI opens its
+// ticket with the run scrolled into view and highlighted.
+func (s *Service) RunURL(runID int64) string {
+	return s.link(fmt.Sprintf("/r/%d", runID))
 }
 
 // SettingsURL is the project's settings page.

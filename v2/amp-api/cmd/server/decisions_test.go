@@ -189,7 +189,7 @@ func TestDecisions_UpdateAskCreatesAMissingDoc(t *testing.T) {
 
 	// Once it has a doc, its options change only in AMP.
 	msg := alice.callExpectError(t, "amp_update_task", map[string]any{"task_id": float64(j), "ask": northStarAsk(), "name": "renamed"})
-	wantErr(t, msg, "This ticket's options are in its decision doc; the owner edits them in AMP: ", fmt.Sprintf("board?task=%d", j))
+	wantErr(t, msg, "This ticket's options are in its decision doc; the owner edits them in AMP: ", fmt.Sprintf("/t/%d", j))
 	if tk := humanTask(t, alice, j); tk["name"] != "Pick a vendor" {
 		t.Fatalf("a refused update changed the ticket: %v", tk["name"])
 	}
@@ -246,7 +246,7 @@ func TestDecisions_Guards(t *testing.T) {
 	j, _, _ := judgmentWithDoc(t, w)
 	dec := alice.call(t, "amp_get_task", map[string]any{"task_id": float64(j)})["decision"].(map[string]any)
 	art := dec["artifact_id"].(float64)
-	link := fmt.Sprintf("board?task=%d", j)
+	link := fmt.Sprintf("/t/%d", j)
 	publish := "Decision docs change in AMP, not by publish: "
 	personOnly := "Only a person records a decision, in AMP: "
 	reviewKeep := "Decision docs are approved and kept by Record decision: "
@@ -455,7 +455,7 @@ func TestDecisions_RecordDecision(t *testing.T) {
 	events := decisionEvents(w)
 	alice := w.s.as(w.alice)
 	j, dep, _ := judgmentWithDoc(t, w)
-	link := fmt.Sprintf("board?task=%d", j)
+	link := fmt.Sprintf("/t/%d", j)
 	v1 := ra.want(t, 200, "bob", http.MethodGet, docPath(j, ""), nil)
 	art := int(v1["artifact_id"].(float64))
 	label := "B: Activation rate (45%, floor 30%)"
@@ -841,7 +841,7 @@ func TestDecisions_DocTicketKeepsItsKind(t *testing.T) {
 	ra := newRestAs(t, w)
 	alice := w.s.as(w.alice)
 	j, _, _ := judgmentWithDoc(t, w)
-	link := fmt.Sprintf("board?task=%d", j)
+	link := fmt.Sprintf("/t/%d", j)
 	refusal := "This ticket's decision is in its doc; record it there or plan a new judgment ticket: "
 
 	// MCP: an agent's tidy-up.
