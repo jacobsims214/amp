@@ -2,6 +2,20 @@
 //! and the terminal is left in cooked mode with echo on. Driven through a real pty. The child has
 //! no controlling terminal, so ^C can only work as a key: exactly the case QA hit (a driver that
 //! ignored SIGINT), where a cooked-mode prompt echoed ^C and waited forever.
+//!
+//! Every child runs in **its own session** (#3691), never in the test runner's:
+//! a child that shares the runner's terminal keeps that terminal as its controlling terminal, and
+//! setup's `terminal_width` opens `/dev/tty` to size its output, so from a background process
+//! group (how a test runner is started under a shell that owns the terminal) the open stops the
+//! *whole process group* with SIGTTOU/SIGTTIN. A stopped group runs no code at all: the 30 s
+//! bound in [`Pty::expect`] cannot fire and the binary's own checks never run, which looked like
+//! an infinite hang and cost the suite its whole time budget on macOS. `setsid` leaves the child
+//! with no controlling terminal (`/dev/tty` opens ENXIO, crossterm falls back to the pty on
+//! stdin/stdout), so the pty stays the only terminal it can see and ^C is still only ever a key
+//! (#2227), as this file means to test.
+//!
+//! A session also makes an interrupted run harmless: [`Pty`] kills and reaps its child on drop, and
+//! with no shared session a killed run hangs its child up instead of orphaning it.
 #![cfg(unix)]
 
 mod common;
@@ -27,10 +41,28 @@ struct Pty {
     master: File,
     /// The test's own handle on the terminal, to read its mode after the child exits.
     slave: OwnedFd,
-    /// The terminal's device path. When the child led a session on it (`start_dev_tty`), macOS
-    /// revokes every open handle as it exits (ENOTTY), so the mode is read through a fresh open.
-    slave_path: Option<std::path::PathBuf>,
+    /// The terminal's device path. When the child led a session on it (every case since #3691, and
+    /// `start_dev_tty` before that), macOS revokes every open handle as it exits (ENOTTY), so the
+    /// mode is read through a fresh open of this path.
+    slave_path: std::path::PathBuf,
     seen: Arc<Mutex<Vec<u8>>>,
+}
+
+/// The python3 shim that detaches the child before `exec`: `setsid` (its own session, so the
+/// runner's terminal is not its controlling terminal) and, for [`Pty::start_dev_tty`], `TIOCSCTTY`
+/// plus stdin from `/dev/tty`. Python does it because this crate forbids `unsafe`, so
+/// `Command::pre_exec` is not available (the same shim as `common::pty_command`, #2906).
+fn shim(dev_tty: bool) -> &'static str {
+    if dev_tty {
+        "import fcntl, os, sys, termios\n\
+         os.setsid()\n\
+         fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n\
+         os.execv('/bin/sh', ['sh', '-c', 'exec \"$0\" \"$@\" </dev/tty'] + sys.argv[1:])"
+    } else {
+        "import os, sys\n\
+         os.setsid()\n\
+         os.execv(sys.argv[1], sys.argv[1:])"
+    }
 }
 
 impl Pty {
@@ -49,28 +81,15 @@ impl Pty {
         let pty = openpty(None, None).expect("openpty");
         let stdio = || Stdio::from(pty.slave.try_clone().unwrap());
         let bin = env!("CARGO_BIN_EXE_amp-harness");
-        let slave_path = dev_tty.then(|| nix::unistd::ttyname(&pty.slave).expect("ttyname"));
-        let mut cmd = if dev_tty {
-            // A new session whose controlling terminal is the pty (stdin is the slave here), so
-            // /dev/tty is it; then `exec BIN ARGS </dev/tty`. Python does the setsid + TIOCSCTTY
-            // because this crate forbids `unsafe` (Command::pre_exec).
-            let mut py = Command::new("python3");
-            py.args([
-                "-c",
-                "import fcntl, os, sys, termios\n\
-                 os.setsid()\n\
-                 fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n\
-                 os.execv('/bin/sh', ['sh', '-c', 'exec \"$0\" \"$@\" </dev/tty'] + sys.argv[1:])",
-                bin,
-            ]);
-            py
-        } else {
-            Command::new(bin)
-        };
+        let slave_path = nix::unistd::ttyname(&pty.slave).expect("ttyname");
+        // Never the runner's terminal: `setsid` before `exec` in both cases (#3691).
+        let mut cmd = Command::new("python3");
+        cmd.args(["-c", shim(dev_tty), bin]);
         cmd.args(args)
             .current_dir(dir.join("project"))
             .env("HOME", dir.join("home"))
             .env("XDG_CONFIG_HOME", dir.join("home/.config"))
+            .env("XDG_STATE_HOME", dir.join("home/.local/state"))
             .env("AMP_CREDENTIAL_STORE", "file")
             .env("AMP_HARNESS_CEILING_DIR", dir)
             .env("AMP_WEB_URL", "http://ui.invalid")
@@ -118,6 +137,23 @@ impl Pty {
         String::from_utf8_lossy(&self.seen.lock().unwrap()).into_owned()
     }
 
+    /// The terminal's mode. Through a fresh open of the device path when the test's own handle is
+    /// gone: the child leads a session on it, so macOS revokes every handle held when it exits
+    /// (ENOTTY).
+    fn mode(&self) -> nix::sys::termios::Termios {
+        tcgetattr(&self.slave)
+            .or_else(|_| tcgetattr(File::open(&self.slave_path).expect("reopen the pty")))
+            .expect("tcgetattr")
+    }
+
+    /// Kills and reaps the child, so no test path (a panic, [`Drop`]) leaves `amp-harness setup`
+    /// running. Its own session has no controlling terminal to hang it up (#3691), so waiting is
+    /// the process's end, not a race.
+    fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
     /// Waits (at most 30 s) for `needle` on the terminal.
     fn expect(&self, needle: &str) {
         let start = Instant::now();
@@ -146,7 +182,7 @@ impl Pty {
                 return status.code().unwrap_or(-1);
             }
             if start.elapsed() > Duration::from_secs(5) {
-                let _ = self.child.kill();
+                self.kill();
                 panic!("still running 5 s after Ctrl+C:\n{}", self.text());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -178,11 +214,7 @@ impl Pty {
             1,
             "only `{said}`: {text}"
         );
-        let mode = match &self.slave_path {
-            Some(path) => tcgetattr(File::open(path).expect("reopen the pty")),
-            None => tcgetattr(&self.slave),
-        }
-        .expect("tcgetattr");
+        let mode = self.mode();
         assert!(
             mode.local_flags
                 .contains(LocalFlags::ECHO | LocalFlags::ICANON | LocalFlags::ISIG),
@@ -190,6 +222,13 @@ impl Pty {
             mode.local_flags
         );
         text
+    }
+}
+
+impl Drop for Pty {
+    /// An interrupted test (a panic, a killed run) must not leave `amp-harness setup` running.
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
