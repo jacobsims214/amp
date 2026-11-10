@@ -605,6 +605,10 @@ pub fn flat(screen: &str) -> String {
 /// test's pty. A new session plus `TIOCSCTTY` on stdin make `/dev/tty` the test's pty. This
 /// crate forbids `unsafe` (`Command::pre_exec`), so python3 does that and then execs the binary,
 /// keeping the same pid, like `setup_ctrl_c.rs`. Add the binary's arguments with `.args`.
+///
+/// It pins no environment itself: the caller sets `HOME`, `XDG_CONFIG_HOME` and `XDG_STATE_HOME`
+/// under its test dir (D13, as [`run`] does; an unset `XDG_STATE_HOME` leaks the caller's real
+/// `~/.local/state` in, #3690).
 pub fn pty_command() -> std::process::Command {
     let mut cmd = std::process::Command::new("python3");
     cmd.args([
@@ -620,12 +624,22 @@ pub fn pty_command() -> std::process::Command {
 
 /// Runs the binary in `dir/project` with HOME in `dir/home`, the file credential store,
 /// `AMP_MCP_URL=url` and no other AMP_* settings. `env` adds variables.
+///
+/// `HOME` and both XDG variables the binary reads (config, state) are pinned under `dir` (D13), so
+/// the child never reads or writes the person's real `~/.config` or `~/.local/state`. Pinning only
+/// `HOME`/`XDG_CONFIG_HOME` was not enough (#3690): an ambient `XDG_STATE_HOME` — standard on
+/// Linux desktops, and what an isolated/disposable test env exports — sent the child's sessions
+/// and repo-trust records outside the test dir, while the in-process `Runtime::load` read them
+/// under it, so a repo agent wrote its trust record where the assertion never looked (`agents.rs`,
+/// repo-scope `amp:checker`). `env` still overrides these (`tests/keychain.rs` and
+/// `tests/repo_trust.rs` pass their own `XDG_STATE_HOME`).
 pub async fn run(dir: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_amp-harness"));
     cmd.args(args)
         .current_dir(dir.join("project"))
         .env("HOME", dir.join("home"))
         .env("XDG_CONFIG_HOME", dir.join("home/.config"))
+        .env("XDG_STATE_HOME", dir.join("home/.local/state"))
         .env("AMP_CREDENTIAL_STORE", "file")
         .env("AMP_MCP_URL", url)
         // The worktree's own .amp.json sits above target/; never find it.
