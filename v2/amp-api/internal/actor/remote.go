@@ -197,9 +197,20 @@ func (r *Registry) routeOnce(projectID int, msg any) error {
 		return nil
 	}
 	err = r.forward(addr, projectID, msg)
-	if retryable(err) {
+	if err != nil {
+		// Forget the cached owner on any failed call, not only the retryable
+		// ones. Whether to retry this message is about running it at most
+		// once; whether to trust the address again is not. An owner that
+		// reset the connection mid-call (it shut down during a rollout) is
+		// not retryable, but keeping its address would send every later
+		// message for the project to a dead replica until this one restarts,
+		// even after the database has let it go. forward only fails for
+		// transport errors and unexpected statuses: the owner's own errors
+		// (not found, conflict, authz) arrive inside a 200 reply.
 		r.mu.Lock()
-		delete(r.owners, projectID)
+		if r.owners[projectID] == addr {
+			delete(r.owners, projectID)
+		}
 		r.mu.Unlock()
 	}
 	return err
