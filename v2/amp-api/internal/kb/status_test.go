@@ -171,8 +171,14 @@ func TestKBStatusBackfillStates(t *testing.T) {
 func TestKBStatusWithoutStore(t *testing.T) {
 	repo := storeTestRepo(t)
 	url, key := typesenseEnv(t)
+	// Namespaced: KBStatus on the global scope ensures the collection exists,
+	// and against a live instance's Typesense an unprefixed name would create
+	// that instance's real kb_global_0 keyword-only (no Ollama here) — the
+	// guide's permanent degradation, not the guide's own test for once (#3689).
 	s := New(url, key, "", "")
+	s.SetCollectionPrefix(NewTestNamespace() + "status_")
 	s.SetStore(repo)
+	t.Cleanup(func() { _ = s.DropTestCollections(context.Background(), s.collectionPrefix) })
 	st := mustStatus(t, s, Global())
 	if st.StoredDocs != nil || st.Backfill != nil || st.IndexedDocs == nil || *st.IndexedDocs != st.TotalDocs ||
 		!strings.Contains(st.Note, "global KB") {

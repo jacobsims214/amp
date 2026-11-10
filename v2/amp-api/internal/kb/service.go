@@ -74,6 +74,13 @@ type Service struct {
 	// backfillOnly, when set (tests only), limits BackfillAll to the KBs
 	// it returns true for.
 	backfillOnly func(Scope) bool
+
+	// collectionPrefix, when set (SetCollectionPrefix: tests only), goes in
+	// front of every collection name, so a suite run against a Typesense a
+	// live instance also uses creates and drops only its own collections.
+	// The global KB's name is fixed (kb_global_0), so without a prefix a test
+	// that drops it deletes that instance's real guide.
+	collectionPrefix string
 }
 
 // ErrReindexRunning is returned when a reindex of the same KB is already
@@ -320,6 +327,80 @@ func collectionName(sc Scope) string {
 	return fmt.Sprintf("kb_%s_%d", sc.Kind, sc.ID)
 }
 
+// CollectionName is the name of sc's search collection: collectionName with
+// this service's test prefix, if set. Nothing else a KB is stored in (alias,
+// reindex builds) is named independently: they all derive from this.
+func (s *Service) CollectionName(sc Scope) string { return s.collectionPrefix + collectionName(sc) }
+
+// SetCollectionPrefix namespaces every collection this service touches:
+// with prefix "kbtest_7f3a_", the global KB is "kbtest_7f3a_kb_global_0"
+// rather than "kb_global_0". It exists for tests, and only they should call
+// it: a suite run against the Typesense a live instance uses must not create,
+// empty or drop that instance's collections. The namespaced collections are
+// deliberately not KB names (see scopeOfBase), so the reconciler of the
+// instance that owns the Typesense never adopts them as a live KB's index.
+func (s *Service) SetCollectionPrefix(prefix string) { s.collectionPrefix = prefix }
+
+// testCollectionPrefix is the namespace every test suite's collections live
+// under. It is a compile-time constant, so a test asserting it — or a person
+// looking at a shared Typesense — can tell test collections from real ones.
+const testCollectionPrefix = "kbtest_"
+
+// NewTestNamespace is the collection prefix a test passes to
+// SetCollectionPrefix: the test namespace and a per-run discriminator, so
+// collections an earlier, killed run left behind never repeat this run's
+// names, and one run's cleanup never touches another's.
+func NewTestNamespace() string {
+	return testCollectionPrefix + fmt.Sprintf("%d_", time.Now().UnixNano())
+}
+
+// IsTestCollectionName reports whether name belongs to a test suite's
+// namespace rather than to a live instance: true for a collection under
+// testCollectionPrefix, false for every name a running AMP uses (kb_5,
+// kb_team_3, kb_global_0). Tests that would otherwise drop a collection by a
+// fixed name (the guide tests) check it first, so a regression in the
+// test wiring fails the test instead of deleting live knowledge.
+func IsTestCollectionName(name string) bool { return strings.HasPrefix(name, testCollectionPrefix) }
+
+// DropTestCollections deletes every collection and alias named under prefix,
+// a test service's own namespace, so a suite run against a Typesense a live
+// instance also uses leaves it as it found it. It refuses a prefix outside
+// the test namespace: names like kb_5 or kb_global_0 are live knowledge and
+// are never swept.
+func (s *Service) DropTestCollections(ctx context.Context, prefix string) error {
+	if !IsTestCollectionName(prefix) {
+		return fmt.Errorf("refusing to drop collections under %q: only the test namespace (%s…) may be swept", prefix, testCollectionPrefix)
+	}
+	aliases, err := s.client.Aliases().Retrieve(ctx)
+	if err != nil {
+		return fmt.Errorf("list aliases: %w", err)
+	}
+	for _, a := range aliases {
+		if a.Name == nil || !strings.HasPrefix(*a.Name, prefix) {
+			continue
+		}
+		// The alias first, as dropCollections does: deleting a collection
+		// through an alias's name would delete its target and leave the alias
+		// dangling.
+		if _, err := s.client.Alias(*a.Name).Delete(ctx); err != nil && !isNotFound(err) {
+			return fmt.Errorf("delete alias %s: %w", *a.Name, err)
+		}
+	}
+	cols, err := s.client.Collections().Retrieve(ctx, &api.GetCollectionsParams{ExcludeFields: pointer.String("fields")})
+	if err != nil {
+		return fmt.Errorf("list collections: %w", err)
+	}
+	for _, c := range cols {
+		if !strings.HasPrefix(c.Name, prefix) {
+			continue
+		}
+		if _, err := s.client.Collection(c.Name).Delete(ctx); err != nil && !isNotFound(err) {
+			return fmt.Errorf("delete collection %s: %w", c.Name, err)
+		}
+	}
+	return nil
+}
+
 func docID(sc Scope, path string, chunkIndex int) string {
 	key := fmt.Sprintf("%d:%s:%d", sc.ID, path, chunkIndex)
 	if sc.Kind != ScopeProject {
@@ -337,7 +418,7 @@ func docID(sc Scope, path string, chunkIndex int) string {
 // call on every write: it checks first, and only a 404 creates one, so a
 // transient error never creates a collection that would shadow the alias.
 func (s *Service) ensureCollection(ctx context.Context, sc Scope) error {
-	name := collectionName(sc)
+	name := s.CollectionName(sc)
 
 	_, err := s.client.Collection(name).Retrieve(ctx)
 	if err == nil {
@@ -577,9 +658,9 @@ func (s *Service) GetDoc(ctx context.Context, sc Scope, path string) (*Doc, erro
 		return docFromRow(sc, d), nil
 	}
 	if !errors.Is(err, repository.ErrNotFound) {
-		return nil, fmt.Errorf("read %s/%s: %w", collectionName(sc), path, err)
+		return nil, fmt.Errorf("read %s/%s: %w", s.CollectionName(sc), path, err)
 	}
-	notFound := fmt.Errorf("doc not found: %s/%s: %w", collectionName(sc), path, err)
+	notFound := fmt.Errorf("doc not found: %s/%s: %w", s.CollectionName(sc), path, err)
 	done, deleted, err := s.storedRead(ctx, sc)
 	if err != nil {
 		return nil, err
@@ -620,7 +701,7 @@ func (s *Service) storedRead(ctx context.Context, sc Scope) (done bool, deleted 
 
 // getIndexed reads a doc's canonical record (chunk 0) from the index.
 func (s *Service) getIndexed(ctx context.Context, sc Scope, path string) (*Doc, error) {
-	col := collectionName(sc)
+	col := s.CollectionName(sc)
 	id := docID(sc, path, 0)
 
 	raw, err := s.client.Collection(col).Document(id).Retrieve(ctx)
@@ -702,7 +783,7 @@ func resolveAt(anns []Annotation, path string, index int, resolved bool, by stri
 // saveAnnotations stores doc's annotations on its first chunk and the
 // preview fields on every chunk, so search hits from any chunk show them.
 func (s *Service) saveAnnotations(ctx context.Context, sc Scope, doc *Doc) error {
-	col := collectionName(sc)
+	col := s.CollectionName(sc)
 	// Marshal annotations to JSON string for Typesense schema compliance
 	annJSON, _ := json.Marshal(doc.Annotations)
 	_, err := s.client.Collection(col).Documents().Upsert(ctx, map[string]interface{}{
@@ -864,7 +945,7 @@ func (s *Service) listStored(ctx context.Context, sc Scope, tag string) ([]*Doc,
 // page so a KB of any size is listed whole. A collection that doesn't exist
 // yet lists empty.
 func (s *Service) listIndexed(ctx context.Context, sc Scope, tag string) ([]*Doc, error) {
-	col := collectionName(sc)
+	col := s.CollectionName(sc)
 	const perPage = 250
 	filterBy := "chunk_index:=0"
 	if tag != "" {
@@ -944,7 +1025,7 @@ func (s *Service) Search(ctx context.Context, sc Scope, query string, tags []str
 		limit = 3 // small default — agents call this from limited-context models
 	}
 
-	col := collectionName(sc)
+	col := s.CollectionName(sc)
 
 	filterBy := "chunk_index:>=0" // include all chunks
 	if len(tags) > 0 {
@@ -963,7 +1044,7 @@ func (s *Service) Search(ctx context.Context, sc Scope, query string, tags []str
 		sortBy += ",updated_at:desc"
 	}
 
-	hasEmbedding := s.collectionHasEmbedding(ctx, collectionName(sc))
+	hasEmbedding := s.collectionHasEmbedding(ctx, s.CollectionName(sc))
 
 	// When using a remote embedder (Ollama), include embedding in query_by
 	// and set prefix=false (required for remote embedders).
@@ -1126,7 +1207,7 @@ func (s *Service) CountDocs(ctx context.Context, sc Scope) (int, error) {
 func (s *Service) countIndexed(ctx context.Context, sc Scope) (int, error) {
 	q := "*"
 	perPage := 0
-	res, err := s.client.Collection(collectionName(sc)).Documents().Search(ctx, &api.SearchCollectionParams{
+	res, err := s.client.Collection(s.CollectionName(sc)).Documents().Search(ctx, &api.SearchCollectionParams{
 		Q:        &q,
 		QueryBy:  pointer.String("title"),
 		FilterBy: pointer.String("chunk_index:=0"),
@@ -1151,7 +1232,7 @@ func (s *Service) ListTags(ctx context.Context, sc Scope) ([]TagCount, error) {
 	if err := s.ensureCollection(ctx, sc); err != nil {
 		return nil, err
 	}
-	col := collectionName(sc)
+	col := s.CollectionName(sc)
 
 	q := "*"
 	filterBy := "chunk_index:=0"
@@ -1439,7 +1520,7 @@ func (s *Service) ListDeletedDocs(ctx context.Context, sc Scope) ([]DeletedDoc, 
 // deleteDocNow performs the actual Typesense deletion. Called either
 // directly or by the asynq worker via HandleDeleteDocTask.
 func (s *Service) deleteDocNow(ctx context.Context, sc Scope, path string) error {
-	col := collectionName(sc)
+	col := s.CollectionName(sc)
 	return s.deleteByPath(ctx, col, path)
 }
 
@@ -1553,7 +1634,7 @@ func (s *Service) Drop(ctx context.Context, sc Scope) error {
 		return err
 	}
 	defer release()
-	return s.dropCollections(ctx, collectionName(sc))
+	return s.dropCollections(ctx, s.CollectionName(sc))
 }
 
 // dropWhenFree waits for a running reindex of sc to end, then drops sc's
@@ -1565,7 +1646,7 @@ func (s *Service) dropWhenFree(sc Scope) {
 	for {
 		release, err := s.beginReindex(ctx, sc)
 		if err == nil {
-			err = s.dropCollections(ctx, collectionName(sc))
+			err = s.dropCollections(ctx, s.CollectionName(sc))
 			release()
 			if err != nil {
 				s.log.Warn("drop after reindex failed; the collections are left", "kb", sc.String(), "err", err)
@@ -1720,12 +1801,22 @@ func (s *Service) SetReindexLock(l ReindexLocker) {
 	s.reindexLock = l
 }
 
+// ReindexLockKey is the name of sc's reindex lock: one per KB, shared by
+// every replica holding one, so two overlapping reindexes of the same KB can
+// never run. It names the collection (which a test service namespaces), so a
+// test's locks never collide with a live instance's.
+func (s *Service) ReindexLockKey(sc Scope) string {
+	return reindexLockKey(s.CollectionName(sc))
+}
+
+func reindexLockKey(collection string) string { return "kb_reindex:" + collection }
+
 // beginReindex claims the right to reindex sc, or returns
 // ErrReindexRunning. Two overlapping runs on one KB can lose docs: on the
 // rebuild path the second snapshots after the first dropped the collection,
 // then drops the collection the first is writing into.
 func (s *Service) beginReindex(ctx context.Context, sc Scope) (release func(), err error) {
-	col := collectionName(sc)
+	col := s.CollectionName(sc)
 	s.reindexMu.Lock()
 	if s.reindexing[col] {
 		s.reindexMu.Unlock()
@@ -1746,7 +1837,7 @@ func (s *Service) beginReindex(ctx context.Context, sc Scope) (release func(), e
 	if locker == nil {
 		return done, nil
 	}
-	unlock, ok, err := locker(ctx, "kb_reindex:"+col)
+	unlock, ok, err := locker(ctx, reindexLockKey(col))
 	if err != nil {
 		done()
 		return nil, fmt.Errorf("reindex lock for %s: %w", col, err)
@@ -1795,7 +1886,7 @@ func (s *Service) runReindex(ctx context.Context, sc Scope) error {
 	// collections can't gain a field after creation. Detect that and
 	// rebuild it so ensureCollection picks up the embedding field this
 	// time, now that Ollama is reachable.
-	rebuild := s.ollamaURL != "" && s.ollamaReachable(ctx) && !s.collectionHasEmbedding(ctx, collectionName(sc))
+	rebuild := s.ollamaURL != "" && s.ollamaReachable(ctx) && !s.collectionHasEmbedding(ctx, s.CollectionName(sc))
 	return s.reindex(ctx, sc, rebuild)
 }
 
@@ -1806,7 +1897,7 @@ func (s *Service) reindex(ctx context.Context, sc Scope, rebuild bool) error {
 	if s.stored(sc) {
 		return s.reindexFromStore(ctx, sc)
 	}
-	col := collectionName(sc)
+	col := s.CollectionName(sc)
 
 	// Snapshot full doc content BEFORE any possible drop+recreate below —
 	// once the collection is dropped there is nothing left to read back.
@@ -1963,7 +2054,7 @@ func (s *Service) RecordReads(ctx context.Context, sc Scope, paths []string, by 
 		}
 	}
 	if _, err := s.store.RecordKBReads(ctx, storeScope(sc), uniq, by, ReadThrottle); err != nil {
-		return fmt.Errorf("record kb reads in %s: %w", collectionName(sc), err)
+		return fmt.Errorf("record kb reads in %s: %w", s.CollectionName(sc), err)
 	}
 	return nil
 }
@@ -1999,7 +2090,7 @@ func (s *Service) updateStoredAnnotations(ctx context.Context, sc Scope, path st
 	}
 	d, err := s.store.UpdateKBAnnotations(ctx, storeScope(sc), path, fn)
 	if errors.Is(err, repository.ErrNotFound) {
-		return nil, fmt.Errorf("doc not found: %s/%s: %w", collectionName(sc), path, err)
+		return nil, fmt.Errorf("doc not found: %s/%s: %w", s.CollectionName(sc), path, err)
 	}
 	if err != nil {
 		return nil, err
@@ -2121,7 +2212,7 @@ func (s *Service) indexFromStore(ctx context.Context, sc Scope, path string) err
 	}
 	for attempt := 1; ; attempt++ {
 		if errors.Is(err, repository.ErrNotFound) {
-			if err := s.deleteByPath(ctx, collectionName(sc), path); err != nil {
+			if err := s.deleteByPath(ctx, s.CollectionName(sc), path); err != nil {
 				return err
 			}
 			s.log.Info("doc removed from the index", "kb", sc.String(), "path", path)
@@ -2243,7 +2334,7 @@ func (s *Service) drainLegacyWrite(ctx context.Context, sc Scope, p queue.WriteD
 // before it is dropped (no write reaches it once the alias has moved). The
 // catch-up after the swap indexes what it copied into the new collection.
 func (s *Service) reindexFromStore(ctx context.Context, sc Scope) error {
-	base := collectionName(sc)
+	base := s.CollectionName(sc)
 	done, err := s.backfillDone(ctx, sc)
 	if err != nil {
 		return fmt.Errorf("reindex: check the backfill of %s: %w", sc, err)
@@ -2625,7 +2716,7 @@ func (s *Service) indexChunks(ctx context.Context, sc Scope, d indexedDoc) (int,
 	if err := s.ensureCollection(ctx, sc); err != nil {
 		return 0, err
 	}
-	return s.indexChunksInto(ctx, sc, collectionName(sc), d)
+	return s.indexChunksInto(ctx, sc, s.CollectionName(sc), d)
 }
 
 // indexChunksInto is indexChunks into the collection (or alias) col.
