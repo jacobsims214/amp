@@ -52,10 +52,16 @@ func newReceiver(t *testing.T) *receiver {
 	return rc
 }
 
+// webhookWaitTimeout bounds how long wait polls for a delivery. A delivery
+// goes audit sink -> dispatcher -> outbox -> deliverLoop (two async hops and
+// two Postgres round trips), which doesn't always fit in 5s under -race in
+// the replicated CI step; 30s matches headerDeliveryTimeout (AMP #3680).
+const webhookWaitTimeout = 30 * time.Second
+
 // wait returns the requests received once cond holds, or fails.
 func (rc *receiver) wait(t *testing.T, what string, cond func([]received) bool) []received {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(webhookWaitTimeout)
 	for {
 		rc.mu.Lock()
 		got := append([]received(nil), rc.got...)
