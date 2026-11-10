@@ -1,0 +1,811 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Team inbox · triage and My work — mockup (AMP #3740)</title>
+<!--
+  BUILDER NOTES
+  =============
+  Mockup for AMP #3740 (epic 202, team workstream inbox v1), drawn from the
+  approved product contract (artifact 36 v2) and the UX entry-point map
+  (discoveries/team-request-ux-entrypoints.md, pinned to origin/main 1f2c3976).
+
+  Tokens and classes copy v2/ui/src/index.css verbatim (theme "Stripe":
+  Barlow / Barlow Condensed / JetBrains Mono, --bg #F2F2F0, square 2px radius,
+  amp-btn / amp-input / amp-panel / amp-label / amp-num / state dots). No org
+  design system is published yet; this mockup follows the product's own tokens.
+
+  Component mapping for the builder:
+  - Queue filter bar  -> extends components/FilterBar.tsx (pills with counts,
+                         owner select) with request states instead of ticket states.
+  - Queue rows        -> TaskCard.tsx pattern (state-colored left edge, meta line).
+  - Detail claim rail -> TaskDrawer OwnerSection (TaskDrawer.tsx:624) semantics:
+                         claim = triage claim (one active, manual, never expires),
+                         assignee = durable owner. Different things, shown separately.
+  - Clarify thread    -> components/human/HumanActions.tsx AnswerAction (:114):
+                         question as quote, answer box, send; needs_information
+                         obliges an answer (contract invariant I5).
+  - Linked work       -> TaskPlacement (TaskDrawer.tsx:786) as read model;
+                         planned_as / delivered_by / duplicate_of / relates_to
+                         come from the request_links table, never metadata.
+  - Delivery          -> artifacts/ArtifactBits.tsx ArtifactStatusTag; delivered
+                         needs outcome_brief + >=1 delivered link (I2).
+  - My work panel     -> a new Panel on pages/MyWork.tsx next to the Waiting-on-you
+                         grid; feeds from Me.teams (types/index.ts:597). It never
+                         fans requests out into per-member owned tickets.
+  - Concurrency       -> claim and writes are rev-checked; a stale write returns
+                         409 request.conflict -> inline banner, shown here.
+  - Attachments       -> private, scan-gated (scan_state), bounded size; restricted
+                         (non-image/office) types need a lead to release.
+
+  Safety invariants the mockup must keep visible:
+  - No control anywhere approves a plan or dispatches work. "Create plan items"
+    creates tickets that await per-ticket human approval; the note says so.
+  - Requests never appear as personal tickets for every team member; the My work
+    slice is claim/ownership only.
+
+  Reviewer controls: the bar at the top switches VIEWS (inbox / request detail /
+  My work / edge states) and STATES per view. Keyboard: [ and ] cycle states.
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow:ital,wght@0,400;0,500;0,600;1,400&family=Barlow+Condensed:wght@500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#F2F2F0; --surface:#FFFFFF; --surface-2:#FAFAF9; --surface-3:#EFEFEC;
+    --scrim:rgba(22,24,27,.32);
+    --line-sub:#E9E9E6; --line:#DCDDDA; --line-str:#C3C5C1;
+    --ink:#16181B; --ink-2:#50555C; --ink-3:#8E939A; --on-ink:#FFFFFF;
+    --primary:#16181B; --accent:#C23D23; --link:#2C66B8;
+    --band-1:#C23D23; --band-2:#EB8A2E; --band-3:#EBC34B; --band-4:#2C66B8;
+    --st-ready:#16181B; --st-prog:#2C66B8; --st-wait:#8E939A; --st-flag:#C23D23;
+    --st-sched:#7A5BB5; --st-done:#16181B;
+    --danger:#C23D23; --danger-ink:#9A2E19; --success:#2F7D4E; --success-ink:#2A6E45;
+    --warning:#D08A1C; --warning-ink:#9A5E0A; --violet:#7A5BB5; --teal:#1F8A7E;
+    --font-body:"Barlow",ui-sans-serif,system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
+    --font-label:"Barlow Condensed","Arial Narrow","Barlow",sans-serif;
+    --font-data:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --radius:2px;
+  }
+  [data-theme="dark"]{
+    --bg:#121315; --surface:#1A1C1F; --surface-2:#1F2125; --surface-3:#2A2D31;
+    --scrim:rgba(0,0,0,.55);
+    --line-sub:#2F3338; --line:#3A3F45; --line-str:#4A5058;
+    --ink:#F0F1F3; --ink-2:#A6ADB6; --ink-3:#8E98A2; --on-ink:#FFFFFF;
+    --primary:#F0F1F3; --accent:#C23D23; --link:#7DA7EC;
+    --st-ready:#F0F1F3; --st-prog:#7DA7EC; --st-wait:#8E98A2; --st-flag:#C23D23;
+    --st-sched:#A88BD8; --st-done:#F0F1F3;
+    --danger:#C23D23; --danger-ink:#9A2E19; --success:#4CAF7C; --success-ink:#3D8A62;
+    --warning:#E5A845; --warning-ink:#B07D28; --violet:#A88BD8; --teal:#4ECDC4;
+  }
+  *,*::before,*::after{box-sizing:border-box}
+  html,body{background:var(--bg)}
+  body{margin:0;color:var(--ink);font-family:var(--font-body);font-size:14px;-webkit-font-smoothing:antialiased}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+  .amp-label{font-family:var(--font-label);font-weight:600;font-size:10.5px;line-height:1;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-3)}
+  .amp-num{font-family:var(--font-data);font-variant-numeric:tabular-nums}
+  .amp-bands-v{width:5px;align-self:stretch;flex-shrink:0;background:linear-gradient(var(--band-1) 0 25%,var(--band-2) 25% 50%,var(--band-3) 50% 75%,var(--band-4) 75%)}
+  .amp-bands-h{height:4px;background:linear-gradient(90deg,var(--band-1) 0 25%,var(--band-2) 25% 50%,var(--band-3) 50% 75%,var(--band-4) 75%)}
+
+  .amp-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;font-family:var(--font-label);font-weight:600;font-size:11.5px;line-height:1;letter-spacing:.14em;text-transform:uppercase;white-space:nowrap;padding:9px 13px;border-radius:var(--radius);border:1px solid var(--ink);background:var(--surface);color:var(--ink);cursor:pointer;transition:background .12s,color .12s,border-color .12s}
+  .amp-btn:hover{background:var(--surface-3)}
+  .amp-btn:disabled{opacity:.45;cursor:not-allowed}
+  .amp-btn-primary{background:var(--primary);color:var(--on-ink);border-color:var(--primary)}
+  .amp-btn-accent{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .amp-btn-danger{color:var(--danger-ink);border-color:var(--danger)}
+  .amp-btn-ghost{border-color:transparent;background:transparent;color:var(--ink-2)}
+  .amp-btn-ghost:hover{color:var(--ink);background:var(--surface-3)}
+  .amp-btn-sm{padding:6px 9px;font-size:10.5px}
+  .amp-input{width:100%;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:7px 10px;font:inherit;font-size:13px;color:var(--ink);outline:none}
+  .amp-input::placeholder{color:var(--ink-3)}
+  .amp-panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius)}
+  .amp-panel-top{box-shadow:inset 0 3px 0 var(--ink)}
+  .amp-skel{display:block;border-radius:var(--radius);background:linear-gradient(90deg,var(--surface-3) 0 35%,var(--surface-2) 50%,var(--surface-3) 65% 100%) 0 0/300% 100%;animation:swp 1.4s ease-in-out infinite}
+  @keyframes swp{from{background-position:100% 0}to{background-position:0 0}}
+  @media (prefers-reduced-motion:reduce){.amp-skel{animation:none;background:var(--surface-3)}}
+
+  /* ── reviewer switcher (not part of the design) ─────────────────────── */
+  .switcher{position:sticky;top:0;z-index:50;background:#16181B;color:#fff;padding:6px 10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-family:var(--font-data);font-size:11px}
+  .switcher .grp{display:flex;gap:2px;align-items:center}
+  .switcher .grp > span{color:#8E939A;margin-right:4px;letter-spacing:.08em;text-transform:uppercase;font-size:9.5px}
+  .switcher button{background:transparent;border:1px solid #3A3F45;color:#C9CDD3;font:inherit;padding:3px 8px;cursor:pointer;border-radius:2px}
+  .switcher button[aria-pressed="true"]{background:#fff;color:#16181B;border-color:#fff}
+  .switcher .hint{color:#8E939A;margin-left:auto}
+
+  /* ── app frame ──────────────────────────────────────────────────────── */
+  .frame{display:grid;grid-template-columns:232px minmax(0,1fr);min-height:calc(100vh - 33px)}
+  .side{background:var(--surface-2);border-right:1px solid var(--line);padding:14px 10px;display:flex;flex-direction:column;gap:2px}
+  .side .navitem{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:var(--radius);color:var(--ink-2);font-size:13px;text-decoration:none}
+  .side .navitem .badge{margin-left:auto;font-family:var(--font-data);font-size:10px;background:var(--st-flag);color:#fff;padding:1px 5px;border-radius:2px}
+  .side .navitem.on{background:var(--surface-3);color:var(--ink);font-weight:500}
+  .side .navsec{margin:12px 6px 4px}
+  .main{min-width:0;display:flex;flex-direction:column}
+  /* view + state visibility: the attribute selectors lose to class rules below,
+     so these must come last and be explicit about the layout of each container */
+  [data-view] [data-in]{display:none}
+  [data-state] [data-show]{display:none}
+  body[data-view="inbox"] section[data-in~="inbox"],
+  body[data-view="detail"] section[data-in~="detail"],
+  body[data-view="mywork"] section[data-in~="mywork"],
+  body[data-view="edge"] section[data-in~="edge"]{display:flex;flex-direction:column}
+  .pagehead{border-bottom:1px solid var(--line);background:var(--surface);padding:12px 24px;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+  .pagehead .crumb{font-size:12px;color:var(--ink-3)}
+  .pagehead h1{margin:0;font-size:18px;font-weight:600}
+  .pagehead .meta{font-size:12.5px;color:var(--ink-2);max-width:64ch}
+  .pagehead .acts{margin-left:auto;display:flex;gap:8px;align-items:center}
+  .body{padding:20px 24px;display:flex;flex-direction:column;gap:16px;min-width:0}
+
+  /* pills (FilterBar pattern) */
+  .pills{display:inline-flex;align-items:center;gap:2px;padding:3px;background:var(--surface);border:1px solid var(--line)}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;font-size:12px;font-weight:500;color:var(--ink-2);border:0;background:transparent;cursor:pointer}
+  .pill:hover{color:var(--ink);background:var(--surface-2)}
+  .pill.on{background:var(--ink);color:var(--on-ink)}
+  .pill .dot{width:8px;height:8px;flex-shrink:0}
+  .pill .n{font-variant-numeric:tabular-nums;color:var(--ink-3)}
+  .pill.on .n{color:#C9CDD3}
+
+  /* request row (TaskCard pattern) */
+  .rq{display:grid;grid-template-columns:3px minmax(0,1fr) auto;gap:0;background:var(--surface);border:1px solid var(--line);cursor:pointer}
+  .rq:hover{border-color:var(--line-str)}
+  .rq .edge{grid-row:1 / span 2}
+  .rq .inner{padding:10px 14px 10px 12px;display:flex;flex-direction:column;gap:5px;min-width:0}
+  .rq .t{display:flex;align-items:baseline;gap:10px;min-width:0}
+  .rq .ref{font-family:var(--font-data);font-size:11px;color:var(--ink-3);flex-shrink:0}
+  .rq .subj{font-weight:600;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .rq .meta{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--ink-2)}
+  .rq .meta .k{color:var(--ink-3)}
+  .rq .sidecol{padding:10px 14px 10px 0;display:flex;flex-direction:column;align-items:flex-end;gap:6px;justify-content:center}
+  .sttag{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:500}
+  .sttag .dot{width:8px;height:8px}
+  .claimtag{font-size:11.5px;color:var(--ink-2);display:inline-flex;gap:5px;align-items:center}
+  .avatar{width:20px;height:20px;border-radius:50%;background:#16181B;color:#fff !important;display:inline-flex;align-items:center;justify-content:center;font-size:9.5px;font-weight:600;flex-shrink:0}
+  .avatar.alt{background:var(--link)}
+  .avatar.cust{background:var(--teal)}
+  .unclaimed{font-family:var(--font-label);font-weight:600;font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);border:1px dashed var(--line-str);padding:4px 8px}
+
+  /* detail layout */
+  .detail{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);gap:16px;align-items:start}
+  .sect{padding:0}
+  .sect > .hd{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line-sub)}
+  .sect > .bd{padding:14px;display:flex;flex-direction:column;gap:12px}
+  .quote{border-left:3px solid var(--st-flag);background:var(--surface-2);padding:10px 12px;font-size:13px;color:var(--ink-2)}
+  .comment{display:flex;gap:10px;align-items:flex-start}
+  .comment .cb{min-width:0}
+  .comment .cm{font-size:12px;color:var(--ink-3);display:flex;gap:8px;flex-wrap:wrap;margin-bottom:2px}
+  .comment .ct{font-size:13px;line-height:1.45}
+  .kv{display:grid;grid-template-columns:120px minmax(0,1fr);gap:6px 12px;font-size:13px}
+  .kv dt{color:var(--ink-3);font-size:12px}
+  .kv dd{margin:0}
+  .chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--surface-2);padding:3px 8px;font-size:12px;color:var(--ink-2)}
+  .chip.warn{border-color:var(--warning);color:var(--warning-ink);background:color-mix(in srgb,var(--warning) 8%,var(--surface))}
+  .chip.lock{border-color:var(--line-str);color:var(--ink-3)}
+  .banner{display:flex;gap:10px;align-items:flex-start;padding:10px 14px;border:1px solid var(--line);font-size:13px}
+  .banner.warn{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 9%,var(--surface));color:var(--ink)}
+  .banner.err{border-color:var(--danger);background:color-mix(in srgb,var(--danger) 7%,var(--surface))}
+  .banner.info{border-color:var(--line);background:var(--surface-2);color:var(--ink-2)}
+  .banner .bt{font-weight:600;color:var(--ink)}
+  .linkrow{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--line-sub);font-size:13px}
+  .linkrow:last-child{border-bottom:0}
+  .linkrow .lr-ref{font-family:var(--font-data);font-size:11px;color:var(--ink-3);width:86px;flex-shrink:0}
+  .linkrow .lr-t{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .linkrow .lr-s{margin-left:auto;flex-shrink:0}
+  .arttag{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:600;padding:2px 7px;border:1px solid var(--line)}
+  .arttag.rev{color:var(--link);border-color:var(--link)}
+  .arttag.ok{color:var(--success-ink);border-color:var(--success)}
+  .arttag.chg{color:var(--warning-ink);border-color:var(--warning)}
+  .attach{display:flex;align-items:center;gap:10px;border:1px solid var(--line);padding:8px 10px;font-size:12.5px}
+  .attach .an{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .attach .as{margin-left:auto;flex-shrink:0;font-size:11px;color:var(--ink-3)}
+  .hist{display:flex;flex-direction:column;gap:0;font-size:12.5px}
+  .hist .h{display:flex;gap:10px;padding:7px 0;border-bottom:1px solid var(--line-sub);color:var(--ink-2)}
+  .hist .h:last-child{border-bottom:0}
+  .hist .ht{font-family:var(--font-data);font-size:10.5px;color:var(--ink-3);width:74px;flex-shrink:0;padding-top:2px}
+
+  /* My work additions */
+  .mw-grid{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:16px;align-items:start}
+  .readouts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr))}
+  .readouts > div{padding:12px 14px;display:grid;gap:6px;border-left:1px solid var(--line)}
+  .readouts > div:first-child{border-left:0}
+  .readouts .v{font-family:var(--font-data);font-size:24px;line-height:1;font-variant-numeric:tabular-nums}
+  .panel-hd{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line-sub)}
+  .panel-hd .r{margin-left:auto;font-size:12px;color:var(--ink-3)}
+  .team-block{padding:12px 14px;border-bottom:1px solid var(--line-sub);display:flex;flex-direction:column;gap:8px}
+  .team-block:last-child{border-bottom:0}
+  .team-counts{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--ink-2)}
+  .team-counts b{font-family:var(--font-data);font-weight:500;color:var(--ink);font-variant-numeric:tabular-nums}
+  .claimed-row{display:flex;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid var(--line-sub);font-size:13px}
+  .claimed-row:last-child{border-bottom:0}
+
+  /* edge sheet */
+  .edge-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;align-items:start}
+  .edge-card .cap{padding:8px 14px;border-bottom:1px solid var(--line-sub);font-size:12px;color:var(--ink-2)}
+
+  .skl-row{display:flex;gap:10px;align-items:center;padding:11px 14px;border-bottom:1px solid var(--line-sub)}
+
+
+
+  /* ── view & state visibility (after component rules so [hidden] wins) ── */
+  [data-view] [data-in]{display:none !important}
+  body[data-view="inbox"] section[data-in~="inbox"],
+  body[data-view="detail"] section[data-in~="detail"],
+  body[data-view="mywork"] section[data-in~="mywork"],
+  body[data-view="edge"] section[data-in~="edge"]{display:flex !important;flex-direction:column}
+  /* multi-state containers (the detail body shows in all six detail states) */
+  body[data-state="filled"] [data-show~="filled"].banner,
+  body[data-state="conflict"] [data-show~="conflict"].banner{display:flex !important}
+
+  [data-state] [data-show]{display:none !important}
+  body[data-state="filled"] [data-show~="filled"],
+  body[data-state="empty"] [data-show~="empty"],
+  body[data-state="loading"] [data-show~="loading"],
+  body[data-state="error"] [data-show~="error"],
+  body[data-state="needsinfo"] [data-show~="needsinfo"],
+  body[data-state="conflict"] [data-show~="conflict"],
+  body[data-state="rejected"] [data-show~="rejected"],
+  body[data-state="duplicate"] [data-show~="duplicate"],
+  body[data-state="delivered"] [data-show~="delivered"]{display:block !important}
+  body[data-state="filled"] [data-show~="filled"].detail,
+  body[data-state="needsinfo"] [data-show~="needsinfo"].detail,
+  body[data-state="conflict"] [data-show~="conflict"].detail,
+  body[data-state="rejected"] [data-show~="rejected"].detail,
+  body[data-state="duplicate"] [data-show~="duplicate"].detail,
+  body[data-state="delivered"] [data-show~="delivered"].detail,
+  body[data-state="loading"] [data-show~="loading"].detail{display:grid !important}
+  body[data-state="filled"] [data-show~="filled"].mw-grid,
+  body[data-state="empty"] [data-show~="empty"].mw-grid,
+  body[data-state="loading"] [data-show~="loading"].mw-grid{display:grid !important}
+  body[data-state="filled"] [data-show~="filled"].edge-grid{display:grid !important}
+  body[data-state="filled"] span[data-show~="filled"].sttag,
+  body[data-state="needsinfo"] span[data-show~="needsinfo"].sttag,
+  body[data-state="conflict"] span[data-show~="conflict"].sttag,
+  body[data-state="rejected"] span[data-show~="rejected"].sttag,
+  body[data-state="duplicate"] span[data-show~="duplicate"].sttag,
+  body[data-state="delivered"] span[data-show~="delivered"].sttag{display:inline-flex !important}
+
+  @media (max-width:900px){
+    .frame{grid-template-columns:1fr}
+    .side{display:none}
+    .detail{grid-template-columns:1fr}
+    .mw-grid{grid-template-columns:1fr}
+    .readouts{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .readouts > div:nth-child(odd){border-left:0}
+    .readouts > div:nth-child(n+3){border-top:1px solid var(--line)}
+    .pagehead{padding:10px 14px}
+    .pagehead .acts{margin-left:0;width:100%;justify-content:flex-end}
+    .pills{max-width:100%;overflow-x:auto}
+    .body{padding:14px}
+    .kv{grid-template-columns:96px minmax(0,1fr)}
+  }
+</style>
+</head>
+<body data-view="inbox" data-state="filled">
+<div class="switcher" role="toolbar" aria-label="Mockup view and state">
+  <div class="grp"><span>View</span>
+    <button data-setview="inbox" aria-pressed="true">Team inbox</button>
+    <button data-setview="detail" aria-pressed="false">Request detail</button>
+    <button data-setview="mywork" aria-pressed="false">My work</button>
+    <button data-setview="edge" aria-pressed="false">Edge states</button>
+  </div>
+  <div class="grp" id="stateGrp"><span>State</span>
+    <button data-setstate="filled" aria-pressed="true">Filled</button>
+    <button data-setstate="loading" aria-pressed="false">Loading</button>
+    <button data-setstate="empty" aria-pressed="false">Empty</button>
+    <button data-setstate="error" aria-pressed="false">Error</button>
+    <button data-setstate="needsinfo" aria-pressed="false" data-only="detail">Needs info</button>
+    <button data-setstate="conflict" aria-pressed="false" data-only="detail">Claim conflict</button>
+    <button data-setstate="rejected" aria-pressed="false" data-only="detail">Rejected</button>
+    <button data-setstate="duplicate" aria-pressed="false" data-only="detail">Duplicate</button>
+    <button data-setstate="delivered" aria-pressed="false" data-only="detail">Delivered</button>
+  </div>
+  <div class="grp"><span>Theme</span>
+    <button data-settheme="light" aria-pressed="true">Light</button>
+    <button data-settheme="dark" aria-pressed="false">Dark</button>
+  </div>
+  <span class="hint">#3740 · team inbox v1 mockup</span>
+</div>
+
+<div class="frame">
+  <!-- ═══ Sidebar: inbox becomes a team surface; Requests item with count ═══ -->
+  <nav class="side" aria-label="Main">
+    <div class="navitem"><span style="font-family:var(--font-label);font-weight:600;letter-spacing:.16em;font-size:13px">AMP</span></div>
+    <div class="navsec amp-label">Overview</div>
+    <a class="navitem" href="#">My work <span class="badge">3</span></a>
+    <a class="navitem" href="#">Sessions</a>
+    <a class="navitem" href="#">Projects</a>
+    <a class="navitem" href="#">Day reports</a>
+    <div class="navsec amp-label">Teams</div>
+    <a class="navitem on" href="#">Platform · Requests <span class="badge">12</span></a>
+    <a class="navitem" href="#">Field ops · Requests</a>
+    <div class="navsec amp-label">Organization</div>
+    <a class="navitem" href="#">Teams &amp; orgs</a>
+  </nav>
+
+  <div class="main">
+<!-- ════════════════ VIEW: TEAM INBOX (queue) ════════════════ -->
+    <section data-in="inbox" aria-label="Team inbox">
+      <div class="pagehead">
+        <span class="crumb">Teams / Platform engineering</span>
+        <h1>Requests</h1>
+        <span class="meta">What customers and API clients asked this team for. One shared queue — claiming a request never creates a ticket for anyone.</span>
+        <div class="acts">
+          <button class="amp-btn amp-btn-sm" type="button">Submit access</button>
+          <button class="amp-btn amp-btn-sm amp-btn-primary" type="button">New request</button>
+        </div>
+      </div>
+      <div class="body">
+        <!-- loading -->
+        <div data-show="loading" class="amp-panel" aria-label="Loading requests">
+          <div class="skl-row"><span class="amp-skel" style="width:3px;align-self:stretch"></span><span class="amp-skel" style="width:64px;height:11px"></span><span class="amp-skel" style="width:42%;height:13px"></span><span class="amp-skel" style="width:90px;height:11px;margin-left:auto"></span></div>
+          <div class="skl-row"><span class="amp-skel" style="width:3px;align-self:stretch"></span><span class="amp-skel" style="width:64px;height:11px"></span><span class="amp-skel" style="width:35%;height:13px"></span><span class="amp-skel" style="width:90px;height:11px;margin-left:auto"></span></div>
+          <div class="skl-row"><span class="amp-skel" style="width:3px;align-self:stretch"></span><span class="amp-skel" style="width:64px;height:11px"></span><span class="amp-skel" style="width:48%;height:13px"></span><span class="amp-skel" style="width:90px;height:11px;margin-left:auto"></span></div>
+          <div class="skl-row" style="border-bottom:0"><span class="amp-skel" style="width:3px;align-self:stretch"></span><span class="amp-skel" style="width:64px;height:11px"></span><span class="amp-skel" style="width:30%;height:13px"></span><span class="amp-skel" style="width:90px;height:11px;margin-left:auto"></span></div>
+        </div>
+
+        <!-- error -->
+        <div data-show="error" class="amp-panel" style="padding:28px;display:flex;flex-direction:column;gap:8px;align-items:flex-start">
+          <span class="amp-label" style="color:var(--danger-ink)">Couldn't load the inbox</span>
+          <h2 style="margin:0;font-size:16px;font-weight:600">The request list didn't come back.</h2>
+          <p style="margin:0;font-size:13px;color:var(--ink-2);max-width:56ch">Nothing was changed. This is usually the connection, not the data — try again, and if it keeps happening tell your team lead the error code below.</p>
+          <p style="margin:0;font-family:var(--font-data);font-size:11px;color:var(--ink-3)">GET /teams/9/requests · request.list_unavailable</p>
+          <button class="amp-btn amp-btn-sm amp-btn-primary" type="button" style="margin-top:6px">Retry</button>
+        </div>
+
+        <!-- empty -->
+        <div data-show="empty" class="amp-panel" style="padding:36px 28px;display:flex;flex-direction:column;gap:10px;align-items:flex-start">
+          <span class="amp-label">Team inbox</span>
+          <h2 style="margin:0;font-size:20px;font-weight:600;max-width:34ch">No requests yet. When someone asks Platform engineering for something, it lands here.</h2>
+          <p style="margin:0;font-size:13.5px;color:var(--ink-2);max-width:62ch;line-height:1.5">Requests come from invited customers on the web, or from MCP and API clients with a submit grant on this team. Nothing here can approve a plan or start work — triage decides what becomes planned tickets, and a person still approves each one.</p>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:4px">
+            <button class="amp-btn amp-btn-sm amp-btn-primary" type="button">Invite a requester</button>
+            <button class="amp-btn amp-btn-sm" type="button">See who can submit</button>
+          </div>
+        </div>
+
+        <!-- filled -->
+        <div data-show="filled" style="display:flex;flex-direction:column;gap:12px">
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+            <div style="position:relative;flex:1;min-width:200px">
+              <input class="amp-input" type="text" placeholder="Search requests, refs, requesters…" aria-label="Search requests">
+            </div>
+            <div class="pills" role="group" aria-label="Filter by state">
+              <button class="pill on" aria-pressed="true">All <span class="n">12</span></button>
+              <button class="pill" aria-pressed="false"><span class="dot" style="background:var(--st-ready)"></span>New <span class="n">4</span></button>
+              <button class="pill" aria-pressed="false"><span class="dot" style="background:var(--band-2)"></span>Triaging <span class="n">3</span></button>
+              <button class="pill" aria-pressed="false"><span class="dot" style="background:var(--st-flag)"></span>Needs&nbsp;info <span class="n">2</span></button>
+              <button class="pill" aria-pressed="false"><span class="dot" style="background:var(--st-prog)"></span>In&nbsp;progress <span class="n">2</span></button>
+              <button class="pill" aria-pressed="false"><span class="dot" style="background:var(--success)"></span>Delivered <span class="n">1</span></button>
+            </div>
+            <select class="amp-input" style="width:auto" aria-label="Whose requests to show">
+              <option>Everyone</option><option>Unclaimed</option><option>Claimed by me</option><option>Assigned to me</option>
+            </select>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:8px" role="list" aria-label="Requests">
+            <div class="rq" role="listitem" aria-label="REQ-8F3K2: Export usage report for October, new, unclaimed">
+              <span class="edge" style="background:var(--st-ready)"></span>
+              <div class="inner">
+                <div class="t"><span class="ref">REQ-8F3K2</span><span class="subj">Export usage report for October</span><span class="chip">Northwind</span></div>
+                <div class="meta"><span><span class="k">from</span> m.ortega@northwind.io</span><span><span class="k">via</span> web</span><span>2h ago</span><span>2 attachments</span></div>
+              </div>
+              <div class="sidecol">
+                <span class="sttag"><span class="dot" style="background:var(--st-ready)"></span>New</span>
+                <button class="amp-btn amp-btn-sm amp-btn-primary" type="button">Claim</button>
+              </div>
+            </div>
+
+            <div class="rq" role="listitem" aria-label="REQ-8F3J7: Webhook retries stopped after deploy, new, unclaimed">
+              <span class="edge" style="background:var(--st-ready)"></span>
+              <div class="inner">
+                <div class="t"><span class="ref">REQ-8F3J7</span><span class="subj">Webhook retries stopped after Thursday's deploy</span></div>
+                <div class="meta"><span><span class="k">from</span> connector:github</span><span><span class="k">via</span> api</span><span>3h ago</span></div>
+              </div>
+              <div class="sidecol">
+                <span class="sttag"><span class="dot" style="background:var(--st-ready)"></span>New</span>
+                <button class="amp-btn amp-btn-sm amp-btn-primary" type="button">Claim</button>
+              </div>
+            </div>
+
+            <div class="rq" role="listitem" aria-label="REQ-8F2Q1: SSO group mapping for the Berlin office, triaging, claimed by you">
+              <span class="edge" style="background:var(--band-2)"></span>
+              <div class="inner">
+                <div class="t"><span class="ref">REQ-8F2Q1</span><span class="subj">SSO group mapping for the Berlin office</span><span class="chip">Acme GmbH</span></div>
+                <div class="meta"><span><span class="k">from</span> it-admin@acme.example</span><span><span class="k">via</span> web</span><span>claimed 26h ago</span><span class="chip lock">1 restricted attachment</span></div>
+              </div>
+              <div class="sidecol">
+                <span class="sttag"><span class="dot" style="background:var(--band-2)"></span>Triaging</span>
+                <span class="claimtag"><span class="avatar">JS</span>You</span>
+              </div>
+            </div>
+
+            <div class="rq" role="listitem" aria-label="REQ-8EZX4: Sandbox keys for the staging environment, needs information, claimed by Priya">
+              <span class="edge" style="background:var(--st-flag)"></span>
+              <div class="inner">
+                <div class="t"><span class="ref">REQ-8EZX4</span><span class="subj">Sandbox keys for the staging environment</span></div>
+                <div class="meta"><span><span class="k">from</span> dev@lumenlabs.co</span><span><span class="k">via</span> mcp</span><span>waiting on requester · 1d</span></div>
+              </div>
+              <div class="sidecol">
+                <span class="sttag"><span class="dot" style="background:var(--st-flag)"></span>Needs info</span>
+                <span class="claimtag"><span class="avatar alt">PN</span>Priya</span>
+              </div>
+            </div>
+
+            <div class="rq" role="listitem" aria-label="REQ-8EXM9: Move the invoicing export to the new bucket, in progress, planned as AMP-V2-3711">
+              <span class="edge" style="background:var(--st-prog)"></span>
+              <div class="inner">
+                <div class="t"><span class="ref">REQ-8EXM9</span><span class="subj">Move the invoicing export to the new bucket</span></div>
+                <div class="meta"><span><span class="k">from</span> finance@brightpath.app</span><span><span class="k">via</span> web</span><span>planned as <span class="amp-num">AMP-V2-3711</span></span></div>
+              </div>
+              <div class="sidecol">
+                <span class="sttag"><span class="dot" style="background:var(--st-prog)"></span>In progress</span>
+                <span class="claimtag"><span class="avatar alt">MT</span>Marco</span>
+              </div>
+            </div>
+
+            <div class="rq" role="listitem" aria-label="REQ-8EWB2: Read-only dashboard for Q3 sign-offs, delivered, awaiting requester acceptance">
+              <span class="edge" style="background:var(--success)"></span>
+              <div class="inner">
+                <div class="t"><span class="ref">REQ-8EWB2</span><span class="subj">Read-only dashboard for Q3 sign-offs</span></div>
+                <div class="meta"><span><span class="k">from</span> a.falk@meridian.dk</span><span><span class="k">via</span> web</span><span>delivered 4h ago · awaiting requester</span></div>
+              </div>
+              <div class="sidecol">
+                <span class="sttag"><span class="dot" style="background:var(--success)"></span>Delivered</span>
+                <span class="claimtag"><span class="avatar">JS</span>You</span>
+              </div>
+            </div>
+          </div>
+          <p style="margin:0;font-size:12px;color:var(--ink-3)">12 requests · claims are manual and never expire — the age shows next to the claim, so a stale claim is visible instead of silently dropped.</p>
+        </div>
+      </div>
+    </section>
+<!-- ════════════════ VIEW: REQUEST DETAIL (team side) ════════════════ -->
+    <section data-in="detail" aria-label="Request detail">
+      <div class="pagehead">
+        <span class="crumb">Teams / Platform engineering / Requests</span>
+        <h1 style="font-size:17px">SSO group mapping for the Berlin office</h1>
+        <span class="ref amp-num" style="font-size:11.5px;color:var(--ink-3)">REQ-8F2Q1 · rev 7</span>
+        <div class="acts">
+          <span data-show="filled needsinfo delivered" class="sttag"><span class="dot" style="background:var(--band-2)"></span>Triaging</span>
+          <span data-show="conflict" class="sttag"><span class="dot" style="background:var(--st-flag)"></span>Triaging · conflict</span>
+          <span data-show="rejected" class="sttag"><span class="dot" style="background:var(--st-flag)"></span>Rejected</span>
+          <span data-show="duplicate" class="sttag"><span class="dot" style="background:var(--st-wait)"></span>Duplicate</span>
+        </div>
+      </div>
+      <div class="body">
+
+        <!-- loading / error -->
+        <div data-show="loading" class="detail">
+          <div class="amp-panel sect"><div class="bd"><span class="amp-skel" style="width:55%;height:15px"></span><span class="amp-skel" style="width:92%;height:12px"></span><span class="amp-skel" style="width:80%;height:12px"></span><span class="amp-skel" style="width:38%;height:12px"></span></div></div>
+          <div class="amp-panel sect"><div class="bd"><span class="amp-skel" style="width:40%;height:13px"></span><span class="amp-skel" style="width:70%;height:12px"></span></div></div>
+        </div>
+        <div data-show="error" class="amp-panel" style="padding:28px;display:flex;flex-direction:column;gap:8px;align-items:flex-start">
+          <span class="amp-label" style="color:var(--danger-ink)">Couldn't open this request</span>
+          <h2 style="margin:0;font-size:16px;font-weight:600">REQ-8F2Q1 didn't load.</h2>
+          <p style="margin:0;font-size:13px;color:var(--ink-2);max-width:56ch">If you followed a link from an email, it may be for a team you're not on — requests outside your teams return not-found on purpose, never permission-denied. Nothing was changed.</p>
+          <button class="amp-btn amp-btn-sm amp-btn-primary" type="button" style="margin-top:6px">Retry</button>
+        </div>
+        <div data-show="empty" class="amp-panel" style="padding:28px"><p style="margin:0;font-size:13px;color:var(--ink-2)">Pick a request from the inbox to see it here.</p></div>
+
+        <!-- conflict banner (409 request.conflict) -->
+        <div data-show="conflict" class="banner err" role="alert">
+          <div>
+            <span class="bt">Priya claimed this request 12 seconds ago.</span>
+            Your view was from before that (rev 7 → 8). Claims are first-write-wins — refresh to see her claim, or ask her to hand it over. Nothing you typed was sent.
+            <div style="margin-top:8px;display:flex;gap:8px"><button class="amp-btn amp-btn-sm amp-btn-primary" type="button">Refresh</button><button class="amp-btn amp-btn-sm" type="button">Open history</button></div>
+          </div>
+        </div>
+
+        <div data-show="filled needsinfo conflict rejected duplicate delivered" class="detail">
+          <!-- ── left column: request + discussion ── -->
+          <div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+            <div class="amp-panel sect">
+              <div class="hd"><span class="amp-label">Request</span><span class="amp-num" style="margin-left:auto;font-size:11px;color:var(--ink-3)">submitted Nov 9, 09:41 · source web · immutable</span></div>
+              <div class="bd">
+                <p style="margin:0;font-size:13.5px;line-height:1.55">We're rolling out SSO for the Berlin office (about 40 people). We need the group mapping set up so Berlin users land in the <i>de-ops</i> and <i>de-view</i> groups instead of the default. IdP metadata XML attached. Target: before Nov 21.</p>
+                <div class="kv">
+                  <dt>Requester</dt><dd>it-admin@acme.example <span style="color:var(--ink-3)">(invited customer — Acme GmbH)</span></dd>
+                  <dt>Source</dt><dd>web · external id <span class="amp-num">acme-sso-2026-014</span></dd>
+                  <dt>Reopened</dt><dd>0 times</dd>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:6px">
+                  <span class="amp-label">Attachments · private to this request</span>
+                  <div class="attach"><span class="an">idp-metadata.xml</span><span class="chip">scanned</span><span class="as">41 KB · XML</span><button class="amp-btn amp-btn-sm amp-btn-ghost" type="button">Download</button></div>
+                  <div class="attach"><span class="an">berlin-rollout.exe</span><span class="chip warn">restricted type</span><span class="as">2.1 MB · held</span><button class="amp-btn amp-btn-sm" type="button" disabled title="Only a team lead can release restricted files">Lead release</button></div>
+                </div>
+                <p style="margin:0;font-size:12px;color:var(--ink-3)">Executables and scripts are held for a team lead. Everything is purged 90 days after the request closes unless someone on the team pins it.</p>
+              </div>
+            </div>
+
+            <div class="amp-panel sect" data-show="filled conflict delivered">
+              <div class="hd"><span class="amp-label">Discussion</span><span style="margin-left:auto;font-size:12px;color:var(--ink-3)">internal comments stay internal</span></div>
+              <div class="bd">
+                <div class="comment"><span class="avatar">JS</span><div class="cb"><div class="cm"><b>You</b><span>internal · 1h ago</span></div><div class="ct">Metadata checks out — Berlin users are in the <span class="amp-num">OU=Berlin</span> branch, mapping is straightforward. Want to route this to the AMP v2 project?</div></div></div>
+                <div class="comment"><span class="avatar alt">PN</span><div class="cb"><div class="cm"><b>Priya Nair</b><span>internal · 40m ago</span></div><div class="ct">Yes — but ask which of the two groups should be the default before we plan it.</div></div></div>
+                <div style="display:flex;gap:8px;align-items:flex-start">
+                  <textarea class="amp-input" rows="2" placeholder="Comment — visible to the team only" aria-label="Internal comment"></textarea>
+                  <button class="amp-btn amp-btn-sm amp-btn-primary" type="button">Post</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- needs-information thread -->
+            <div class="amp-panel sect" data-show="needsinfo">
+              <div class="hd"><span class="amp-label">Clarification</span><span class="chip" style="margin-left:auto;border-color:var(--st-flag);color:var(--danger-ink)">needs the requester's answer</span></div>
+              <div class="bd">
+                <div class="quote"><span class="amp-label" style="display:block;margin-bottom:6px;color:var(--danger-ink)">Question to requester · sent 26h ago</span>Which group should be the default for Berlin users — <span class="amp-num">de-ops</span> or <span class="de-view" style="font-family:var(--font-data)">de-view</span>? And should existing Berlin accounts be moved, or only new sign-ins?</div>
+                <p style="margin:0;font-size:12.5px;color:var(--ink-2)">The request stays in <b>Needs information</b> until the requester answers; asking obliges an answer (contract I5). There is no SLA clock on the requester in v1.</p>
+                <div class="comment"><span class="avatar cust">IT</span><div class="cb"><div class="cm"><b>it-admin@acme.example</b><span>requester · hasn't answered yet</span></div><div class="ct" style="color:var(--ink-3)"><i>No answer yet. The requester sees only this question and a plain-language status — never this page.</i></div></div></div>
+              </div>
+            </div>
+
+            <!-- rejected -->
+            <div class="amp-panel sect" data-show="rejected">
+              <div class="hd"><span class="amp-label">Rejected</span><span class="amp-num" style="margin-left:auto;font-size:11px;color:var(--ink-3)">by you · Nov 10, 11:02</span></div>
+              <div class="bd">
+                <div class="quote" style="border-left-color:var(--st-flag)">We don't map IdP groups per office in the hosted tier; this needs the self-hosted directory sync. Pointed the requester at the directory-sync guide.</div>
+                <p style="margin:0;font-size:12.5px;color:var(--ink-2)">A rejection carries a reason and an actor — the requester sees the reason, verbatim. The team can reopen from here; the requester can't.</p>
+                <div><button class="amp-btn amp-btn-sm" type="button">Reopen</button></div>
+              </div>
+            </div>
+
+            <!-- duplicate -->
+            <div class="amp-panel sect" data-show="duplicate">
+              <div class="hd"><span class="amp-label">Duplicate</span><span class="amp-num" style="margin-left:auto;font-size:11px;color:var(--ink-3)">marked by Priya · Nov 10, 10:15</span></div>
+              <div class="bd">
+                <p style="margin:0;font-size:13px">Same rollout as <a href="#" style="color:var(--link)">REQ-8DXT0 — SSO group mapping, Berlin pilot</a>. All follow-up happens on the canonical request; this one stays readable for the requester.</p>
+                <div class="banner info"><div><span class="bt">Canonical is never a duplicate.</span> Reopening this one detaches it (contract D7).</div></div>
+                <div style="display:flex;gap:8px"><button class="amp-btn amp-btn-sm" type="button">Open canonical</button><button class="amp-btn amp-btn-sm amp-btn-ghost" type="button">Reopen this one</button></div>
+              </div>
+            </div>
+
+            <!-- delivered -->
+            <div class="amp-panel sect" data-show="delivered">
+              <div class="hd"><span class="amp-label">Delivery</span><span class="chip" style="margin-left:auto;border-color:var(--success);color:var(--success-ink)">delivered · awaiting requester acceptance</span></div>
+              <div class="bd">
+                <div class="kv">
+                  <dt>Outcome brief</dt><dd>Group mapping for OU=Berlin → de-ops (default) and de-view, live in production. Includes: new sign-ins. Not included: moving the 14 existing Berlin accounts — that needs a data migration, offered as a follow-up request.</dd>
+                </div>
+                <div class="linkrow"><span class="lr-ref">DELIVERED BY</span><span class="lr-t">Artifact #41 — Berlin SSO mapping runbook (v2)</span><span class="lr-s"><span class="arttag ok">approved</span></span></div>
+                <div class="linkrow"><span class="lr-ref">DELIVERED BY</span><span class="lr-t">AMP-V2-3711 — Apply group mapping to prod IdP</span><span class="lr-s"><span class="arttag ok">merged</span></span></div>
+                <p style="margin:0;font-size:12.5px;color:var(--ink-2)">Acceptance belongs to the requester alone (contract I1) — no one on the team, and no agent, can accept on their behalf. The requester can accept or reopen; either way it's recorded.</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- ── right rail: triage ── -->
+          <div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+            <div class="amp-panel sect">
+              <div class="hd"><span class="amp-label">Triage</span></div>
+              <div class="bd">
+                <div class="kv">
+                  <dt>Claim</dt>
+                  <dd data-show="filled needsinfo delivered duplicate rejected"><span class="claimtag"><span class="avatar">JS</span>You · 26h</span> <button class="amp-btn amp-btn-sm amp-btn-ghost" type="button">Release</button></dd>
+                  <dd data-show="conflict"><span class="claimtag"><span class="avatar alt">PN</span>Priya · just now</span></dd>
+                  <dt>Assignee</dt><dd><select class="amp-input" style="padding:4px 8px;font-size:12.5px" aria-label="Assign to a team member"><option>Unassigned</option><option selected>You</option><option>Priya Nair</option><option>Marco Testa</option></select></dd>
+                </div>
+                <p style="margin:0;font-size:12px;color:var(--ink-3)">Claim = who's triaging now (one active, first-write-wins). Assignee = who owns it to delivery. Only a lead can take someone else's claim.</p>
+                <div style="display:flex;gap:8px;flex-wrap:wrap" data-show="filled needsinfo">
+                  <button class="amp-btn amp-btn-sm" type="button">Ask the requester</button>
+                  <button class="amp-btn amp-btn-sm amp-btn-danger" type="button">Reject…</button>
+                  <button class="amp-btn amp-btn-sm amp-btn-ghost" type="button">Mark duplicate…</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="amp-panel sect" data-show="filled needsinfo conflict delivered">
+              <div class="hd"><span class="amp-label">Planning</span><span class="chip" style="margin-left:auto">routes to: AMP v2</span></div>
+              <div class="bd">
+                <div class="linkrow"><span class="lr-ref">PLANNED AS</span><span class="lr-t">AMP-V2-3712 — Berlin SSO group mapping</span><span class="lr-s"><span class="arttag rev">awaiting approval</span></span></div>
+                <div class="linkrow"><span class="lr-ref">RELATES TO</span><span class="lr-t">REQ-8DXT0 — Berlin pilot (field ops)</span><span class="lr-s"></span></div>
+                <div class="banner warn" style="margin-top:4px"><div><span class="bt">Handoff never auto-approves.</span> Plan items created from this request land as tickets awaiting a person's approval — the request text reaches agents as quoted, untrusted data. Nothing here dispatches work.</div></div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                  <button class="amp-btn amp-btn-sm amp-btn-primary" type="button">Create plan items…</button>
+                  <button class="amp-btn amp-btn-sm" type="button">Change project…</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="amp-panel sect" data-show="filled needsinfo conflict">
+              <div class="hd"><span class="amp-label">Deliver</span></div>
+              <div class="bd">
+                <p style="margin:0;font-size:12.5px;color:var(--ink-2)">Delivering needs an outcome brief (what is and isn't included) and at least one delivered link — a ticket, an artifact or a receipt.</p>
+                <button class="amp-btn amp-btn-sm" type="button" disabled title="Add an outcome brief and a delivered link first">Mark delivered</button>
+              </div>
+            </div>
+
+            <div class="amp-panel sect" data-show="filled needsinfo conflict rejected duplicate delivered">
+              <div class="hd"><span class="amp-label">History</span><span class="amp-num" style="margin-left:auto;font-size:11px;color:var(--ink-3)">append-only</span></div>
+              <div class="bd" style="gap:0">
+                <div class="hist">
+                  <div class="h"><span class="ht">11:02</span><span data-show="rejected">You rejected with a reason.</span><span data-show="filled needsinfo conflict duplicate delivered">Priya commented (internal).</span></div>
+                  <div class="h"><span class="ht">10:31</span><span>You asked the requester a question → Needs information.</span></div>
+                  <div class="h"><span class="ht">09:58</span><span>You claimed the request → Triaging.</span></div>
+                  <div class="h"><span class="ht">09:41</span><span>it-admin@acme.example submitted via web (id acme-sso-2026-014).</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+<!-- ════════════════ VIEW: MY WORK (team inbox panel) ════════════════ -->
+    <section data-in="mywork" aria-label="My work with team inbox panel">
+      <div class="pagehead">
+        <span class="crumb">Overview</span>
+        <h1>My work</h1>
+        <span class="meta">A summary across your projects — and the team queues you belong to. Team requests are shared; they never become your personal tickets unless you claim one.</span>
+      </div>
+      <div class="body">
+        <div data-show="loading" class="mw-grid">
+          <div class="amp-panel sect"><div class="bd"><span class="amp-skel" style="width:60%;height:14px"></span><span class="amp-skel" style="width:85%;height:12px"></span><span class="amp-skel" style="width:70%;height:12px"></span></div></div>
+          <div class="amp-panel sect"><div class="bd"><span class="amp-skel" style="width:45%;height:13px"></span><span class="amp-skel" style="width:75%;height:12px"></span></div></div>
+        </div>
+        <div data-show="error" class="amp-panel" style="padding:24px;display:flex;flex-direction:column;gap:8px;align-items:flex-start">
+          <span class="amp-label" style="color:var(--danger-ink)">Couldn't load My work</span>
+          <p style="margin:0;font-size:13px;color:var(--ink-2)">The page will retry on its own; your team queues are unaffected. <button class="amp-btn amp-btn-sm amp-btn-ghost" type="button">Retry now</button></p>
+        </div>
+        <div data-show="empty" class="mw-grid">
+          <div class="amp-panel" style="padding:28px;display:flex;flex-direction:column;gap:8px">
+            <span class="amp-label">Nothing waits on you</span>
+            <h2 style="margin:0;font-size:18px;font-weight:600">No project needs you right now.</h2>
+            <p style="margin:0;font-size:13px;color:var(--ink-2);max-width:56ch">Approvals, questions, merges and your own tickets appear here, grouped by project.</p>
+          </div>
+          <div class="amp-panel">
+            <div class="panel-hd"><span class="amp-label">Team inboxes</span></div>
+            <div class="team-block"><span class="amp-label">Platform engineering</span><p style="margin:0;font-size:13px;color:var(--ink-2)">No requests waiting. The shared queue is empty — nothing to triage.</p></div>
+          </div>
+        </div>
+
+        <div data-show="filled" class="mw-grid">
+          <div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+            <div class="amp-panel amp-panel-top">
+              <div class="readouts" aria-label="Waiting on you">
+                <div style="background:var(--st-flag);color:#fff"><span class="amp-label" style="color:#fff">Waiting on you</span><span class="v">3</span><span style="font-size:11.5px">in 2 projects</span></div>
+                <div><span class="amp-label">Approve</span><span class="v">1</span><span style="font-size:11.5px;color:var(--ink-2)">plan</span></div>
+                <div><span class="amp-label">Answer</span><span class="v">1</span><span style="font-size:11.5px;color:var(--ink-2)">question</span></div>
+                <div><span class="amp-label">Merge</span><span class="v">1</span><span style="font-size:11.5px;color:var(--ink-2)">PR</span></div>
+              </div>
+            </div>
+            <div class="amp-panel">
+              <div class="panel-hd"><span class="amp-label">By project · most waiting first</span></div>
+              <div class="claimed-row"><span class="amp-num" style="font-size:10.5px;color:var(--ink-3);width:64px">AMP-V2</span><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">AMP v2</span><span style="margin-left:auto;font-size:12px;color:var(--ink-2)">1 plan to approve · 1 question</span></div>
+              <div class="claimed-row"><span class="amp-num" style="font-size:10.5px;color:var(--ink-3);width:64px">NWC</span><span>Northwind Commerce</span><span style="margin-left:auto;font-size:12px;color:var(--ink-2)">1 PR to merge</span></div>
+            </div>
+            <div class="amp-panel">
+              <div class="panel-hd"><span class="amp-label">Claimed by me · team requests</span><span class="r">2 claimed · claims never expire</span></div>
+              <div class="claimed-row"><span class="edge" style="width:3px;align-self:stretch;background:var(--band-2)"></span><span class="amp-num" style="font-size:11px;color:var(--ink-3)">REQ-8F2Q1</span><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">SSO group mapping for the Berlin office</span><span style="margin-left:auto;font-size:12px;color:var(--ink-2)">triaging · 26h</span></div>
+              <div class="claimed-row"><span class="edge" style="width:3px;align-self:stretch;background:var(--success)"></span><span class="amp-num" style="font-size:11px;color:var(--ink-3)">REQ-8EWB2</span><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Read-only dashboard for Q3 sign-offs</span><span style="margin-left:auto;font-size:12px;color:var(--ink-2)">delivered · awaiting requester</span></div>
+            </div>
+          </div>
+          <aside style="display:flex;flex-direction:column;gap:16px;min-width:0">
+            <!-- THE NEW PANEL: shared team inbox, deliberately not "your" tickets -->
+            <div class="amp-panel">
+              <div class="panel-hd"><span class="amp-label">Team inboxes</span><span class="r">shared queues, not your tickets</span></div>
+              <div class="team-block">
+                <div style="display:flex;align-items:baseline;gap:8px"><b style="font-size:13.5px">Platform engineering</b><a href="#" style="margin-left:auto;font-size:12.5px;color:var(--link)">Open inbox ›</a></div>
+                <div class="team-counts"><span><b>4</b> new</span><span><b>3</b> triaging</span><span style="color:var(--danger-ink)"><b>2</b> need info</span><span><b>2</b> in progress</span></div>
+                <p style="margin:0;font-size:12px;color:var(--ink-3)">4 unclaimed — anyone on the team can take one.</p>
+              </div>
+              <div class="team-block">
+                <div style="display:flex;align-items:baseline;gap:8px"><b style="font-size:13.5px">Field ops</b><a href="#" style="margin-left:auto;font-size:12.5px;color:var(--link)">Open inbox ›</a></div>
+                <div class="team-counts"><span><b>1</b> new</span><span><b>1</b> triaging</span></div>
+              </div>
+            </div>
+            <div class="amp-panel">
+              <div class="panel-hd"><span class="amp-label">Your agents</span><span class="r">2 running</span></div>
+              <div class="claimed-row"><span class="amp-num" style="font-size:12px;color:var(--st-prog)">2</span><span>AMP v2</span><span style="margin-left:auto"></span></div>
+            </div>
+            <div class="amp-panel">
+              <div class="panel-hd"><span class="amp-label">Done in the last 24h</span><span class="r">5</span></div>
+              <p style="margin:0;padding:10px 14px;font-size:13px;color:var(--ink-2)">5 tickets by you and your agents.</p>
+            </div>
+            <p style="margin:0;font-size:12px;line-height:1.5;color:var(--ink-3)">A request shows in "Claimed by me" only after you claim it. Team counts are the whole queue — nothing here files a personal ticket for every member.</p>
+          </aside>
+        </div>
+      </div>
+    </section>
+<!-- ════════════════ VIEW: EDGE STATES SHEET ════════════════ -->
+    <section data-in="edge" aria-label="Edge states">
+      <div class="pagehead">
+        <span class="crumb">Teams / Platform engineering / Requests</span>
+        <h1>Edge states</h1>
+        <span class="meta">The awkward cases, in one sheet: attachment upload pipeline, restricted files, invite-pending requester, permission denial, and the narrow-viewport layout.</span>
+      </div>
+      <div class="body">
+        <div data-show="loading" class="amp-panel sect"><div class="bd"><span class="amp-skel" style="width:50%;height:14px"></span><span class="amp-skel" style="width:80%;height:12px"></span></div></div>
+        <div data-show="error empty" class="amp-panel" style="padding:24px"><p style="margin:0;font-size:13px;color:var(--ink-2)">Edge states are illustrative; switch to Filled.</p></div>
+        <div data-show="filled needsinfo conflict rejected duplicate delivered" class="edge-grid">
+
+          <div class="amp-panel edge-card">
+            <div class="cap amp-label">Attachment upload (submit form)</div>
+            <div class="bd">
+              <div class="attach"><span class="an">idp-metadata.xml</span><span class="chip">scanned</span><span class="as">41 KB</span></div>
+              <div class="attach"><span class="an">screenshot-login.png</span><span class="chip" style="border-color:var(--st-prog);color:var(--link)">uploading… 62%</span><span class="as">1.8 MB</span></div>
+              <div class="attach" style="border-color:var(--danger)"><span class="an">logs-bundle.zip</span><span class="chip" style="border-color:var(--danger);color:var(--danger-ink)">failed · over 25 MB</span><span class="as">38 MB</span><button class="amp-btn amp-btn-sm amp-btn-ghost" type="button">Remove</button></div>
+              <p style="margin:0;font-size:12px;color:var(--ink-3)">Per-file limit 25 MB, 5 files, 60 MB total. The stored type is sniffed server-side, never the client's word.</p>
+            </div>
+          </div>
+
+          <div class="amp-panel edge-card">
+            <div class="cap amp-label">Restricted attachment (team view)</div>
+            <div class="bd">
+              <div class="attach"><span class="an">berlin-rollout.exe</span><span class="chip warn">restricted type</span><span class="as">held</span></div>
+              <p style="margin:0;font-size:12.5px;color:var(--ink-2)">Executables, scripts and archives of them are held. A team lead can release after checking; the release is audited. Scan state gates every download.</p>
+              <div><button class="amp-btn amp-btn-sm" type="button" disabled>Release (lead only)</button> <button class="amp-btn amp-btn-sm amp-btn-ghost" type="button">Ask for a different format</button></div>
+            </div>
+          </div>
+
+          <div class="amp-panel edge-card">
+            <div class="cap amp-label">Invited, not signed in yet (requester)</div>
+            <div class="bd" style="text-align:left">
+              <span class="amp-label">You're invited</span>
+              <h3 style="margin:0;font-size:16px;font-weight:600">Platform engineering invited you to submit requests.</h3>
+              <p style="margin:0;font-size:13px;color:var(--ink-2);line-height:1.5">Sign in with it-admin@acme.example to send and follow your requests. You'll see your own requests only — never the team's queue or any project.</p>
+              <div><button class="amp-btn amp-btn-sm amp-btn-primary" type="button">Sign in to continue</button></div>
+            </div>
+          </div>
+
+          <div class="amp-panel edge-card">
+            <div class="cap amp-label">Not your request (requester, 404 not 403)</div>
+            <div class="bd">
+              <span class="amp-label" style="color:var(--danger-ink)">Not found</span>
+              <h3 style="margin:0;font-size:16px;font-weight:600">This link doesn't open anything.</h3>
+              <p style="margin:0;font-size:13px;color:var(--ink-2);line-height:1.5">Request links are unguessable and personal. If you expected a request here, ask the team to re-share it from the request page. We don't say whether it exists — that's deliberate.</p>
+            </div>
+          </div>
+
+          <div class="amp-panel edge-card">
+            <div class="cap amp-label">No submit access (customer, grant revoked)</div>
+            <div class="bd">
+              <span class="amp-label">Submit access revoked</span>
+              <p style="margin:0;font-size:13px;color:var(--ink-2);line-height:1.5">Your grant to submit to Platform engineering was revoked on Nov 8. Requests you already sent stay readable; new ones need the team lead to re-grant access.</p>
+              <div><button class="amp-btn amp-btn-sm" type="button">My requests</button> <button class="amp-btn amp-btn-sm amp-btn-ghost" type="button">Contact the team</button></div>
+            </div>
+          </div>
+
+          <div class="amp-panel edge-card">
+            <div class="cap amp-label">Long content + keyset paging</div>
+            <div class="bd">
+              <div class="rq" style="cursor:default"><span class="edge" style="background:var(--st-ready)"></span><div class="inner"><div class="t"><span class="ref">REQ-8E9P0</span><span class="subj">Quarterly access recertification export for the Frankfurt, Berlin and Munich offices incl. service accounts</span></div><div class="meta"><span><span class="k">from</span> compliance@acme.example</span><span>5d ago</span></div></div></div>
+              <p style="margin:0;font-size:12px;color:var(--ink-3)">Long subjects truncate with the full text on hover/focus. The list pages by cursor — no page numbers to drift under new arrivals.</p>
+              <div><button class="amp-btn amp-btn-sm" type="button">Older requests ›</button></div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </section>
+</div>
+</div>
+<script>
+(function(){
+  const body=document.body;
+  const viewBtns=[...document.querySelectorAll('[data-setview]')];
+  const stateBtns=[...document.querySelectorAll('[data-setstate]')];
+  const themeBtns=[...document.querySelectorAll('[data-settheme]')];
+  // Deep link for review/screenshots: ?view=mywork&state=filled
+  const qp=new URLSearchParams(location.search);
+  if(qp.get('view')) body.dataset.view=qp.get('view');
+  if(qp.get('state')) body.dataset.state=qp.get('state');
+  function refresh(){
+    viewBtns.forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.setview===body.dataset.view)));
+    stateBtns.forEach(b=>{
+      const only=b.dataset.only;
+      const hidden=only && only!==body.dataset.view;
+      b.style.display=hidden?'none':'';
+      b.setAttribute('aria-pressed',String(b.dataset.setstate===body.dataset.state));
+    });
+    themeBtns.forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.settheme===document.documentElement.dataset.theme)));
+  }
+  viewBtns.forEach(b=>b.addEventListener('click',()=>{body.dataset.view=b.dataset.setview;
+    const only=b.dataset.setview==='detail'?'filled':'filled';
+    const cur=[...stateBtns].find(s=>s.dataset.setstate===body.dataset.state);
+    if(cur && cur.dataset.only && cur.dataset.only!==body.dataset.view){body.dataset.state='filled'}
+    refresh();}));
+  stateBtns.forEach(b=>b.addEventListener('click',()=>{body.dataset.state=b.dataset.setstate;refresh();}));
+  themeBtns.forEach(b=>b.addEventListener('click',()=>{document.documentElement.dataset.theme=b.dataset.settheme;refresh();}));
+  refresh();
+})();
+</script>
+</body>
+</html>
