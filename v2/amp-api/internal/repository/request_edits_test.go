@@ -226,24 +226,23 @@ func TestUpdateRequestStaleRevConflicts(t *testing.T) {
 		t.Errorf("stale edit returned a row (%v); want nil so the caller cannot mistake it for success", conflicting)
 	}
 
-	// The conflict is the F2 slice's 409-with-current-record: it carries the row.
+	// The conflict is the F2 slice's 409-with-current-revision: the shared
+	// RequestRevConflict carries the rev the row is actually at, so a client can
+	// retry with the right If-Match without a second round trip.
 	var revErr *RequestRevConflict
 	if !errors.As(err, &revErr) {
 		t.Fatalf("stale edit error = %T %v, want *RequestRevConflict", err, err)
 	}
-	if revErr.Expected != 1 || revErr.Current == nil || revErr.Current.Rev != 2 {
-		t.Errorf("conflict = {expected %d, current %v}, want {expected 1, current rev 2}",
+	if revErr.Expected != 1 || revErr.Current != 2 {
+		t.Errorf("conflict = {expected %d, current %d}, want {expected 1, current 2}",
 			revErr.Expected, revErr.Current)
 	}
-	if revErr.Current.Subject != first {
-		t.Errorf("conflict's current record subject = %q, want the winner's %q", revErr.Current.Subject, first)
+	if revErr.Current != current.Rev {
+		t.Errorf("conflict current rev = %d, want the winner's %d", revErr.Current, current.Rev)
 	}
-	// The conflict's row is a snapshot of what is stored, not the rejected payload.
-	if strings.Contains(revErr.Current.Subject, stale) {
-		t.Error("conflict's current record carries the rejected payload")
-	}
-	if revErr.Current.Rev != current.Rev {
-		t.Errorf("conflict current rev = %d, want the winner's %d", revErr.Current.Rev, current.Rev)
+	// The message tells the caller to reload rather than reporting a bare number.
+	if !strings.Contains(revErr.Error(), "reload") {
+		t.Errorf("conflict message %q does not tell the caller what to do", revErr.Error())
 	}
 
 	// Nothing the loser sent landed, and the winner's value is intact on disk.
@@ -268,12 +267,12 @@ func TestUpdateRequestStaleRevConflicts(t *testing.T) {
 // have moved exactly once, and the stored text must be a whole value from the
 // winner (never interleaved or partially applied).
 //
-// It also pins what the row lock buys, which the WHERE predicate alone does not:
-// each loser's conflict must carry the CURRENT row (rev 2, the winner's text),
-// not the rev-1 row the loser read before it blocked. Without FOR UPDATE every
-// loser would report "the row is at rev 1" — the revision it already knew — and a
-// client retrying on that number would loop forever. That assertion is what makes
-// this test fail when the lock is removed.
+// It also pins that every loser is told the CURRENT revision (rev 2), never the
+// stale one it read: a client retrying on the number it already had would loop.
+// Note what this test alone does NOT prove: with goroutines starting together the
+// winner often commits before the losers read, so they conflict from an honest
+// post-commit read and the lock never has to block anything. The lock itself is
+// proved deterministically by TestUpdateRequestBlocksOnAHeldRowLock.
 func TestUpdateRequestConcurrentEditorsOneWinner(t *testing.T) {
 	f := newRequestRowsFixture(t)
 	req := f.newEditableRequest(nil)
@@ -316,19 +315,14 @@ func TestUpdateRequestConcurrentEditorsOneWinner(t *testing.T) {
 	if len(losers) != editors-1 {
 		t.Fatalf("%d conflicts, want %d", len(losers), editors-1)
 	}
-	// Every loser was told the truth about where the row actually is.
+	// Every loser was told the truth about where the row actually is. (The winner's
+	// text is checked against the re-read below; the conflict carries the revision,
+	// not a copy of the row, so that one error shape serves a claim race and a
+	// stale edit alike.)
 	for i, conflict := range losers {
-		if conflict.Current == nil {
-			t.Errorf("loser %d's conflict carries no current row", i)
-			continue
-		}
-		if conflict.Current.Rev != req.Rev+1 {
-			t.Errorf("loser %d's conflict says the row is at rev %d, want %d (the winner's): without the lock the loser reports the stale revision it already had",
-				i, conflict.Current.Rev, req.Rev+1)
-		}
-		if conflict.Current.Subject != winners[0] {
-			t.Errorf("loser %d's conflict carries subject %q, want the winner's %q",
-				i, conflict.Current.Subject, winners[0])
+		if conflict.Current != req.Rev+1 {
+			t.Errorf("loser %d's conflict says the row is at rev %d, want %d (the winner's): a loser reporting the stale revision it already had would make a client loop",
+				i, conflict.Current, req.Rev+1)
 		}
 	}
 
@@ -870,14 +864,11 @@ func TestUpdateRequestBlocksOnAHeldRowLock(t *testing.T) {
 		}
 		var conflict *RequestRevConflict
 		if !errors.As(err, &conflict) {
-			t.Fatalf("error %T does not carry the current row", err)
+			t.Fatalf("error %T does not carry the current revision", err)
 		}
-		if conflict.Current == nil || conflict.Current.Rev != req.Rev+1 {
-			t.Errorf("conflict current = %v, want rev %d", conflict.Current, req.Rev+1)
-		}
-		if conflict.Current != nil && conflict.Current.Subject != holderSubject {
-			t.Errorf("conflict current subject = %q, want the holder's %q",
-				conflict.Current.Subject, holderSubject)
+		if conflict.Current != req.Rev+1 {
+			t.Errorf("conflict current rev = %d, want the holder's %d (the committed revision, not the one the blocked edit read)",
+				conflict.Current, req.Rev+1)
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("the blocked edit never returned after the lock was released")

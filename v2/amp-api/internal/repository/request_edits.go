@@ -85,25 +85,12 @@ func (e RequestEdit) Empty() bool {
 	return e.Subject == nil && e.InputBrief == nil && e.OutcomeBrief == nil && len(e.Metadata) == 0
 }
 
-// RequestRevConflict is a versioned edit refused because the row had moved on.
-// It matches ErrConflict, so authz.StatusOf answers 409 without the service
-// knowing this type, and it carries the request as it actually stands — which is
-// what the REST/MCP slices need to answer "409 with the code and current record"
-// instead of making the caller re-read in a second round trip.
-type RequestRevConflict struct {
-	RequestID int
-	Expected  int
-	Current   *domain.TeamRequest
-}
-
-func (e *RequestRevConflict) Error() string {
-	return fmt.Sprintf("request %d is at rev %d, not %d", e.RequestID, e.Current.Rev, e.Expected)
-}
-
-// Is makes errors.Is(err, ErrConflict) true, so a stale revision takes the same
-// 409 path as every other conflict in the repository without a second error
-// vocabulary at the service boundary.
-func (e *RequestRevConflict) Is(target error) bool { return target == ErrConflict }
+// A stale revision is reported with the repository's shared RequestRevConflict
+// (request_claims.go, slice C2): the same type answers a lost claim and a stale
+// edit because both are the same refusal — "this row changed since you read it" —
+// and one error shape means the service and REST layers map it once. Its Current
+// is the revision the row is actually at, which is what this slice's contract
+// promises and what a client needs to retry with the right If-Match.
 
 // RequestEditActor is who made an edit, for the note the edit writes. Name is
 // the display snapshot that keeps the row readable after the account is deleted
@@ -186,7 +173,7 @@ func (r *Repo) UpdateRequest(ctx context.Context, requestID, orgID, teamID, expe
 		return nil, false, fmt.Errorf("update request %d: lock request: %w", requestID, err)
 	}
 	if current.Rev != expectedRev {
-		return nil, false, &RequestRevConflict{RequestID: requestID, Expected: expectedRev, Current: current}
+		return nil, false, &RequestRevConflict{RequestID: requestID, Expected: expectedRev, Current: current.Rev}
 	}
 
 	// Validate and normalise before writing: a rejected field never bumps the
@@ -225,7 +212,7 @@ func (r *Repo) UpdateRequest(ctx context.Context, requestID, orgID, teamID, expe
 		// revision moved between the lock and the write in a way this transaction
 		// cannot see (a deferred/autonomous writer). Report it as the conflict it is:
 		// a 404 would tell the caller their request does not exist when it does.
-		return nil, false, &RequestRevConflict{RequestID: requestID, Expected: expectedRev, Current: current}
+		return nil, false, &RequestRevConflict{RequestID: requestID, Expected: expectedRev, Current: current.Rev}
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("update request %d: %w", requestID, err)
