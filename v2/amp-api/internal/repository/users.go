@@ -133,6 +133,19 @@ func (r *Repo) ProvisionUserFromClaims(ctx context.Context, subject, email, disp
 	return u, pv, nil
 }
 
+// firstSignInKindSQL is the kind a *new* user row gets: a customer when this
+// email has a pending requester invitation (#3767), a person otherwise.
+//
+// It only ever decides a row that does not exist yet. The ON CONFLICT (subject)
+// arm above deliberately does not touch kind, so a returning account — a
+// person, an agent, or an existing team member — keeps whatever kind it had: an
+// explicit requester invitation can provision a new customer identity, it can
+// never convert or demote an existing one.
+const firstSignInKindSQL = `CASE WHEN EXISTS (
+		 SELECT 1 FROM invites
+		 WHERE lower(email) = lower($2) AND accepted_at IS NULL AND kind = '` + domain.InviteKindRequester + `')
+	 THEN '` + domain.UserKindCustomer + `' ELSE '` + domain.UserKindHuman + `' END`
+
 func (r *Repo) upsertUserFromClaims(ctx context.Context, subject, email, displayName string, bootstrapAdmins map[string]bool, pv *Provisioned) (*domain.User, error) {
 	if email == "" {
 		return nil, EmptyEmailClaimError
@@ -154,8 +167,8 @@ func (r *Repo) upsertUserFromClaims(ctx context.Context, subject, email, display
 
 	u := &domain.User{}
 	err := r.db.QueryRow(ctx,
-		`INSERT INTO users (subject, email, display_name)
-		 VALUES ($1, $2, $3)
+		`INSERT INTO users (subject, email, display_name, kind)
+		 VALUES ($1, $2, $3, `+firstSignInKindSQL+`)
 		 ON CONFLICT (subject) DO UPDATE SET
 		   email = EXCLUDED.email,
 		   display_name = CASE WHEN EXCLUDED.display_name != '' THEN EXCLUDED.display_name ELSE users.display_name END,
@@ -181,6 +194,12 @@ func (r *Repo) upsertUserFromClaims(ctx context.Context, subject, email, display
 // presents an email that already belongs to an existing user row. We update
 // that row's subject (and display name if provided) so the provisioning
 // succeeds, then continue with the normal role-granting flow.
+//
+// It takes over a person's or a customer's row (a requester whose Dex identity
+// was recreated with a new subject is the same requester, and #3767 provisions
+// customers through this account path: refusing them here would lock a
+// customer out of their own requests permanently). An agent account and the
+// Local Dev user are never taken over, which is the rule #124 established.
 func (r *Repo) updateExistingUserByEmail(ctx context.Context, subject, email, displayName string, bootstrapAdmins map[string]bool, pv *Provisioned) (*domain.User, error) {
 	u := &domain.User{}
 	err := r.db.QueryRow(ctx,
@@ -188,7 +207,7 @@ func (r *Repo) updateExistingUserByEmail(ctx context.Context, subject, email, di
 		 SET subject = $1,
 		     display_name = CASE WHEN $3 != '' THEN $3 ELSE display_name END,
 		     last_seen_at = NOW()
-		 WHERE email = $2 AND kind = 'human' AND subject <> '`+LocalDevSubject+`'
+		 WHERE email = $2 AND kind IN ('`+domain.UserKindHuman+`', '`+domain.UserKindCustomer+`') AND subject <> '`+LocalDevSubject+`'
 		 RETURNING `+userCols,
 		subject, email, displayName,
 	).Scan(userDest(u)...)

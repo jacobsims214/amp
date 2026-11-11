@@ -619,23 +619,31 @@ func (r *Repo) setOwners(ctx context.Context, stmt string, id int, userIDs []int
 
 // ---- Invites ----
 
-const inviteCols = `id, email, org_id, org_role, team_id, team_role, invited_by, created_at, accepted_at`
+const inviteCols = `id, email, org_id, org_role, team_id, team_role, invited_by, created_at, accepted_at, kind`
 
 func scanInvite(row rowScanner, i *domain.Invite) error {
-	return row.Scan(&i.ID, &i.Email, &i.OrgID, &i.OrgRole, &i.TeamID, &i.TeamRole, &i.InvitedBy, &i.CreatedAt, &i.AcceptedAt)
+	return row.Scan(&i.ID, &i.Email, &i.OrgID, &i.OrgRole, &i.TeamID, &i.TeamRole, &i.InvitedBy, &i.CreatedAt, &i.AcceptedAt, &i.Kind)
 }
 
-// CreateInvite records a pending membership for an email that has never
-// signed in. Re-inviting the same email to the same org/team updates the roles.
+// CreateInvite records a pending invitation for an email that has never
+// signed in. Re-inviting the same email to the same org/team updates the
+// roles *and the kind*, so the last invitation is what the person's first
+// sign-in acts on: a replay replaces the pending intent instead of adding a
+// second pending row (idx_invites_pending), and nothing accumulates.
 func (r *Repo) CreateInvite(ctx context.Context, inv domain.Invite) (*domain.Invite, error) {
+	kind, err := domain.NormalizeInviteKind(inv.Kind)
+	if err != nil {
+		return nil, err
+	}
 	out := &domain.Invite{}
-	err := scanInvite(r.db.QueryRow(ctx, `
-		INSERT INTO invites (email, org_id, org_role, team_id, team_role, invited_by)
-		VALUES (lower(trim($1)), $2, $3, $4, $5, $6)
+	err = scanInvite(r.db.QueryRow(ctx, `
+		INSERT INTO invites (email, org_id, org_role, team_id, team_role, invited_by, kind)
+		VALUES (lower(trim($1)), $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (lower(email), org_id, COALESCE(team_id, 0)) WHERE accepted_at IS NULL
-		DO UPDATE SET org_role = EXCLUDED.org_role, team_role = EXCLUDED.team_role, invited_by = EXCLUDED.invited_by
+		DO UPDATE SET org_role = EXCLUDED.org_role, team_role = EXCLUDED.team_role, invited_by = EXCLUDED.invited_by,
+		              kind = EXCLUDED.kind
 		RETURNING `+inviteCols,
-		inv.Email, inv.OrgID, inv.OrgRole, inv.TeamID, inv.TeamRole, inv.InvitedBy), out)
+		inv.Email, inv.OrgID, inv.OrgRole, inv.TeamID, inv.TeamRole, inv.InvitedBy, kind), out)
 	return out, err
 }
 
@@ -669,8 +677,19 @@ func (r *Repo) AcceptInvites(ctx context.Context, userID int, email string) (int
 	return len(accepted), err
 }
 
-// AcceptInvitesList is AcceptInvites returning the invites it accepted
-// (each grants its org role, and its team role when it names a team).
+// AcceptInvitesList is AcceptInvites returning the invites it accepted.
+//
+// A membership invite grants its org role, and its team role when it names a
+// team. A requester invite (#3767) grants *no membership at all*: it only
+// records that the person accepted, because the customer identity it
+// provisioned must reach no project by implication. Team submit access is a
+// separate revocable grant (#3768), never a consequence of accepting.
+//
+// Two things are refused and left pending, so the person who wrote the
+// invitation fixes it rather than getting a silent surprise:
+//   - an org owner/admin role for a customer account (#3766);
+//   - team membership for a customer account, since team membership is how a
+//     person reaches a project through `AccessibleProjectIDs`.
 func (r *Repo) AcceptInvitesList(ctx context.Context, userID int, email string) ([]domain.Invite, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
@@ -685,6 +704,10 @@ func (r *Repo) AcceptInvitesList(ctx context.Context, userID int, email string) 
 	if err != nil {
 		return nil, err
 	}
+	kind, err := customerKind(ctx, tx, userID)
+	if err != nil {
+		return nil, err
+	}
 	for _, inv := range pending {
 		// An invite that names an org owner/admin role is a grant path like any
 		// other: a customer account can't accept one (#3766,
@@ -694,21 +717,27 @@ func (r *Repo) AcceptInvitesList(ctx context.Context, userID int, email string) 
 		if err := guardCustomerOrgRole(ctx, tx, userID, inv.OrgRole); err != nil {
 			return nil, fmt.Errorf("invite %d: %w", inv.ID, err)
 		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, $3)
-			ON CONFLICT (org_id, user_id) DO UPDATE SET role = CASE
-			  WHEN org_members.role = 'owner' OR EXCLUDED.role = 'owner' THEN 'owner'
-			  WHEN org_members.role = 'admin' OR EXCLUDED.role = 'admin' THEN 'admin'
-			  ELSE 'member' END`, inv.OrgID, userID, inv.OrgRole); err != nil {
-			return nil, err
-		}
-		if inv.TeamID != nil {
+		if !inv.IsRequester() {
+			if kind && inv.TeamID != nil {
+				return nil, fmt.Errorf("invite %d: %w", inv.ID, conflictf(
+					"a customer account can't join a team through an invite: team membership reaches projects, and customers submit requests"))
+			}
 			if _, err := tx.Exec(ctx, `
-				INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, $3)
-				ON CONFLICT (team_id, user_id) DO UPDATE SET role = CASE
-				  WHEN team_members.role = 'lead' OR EXCLUDED.role = 'lead' THEN 'lead' ELSE 'member' END`,
-				*inv.TeamID, userID, inv.TeamRole); err != nil {
+				INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, $3)
+				ON CONFLICT (org_id, user_id) DO UPDATE SET role = CASE
+				  WHEN org_members.role = 'owner' OR EXCLUDED.role = 'owner' THEN 'owner'
+				  WHEN org_members.role = 'admin' OR EXCLUDED.role = 'admin' THEN 'admin'
+				  ELSE 'member' END`, inv.OrgID, userID, inv.OrgRole); err != nil {
 				return nil, err
+			}
+			if inv.TeamID != nil {
+				if _, err := tx.Exec(ctx, `
+					INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, $3)
+					ON CONFLICT (team_id, user_id) DO UPDATE SET role = CASE
+					  WHEN team_members.role = 'lead' OR EXCLUDED.role = 'lead' THEN 'lead' ELSE 'member' END`,
+					*inv.TeamID, userID, inv.TeamRole); err != nil {
+					return nil, err
+				}
 			}
 		}
 		if _, err := tx.Exec(ctx, `UPDATE invites SET accepted_at = NOW(), accepted_user_id = $2 WHERE id = $1`, inv.ID, userID); err != nil {
@@ -719,6 +748,23 @@ func (r *Repo) AcceptInvitesList(ctx context.Context, userID int, email string) 
 		return nil, err
 	}
 	return pending, nil
+}
+
+// customerKind reports whether userID is a customer account, read by primary
+// key inside the caller's transaction so a concurrent kind change cannot slip
+// between the check and the grant.
+func customerKind(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, userID int) (bool, error) {
+	var kind string
+	err := q.QueryRow(ctx, `SELECT kind FROM users WHERE id = $1`, userID).Scan(&kind)
+	if err == pgx.ErrNoRows {
+		return false, fmt.Errorf("user %d: %w", userID, ErrNotFound)
+	}
+	if err != nil {
+		return false, err
+	}
+	return kind == domain.UserKindCustomer, nil
 }
 
 // MoveProjectToOrg sets a project's org. Team links to teams outside the new

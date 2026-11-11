@@ -177,14 +177,16 @@ func (s *Server) Register(mcp *server.MCPServer) {
 
 	mcp.AddTool(tool("amp_manage_invites",
 		"List, create, or revoke pending invites for people who haven't signed in yet. Requires org owner/admin "+
-			"(team leads may invite into their own team).",
+			"(team leads may invite into their own team). kind \"requester\" invites someone to send requests to a team: "+
+			"their first sign-in creates a customer account with no org or project access, and it must name a team.",
 		props{
 			"org_id":    num("REQUIRED. Org ID."),
 			"action":    str("REQUIRED. One of: list, create, revoke."),
-			"email":     str("For create: the person's email."),
-			"org_role":  str("For create: owner, admin, or member (default member)."),
-			"team_id":   num("For create: optional team to join."),
-			"team_role": str("For create: lead or member (default member)."),
+			"email":     str("For create: the person's email. A requester invite needs an email with no AMP account yet."),
+			"kind":      str("For create: member (default) or requester. requester provisions a customer identity with no membership."),
+			"org_role":  str("For create: owner, admin, or member (default member). A requester invite must leave it at member."),
+			"team_id":   num("For create: the team to join, or (requester) the team they can send requests to. Required for requester."),
+			"team_role": str("For create: lead or member (default member). A requester invite must leave it at member."),
 			"invite_id": num("For revoke: invite ID."),
 		}), wrap(ctx, s.open(s.manageInvites)))
 
@@ -3447,7 +3449,7 @@ func (s *Server) manageInvites(rctx context.Context, args map[string]interface{}
 		return jsonResult(map[string]interface{}{"invites": invites})
 	case "create":
 		res, err := s.svc.Invite(rctx, p, domain.Invite{
-			Email: optStr(args, "email", ""), OrgID: orgID,
+			Email: optStr(args, "email", ""), OrgID: orgID, Kind: optStr(args, "kind", ""),
 			OrgRole: optStr(args, "org_role", ""), TeamID: optIntPtr(args, "team_id"), TeamRole: optStr(args, "team_role", ""),
 		})
 		if err != nil {
