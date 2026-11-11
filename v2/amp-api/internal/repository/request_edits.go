@@ -30,20 +30,21 @@ package repository
 // slice keeps that promise: one column list, one scanner, one tenant predicate,
 // so an edit returns exactly the shape every other read returns.
 //
-// WHY THE EDIT'S HISTORY IS A COMMENT AND NOT A request_events ROW. Migration
-// 054 makes request_events.action a closed vocabulary of seven verbs (submit,
-// transition, claim, release, assign, link, unlink) with a CHECK, mirrored by
-// domain.RequestEventActions, and none of them means "the content was edited".
-// Adding a verb needs a migration, and this story designates one migration
-// writer (AMP #3871) so two slices cannot race the next prefix; an edit also
-// must not fake a `transition` with from_state = to_state, which would put a
-// state change that never happened into the team's history rail. So the edit is
-// recorded the way 054 defines for "what a transition or a connector writes on
-// the request's behalf": one append-only request_comments row of kind `system`,
-// in the same transaction as the write, naming the changed fields and the
-// revision it moved from and to — never the text. Follow-up (not this slice):
-// once a migration slot is free, add `edit` to the event vocabulary and move
-// this record there.
+// THE EDIT'S HISTORY IS ONE request_events ROW OF ACTION `edit`. The approved
+// contract says an edit updates the current revision atomically WITH an edit
+// event, and 054's split puts an act in the team's history rail, not in the
+// requester's thread — so the row is appended to request_events in the same
+// transaction as the UPDATE and the rev bump, and no request_comments row is
+// written. Migration 062 widened 054's closed seven-verb CHECK with `edit` and
+// domain.RequestEventActions mirrors it (#3754's rule: DB and domain may not
+// disagree); AMP #3873 shipped a `system` comment only because 061 was the
+// story's sole migration writer and no slot was free.
+//
+// The row carries the actor (display snapshot plus nullable AMP user), empty
+// from_state/to_state (054's request_events_transition_states rule: only a
+// `transition` names states, so an edit can never fake a lifecycle move), and a
+// detail of the changed FIELD NAMES and the revision it moved between — never
+// the brief text, because a request's history is requester-visible.
 
 import (
 	"context"
@@ -218,17 +219,12 @@ func (r *Repo) UpdateRequest(ctx context.Context, requestID, orgID, teamID, expe
 		return nil, false, fmt.Errorf("update request %d: %w", requestID, err)
 	}
 
-	// The edit is recorded in the same transaction as the write, so the history
-	// can never show an edit whose content did not land, or miss one that did.
-	// The note names the fields and the revision transition, never the text: the
-	// thread is readable by the whole team and the requester, so it says that an
-	// edit happened and where, without copying a brief into a second place.
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO request_comments (request_id, kind, body, author, author_user_id)
-		VALUES ($1, $2, $3, $4, $5)`,
-		requestID, string(domain.RequestCommentSystem), editNote(changedFields, expectedRev, next.Rev),
-		by.Name, by.UserID); err != nil {
-		return nil, false, fmt.Errorf("update request %d: record the edit: %w", requestID, err)
+	// The edit event is appended in the same transaction as the write, so the
+	// history can never show an edit whose content did not land, or miss one that
+	// did — and a failed insert rolls the content and the revision back with it.
+	// It names the fields and the revision transition, never the text.
+	if err := insertRequestEditEvent(ctx, tx, updated, by, changedFields, expectedRev, next.Rev); err != nil {
+		return nil, false, fmt.Errorf("update request %d: %w", requestID, err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -374,29 +370,54 @@ func asFloat(v any) (float64, bool) {
 	return 0, false
 }
 
-// editNote is the history line one edit writes: what moved, and the revision it
-// moved from and to.
-func editNote(fields []string, from, to int) string {
-	return fmt.Sprintf("edited %s (rev %d → %d)", joinFieldNames(fields), from, to)
+// editEventDetail is what one edit history row explains: which fields moved (the
+// editable surface's names, or "metadata.<key>") and the revision transition.
+// Field names and numbers only — never a subject or a brief, because a request's
+// history is requester-visible and copying content into it would need its own
+// redaction rule.
+type editEventDetail struct {
+	Fields  []string `json:"fields"`
+	FromRev int      `json:"from_rev"`
+	ToRev   int      `json:"to_rev"`
 }
 
-// joinFieldNames lists changed fields as "a, b and c" so a note with two fields
-// reads like a sentence rather than a dump.
-func joinFieldNames(fields []string) string {
-	switch len(fields) {
-	case 0:
-		return "no fields"
-	case 1:
-		return fields[0]
-	case 2:
-		return fields[0] + " and " + fields[1]
+// insertRequestEditEvent appends the one history row an edit gets (I6) — action
+// `edit`, no states (054's CHECK allows states only on a transition) — in the
+// transaction that made the change. It is its own function rather than a call
+// into request_claims.go's insertRequestEvent because that helper's input is a
+// claim write; this path owns its single event row, the same division
+// request_create.go's submit row follows.
+func insertRequestEditEvent(ctx context.Context, tx pgx.Tx, req *domain.TeamRequest,
+	by RequestEditActor, fields []string, fromRev, toRev int) error {
+	ev := domain.RequestEvent{
+		RequestID:   req.ID,
+		OrgID:       req.OrgID,
+		TeamID:      req.TeamID,
+		Action:      domain.RequestActionEdit,
+		Actor:       by.Name,
+		ActorUserID: by.UserID,
 	}
-	out := ""
-	for i, f := range fields[:len(fields)-1] {
-		if i > 0 {
-			out += ", "
-		}
-		out += f
+	// Validate through the domain so this row cannot be the one place the domain
+	// verb list and 054's CHECK disagree: it refuses an unknown action and any
+	// state on a non-transition before the database would.
+	if err := ev.Validate(); err != nil {
+		return fmt.Errorf("record edit event: %w", err)
 	}
-	return out + " and " + fields[len(fields)-1]
+	if ev.Actor == "" {
+		// History has no anonymous rows (054's actor CHECK); UpdateRequest already
+		// defaults a nameless caller to "system", and this keeps the helper safe.
+		ev.Actor = "system"
+	}
+	var id int64
+	err := tx.QueryRow(ctx, `INSERT INTO request_events
+		(request_id, org_id, team_id, action, from_state, to_state, actor, actor_user_id, detail)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+		ev.RequestID, ev.OrgID, ev.TeamID, string(ev.Action), string(ev.FromStatus), string(ev.ToStatus),
+		ev.Actor, ev.ActorUserID,
+		requestEventDetail(editEventDetail{Fields: fields, FromRev: fromRev, ToRev: toRev}),
+	).Scan(&id)
+	if err != nil {
+		return fmt.Errorf("record edit event for request %d: %w", req.ID, err)
+	}
+	return nil
 }

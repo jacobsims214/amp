@@ -85,7 +85,8 @@ var RequestCommentKinds = []RequestCommentKind{
 
 // RequestEventAction is what one append-only history row records: the submit,
 // one state transition (from/to), a claim or its release, an assignee
-// transfer, and a link or its detach. Every such act writes exactly one row.
+// transfer, a link or its detach, and a versioned content edit. Every such act
+// writes exactly one row.
 type RequestEventAction string
 
 const (
@@ -96,12 +97,19 @@ const (
 	RequestActionAssign     RequestEventAction = "assign"
 	RequestActionLink       RequestEventAction = "link"
 	RequestActionUnlink     RequestEventAction = "unlink"
+	// RequestActionEdit is a versioned content edit (AMP #3873's UpdateRequest,
+	// widened by migration 062). Like every non-transition verb it names no
+	// states; the revision it moved between is in the row's detail.
+	RequestActionEdit RequestEventAction = "edit"
 )
 
-// RequestEventActions are the history actions.
+// RequestEventActions are the history actions. The set mirrors migration 054's
+// request_events_action CHECK as widened by 062: the database and the domain
+// may not disagree about the vocabulary (#3754's rule, restated in 054).
 var RequestEventActions = []RequestEventAction{
 	RequestActionSubmit, RequestActionTransition, RequestActionClaim,
 	RequestActionRelease, RequestActionAssign, RequestActionLink, RequestActionUnlink,
+	RequestActionEdit,
 }
 
 // RequestLinkKind is the durable relation a link row carries: routing a

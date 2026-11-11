@@ -27,11 +27,19 @@ package repository
 // slices from now: another tenant's request is a 404 and not a conflict, a
 // missing tenant is a caller bug, a cancelled context is neither, a no-op edit
 // does not churn the revision, an edit that would break a whole-row invariant is
-// refused without writing, and the history note lands in the same transaction
-// and names the fields without echoing the text.
+// refused without writing, and the edit's history row lands in the same
+// transaction and names the fields without echoing the text.
+//
+// The record shape itself is migration 062's: a current-rev edit appends one
+// request_events row of action `edit` (empty from/to, ids-and-field-names detail)
+// and writes no request_comments row at all, while a failing event insert rolls
+// the content and the revision back with it —
+// TestUpdateRequestRecordsTheEditInHistory and
+// TestUpdateRequestFailedEventInsertRollsBack.
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -128,28 +136,77 @@ func (f *requestRowsFixture) mustEdit(req *domain.TeamRequest, edit RequestEdit)
 	return got
 }
 
-// editNotes returns every `system` comment body on a request, in append order —
-// the history the edit writes.
-func (f *requestRowsFixture) editNotes(requestID int) []string {
+// editEvents returns every `edit` history row on a request, in append order —
+// the history an edit writes. It reads request_events, not request_comments,
+// because that IS the fix: an edit is an act, and acts live in the team's
+// history rail (migration 062's verb).
+func (f *requestRowsFixture) editEvents(requestID int) []domain.RequestEvent {
 	f.t.Helper()
-	rows, err := f.r.db.Query(f.ctx, `SELECT body FROM request_comments
-		WHERE request_id = $1 AND kind = $2 ORDER BY id`, requestID, string(domain.RequestCommentSystem))
+	return f.events(requestID, string(domain.RequestActionEdit))
+}
+
+// events returns a request's history rows of one action, in append order.
+func (f *requestRowsFixture) events(requestID int, action string) []domain.RequestEvent {
+	f.t.Helper()
+	rows, err := f.r.db.Query(f.ctx, `SELECT id, request_id, org_id, team_id, action, from_state, to_state,
+		actor, actor_user_id, detail, created_at
+		FROM request_events WHERE request_id = $1 AND action = $2 ORDER BY id`, requestID, action)
 	if err != nil {
-		f.t.Fatalf("read edit notes for %d: %v", requestID, err)
+		f.t.Fatalf("read %s events for %d: %v", action, requestID, err)
 	}
 	defer rows.Close()
-	out := []string{}
+	out := []domain.RequestEvent{}
 	for rows.Next() {
-		var body string
-		if err := rows.Scan(&body); err != nil {
-			f.t.Fatalf("scan edit note: %v", err)
+		var ev domain.RequestEvent
+		if err := rows.Scan(&ev.ID, &ev.RequestID, &ev.OrgID, &ev.TeamID, &ev.Action,
+			&ev.FromStatus, &ev.ToStatus, &ev.Actor, &ev.ActorUserID, &ev.Detail, &ev.CreatedAt); err != nil {
+			f.t.Fatalf("scan %s event: %v", action, err)
 		}
-		out = append(out, body)
+		out = append(out, ev)
 	}
 	if err := rows.Err(); err != nil {
-		f.t.Fatalf("read edit notes for %d: %v", requestID, err)
+		f.t.Fatalf("read %s events for %d: %v", action, requestID, err)
 	}
 	return out
+}
+
+// eventCount is how many history rows of ANY action a request has, so a test can
+// say "exactly one row was appended" rather than "one row of this verb".
+func (f *requestRowsFixture) eventCount(requestID int) int {
+	f.t.Helper()
+	var n int
+	if err := f.r.db.QueryRow(f.ctx, `SELECT count(*) FROM request_events WHERE request_id = $1`, requestID).Scan(&n); err != nil {
+		f.t.Fatalf("count history for %d: %v", requestID, err)
+	}
+	return n
+}
+
+// commentCount is how many discussion rows (any kind) a request has. An edit must
+// write NONE of them: the record moved to the history rail, and duplicating it
+// into the requester-visible thread is exactly what the approved shape forbids.
+func (f *requestRowsFixture) commentCount(requestID int) int {
+	f.t.Helper()
+	var n int
+	if err := f.r.db.QueryRow(f.ctx, `SELECT count(*) FROM request_comments WHERE request_id = $1`, requestID).Scan(&n); err != nil {
+		f.t.Fatalf("count comments for %d: %v", requestID, err)
+	}
+	return n
+}
+
+// editDetail decodes the single edit event of one edit; it fails the test when the
+// count is not exactly one, so callers can assert on the detail without repeating
+// the count check.
+func (f *requestRowsFixture) editDetail(requestID int) (domain.RequestEvent, editEventDetail) {
+	f.t.Helper()
+	events := f.editEvents(requestID)
+	if len(events) != 1 {
+		f.t.Fatalf("edit events = %d (%v), want exactly one", len(events), events)
+	}
+	var detail editEventDetail
+	if err := json.Unmarshal([]byte(events[0].Detail), &detail); err != nil {
+		f.t.Fatalf("decode edit detail %q: %v", events[0].Detail, err)
+	}
+	return events[0], detail
 }
 
 // TestUpdateRequestCurrentRevEditsAndBumpsOnce is acceptance criterion 1: an edit
@@ -255,9 +312,9 @@ func TestUpdateRequestStaleRevConflicts(t *testing.T) {
 			reread.Rev, reread.Subject, first)
 	}
 
-	// A failed edit writes no history: the note trail shows only the winner.
-	if notes := f.editNotes(req.ID); len(notes) != 1 {
-		t.Errorf("edit notes = %d (%v), want exactly the one successful edit", len(notes), notes)
+	// A failed edit writes no history: the history rail shows only the winner's.
+	if events := f.editEvents(req.ID); len(events) != 1 {
+		t.Errorf("edit events = %d (%v), want exactly the one successful edit", len(events), events)
 	}
 }
 
@@ -337,10 +394,10 @@ func TestUpdateRequestConcurrentEditorsOneWinner(t *testing.T) {
 	if reread.Subject != winners[0] {
 		t.Errorf("stored subject = %q, want the winner's %q", reread.Subject, winners[0])
 	}
-	// One write, one note: a loser's transaction rolled back whole, including its
+	// One write, one event: a loser's transaction rolled back whole, including its
 	// history row.
-	if notes := f.editNotes(req.ID); len(notes) != 1 {
-		t.Errorf("edit notes = %d (%v), want exactly one for one winner", len(notes), notes)
+	if events := f.editEvents(req.ID); len(events) != 1 {
+		t.Errorf("edit events = %d (%v), want exactly one for one winner", len(events), events)
 	}
 }
 
@@ -498,7 +555,7 @@ func TestUpdateRequestTenantScopeIsNotFound(t *testing.T) {
 		})
 	}
 
-	// None of the probes wrote anything, and none wrote a history note.
+	// None of the probes wrote anything, and none wrote a history row.
 	reread, err := f.r.GetRequest(f.ctx, req.ID, req.OrgID, f.team)
 	if err != nil {
 		t.Fatalf("re-read: %v", err)
@@ -506,8 +563,11 @@ func TestUpdateRequestTenantScopeIsNotFound(t *testing.T) {
 	if reread.Rev != req.Rev || reread.Subject != req.Subject {
 		t.Errorf("a refused edit changed the row: rev %d subject %q", reread.Rev, reread.Subject)
 	}
-	if notes := f.editNotes(req.ID); len(notes) != 0 {
-		t.Errorf("refused edits left history notes: %v", notes)
+	if events := f.editEvents(req.ID); len(events) != 0 {
+		t.Errorf("refused edits left history rows: %v", events)
+	}
+	if n := f.commentCount(req.ID); n != 0 {
+		t.Errorf("refused edits left %d discussion rows, want 0", n)
 	}
 }
 
@@ -598,8 +658,11 @@ func TestUpdateRequestNoOpChangesNothing(t *testing.T) {
 		t.Errorf("removing an absent key: err %v changed %v, want a no-op", err, changed)
 	}
 
-	if notes := f.editNotes(req.ID); len(notes) != 0 {
-		t.Errorf("no-op edits left history notes: %v", notes)
+	if events := f.editEvents(req.ID); len(events) != 0 {
+		t.Errorf("no-op edits left history rows: %v", events)
+	}
+	if n := f.commentCount(req.ID); n != 0 {
+		t.Errorf("no-op edits left %d discussion rows, want 0", n)
 	}
 }
 
@@ -697,76 +760,179 @@ func TestUpdateRequestRefusesInvalidAndInvariantBreakingEdits(t *testing.T) {
 	})
 }
 
-// TestUpdateRequestRecordsTheEditInHistory: the edit and its history row land in
-// one transaction (so a reader never sees one without the other), the note names
-// the changed fields and the revision transition, and it never echoes the text.
+// TestUpdateRequestRecordsTheEditInHistory is the acceptance criterion's record
+// shape (approved #3873, migration 062): a current-rev edit writes EXACTLY ONE
+// request_events row of action `edit`, with empty from/to states and a detail of
+// field names and the revision transition only — and NO request_comments row at
+// all. The comment the pre-062 code wrote is gone; an edit is an act, and acts
+// live in the team's history rail.
 func TestUpdateRequestRecordsTheEditInHistory(t *testing.T) {
 	f := newRequestRowsFixture(t)
 	req := f.newEditableRequest(nil)
 
-	secret := "a brief that must not be copied into the thread: SECRET-TOKEN-42"
+	secret := "a brief that must not be copied into the history: SECRET-TOKEN-42"
 	subject := "SSO for the portal"
 	got := f.mustEdit(req, RequestEdit{Subject: &subject, InputBrief: &secret})
-
-	notes := f.editNotes(req.ID)
-	if len(notes) != 1 {
-		t.Fatalf("edit notes = %d (%v), want exactly one", len(notes), notes)
-	}
-	note := notes[0]
-	for _, want := range []string{"subject", "input_brief", "rev 1 → 2"} {
-		if !strings.Contains(note, want) {
-			t.Errorf("note %q does not mention %q", note, want)
-		}
-	}
-	if strings.Contains(note, "SECRET-TOKEN-42") || strings.Contains(note, subject) {
-		t.Errorf("the history note echoes request text: %q", note)
+	if got.Rev != req.Rev+1 {
+		t.Fatalf("rev after the edit = %d, want %d", got.Rev, req.Rev+1)
 	}
 
-	// The note is attributed to the editor, with the account linked.
-	var author string
-	var authorID *int
-	err := f.r.db.QueryRow(f.ctx, `SELECT author, author_user_id FROM request_comments
-		WHERE request_id = $1 AND kind = $2 ORDER BY id DESC LIMIT 1`, req.ID, string(domain.RequestCommentSystem)).
-		Scan(&author, &authorID)
-	if err != nil {
-		t.Fatalf("read the note's attribution: %v", err)
+	// Exactly one history row, of action `edit`. The fixture request was inserted
+	// directly (no submit row), so "one row" is a real count of what the edit did.
+	all := f.events(req.ID, string(domain.RequestActionEdit))
+	if len(all) != 1 {
+		t.Fatalf("edit events = %d (%v), want exactly one", len(all), all)
 	}
-	if author != "desk@edits.test" {
-		t.Errorf("note author = %q, want the editor's display name", author)
+	if n := f.eventCount(req.ID); n != 1 {
+		t.Errorf("request %d has %d history rows after one edit, want 1", req.ID, n)
 	}
-	if authorID == nil || *authorID != f.user {
-		t.Errorf("note author_user_id = %v, want %d", authorID, f.user)
+	ev, detail := f.editDetail(req.ID)
+
+	// A non-transition verb names no states (054's request_events_transition_states
+	// rule): an edit can never fake a lifecycle move.
+	if ev.FromStatus != "" || ev.ToStatus != "" {
+		t.Errorf("edit event carries states %q -> %q, want both empty", ev.FromStatus, ev.ToStatus)
+	}
+	// Tenant columns are copied from the request, not asked of the caller.
+	if ev.OrgID != req.OrgID || ev.TeamID != req.TeamID {
+		t.Errorf("edit event tenant = org %d team %d, want org %d team %d", ev.OrgID, ev.TeamID, req.OrgID, req.TeamID)
+	}
+	// The detail names the changed fields and the revision transition, in a stable
+	// order, and never the text.
+	if strings.Join(detail.Fields, ",") != "subject,input_brief" {
+		t.Errorf("edit event fields = %v, want [subject input_brief]", detail.Fields)
+	}
+	if detail.FromRev != 1 || detail.ToRev != 2 {
+		t.Errorf("edit event revs = %d -> %d, want 1 -> 2", detail.FromRev, detail.ToRev)
+	}
+	if strings.Contains(ev.Detail, "SECRET-TOKEN-42") || strings.Contains(ev.Detail, subject) {
+		t.Errorf("the history row echoes request text: %q", ev.Detail)
 	}
 
-	// A connector-style editor with no AMP user is still attributable by name.
+	// The edit wrote no comment: the requester-visible thread stays empty, because
+	// duplicating an act into it is exactly what the approved shape drops.
+	if n := f.commentCount(req.ID); n != 0 {
+		t.Errorf("an edit wrote %d request_comments rows, want 0", n)
+	}
+
+	// The row is attributed to the editor, with the account linked.
+	if ev.Actor != "desk@edits.test" {
+		t.Errorf("edit event actor = %q, want the editor's display name", ev.Actor)
+	}
+	if ev.ActorUserID == nil || *ev.ActorUserID != f.user {
+		t.Errorf("edit event actor_user_id = %v, want %d", ev.ActorUserID, f.user)
+	}
+
+	// A connector-style editor with no AMP user is still attributable by name, and
+	// a second edit appends a second row (append-only: never an update in place).
 	second := "SSO for the portal, corrected"
 	if _, _, err := f.r.UpdateRequest(f.ctx, req.ID, req.OrgID, f.team, got.Rev,
 		RequestEdit{Subject: &second}, RequestEditActor{Name: "github-connector"}); err != nil {
 		t.Fatalf("connector edit: %v", err)
 	}
-	notes = f.editNotes(req.ID)
-	if len(notes) != 2 {
-		t.Fatalf("edit notes = %d (%v), want two", len(notes), notes)
+	events := f.editEvents(req.ID)
+	if len(events) != 2 {
+		t.Fatalf("edit events = %d (%v), want two", len(events), events)
 	}
-	var nullAuthor *int
-	if err := f.r.db.QueryRow(f.ctx, `SELECT author_user_id FROM request_comments
-		WHERE request_id = $1 AND kind = $2 ORDER BY id DESC LIMIT 1`, req.ID, string(domain.RequestCommentSystem)).
-		Scan(&nullAuthor); err != nil {
-		t.Fatalf("read the connector note: %v", err)
+	if events[1].ActorUserID != nil {
+		t.Errorf("connector edit actor_user_id = %v, want nil (no AMP user)", *events[1].ActorUserID)
 	}
-	if nullAuthor != nil {
-		t.Errorf("connector note author_user_id = %v, want nil (no AMP user)", *nullAuthor)
+	if events[1].Actor != "github-connector" {
+		t.Errorf("connector edit actor = %q, want its integration identity", events[1].Actor)
+	}
+	if n := f.commentCount(req.ID); n != 0 {
+		t.Errorf("two edits wrote %d request_comments rows, want 0", n)
+	}
+}
+
+// TestUpdateRequestFailedEventInsertRollsBack is the acceptance criterion's
+// atomicity half: the content write, the rev bump and the edit event are one
+// transaction, so a failing event insert leaves NOTHING behind — the revision does
+// not move, the subject does not change, and no history row exists.
+//
+// The failure is injected by a trigger on request_events scoped to this test's
+// request id, so the edit's own INSERT really is the statement that fails (rather
+// than the repository's error path being simulated).
+func TestUpdateRequestFailedEventInsertRollsBack(t *testing.T) {
+	f := newRequestRowsFixture(t)
+	req := f.newEditableRequest(nil)
+
+	fn := fmt.Sprintf("request_edits_test_fail_event_%d", f.suffix)
+	if _, err := f.r.db.Exec(f.ctx, fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION %[1]s() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.action = 'edit' AND NEW.request_id = %[2]d THEN
+				RAISE EXCEPTION 'injected failure while recording the edit event';
+			END IF;
+			RETURN NEW;
+		END $$ LANGUAGE plpgsql`, fn, req.ID)); err != nil {
+		t.Fatalf("create the failure injector: %v", err)
+	}
+	dropInjector := func() {
+		t.Helper()
+		if _, err := f.r.db.Exec(f.ctx, `DROP TRIGGER IF EXISTS request_edits_test_fail_event ON request_events`); err != nil {
+			t.Fatalf("drop the failure injector trigger: %v", err)
+		}
+		if _, err := f.r.db.Exec(f.ctx, `DROP FUNCTION IF EXISTS `+fn+`()`); err != nil {
+			t.Fatalf("drop the failure injector function: %v", err)
+		}
+	}
+	t.Cleanup(dropInjector)
+	if _, err := f.r.db.Exec(f.ctx, `CREATE TRIGGER request_edits_test_fail_event
+		BEFORE INSERT ON request_events FOR EACH ROW EXECUTE FUNCTION `+fn+`()`); err != nil {
+		t.Fatalf("install the failure injector: %v", err)
+	}
+
+	subject := "a subject the failed transaction must not store"
+	got, changed, err := f.r.UpdateRequest(f.ctx, req.ID, req.OrgID, f.team, req.Rev,
+		RequestEdit{Subject: &subject}, f.editActor())
+	if err == nil {
+		t.Fatalf("the injected event failure produced no error (row %v, changed %v)", got, changed)
+	}
+	if got != nil || changed {
+		t.Fatalf("a rolled-back edit returned row %v changed=%v", got, changed)
+	}
+	if errors.Is(err, ErrConflict) || errors.Is(err, ErrNotFound) {
+		t.Errorf("an event failure read as %v; it is a server fault, not a client answer", err)
+	}
+
+	// Nothing moved: same rev, same subject, and no history row at all.
+	reread, getErr := f.r.GetRequest(f.ctx, req.ID, req.OrgID, f.team)
+	if getErr != nil {
+		t.Fatalf("re-read: %v", getErr)
+	}
+	if reread.Rev != req.Rev || reread.Subject != req.Subject {
+		t.Errorf("the rolled-back edit wrote: rev %d subject %q (want rev %d %q)",
+			reread.Rev, reread.Subject, req.Rev, req.Subject)
+	}
+	if n := f.eventCount(req.ID); n != 0 {
+		t.Errorf("%d history rows survived the rolled-back edit, want 0", n)
+	}
+
+	// With the fault gone the same edit at the same revision succeeds, which is what
+	// proves the rollback left no stuck state behind.
+	dropInjector()
+	got, changed, err = f.r.UpdateRequest(f.ctx, req.ID, req.OrgID, f.team, req.Rev,
+		RequestEdit{Subject: &subject}, f.editActor())
+	if err != nil || !changed {
+		t.Fatalf("retry after the fault: err %v changed %v", err, changed)
+	}
+	if got.Rev != req.Rev+1 {
+		t.Errorf("retry rev = %d, want %d", got.Rev, req.Rev+1)
+	}
+	if events := f.editEvents(req.ID); len(events) != 1 {
+		t.Errorf("retry edit events = %d (%v), want exactly one", len(events), events)
 	}
 }
 
 // TestUpdateRequestNoteFollowsTheRequestLifecycle proves the history row the edit
 // writes is not orphaned: it hangs off the request, so deleting the request (or,
-// via 054's composite cascades, its team) takes the note with it. An orphan note
+// via 054's composite cascades, its team) takes the row with it. An orphan row
 // under a reused id would be a cross-tenant read.
 func TestUpdateRequestNoteFollowsTheRequestLifecycle(t *testing.T) {
 	f := newRequestRowsFixture(t)
 	req := f.newEditableRequest(nil)
-	subject := "an edit whose note must die with its request"
+	subject := "an edit whose history row must die with its request"
 
 	got, changed, err := f.r.UpdateRequest(f.ctx, req.ID, req.OrgID, f.team, req.Rev,
 		RequestEdit{Subject: &subject}, f.editActor())
@@ -780,20 +946,20 @@ func TestUpdateRequestNoteFollowsTheRequestLifecycle(t *testing.T) {
 	if reread.Rev != got.Rev || reread.Subject != subject {
 		t.Error("stored row and returned row disagree after an edit")
 	}
-	if len(f.editNotes(req.ID)) != 1 {
-		t.Error("the edit landed without its history note")
+	if len(f.editEvents(req.ID)) != 1 {
+		t.Error("the edit landed without its history event")
 	}
 
 	if _, err := f.r.db.Exec(f.ctx, `DELETE FROM team_requests WHERE id = $1`, req.ID); err != nil {
 		t.Fatalf("delete request: %v", err)
 	}
 	var remaining int
-	if err := f.r.db.QueryRow(f.ctx, `SELECT count(*) FROM request_comments WHERE request_id = $1`, req.ID).
+	if err := f.r.db.QueryRow(f.ctx, `SELECT count(*) FROM request_events WHERE request_id = $1`, req.ID).
 		Scan(&remaining); err != nil {
-		t.Fatalf("count notes after delete: %v", err)
+		t.Fatalf("count history after delete: %v", err)
 	}
 	if remaining != 0 {
-		t.Errorf("%d notes survived their request's deletion", remaining)
+		t.Errorf("%d history rows survived their request's deletion", remaining)
 	}
 	if _, err := f.r.GetRequest(f.ctx, req.ID, req.OrgID, f.team); !errors.Is(err, ErrNotFound) {
 		t.Errorf("a deleted request still reads back: %v", err)
@@ -883,8 +1049,8 @@ func TestUpdateRequestBlocksOnAHeldRowLock(t *testing.T) {
 		t.Errorf("stored = rev %d subject %q, want the holder's rev %d %q",
 			reread.Rev, reread.Subject, req.Rev+1, holderSubject)
 	}
-	if notes := f.editNotes(req.ID); len(notes) != 0 {
-		t.Errorf("the conflicted edit left a history note: %v", notes)
+	if events := f.editEvents(req.ID); len(events) != 0 {
+		t.Errorf("the conflicted edit left a history row: %v", events)
 	}
 }
 
