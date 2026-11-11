@@ -406,7 +406,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"acceptance_criteria": str("REQUIRED. Specific verifiable conditions that prove the ticket is done. On a human ticket, what done means for the person (required)."),
 			"dependency_ids":      arr("The ticket IDs this ticket needs finished first. Leave empty ONLY if it truly needs nothing — it will be dispatchable immediately."),
 			"priority":            str("Priority: 0=low, 1=normal (default), 2=high, 3=critical."),
-			"assigned_to":         str("REQUIRED. Who should work this ticket, e.g. 'amp-worker'. Set at planning time so the user can review before dispatch."),
+			"assigned_to":         str("REQUIRED. " + agentLabelDesc + " Set at planning time so the user can review before dispatch."),
 			"start_at":            str("Optional. ISO 8601 datetime (e.g. '2026-04-14T09:00:00Z') to schedule this ticket. It is held as blocked until then."),
 			"owner":               str("Optional. The AMP user who owns the ticket: omit for yourself, 'none' to leave it unassigned for anyone on the project to pick up, or a project member's email/id."),
 			"metadata":            obj("Optional. Key/value metadata for integrations, e.g. {\"jira_key\": \"PLAT-123\"}. Values: string, number, or boolean. Project, epic, and story metadata is inherited."),
@@ -449,7 +449,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 							"description": "Refs of tickets in this batch, or IDs of existing tickets, that must finish first.",
 							"items":       map[string]interface{}{"type": []string{"string", "number"}},
 						},
-						"assigned_to":  str("Who should work it, e.g. 'amp-worker'."),
+						"assigned_to":  str(agentLabelDesc),
 						"priority":     str("0=low, 1=normal (default), 2=high, 3=critical."),
 						"owner":        str("Optional: omit for yourself, 'none' for unassigned, or a project member."),
 						"start_at":     str("Optional. ISO 8601 datetime to schedule it; it's held until then."),
@@ -578,15 +578,16 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.guard(authz.Member, s.assignTask)))
 
 	mcp.AddTool(tool("amp_dispatch_task",
-		"Start work on a ticket (task): mark it dispatched to an agent (state in_progress, not started) and get everything needed to start "+
-			"that worker NOW: dispatch_id, worker_prompt (its ready-to-use prompt) and next. Start the worker in the same turn — the "+
+		"Record that you are starting a worker on a ticket (task), and get what you need to launch it: dispatch_id, worker_prompt "+
+			"(its ready-to-use prompt) and next. AMP runs no agents, so this starts nothing by itself: it marks the ticket dispatched "+
+			"(state in_progress, not started), and you launch the worker in the same turn with your harness's launch tool. The "+
 			"ticket stays \"not started\" until the worker calls amp_claim_task with the dispatch_id, and AMP returns it to ready if "+
 			"nobody does. If you aren't starting a worker, don't dispatch: amp_set_task_state(backlog) undoes it. Fails if the ticket "+
 			"is blocked or isn't approved yet. An unassigned ticket becomes yours; someone else's can't be dispatched. Human tickets "+
 			"are never dispatched: their owner does them.",
 		props{
 			"task_id":  num("REQUIRED. Task ID."),
-			"agent_id": str("REQUIRED. Agent identifier, e.g. 'amp-worker'."),
+			"agent_id": str("REQUIRED. " + agentLabelDesc),
 		}), wrap(ctx, s.guard(authz.Member, s.dispatchTask)))
 
 	mcp.AddTool(tool("amp_complete_task", "Mark a task completed. Auto-unblocks any tasks that were waiting on it. "+
@@ -2688,6 +2689,14 @@ func optMetadataPatch(args map[string]interface{}) (domain.MetadataPatch, error)
 	}
 	return p, nil
 }
+
+// agentLabelDesc is the help on every field that names a ticket's agent
+// (assigned_to, agent_id). It used to give 'amp-worker' as the example: a name
+// no agent has, which models read as a worker AMP runs and stopped after
+// dispatching. The example is a real launchable name, and the text says the
+// field is only a label. It is sent three times in every tools/list: keep it short.
+const agentLabelDesc = "The agent you will launch to work it: your harness's subagent or agent profile " +
+	"(e.g. 'amp:amp-worker-backend' in Claude Code with the AMP plugin). Only a label: AMP's server runs no agents."
 
 // performerDesc is the performer field's help on the create tools.
 const performerDesc = "Optional. 'agent' (default: dispatched to an agent) or 'human': its owner does it and marks it done in AMP; agents never dispatch it. " +

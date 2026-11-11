@@ -316,8 +316,9 @@ re-dispatch) `previously_returned`. Launch that worker **in the same message** w
 `worker_prompt` as its prompt, in the foreground, and wait for it to finish. Its `next` says
 so in exactly these words:
 
-> Ticket #N is dispatched to <agent> but no worker has started it yet. Start the worker now, in
-> this same turn, with worker_prompt as its prompt (the launch tool of your harness: Agent/Task
+> Ticket #N is dispatched to <agent> but no worker has started it yet. AMP runs no agents:
+> nothing works on it until you launch one. Start the worker now, in this same turn, with
+> worker_prompt as its prompt (the launch tool of your harness: Agent/Task
 > in Claude Code, the task tool in opencode, amp_run_ticket in the AMP harness). It stays "not
 > started" until the worker calls amp_claim_task(task_id=N, dispatch_id="d_…"). If nobody claims
 > it by <start_by> (30 minutes), AMP returns it to ready by itself. If you aren't starting the
@@ -327,8 +328,8 @@ so in exactly these words:
 and `worker_prompt` is ready to hand over as it is:
 
 > Execute approved ticket #N in project P (dispatched to <agent>). First call
-> amp_claim_task(task_id=N, dispatch_id="d_…") to start it, then follow the amp-execution
-> protocol: read the ticket with amp_get_task(task_id=N, include=["comments","history","runs"]),
+> amp_claim_task(task_id=N, dispatch_id="d_…") to start it, then work it (with the amp-execution
+> skill, if you have it): read the ticket with amp_get_task(task_id=N, include=["comments","history","runs"]),
 > post your starting comment, do the work, and finish the ticket yourself with
 > amp_complete_task(task_id=N, dispatch_id="d_…", model=…, tokens…, branch=…, commit=…,
 > pr_url=…) when every acceptance criterion is met, or amp_block_task(task_id=N,

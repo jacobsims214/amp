@@ -94,7 +94,7 @@ var toolCatalog = map[string]toolInfo{
 	"amp_claim_task":         {title: "Claim ticket", keywords: "claim a ticket, take an unassigned ticket, the ticket you were dispatched for", idempotent: true},
 	"amp_return_task":        {title: "Return ticket", keywords: "release a dispatched ticket nobody started, or your own worker's ticket with its dispatch_id, worker died or timed out, undo a dispatch, back to ready"},
 	"amp_handover_tasks":     {title: "Hand over tickets", keywords: "move someone's open tickets to another person"},
-	"amp_dispatch_task":      {title: "Dispatch ticket", keywords: "start work on a ticket, hand a ticket to a worker agent, begin a ticket, worker_prompt to launch the worker"},
+	"amp_dispatch_task":      {title: "Dispatch ticket", keywords: "start work on a ticket, record a dispatch before launching your own worker agent, begin a ticket, worker_prompt to launch the worker"},
 	"amp_add_task_comment":   {title: "Comment on ticket", keywords: "comment on a ticket, post a progress update, log a note or finding"},
 	"amp_block_task":         {title: "Block ticket with a question", keywords: "ask the user a question, stop for a decision, flag a blocker, request review"},
 	"amp_answer_question":    {title: "Answer ticket question", keywords: "record the user's answer to a blocked ticket, unblock"},
