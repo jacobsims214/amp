@@ -72,25 +72,41 @@ func TestMigration_062RequestEventEdit(t *testing.T) {
 		}
 	})
 
-	t.Run("upgrade from 054", func(t *testing.T) {
+	t.Run("upgrade from 054's level", func(t *testing.T) {
 		dsn := freshDatabase(t)
 		repo, err := repository.New(ctx, dsn)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer repo.Close()
-		// Exactly the level #3873 shipped against: 054's seven verbs and nothing after.
+		// Exactly the level #3873 shipped against: 054's seven-verb CHECK and no
+		// 062. Every migration between 054 and 061 leaves that constraint alone (a
+		// grep for request_events_action finds only 054 and 062), so stopping at 061
+		// is the strongest form of "from 054's level": all the intervening schema is
+		// present and 062 is the only thing left to apply.
 		var before []repository.Migration
 		for _, m := range migrations {
-			if m.Version < "055" {
+			if m.Version < "062" {
 				before = append(before, m)
 			}
 		}
 		if len(before) == len(migrations) {
-			t.Fatal("no migration 054")
+			t.Fatal("no migration 062")
 		}
 		if err := repo.RunMigrations(ctx, before); err != nil {
-			t.Fatalf("migrate to 054: %v", err)
+			t.Fatalf("migrate to 061: %v", err)
+		}
+		// The pre-062 CHECK really is the seven-verb one, so the widening below is
+		// what makes `edit` storable rather than a coincidence.
+		{
+			pre, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pre.Close(ctx)
+			if def := actionDefinition(t, pre); strings.Contains(def, "'edit'") {
+				t.Fatalf("a pre-062 database already accepts `edit`: %s", def)
+			}
 		}
 		db, err := pgx.Connect(ctx, dsn)
 		if err != nil {
@@ -133,6 +149,13 @@ func TestMigration_062RequestEventEdit(t *testing.T) {
 			VALUES ($1, 'system', 'edited subject (rev 1 → 2)', 'Desk lead', $2)`, requestID, userID); err != nil {
 			t.Fatalf("seed the pre-062 edit comment: %v", err)
 		}
+		// At this level an `edit` row is refused by the CHECK itself (23514, not a
+		// foreign-key or not-null error), which is what makes the widening below the
+		// reason it becomes storable.
+		_, editErr := db.Exec(ctx, `INSERT INTO request_events
+			(request_id, org_id, team_id, action, actor, actor_user_id)
+			VALUES ($1, $2, $3, 'edit', 'Desk lead', $4)`, requestID, orgID, teamID, userID)
+		wantSQLState(t, "an edit row before 062", editErr, "23514")
 
 		if err := repo.RunMigrations(ctx, migrations); err != nil {
 			t.Fatalf("upgrade to 062: %v", err)
