@@ -37,6 +37,11 @@ type Service struct {
 	// shared by every Service, which main uses). Same-process burst guard only;
 	// see request_limits.go.
 	RequestLimits *RequestLimiter
+	// Now is the clock the request-submission path reads (nil: time.Now), so a
+	// test can drive the submission limiter's window and its refund from one
+	// instant. It is deliberately narrow: this is the only clock the submit path
+	// needs, and every other duration in the service keeps using time.Now.
+	Now func() time.Time
 	// Remote is the instance's remote control configuration (off unless
 	// RELAY_ENABLED and auth are on).
 	Remote RemoteConfig
