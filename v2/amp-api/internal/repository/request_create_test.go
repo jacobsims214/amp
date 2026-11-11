@@ -41,6 +41,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -898,6 +899,55 @@ func TestCreateRequestUnkeyedSubmitsAreDistinct(t *testing.T) {
 			t.Fatalf("request id %d was returned twice", id)
 		}
 		seen[id] = true
+	}
+}
+
+// TestCreateRequestKeyBoundIsBytes pins the repository's own half of the key
+// bound: it measures BYTES, exactly as 061's length() CHECK does, so a 255-byte
+// key is storable and a 256-byte key is refused by this layer rather than
+// arriving as a CHECK violation from the write. A multibyte key of ≤255 runes
+// over 255 bytes is the case the two used to disagree about; here it is refused
+// for the same reason any oversized key is, with a message that says bytes.
+func TestCreateRequestKeyBoundIsBytes(t *testing.T) {
+	f := newRequestCreateFixture(t)
+	cases := []struct {
+		name    string
+		key     string
+		wantErr bool
+	}{
+		{"255-byte ASCII key", strings.Repeat("k", 255), false},
+		{"256-byte ASCII key", strings.Repeat("k", 256), true},
+		{"260-byte two-byte-rune key", strings.Repeat("é", 130), true},
+		{"254-byte two-byte-rune key", strings.Repeat("é", 127), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := f.input("Key bound " + tc.name)
+			in.IdempotencyKey = tc.key
+			_, created, err := f.r.CreateRequest(f.ctx, in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("a %d-byte key was stored", len(tc.key))
+				}
+				if !strings.Contains(err.Error(), "bytes") || strings.Contains(err.Error(), "characters") {
+					t.Fatalf("refusal %q does not say the bound is in bytes", err.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("a %d-byte key was refused: %v", len(tc.key), err)
+			}
+			if !created {
+				t.Fatal("the submission was reported as a replay")
+			}
+		})
+	}
+	// Exactly the accepted keys were stored: the refused ones consumed nothing.
+	if got := f.countKeys(); got != 2 {
+		t.Fatalf("%d key rows after the bound matrix, want the 2 from the accepted keys", got)
+	}
+	if got := f.countRequests(); got != 2 {
+		t.Fatalf("%d requests after the bound matrix, want 2", got)
 	}
 }
 

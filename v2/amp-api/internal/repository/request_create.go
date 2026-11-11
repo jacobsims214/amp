@@ -339,12 +339,13 @@ func prepareRequestCreate(in CreateRequestInput) (*domain.TeamRequest, string, s
 
 // normalizeRequestIdempotencyKey trims the client's token and enforces 061's
 // bound. Only a blank key is "no key": an all-spaces header is the same as no
-// header rather than a key of spaces, and 255 characters is the conventional
-// Idempotency-Key ceiling, which the column also enforces.
+// header rather than a key of spaces, and 255 bytes is the conventional
+// Idempotency-Key ceiling, which the column also enforces (061's length() CHECK
+// counts bytes, as this check does — the two agree on multibyte keys).
 func normalizeRequestIdempotencyKey(key string) (string, error) {
 	key = strings.TrimSpace(key)
 	if len(key) > 255 {
-		return "", fmt.Errorf("idempotency key is over 255 characters (got %d): send a short client-chosen token", len(key))
+		return "", fmt.Errorf("idempotency key is over 255 bytes (got %d): send a short client-chosen token", len(key))
 	}
 	return key, nil
 }

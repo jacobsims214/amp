@@ -826,6 +826,140 @@ func TestSubmitRequest_WritesNoLifecycleState(t *testing.T) {
 	}
 }
 
+// ---- the idempotency key's bound is BYTES, in every layer ----
+
+// The service's bound on a client's key measures the same unit the layers that
+// actually enforce it measure — bytes — so a key this shaper accepts is a key the
+// repository and 061's CHECK accept. The case worth pinning is the multibyte one:
+// 130 × 'é' is 130 runes and 260 bytes, so a rune-counting check passed it and the
+// repository then refused it as an untranslated server fault.
+func TestShapeSubmission_IdempotencyKeyBoundIsBytes(t *testing.T) {
+	team := &domain.Team{ID: 7, OrgID: 3, Name: "Inbox"}
+	requester := 42
+	cases := []struct {
+		name    string
+		key     string
+		wantErr bool
+		// wantKey is the key the shaper must return (the trimmed one); it is only
+		// checked when the submission is accepted.
+		wantKey string
+	}{
+		{"255-byte ASCII key is accepted", strings.Repeat("k", 255), false, strings.Repeat("k", 255)},
+		{"256-byte ASCII key is refused", strings.Repeat("k", 256), true, ""},
+		// 130 two-byte runes: under the old rune bound, over the byte bound, and
+		// over 061's length() CHECK — the one that used to arrive as a 500.
+		{"260-byte two-byte-rune key is refused", strings.Repeat("é", 130), true, ""},
+		// Exactly 255 bytes of multibyte text is still inside the bound: the unit
+		// changed, the ceiling did not.
+		{"254 bytes of two-byte runes is accepted", strings.Repeat("é", 127), false, strings.Repeat("é", 127)},
+		{"whitespace-only key means no key", "   \t \n", false, ""},
+		{"a key is trimmed before it is measured", "  " + strings.Repeat("k", 255) + "  ", false, strings.Repeat("k", 255)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, key, err := shapeSubmission(team, &requester, "someone@example.test", SubmitRequestInput{
+				Subject: "ok", IdempotencyKey: tc.key,
+			})
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("shapeSubmission refused a %d-byte key: %v", len(strings.TrimSpace(tc.key)), err)
+				}
+				if key != tc.wantKey {
+					t.Fatalf("key = %q, want %q", key, tc.wantKey)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("a %d-byte key (%d runes) was accepted", len(strings.TrimSpace(tc.key)), len([]rune(strings.TrimSpace(tc.key))))
+			}
+			if code := authz.CodeOf(err); code != authz.CodeRequestInvalid {
+				t.Fatalf("code = %q, want %q", code, authz.CodeRequestInvalid)
+			}
+			if status := authz.StatusOf(err, 500); status != 400 {
+				t.Fatalf("status = %d, want 400: a caller's oversized key is never a server fault", status)
+			}
+			if !strings.Contains(err.Error(), "idempotency_key") {
+				t.Fatalf("refusal %q does not name idempotency_key", err.Error())
+			}
+			if !strings.Contains(err.Error(), "bytes") || strings.Contains(err.Error(), "characters") {
+				t.Fatalf("refusal %q does not say the bound is in bytes", err.Error())
+			}
+		})
+	}
+}
+
+// The same bound through the real path: an oversized key is refused as the
+// field-naming 400 BEFORE the limiter is charged and before the repository is
+// reached, so a client fumbling the header spends no quota and writes nothing —
+// including the multibyte key that used to slip past the rune check and come back
+// as a server fault from the write.
+func TestSubmitRequest_OversizedKeySpendsNothing(t *testing.T) {
+	f := newSubmitFixture(t)
+	f.withClock(f.now)
+	member := f.principal(f.member)
+	before := f.requestCount()
+
+	for _, tc := range []struct{ name, key string }{
+		{"256-byte ASCII", strings.Repeat("k", maxRequestIdempotencyKeyLen+1)},
+		{"260-byte two-byte runes", strings.Repeat("é", 130)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if len(tc.key) <= maxRequestIdempotencyKeyLen {
+				t.Fatalf("fixture key is %d bytes, not over the bound", len(tc.key))
+			}
+			// The multibyte case is the regression: it must be a key the RUNE count
+			// would have let through, or this test would not prove the unit changed.
+			if runes := len([]rune(tc.key)); runes != len(tc.key) && runes > maxRequestIdempotencyKeyLen {
+				t.Fatalf("fixture key is %d runes; the rune-counting check would have refused it too", runes)
+			}
+
+			_, err := f.svc.SubmitRequest(f.ctx, member, f.submission(tc.key))
+			if err == nil {
+				t.Fatalf("a %d-byte key was accepted", len(tc.key))
+			}
+			if code := authz.CodeOf(err); code != authz.CodeRequestInvalid {
+				t.Fatalf("code = %q, want %q", code, authz.CodeRequestInvalid)
+			}
+			if status := authz.StatusOf(err, 500); status != 400 {
+				t.Fatalf("status = %d, want 400", status)
+			}
+			if !strings.Contains(err.Error(), "idempotency_key") {
+				t.Fatalf("refusal %q does not name idempotency_key", err.Error())
+			}
+			// No quota: the refusal happened before Allow. Zero, not 1, because a
+			// charged-then-refused path would leave a unit behind.
+			if n := f.limitCount(f.webKey(f.member)); n != 0 {
+				t.Fatalf("the refused key spent %d limiter units, want 0", n)
+			}
+			// Nothing written: the key never reached the repository.
+			if got := f.requestCount(); got != before {
+				t.Fatalf("%d request rows after the refusal, want %d", got, before)
+			}
+		})
+	}
+
+	// The ceiling itself still submits: 255 bytes of ASCII and 255 bytes of
+	// multibyte text both create a request, so the fix tightened the unit without
+	// moving the bound.
+	for _, tc := range []struct{ name, key string }{
+		{"255-byte ASCII", strings.Repeat("k", maxRequestIdempotencyKeyLen)},
+		{"255-byte multibyte", strings.Repeat("é", maxRequestIdempotencyKeyLen/2) + "k"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if len(tc.key) != maxRequestIdempotencyKeyLen {
+				t.Fatalf("fixture key is %d bytes, want %d", len(tc.key), maxRequestIdempotencyKeyLen)
+			}
+			res, err := f.svc.SubmitRequest(f.ctx, member, f.submission(tc.key))
+			if err != nil {
+				t.Fatalf("a %d-byte key was refused: %v", len(tc.key), err)
+			}
+			if !res.Created {
+				t.Fatal("the submission was reported as a replay")
+			}
+		})
+	}
+}
+
 // ---- pure: the shapers name the field ----
 
 // Every malformed submission is refused as request.invalid naming the field it

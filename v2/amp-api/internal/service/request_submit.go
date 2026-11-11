@@ -72,7 +72,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
@@ -84,6 +83,14 @@ import (
 // refused as request.invalid naming the field, instead of reaching the
 // repository and surfacing as a server fault. The repository's own check stays
 // authoritative.
+//
+// The unit is BYTES, because that is what the two layers underneath count:
+// normalizeRequestIdempotencyKey in the repository measures len(key), and 061's
+// request_idempotency_keys_key_length CHECK is SQL length() over a TEXT column,
+// which is bytes in Postgres (ASCII encoding, no char semantics). Counting runes
+// here would let a multibyte key of ≤255 runes pass this check and be refused by
+// the repository as an untranslated server fault — the exact invariant the call
+// site below states it must never break.
 const maxRequestIdempotencyKeyLen = 255
 
 // requestPublicRefAttempts bounds the mint/retry loop for a reference
@@ -285,8 +292,8 @@ func (s *Service) submitterIdentity(ctx context.Context, p authz.Principal) (*in
 // than stored in a form nobody asked for.
 func shapeSubmission(team *domain.Team, requester *int, contact string, in SubmitRequestInput) (*domain.TeamRequest, string, error) {
 	key := strings.TrimSpace(in.IdempotencyKey)
-	if n := utf8.RuneCountInString(key); n > maxRequestIdempotencyKeyLen {
-		return nil, "", authz.RequestInvalid("idempotency_key is over %d characters (got %d): send a short client-chosen token", maxRequestIdempotencyKeyLen, n)
+	if n := len(key); n > maxRequestIdempotencyKeyLen {
+		return nil, "", authz.RequestInvalid("idempotency_key is over %d bytes (got %d): send a short client-chosen token", maxRequestIdempotencyKeyLen, n)
 	}
 	// Clean applies domain.Metadata's bounds (50 keys, 64-character keys,
 	// 1000-character values) and drops nulls, so a connector's labels can never
