@@ -339,6 +339,90 @@ func (c *Checker) RequireTeamManager(ctx context.Context, p Principal, team *dom
 	return nil
 }
 
+// ---- Capabilities outside the project Level ladder ----
+
+// TeamSubmit fails unless p may submit a request to teamID's inbox.
+//
+// Submitting is deliberately not a project Level (approved contract artifact 36
+// v2 §2, build slice B3): a project Level >= Member grants TaskRead on every
+// ticket, comment and history row in the project, and a requester must never
+// get that. So this check is team-scoped and never consults project access —
+// no Level value, not even Owner, satisfies it on its own.
+//
+// It passes for:
+//
+//   - a member of the team (team_members row, member or lead);
+//   - an owner or admin of the team's org, and a global admin — the people who
+//     administer the team and its submit access (RequireTeamManager, D14);
+//   - the holder of an in-force submit grant on that team (team_submit_grants),
+//     which is how an invited customer who is in no org and on no team submits.
+//
+// The grant is re-read from the database on every call and nothing here caches
+// an allow-set: a revoked grant fails on the very next call with nothing to
+// reset (revocation is a state on the row, `revoked_at`, not a delete — see
+// repository.RevokeTeamSubmit). Tenancy comes from the rows themselves: the
+// grant's composite FK binds (team_id, org_id), team_members binds the team,
+// and the org role is read for the team's own org — so a grant or membership in
+// another org can never satisfy a team here.
+//
+// Refusals follow RequireProject's shape so existence never leaks: a caller with
+// no relationship to the team at all (not in its org, no grant) is told the team
+// is not found, while an org member who can already see the team and simply may
+// not submit to it gets 403 with the reason.
+func (c *Checker) TeamSubmit(ctx context.Context, p Principal, teamID int) error {
+	team, err := c.repo.GetTeam(ctx, teamID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return NotFound("team %d not found", teamID)
+		}
+		return err
+	}
+	if p.Super {
+		return nil
+	}
+	if !p.HasUser() {
+		// Local dev before its user row is provisioned (auth disabled): it has
+		// no membership and no grant of its own, and being Super is the whole
+		// of its authority — handled above.
+		return NotFound("team %d not found", teamID)
+	}
+
+	// A team member or the team's lead submits to their own inbox.
+	teamRole, err := c.repo.GetTeamRole(ctx, team.ID, p.UserID)
+	if err != nil {
+		return err
+	}
+	if teamRole != "" {
+		return nil
+	}
+
+	// Org owner/admin administer the team (D14), so they may submit to it.
+	orgRole, err := c.repo.GetOrgRole(ctx, team.OrgID, p.UserID)
+	if err != nil {
+		return err
+	}
+	if orgRole == domain.OrgRoleOwner || orgRole == domain.OrgRoleAdmin {
+		return nil
+	}
+
+	// The grant: one indexed lookup, read now rather than remembered. This is
+	// the line that makes revocation and re-granting take effect per request.
+	granted, err := c.repo.HasTeamSubmitGrant(ctx, team.ID, p.UserID)
+	if err != nil {
+		return err
+	}
+	if granted {
+		return nil
+	}
+
+	if orgRole == "" {
+		// No membership, no grant, not in the org: the inbox is not theirs to
+		// know about.
+		return NotFound("team %d not found", teamID)
+	}
+	return Forbidden("team %d: submitting requires team membership or submit access", team.ID)
+}
+
 // ResolveUser turns a user reference — "me", a numeric ID, or an email —
 // into a user ID.
 func (c *Checker) ResolveUser(ctx context.Context, p Principal, ref string) (int, error) {
