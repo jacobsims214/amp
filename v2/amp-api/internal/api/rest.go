@@ -139,10 +139,13 @@ func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("/api/tasks/", h.taskSub)
 	mux.HandleFunc("/api/runs/", h.runSub)
 	mux.HandleFunc("/api/kb/", h.kbDoc)
-	// SSE: streams, never a 403 after it starts. The submit-scope gate runs
-	// before the stream opens, so a narrowed credential is refused with a
-	// body rather than being handed an empty stream (AMP #3772).
-	mux.mux.HandleFunc("/api/events", h.submitScopeGate(h.events))
+	// SSE: goes through denied() like every other route, so a refusal is
+	// audited as access.denied (AMP #3862). The ordering is what makes it
+	// safe: submitScopeGate refuses before h.events runs, so a refused request
+	// writes its 403 and returns without a stream, while a stream that does
+	// open has already written 200 by the time denied() looks (statusRecorder
+	// forwards Flush, so streaming is unaffected — AMP #3772 pinning it here).
+	mux.HandleFunc("/api/events", h.events)
 	mux.HandleFunc("/api/orgs", h.orgs)
 	mux.HandleFunc("/api/orgs/", h.orgSub)
 	mux.HandleFunc("/api/teams/", h.teamSub)

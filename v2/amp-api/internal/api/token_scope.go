@@ -6,10 +6,11 @@ package api
 // A submit-scoped API token may make exactly one call: `POST
 // /api/teams/{id}/requests`, the team-inbox submission, for the one team the
 // token is bound to. Everything else is refused here, before the handler runs —
-// every route registered through deniedMux (which is every /api route except
-// the SSE stream, the GitHub hook and the receipt-upload prefix) plus the SSE
-// stream itself, which is registered unwrapped because a 403 after it starts
-// streaming is useless.
+// every route registered through deniedMux, which is every /api route except
+// the two that carry no AMP session at all (the GitHub hook and the
+// receipt-upload prefix). The SSE stream included: the gate refuses before the
+// stream opens, so the caller gets a 403 body rather than an empty stream, and
+// denied() records it as access.denied (AMP #3862).
 //
 // This is a boundary, not the whole enforcement. The capability layer narrows
 // the same credential independently (authz/token_scope.go: no project level, no
@@ -65,7 +66,9 @@ func submitScopeRoute(method, path string) (teamID int, ok bool) {
 // submitScopeGate refuses a submit-scoped credential on every route but its one
 // submission. It is applied by deniedMux.HandleFunc, so registration is what
 // enforces it: a handler added to the REST surface cannot forget the gate,
-// because there is no other way to register one.
+// because there is no other way to register one. Because the gate sits inside
+// denied() and refuses before the wrapped handler runs, the refusal is audited
+// as access.denied on every route, the SSE stream included (AMP #3862).
 func (h *RestHandler) submitScopeGate(fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		p, err := authz.FromContext(r.Context())

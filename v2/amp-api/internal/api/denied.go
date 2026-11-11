@@ -15,6 +15,10 @@ import (
 // per actor and route; KB decisions/audit-log-v2.md, #2428), unless the
 // service already recorded a specific refusal for the request
 // (plan.approve.denied, task.dispatch.denied, ...).
+//
+// This includes the SSE stream: a request that is refused before the stream
+// opens writes its 403 and is audited here, while a stream that does open
+// writes status 200 and is never recorded (AMP #3862).
 
 // deniedMux registers handlers wrapped by RestHandler.denied.
 type deniedMux struct {
@@ -26,7 +30,8 @@ func (m *deniedMux) HandleFunc(pattern string, fn http.HandlerFunc) {
 	// The submit-scope gate is inside denied() so registration is what
 	// enforces it (AMP #3772): a scoped credential is refused before the
 	// handler runs, and the refusal is recorded as access.denied like every
-	// other 403 on this surface.
+	// other 403 on this surface. Every /api route is registered here, the SSE
+	// stream included, so no route can refuse silently (AMP #3862).
 	m.mux.HandleFunc(pattern, m.h.denied(m.h.submitScopeGate(fn)))
 }
 
@@ -59,6 +64,21 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 
 // Unwrap lets http.ResponseController reach the underlying writer.
 func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+// Flush makes the recorder transparent to streaming handlers. They need the
+// writer they are handed to be an http.Flusher, and embedding the
+// http.ResponseWriter *interface* does not promote Flush — without this,
+// wrapping a streaming handler in denied() would make it answer "streaming
+// not supported" (hub.ServeFiltered type-asserts http.Flusher). net/http treats
+// a flush as an implicit 200, so it is recorded as one. A writer that cannot
+// flush answers ErrNotSupported, which there is nothing to do about here: the
+// recorder has no body to write, and the server's own writers always flush.
+func (r *statusRecorder) Flush() {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	_ = http.NewResponseController(r.ResponseWriter).Flush()
+}
 
 // denied wraps fn so a 403 it writes is audited as access.denied.
 func (h *RestHandler) denied(fn http.HandlerFunc) http.HandlerFunc {
