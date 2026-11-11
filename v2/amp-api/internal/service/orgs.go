@@ -475,10 +475,22 @@ func (s *Service) ListInvites(ctx context.Context, p authz.Principal, orgID int)
 	return s.Repo.ListPendingInvites(ctx, orgID)
 }
 
-// Invite records a pending membership. Org admins can invite with any role
+// Invite records a pending invitation. Org admins can invite with any role
 // (owner only by owners); team leads may invite into their own team as
 // plain org members.
+//
+// A requester invitation (kind "requester", #3767) is the customer path from
+// the approved contract §5: it must name a team (the team the person will be
+// able to submit to), grants no org or team role, and needs only that team's
+// manager — a team lead or an org owner/admin (RequireTeamManager). An existing
+// account is never turned into a customer by an invitation, so a requester
+// invite naming an email that already has one is refused rather than applied.
 func (s *Service) Invite(ctx context.Context, p authz.Principal, inv domain.Invite) (*MemberResult, error) {
+	kind, err := domain.NormalizeInviteKind(inv.Kind)
+	if err != nil {
+		return nil, authz.BadRequest("%s", err)
+	}
+	inv.Kind = kind
 	a, err := s.orgAccess(ctx, p, inv.OrgID)
 	if err != nil {
 		return nil, err
@@ -488,6 +500,9 @@ func (s *Service) Invite(ctx context.Context, p authz.Principal, inv domain.Invi
 	}
 	if inv.TeamRole == "" {
 		inv.TeamRole = domain.TeamRoleMember
+	}
+	if inv.IsRequester() {
+		return s.inviteRequester(ctx, p, a, inv)
 	}
 	if !a.admin {
 		if inv.TeamID == nil || inv.OrgRole != domain.OrgRoleMember {
@@ -505,6 +520,40 @@ func (s *Service) Invite(ctx context.Context, p authz.Principal, inv domain.Invi
 		return nil, authz.Forbidden("only org owners can grant the owner role")
 	}
 	return s.invite(ctx, p, inv)
+}
+
+// inviteRequester stores a requester invitation: the customer-targeted half of
+// the approved contract §5 (#3767). The invite is bound to one org, one team
+// and one recipient email, and only that team's manager can issue it.
+func (s *Service) inviteRequester(ctx context.Context, p authz.Principal, a orgAccess, inv domain.Invite) (*MemberResult, error) {
+	if inv.TeamID == nil {
+		return nil, authz.BadRequest("a requester invitation must name the team they can send requests to")
+	}
+	// The invitation is not a membership: it must not smuggle a role in.
+	if inv.OrgRole != domain.OrgRoleMember || inv.TeamRole != domain.TeamRoleMember {
+		return nil, authz.BadRequest("a requester invitation grants no org or team role: leave org_role and team_role at member")
+	}
+	team, err := s.Repo.GetTeam(ctx, *inv.TeamID)
+	if err != nil || team.OrgID != inv.OrgID {
+		return nil, authz.BadRequest("team is not in this org")
+	}
+	if err := s.Authz.RequireTeamManager(ctx, p, team); err != nil {
+		return nil, err
+	}
+	// An existing account keeps its kind: an explicit requester invitation
+	// provisions a new customer identity, it never converts or demotes a
+	// person, an agent or a team member.
+	if u, err := s.Repo.GetUserByEmail(ctx, inv.Email); err == nil {
+		return nil, authz.BadRequest("%s already has an AMP account, so a requester invitation would not create a customer identity; only a new email can be invited as a requester", u.Email)
+	}
+	inv.InvitedBy = p.UserRef()
+	created, err := s.Repo.CreateInvite(ctx, inv)
+	if err != nil {
+		return nil, err
+	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "invite.create", OrgID: intRef(inv.OrgID), TargetType: "invite", TargetID: idStr(created.ID),
+		Summary: "invited " + inv.Email + " to send requests to team " + team.Name, Details: map[string]any{"kind": inv.Kind, "team_id": *inv.TeamID}})
+	return &MemberResult{Invited: true, Invite: created}, nil
 }
 
 // invite validates and stores an invite; if the email already belongs to

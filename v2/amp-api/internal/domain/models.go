@@ -999,6 +999,9 @@ type ProjectMember struct {
 	Disabled    bool   `json:"disabled,omitempty"`
 }
 
+// Invite is a pending invitation for an email that has not signed in yet.
+// Kind says what accepting it provisions: membership (the default, and the
+// meaning of every row written before #3767) or a requester identity.
 type Invite struct {
 	ID         int        `json:"id"`
 	Email      string     `json:"email"`
@@ -1009,7 +1012,42 @@ type Invite struct {
 	InvitedBy  *int       `json:"invited_by"`
 	CreatedAt  time.Time  `json:"created_at"`
 	AcceptedAt *time.Time `json:"accepted_at,omitempty"`
+	Kind       string     `json:"kind,omitempty"`
 }
+
+const (
+	// InviteKindMember is a membership invitation: accepting it adds an org
+	// member row (and a team member row when it names a team). It is the
+	// default, and what every invite written before #3767 means.
+	InviteKindMember = "member"
+	// InviteKindRequester is a requester invitation: the invited person's
+	// first sign-in provisions a customer identity, and accepting the invite
+	// grants no org or team membership at all. Team submit access is a
+	// separate, revocable grant (#3768), never a consequence of acceptance.
+	InviteKindRequester = "requester"
+)
+
+// InviteKinds is the closed set of invitation intents, in the order the
+// schema's CHECK names them (`invites_kind_check`, migration 058).
+var InviteKinds = []string{InviteKindMember, InviteKindRequester}
+
+// NormalizeInviteKind validates an invitation intent (" Requester " is a
+// requester invite). An empty kind is a membership invite, so callers that
+// predate #3767 keep inviting members.
+func NormalizeInviteKind(s string) (string, error) {
+	k := strings.ToLower(strings.TrimSpace(s))
+	if k == "" {
+		return InviteKindMember, nil
+	}
+	if !slices.Contains(InviteKinds, k) {
+		return "", fmt.Errorf("invite kind must be one of %s", strings.Join(InviteKinds, ", "))
+	}
+	return k, nil
+}
+
+// IsRequester reports whether accepting this invite provisions a requester
+// identity rather than membership.
+func (i Invite) IsRequester() bool { return i.Kind == InviteKindRequester }
 
 // HasRole reports whether the user holds a global role.
 func (u *User) HasRole(role string) bool {
