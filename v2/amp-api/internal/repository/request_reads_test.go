@@ -637,6 +637,76 @@ func TestListRequestsCursorAndLimit(t *testing.T) {
 	}
 }
 
+// TestCountRequestsIgnoresTheCursor pins CountRequests' documented contract: it
+// answers how many requests the filter matches in total, ignoring its paging
+// fields — both of them. Limit is trivially ignored (it never reaches the
+// predicate), but BeforeID is part of requestListWhere, so a count handed a
+// paged filter would otherwise answer "rows left below the cursor": the exact
+// number a queue pill must not show, and one that shrinks every time someone
+// scrolls. The count with a cursor set must equal the count without it and
+// equal the number of rows paging the same filter to the end yields.
+func TestCountRequestsIgnoresTheCursor(t *testing.T) {
+	f := newRequestReadsFixture(t)
+	ids := make([]int, 7)
+	for i := range ids {
+		ids[i] = f.newRequest(f.team, domain.RequestStatusNew)
+	}
+	total := RequestFilter{OrgID: f.org, TeamID: f.team}
+
+	// The total the pill shows, and the independent truth: paging the filter
+	// to the end.
+	all := f.pageAll(total, 2)
+	want := len(all)
+	if want != len(ids) {
+		t.Fatalf("paging the filter yielded %d rows, want the %d inserted", want, len(ids))
+	}
+	without, err := f.r.CountRequests(f.ctx, total)
+	if err != nil {
+		t.Fatalf("CountRequests without a cursor: %v", err)
+	}
+	if without != want {
+		t.Fatalf("CountRequests without a cursor = %d, want %d", without, want)
+	}
+
+	// Every cursor a caller could arrive with: one at the newest row (only the
+	// rest of the queue is below it — the worst under-count a pill could show),
+	// one at a middle page's start, and one carrying a partial Limit, which must
+	// not change the answer either.
+	for _, tc := range []struct {
+		name string
+		f    RequestFilter
+	}{
+		{"cursor at the newest row", RequestFilter{OrgID: f.org, TeamID: f.team, BeforeID: ids[len(ids)-1]}},
+		{"cursor at a middle page start", RequestFilter{OrgID: f.org, TeamID: f.team, BeforeID: ids[3]}},
+		{"cursor and a one-row limit", RequestFilter{OrgID: f.org, TeamID: f.team, BeforeID: ids[2], Limit: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := f.r.CountRequests(f.ctx, tc.f)
+			if err != nil {
+				t.Fatalf("CountRequests: %v", err)
+			}
+			if got != without || got != want {
+				t.Fatalf("CountRequests with a cursor = %d, want %d (the filter total, equal to the count without a cursor and to paging the filter to the end)", got, want)
+			}
+		})
+	}
+
+	// ListRequests' cursor semantics are unchanged by the count's fix: the
+	// same paged filter still returns only what is below its cursor.
+	paged, err := f.r.ListRequests(f.ctx, RequestFilter{OrgID: f.org, TeamID: f.team, BeforeID: ids[3], Limit: 10})
+	if err != nil {
+		t.Fatalf("ListRequests: %v", err)
+	}
+	if len(paged.Items) != 3 {
+		t.Fatalf("a cursor at the 4th of 7 rows listed %d rows, want 3: the list must still page", len(paged.Items))
+	}
+	for _, r := range paged.Items {
+		if r.ID >= ids[3] {
+			t.Fatalf("ListRequests returned id %d at or above the cursor %d", r.ID, ids[3])
+		}
+	}
+}
+
 // TestListRequestsRowsCarryNoProjectData is the DTO half of criterion 2: a
 // queue row is a request and nothing else. The list is built from the shared
 // scanner, so this test asserts the shape rather than trusting the query — it

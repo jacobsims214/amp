@@ -27,7 +27,9 @@ package repository
 // "23 in triage" above a page that cannot reach 23 rows is the bug this shape
 // prevents. requestListWhere builds the predicate once; ListRequests adds
 // ORDER BY/LIMIT and CountRequests wraps it in count(*). A filter added to one
-// is therefore added to both.
+// is therefore added to both. The one term they do not share is the paging
+// cursor: CountRequests zeroes BeforeID, because a count is the filter's total
+// and never the remainder of a page.
 //
 // No project data. The list returns domain.TeamRequest rows and nothing else:
 // no epic/story/task names, no project codes, no agent identities. The one
@@ -160,7 +162,17 @@ func (r *Repo) ListRequests(ctx context.Context, f RequestFilter) (*RequestPage,
 // CountRequests is how many requests the filter matches in total, ignoring its
 // paging fields. It is the number a queue pill shows, computed by the same
 // predicate ListRequests pages with.
+//
+// The cursor is cleared before the predicate is built. It is a paging field
+// exactly like Limit — "rows below this one" describes a page, not the filter
+// — so honoring it would answer "how many rows are left below the cursor",
+// the one number a queue pill must never show: the pill counts the queue (the
+// filter's total), not the rest of someone's scroll. Limit never reached the
+// predicate; BeforeID does, so it is zeroed here, on the caller's value copy.
+// The caller's filter is untouched and ListRequests' cursor semantics are
+// unaffected.
 func (r *Repo) CountRequests(ctx context.Context, f RequestFilter) (int, error) {
+	f.BeforeID = 0
 	where, args, err := requestListWhere(f)
 	if err != nil {
 		return 0, err
@@ -185,7 +197,10 @@ func requestListLimit(limit int) int {
 
 // requestListWhere builds the tenant predicate and every filter, returning the
 // SQL fragment and its arguments in order. Both readers call it, which is what
-// keeps a count and the pages it counts from drifting apart.
+// keeps a count and the pages it counts from drifting apart. It includes the
+// paging cursor when BeforeID is set; a caller whose answer must be the
+// filter's total rather than one page's remainder (CountRequests) clears
+// BeforeID before calling.
 //
 // The first two terms are the org/team halves of request_rows.go's
 // requestTenantWhere, in the same order, so a caller reading either file sees
