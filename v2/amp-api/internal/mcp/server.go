@@ -981,6 +981,23 @@ func (s *Server) createProject(rctx context.Context, args map[string]interface{}
 	return jsonResult(p)
 }
 
+// accountKind names the caller's account kind for whoami. The Principal knows
+// whether it is an agent; a customer is neither an agent nor a person signing
+// in to run agents, so the row's own kind is read (a user id lookup, no extra
+// state on the Principal). Before provisioning, or for a caller with no user
+// row, the Principal's own flags decide.
+func (s *Server) accountKind(ctx context.Context, p authz.Principal) string {
+	if p.HasUser() {
+		if u, err := s.repo.GetUserByID(ctx, p.UserID); err == nil && u.Kind != "" {
+			return u.Kind
+		}
+	}
+	if p.Agent {
+		return domain.UserKindAgent
+	}
+	return domain.UserKindHuman
+}
+
 func (s *Server) listProjects(rctx context.Context, _ map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	visible, err := s.svc.Authz.VisibleProjects(rctx, caller(rctx).p)
 	if err != nil {
@@ -1002,7 +1019,7 @@ func (s *Server) listProjects(rctx context.Context, _ map[string]interface{}) (*
 func (s *Server) whoami(rctx context.Context, _ map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	p := caller(rctx).p
 	out := map[string]interface{}{"user_id": p.UserID, "email": p.Email, "global_admin": p.Super,
-		"account": map[bool]string{true: domain.UserKindAgent, false: domain.UserKindHuman}[p.Agent], "via_api_token": p.ViaToken}
+		"account": s.accountKind(rctx, p), "via_api_token": p.ViaToken}
 	if p.HasUser() {
 		orgs, err := s.repo.ListOrgs(rctx, p.UserRef())
 		if err != nil {

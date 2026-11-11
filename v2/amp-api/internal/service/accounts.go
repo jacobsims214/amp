@@ -187,6 +187,12 @@ func (s *Service) SetUserRole(ctx context.Context, p authz.Principal, userID int
 	if grant && role == domain.RoleAdmin && u.IsAgent() {
 		return authz.BadRequest("agent accounts can't be global admins")
 	}
+	// Same administration invariant as the org roles (#3766): a customer is a
+	// requester identity, and a global admin bypasses every org and project
+	// check, so a customer account is never one.
+	if grant && role == domain.RoleAdmin && u.IsCustomer() {
+		return authz.BadRequest("customer accounts can't be global admins: customers submit requests, they never administer AMP")
+	}
 	before, _ := s.Repo.UserRoles(ctx, userID)
 	if err := s.Repo.SetUserRole(ctx, userID, role, grant); err != nil {
 		return err

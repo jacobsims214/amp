@@ -1,6 +1,8 @@
 package domain
 
 import (
+	"fmt"
+	"slices"
 	"strings"
 	"time"
 )
@@ -731,8 +733,11 @@ type User struct {
 	Roles       []string  `json:"roles"`
 	CreatedAt   time.Time `json:"created_at"`
 	LastSeenAt  time.Time `json:"last_seen_at"`
-	// Kind is UserKindHuman (signs in through Dex) or UserKindAgent (an
-	// account for an autonomous agent, which uses API tokens).
+	// Kind is UserKindHuman (signs in through Dex), UserKindAgent (an
+	// account for an autonomous agent, which uses API tokens) or
+	// UserKindCustomer (an authenticated requester who submits team
+	// requests: a real identity, never an org or project member by
+	// implication).
 	Kind string `json:"kind"`
 	// ManagedBy is the person responsible for an agent account.
 	ManagedBy *int `json:"managed_by,omitempty"`
@@ -869,10 +874,45 @@ func (f AuditFilter) Values() map[string]any {
 // IsAgent reports whether u is an agent account.
 func (u *User) IsAgent() bool { return u != nil && u.Kind == UserKindAgent }
 
+// IsCustomer reports whether u is a customer account: an authenticated
+// requester identity, not a member of any org or project by implication.
+func (u *User) IsCustomer() bool { return u != nil && u.Kind == UserKindCustomer }
+
 const (
-	UserKindHuman = "human"
-	UserKindAgent = "agent"
+	UserKindHuman    = "human"
+	UserKindAgent    = "agent"
+	UserKindCustomer = "customer"
 )
+
+// UserKinds is the closed set of account kinds, in the order the schema's
+// CHECK names them (`users_kind_check`, migration 057). Adding a kind means
+// widening both this list and that CHECK.
+var UserKinds = []string{UserKindHuman, UserKindAgent, UserKindCustomer}
+
+// NormalizeUserKind validates an account kind (" Customer " is customer).
+// An empty kind is a person: JIT provisioning's default (migration 009).
+func NormalizeUserKind(s string) (string, error) {
+	k := strings.ToLower(strings.TrimSpace(s))
+	if k == "" {
+		return UserKindHuman, nil
+	}
+	if !slices.Contains(UserKinds, k) {
+		return "", fmt.Errorf("account kind must be one of %s", strings.Join(UserKinds, ", "))
+	}
+	return k, nil
+}
+
+// CanHoldOrgRole reports whether an account of this kind may hold role in an
+// org. A customer is a requester identity and never its administrator: org
+// owner/admin reaches every project in the org (see levelFromAccess), which
+// is exactly what a customer must never get. Plain membership is allowed, so
+// a customer may sit in an org without gaining anything from it.
+func CanHoldOrgRole(kind, role string) bool {
+	if kind != UserKindCustomer {
+		return true
+	}
+	return role != OrgRoleOwner && role != OrgRoleAdmin
+}
 
 // APIToken is a long-lived credential for MCP (and API) access, for agent
 // accounts and for people running headless agents. Only a hash is stored;

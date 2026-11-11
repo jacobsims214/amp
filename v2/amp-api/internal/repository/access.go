@@ -160,13 +160,20 @@ func (r *Repo) SetOrgReceiptsMode(ctx context.Context, id int, mode string) erro
 	return err
 }
 
-// CreateOrg creates an org; ownerID, when set, becomes its first owner.
+// CreateOrg creates an org; ownerID, when set, becomes its first owner. A
+// customer account can't be an org's owner (domain.CanHoldOrgRole): the org's
+// owner reaches every project in it, and a requester identity never does.
 func (r *Repo) CreateOrg(ctx context.Context, name, slug string, createdBy, ownerID *int) (*domain.Org, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if ownerID != nil {
+		if err := guardCustomerOrgRole(ctx, tx, *ownerID, domain.OrgRoleOwner); err != nil {
+			return nil, err
+		}
+	}
 	o := &domain.Org{}
 	err = scanOrg(tx.QueryRow(ctx,
 		`INSERT INTO orgs AS o (name, slug, created_by) VALUES ($1, $2, $3) RETURNING `+orgCols,
@@ -264,13 +271,18 @@ func scanUserMember(row rowScanner, m *domain.Member) error {
 }
 
 // SetOrgMember adds a user to an org or changes their role. Demoting the
-// last owner is refused.
+// last owner is refused, and so is an owner/admin grant to a customer
+// account (domain.CanHoldOrgRole): org owner/admin reaches every project in
+// the org, which a requester identity must never get.
 func (r *Repo) SetOrgMember(ctx context.Context, orgID, userID int, role string) error {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := guardCustomerOrgRole(ctx, tx, userID, role); err != nil {
+		return err
+	}
 	if role != domain.OrgRoleOwner {
 		if err := guardLastOrgOwner(ctx, tx, orgID, userID); err != nil {
 			return err
@@ -282,6 +294,31 @@ func (r *Repo) SetOrgMember(ctx context.Context, orgID, userID int, role string)
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// guardCustomerOrgRole refuses an org owner/admin role for a customer
+// account, and only that: any other account keeps every role it could hold
+// before (#3766). It runs inside the writing transaction so a concurrent
+// kind change cannot slip between the check and the grant, and it reads the
+// row by primary key, so it is one indexed lookup per grant.
+func guardCustomerOrgRole(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, userID int, role string) error {
+	if role != domain.OrgRoleOwner && role != domain.OrgRoleAdmin {
+		return nil
+	}
+	var kind, email string
+	err := q.QueryRow(ctx, `SELECT kind, email FROM users WHERE id = $1`, userID).Scan(&kind, &email)
+	if err == pgx.ErrNoRows {
+		return fmt.Errorf("user %d: %w", userID, ErrNotFound)
+	}
+	if err != nil {
+		return err
+	}
+	if !domain.CanHoldOrgRole(kind, role) {
+		return conflictf("a customer account can't be org %s: customers submit requests, they never administer an org (%s)", role, email)
+	}
+	return nil
 }
 
 // RemoveOrgMember removes a user from an org and all of its teams.
@@ -649,6 +686,14 @@ func (r *Repo) AcceptInvitesList(ctx context.Context, userID int, email string) 
 		return nil, err
 	}
 	for _, inv := range pending {
+		// An invite that names an org owner/admin role is a grant path like any
+		// other: a customer account can't accept one (#3766,
+		// domain.CanHoldOrgRole). Refuse loudly instead of granting it or
+		// silently downgrading it to member, so the admin who wrote the
+		// invite fixes it (revoke it, or invite them as a plain member).
+		if err := guardCustomerOrgRole(ctx, tx, userID, inv.OrgRole); err != nil {
+			return nil, fmt.Errorf("invite %d: %w", inv.ID, err)
+		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, $3)
 			ON CONFLICT (org_id, user_id) DO UPDATE SET role = CASE

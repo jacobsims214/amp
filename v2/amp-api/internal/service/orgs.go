@@ -125,8 +125,16 @@ func (s *Service) CreateOrg(ctx context.Context, p authz.Principal, name, slug, 
 		id, err := s.Authz.ResolveUser(ctx, p, owner)
 		switch {
 		case err == nil:
+			// The owner role is a grant path like any other: a customer
+			// account can't be made the org's first owner (#3766), which
+			// the repository also refuses inside its writing transaction.
+			if err := s.requireKindCanHoldOrgRole(ctx, id, domain.OrgRoleOwner); err != nil {
+				return nil, nil, err
+			}
 			ownerID = &id
 		case strings.Contains(owner, "@"):
+			// No AMP user yet: the invite will grant the role when it is
+			// accepted, and AcceptInvitesList re-checks the kind then.
 			inviteOwner = owner
 		default:
 			return nil, nil, err
@@ -237,6 +245,14 @@ func (s *Service) AddOrgMember(ctx context.Context, p authz.Principal, orgID int
 		}
 		return nil, err
 	}
+	// A customer may be in an org as a plain member, never as its owner or
+	// admin: org owner/admin reaches every project in the org, and a
+	// requester identity must reach none (#3766). The repository refuses the
+	// same grant inside its writing transaction, so no other path slips past
+	// this clear answer.
+	if err := s.requireKindCanHoldOrgRole(ctx, userID, role); err != nil {
+		return nil, err
+	}
 	current, err := s.Repo.GetOrgRole(ctx, orgID, userID)
 	if err != nil {
 		return nil, err
@@ -281,6 +297,23 @@ func (s *Service) RemoveOrgMember(ctx context.Context, p authz.Principal, orgID 
 		Before: roleValue(current), After: roleValue("")})
 	s.endRemoteAfterAccessChange(ctx, p, userID)
 	return userID, nil
+}
+
+// requireKindCanHoldOrgRole refuses an org owner/admin role for a customer
+// account, with the same clear message as the repository's writing-transaction
+// guard (#3766). Any other account, and any other org role, is unaffected.
+func (s *Service) requireKindCanHoldOrgRole(ctx context.Context, userID int, role string) error {
+	if role != domain.OrgRoleOwner && role != domain.OrgRoleAdmin {
+		return nil
+	}
+	u, err := s.Repo.GetUserByID(ctx, userID)
+	if err != nil {
+		return authz.NotFound("user %d not found", userID)
+	}
+	if !domain.CanHoldOrgRole(u.Kind, role) {
+		return authz.BadRequest("a customer account can't be org %s: customers submit requests, they never administer an org (%s)", role, u.Email)
+	}
+	return nil
 }
 
 // ---- Teams ----
@@ -488,6 +521,16 @@ func (s *Service) invite(ctx context.Context, p authz.Principal, inv domain.Invi
 		team, err := s.Repo.GetTeam(ctx, *inv.TeamID)
 		if err != nil || team.OrgID != inv.OrgID {
 			return nil, authz.BadRequest("team is not in this org")
+		}
+	}
+	// An email that already belongs to an AMP account is granted the invite's
+	// role on the spot below, which makes this a grant path: a customer
+	// account can't be invited as a plain member never mind owner/admin, so
+	// refuse here rather than at acceptance (#3766). An email with no account
+	// yet is checked when it is accepted.
+	if u, err := s.Repo.GetUserByEmail(ctx, inv.Email); err == nil {
+		if err := s.requireKindCanHoldOrgRole(ctx, u.ID, inv.OrgRole); err != nil {
+			return nil, err
 		}
 	}
 	inv.InvitedBy = p.UserRef()
