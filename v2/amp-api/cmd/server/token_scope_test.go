@@ -337,9 +337,9 @@ func TestSubmitScopeMCPToolList(t *testing.T) {
 		t.Fatalf("decode tools/list: %v (%s)", err, b)
 	}
 	// The invariant, whichever slice has landed: nothing but the submission may
-	// ever be advertised to a submit-only credential. (The submit tool itself is
-	// build slice I1, so today this is the empty list; when it lands, this list
-	// is exactly it — and either way nothing else may appear.)
+	// ever be advertised to a submit-only credential. The submit tool landed with
+	// slice I1 (#3920), so this list is exactly it — and either way nothing else
+	// may appear, which is what fails if a later request tool forgets the scope.
 	var names []string
 	for _, tl := range list.Result.Tools {
 		names = append(names, tl.Name)

@@ -110,6 +110,15 @@ var toolCatalog = map[string]toolInfo{
 	"amp_list_deleted_tasks": {title: "List trash", keywords: "deleted tickets, epics and stories", readOnly: true},
 	"amp_restore_tasks":      {title: "Restore from trash", keywords: "undelete tickets, epics or stories"},
 
+	// Team inbox
+	//
+	// amp_submit_request is deliberately NOT flagged idempotent: it is idempotent
+	// only when the caller sends an idempotency_key, and a retry without one
+	// submits a second request. The flag a model reads must not promise more
+	// than the tool keeps (the condition is in the description instead), so the
+	// honest hint is "not idempotent" — the same way a write tool with no key is.
+	"amp_submit_request": {title: "Submit team request", keywords: "submit a request, intake, team inbox, send work to a team, no project needed, idempotency key replay"},
+
 	// Reports
 	"amp_day_report":          {title: "Draft day report", keywords: "end of day, wrap up today, standup draft", readOnly: true},
 	"amp_save_day_report":     {title: "Save day report", keywords: "save the end-of-day report", idempotent: true},
