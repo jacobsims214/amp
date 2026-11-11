@@ -316,6 +316,28 @@ func (s *Service) requireKindCanHoldOrgRole(ctx context.Context, userID int, rol
 	return nil
 }
 
+// requireKindCanBeTeamMember refuses team membership for a customer account,
+// with the same conflict (409) and the same shape as the invite-acceptance
+// path's refusal (Repo.AcceptInvitesList, #3861). Team membership is how a
+// person reaches every project the team is linked to, which a requester
+// identity must never get; a customer reaches a team's inbox through a submit
+// grant instead (Service.GrantSubmitAccess). Any other account kind is
+// unaffected, and so is every human path.
+//
+// The repository refuses the same grant inside its writing transaction
+// (guardCustomerTeamMember), so this is the clear answer, not the only guard.
+func (s *Service) requireKindCanBeTeamMember(ctx context.Context, userID int) error {
+	u, err := s.Repo.GetUserByID(ctx, userID)
+	if err != nil {
+		return authz.NotFound("user %d not found", userID)
+	}
+	if u.IsCustomer() {
+		return &authz.Error{Status: 409, Msg: fmt.Sprintf(
+			"a customer account can't join a team: team membership reaches projects, and customers submit requests (%s); give them submit access to the team's inbox instead", u.Email)}
+	}
+	return nil
+}
+
 // ---- Teams ----
 
 func (s *Service) ListTeams(ctx context.Context, p authz.Principal, orgID int) ([]domain.Team, error) {
@@ -427,6 +449,16 @@ func (s *Service) AddTeamMember(ctx context.Context, p authz.Principal, teamID i
 		if invite && strings.Contains(user, "@") {
 			return s.invite(ctx, p, domain.Invite{Email: user, OrgID: team.OrgID, OrgRole: domain.OrgRoleMember, TeamID: &team.ID, TeamRole: role})
 		}
+		return nil, err
+	}
+	// A customer is not a team member by implication (#3861): team membership
+	// reaches every project the team is linked to, which the approved contract
+	// forbids for a requester identity (see architecture/customer-accounts.md).
+	// The invite-acceptance path already refused this (AcceptInvitesList); the
+	// direct add path did not until now. The repository refuses the same grant
+	// inside its writing transaction, so no other caller slips past this clear
+	// answer.
+	if err := s.requireKindCanBeTeamMember(ctx, userID); err != nil {
 		return nil, err
 	}
 	previous, _ := s.Repo.GetTeamRole(ctx, teamID, userID)

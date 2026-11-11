@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -36,6 +37,8 @@ type customerDB struct {
 	dsn string
 	ctx context.Context
 	org int
+	// team is a team in org, with no members but the ones a test adds.
+	team int
 	// person, agent and customer are users rows, of those kinds.
 	person, agent, customer int
 }
@@ -59,6 +62,7 @@ func newCustomerDB(t *testing.T) *customerDB {
 	t.Cleanup(func() { db.Close(context.Background()) })
 	d := &customerDB{t: t, db: db, dsn: dsn, ctx: ctx}
 	d.org = d.insert(`INSERT INTO orgs (name, slug) VALUES ('Customer org', 'customer-org') RETURNING id`)
+	d.team = d.insert(`INSERT INTO teams (org_id, name) VALUES ($1, 'Inbox') RETURNING id`, d.org)
 	d.person = d.insert(`INSERT INTO users (subject, email, kind) VALUES ('cust-person', 'person@customer.test', 'human') RETURNING id`)
 	d.agent = d.insert(`INSERT INTO users (subject, email, kind) VALUES ('cust-agent', 'agent@customer.test', 'agent') RETURNING id`)
 	d.customer = d.insert(`INSERT INTO users (subject, email, kind) VALUES ('cust-customer', 'requester@customer.test', 'customer') RETURNING id`)
@@ -95,6 +99,41 @@ func (d *customerDB) orgRole(userID int) string {
 		d.t.Fatalf("org role of %d: %v", userID, err)
 	}
 	return role
+}
+
+// teamRole returns the user's role on the fixture team, "" when there is no
+// row.
+func (d *customerDB) teamRole(userID int) string {
+	d.t.Helper()
+	var role string
+	err := d.db.QueryRow(d.ctx, `SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2`, d.team, userID).Scan(&role)
+	if err == pgx.ErrNoRows {
+		return ""
+	}
+	if err != nil {
+		d.t.Fatalf("team role of %d: %v", userID, err)
+	}
+	return role
+}
+
+// auditActions returns the audit_log actions recorded against the fixture
+// team, newest first.
+func (d *customerDB) auditActions() []string {
+	d.t.Helper()
+	rows, err := d.db.Query(d.ctx, `SELECT action FROM audit_log WHERE target_type = 'team' AND target_id = $1 ORDER BY id DESC`, fmt.Sprint(d.team))
+	if err != nil {
+		d.t.Fatalf("audit actions: %v", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var a string
+		if err := rows.Scan(&a); err != nil {
+			d.t.Fatal(err)
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 func (d *customerDB) repo() *repository.Repo {
@@ -500,6 +539,181 @@ func TestCustomerOrgRoleRefusedInService(t *testing.T) {
 		botIdent := &auth.Identity{Subject: bot.Subject, Email: bot.Email, Name: "bot", User: bot}
 		if got := fmt.Sprint(w.as(botIdent).call(t, "amp_whoami", map[string]interface{}{})["account"]); got != domain.UserKindAgent {
 			t.Fatalf("agent whoami account = %q", got)
+		}
+	})
+}
+
+// ---- Team membership: the other half of the requester-isolation invariant ----
+
+// TestCustomerTeamMembershipRefused (AMP #3861) closes the gap the wave review
+// of #3766-#3772 found: the invite-acceptance path refused team membership for
+// a customer, but the *direct* add path (`Service.AddTeamMember` →
+// `Repo.SetTeamMember`) did not. Team membership is how a person reaches every
+// project a team is linked to (`AccessibleProjectIDs`), so it is the one
+// membership a requester identity may never hold.
+//
+// Proved here on a real database, at both layers:
+//   - the service refuses a customer add and writes no team_members row, no
+//     org_members row, and no successful-add audit entry;
+//   - the repository refuses it as a backstop when SetTeamMember is called
+//     directly with a customer id, inside its writing transaction;
+//   - a human's direct add is unchanged, and so is CreateAgent's grant to the
+//     freshly created agent row it manages;
+//   - plain org membership for a customer is still allowed (deliberate).
+func TestCustomerTeamMembershipRefused(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Service.AddTeamMember refuses a customer", func(t *testing.T) {
+		d := newCustomerDB(t)
+		svc, _ := d.svc()
+		// The caller is an org owner, so the refusal is about the target's
+		// kind, not the caller's rights (RequireTeamManager passes).
+		if err := d.repo().SetOrgMember(ctx, d.org, d.person, domain.OrgRoleOwner); err != nil {
+			t.Fatal(err)
+		}
+		lead := d.principal(d.person)
+		// Both ways of naming the customer: by email, and by id.
+		for _, ref := range []string{"requester@customer.test", fmt.Sprint(d.customer)} {
+			res, err := svc.AddTeamMember(ctx, lead, d.team, ref, domain.TeamRoleMember, false)
+			if err == nil {
+				t.Fatalf("service added customer %q to the team: %+v", ref, res)
+			}
+			if !strings.Contains(err.Error(), "customer") {
+				t.Fatalf("refusal (%q) does not name the customer account: %v", ref, err)
+			}
+			// Same conflict as the invite-acceptance path (#3861): 409.
+			if got := authz.StatusOf(err, 500); got != 409 {
+				t.Fatalf("refusal (%q) status = %d, want 409", ref, got)
+			}
+			// A customer that did not join the team has no routing grant
+			// either: the refusal suggests one, it does not silently add it.
+			if got := d.teamRole(d.customer); got != "" {
+				t.Fatalf("refused add (%q) wrote team role %q", ref, got)
+			}
+			if got := d.orgRole(d.customer); got != "" {
+				t.Fatalf("refused add (%q) wrote org role %q", ref, got)
+			}
+		}
+		for _, a := range d.auditActions() {
+			if a == "team.member.set" {
+				t.Fatalf("refused add still audited a successful grant (%v)", d.auditActions())
+			}
+		}
+	})
+
+	t.Run("Service.AddTeamMember still adds a human", func(t *testing.T) {
+		d := newCustomerDB(t)
+		svc, _ := d.svc()
+		if err := d.repo().SetOrgMember(ctx, d.org, d.person, domain.OrgRoleOwner); err != nil {
+			t.Fatal(err)
+		}
+		lead := d.principal(d.person)
+		// A human, directly by email: the regression the ticket asks for.
+		res, err := svc.AddTeamMember(ctx, lead, d.team, "person@customer.test", domain.TeamRoleMember, false)
+		if err != nil {
+			t.Fatalf("a person's direct add was refused: %v", err)
+		}
+		if res == nil || !res.Added || res.UserID != d.person || res.Role != domain.TeamRoleMember {
+			t.Fatalf("person add = %+v", res)
+		}
+		if got := d.teamRole(d.person); got != domain.TeamRoleMember {
+			t.Fatalf("person team role = %q", got)
+		}
+		if got := d.orgRole(d.person); got == "" {
+			t.Fatal("a direct team add no longer gives the person org membership")
+		}
+		// Promoting them to lead on the same team is unchanged too.
+		if _, err := svc.AddTeamMember(ctx, lead, d.team, fmt.Sprint(d.person), domain.TeamRoleLead, false); err != nil {
+			t.Fatalf("promoting a person to team lead: %v", err)
+		}
+		if got := d.teamRole(d.person); got != domain.TeamRoleLead {
+			t.Fatalf("person team role after promotion = %q", got)
+		}
+		// The successful adds are audited, so the pair of subtests shows the
+		// refusal also suppresses the audit row rather than merely the insert.
+		found := false
+		for _, a := range d.auditActions() {
+			if a == "team.member.set" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("a person's add is not audited: %v", d.auditActions())
+		}
+	})
+
+	t.Run("Repo.SetTeamMember refuses a customer directly", func(t *testing.T) {
+		d := newCustomerDB(t)
+		repo := d.repo()
+		// Called straight at the repository, with no service check in front of
+		// it: the in-transaction guard is the backstop. Both the member and the
+		// lead role are refused — team membership itself is the vector.
+		for _, role := range []string{domain.TeamRoleMember, domain.TeamRoleLead} {
+			err := repo.SetTeamMember(ctx, d.team, d.customer, role)
+			if err == nil {
+				t.Fatalf("repository granted a customer team %s", role)
+			}
+			if !strings.Contains(err.Error(), "customer") {
+				t.Fatalf("refusal does not name the customer account: %v", err)
+			}
+			if !errors.Is(err, repository.ErrConflict) {
+				t.Fatalf("refusal is not a conflict (409): %v", err)
+			}
+			if got := d.teamRole(d.customer); got != "" {
+				t.Fatalf("refused %s grant wrote team role %q", role, got)
+			}
+			if got := d.orgRole(d.customer); got != "" {
+				t.Fatalf("refused %s grant wrote org role %q", role, got)
+			}
+		}
+		// A customer who is already a plain org member (deliberate, and
+		// allowed) still gets no team row: the guard runs before both inserts.
+		if err := repo.SetOrgMember(ctx, d.org, d.customer, domain.OrgRoleMember); err != nil {
+			t.Fatalf("a customer may be a plain org member: %v", err)
+		}
+		if err := repo.SetTeamMember(ctx, d.team, d.customer, domain.TeamRoleMember); err == nil {
+			t.Fatal("repository added an org-member customer to the team")
+		}
+		if got := d.teamRole(d.customer); got != "" {
+			t.Fatalf("refused add wrote team role %q", got)
+		}
+	})
+
+	t.Run("Repo.SetTeamMember still adds a human and an agent", func(t *testing.T) {
+		d := newCustomerDB(t)
+		repo := d.repo()
+		if err := repo.SetTeamMember(ctx, d.team, d.person, domain.TeamRoleMember); err != nil {
+			t.Fatalf("person: %v", err)
+		}
+		if err := repo.SetTeamMember(ctx, d.team, d.agent, domain.TeamRoleMember); err != nil {
+			t.Fatalf("agent: %v", err)
+		}
+		if got := d.teamRole(d.person); got != domain.TeamRoleMember {
+			t.Fatalf("person team role = %q", got)
+		}
+		if got := d.teamRole(d.agent); got != domain.TeamRoleMember {
+			t.Fatalf("agent team role = %q", got)
+		}
+	})
+
+	t.Run("CreateAgent still puts its new agent on a team", func(t *testing.T) {
+		d := newCustomerDB(t)
+		svc, _ := d.svc()
+		// CreateAgent calls Repo.SetTeamMember for the agent row it has just
+		// created (kind='agent'), so the repository guard must not touch it.
+		if err := d.repo().SetTeamMember(ctx, d.team, d.person, domain.TeamRoleLead); err != nil {
+			t.Fatal(err)
+		}
+		owner := d.principal(d.person)
+		bot, err := svc.CreateAgent(ctx, owner, "team bot", []int{d.team})
+		if err != nil {
+			t.Fatalf("CreateAgent on a team: %v", err)
+		}
+		if got := d.kindOf(bot.ID); got != domain.UserKindAgent {
+			t.Fatalf("new account kind = %q", got)
+		}
+		if got := d.teamRole(bot.ID); got != domain.TeamRoleMember {
+			t.Fatalf("agent team role = %q", got)
 		}
 	})
 }

@@ -479,12 +479,24 @@ func (r *Repo) ListTeamMembers(ctx context.Context, teamID int) ([]domain.Member
 
 // SetTeamMember adds a user to a team (and to the team's org as a member,
 // if they aren't in it yet) or changes their team role.
+//
+// A customer account is refused (#3861): team membership is how a person
+// reaches a project through AccessibleProjectIDs, which is exactly the access
+// a requester identity must never get, so a direct add is guarded like the
+// invite-acceptance path it mirrors (AcceptInvitesList). The kind is read in
+// the same transaction that writes the rows, so a concurrent kind change
+// cannot slip between the check and the grant, and no caller can bypass the
+// service's own check by reaching this method directly. It also creates no org
+// membership row for the customer, since the guard runs before either insert.
 func (r *Repo) SetTeamMember(ctx context.Context, teamID, userID int, role string) error {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := guardCustomerTeamMember(ctx, tx, userID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO org_members (org_id, user_id, role)
 		SELECT org_id, $2, 'member' FROM teams WHERE id = $1
@@ -497,6 +509,34 @@ func (r *Repo) SetTeamMember(ctx context.Context, teamID, userID int, role strin
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// guardCustomerTeamMember refuses team membership for a customer account
+// (#3861). Team membership reaches every project its team is linked to
+// (AccessibleProjectIDs), so it is the one membership a requester identity may
+// never hold: a customer reaches a team's inbox through a submit grant
+// (GrantSubmitAccess), never through membership. Every other account kind, and
+// every human and agent path, is unaffected.
+//
+// It runs inside the writing transaction and reads the row by primary key, so
+// a concurrent kind change cannot slip between the check and the grant, and it
+// is the backstop that makes the invariant hold for any future caller of
+// SetTeamMember rather than only the service that fronts it today.
+func guardCustomerTeamMember(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, userID int) error {
+	var kind, email string
+	err := q.QueryRow(ctx, `SELECT kind, email FROM users WHERE id = $1`, userID).Scan(&kind, &email)
+	if err == pgx.ErrNoRows {
+		return fmt.Errorf("user %d: %w", userID, ErrNotFound)
+	}
+	if err != nil {
+		return err
+	}
+	if kind == domain.UserKindCustomer {
+		return conflictf("a customer account can't join a team: team membership reaches projects, and customers submit requests (%s); give them submit access to the team's inbox instead", email)
+	}
+	return nil
 }
 
 func (r *Repo) RemoveTeamMember(ctx context.Context, teamID, userID int) error {
