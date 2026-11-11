@@ -5,12 +5,14 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
+	"github.com/simstech/amp-api/internal/repository"
 )
 
 // Accounts: agent accounts, deactivation, and API tokens.
@@ -238,11 +240,59 @@ type NewToken struct {
 	Token string `json:"token"`
 }
 
-// CreateToken mints an API token for userID (the caller, or an agent they
-// manage). expiresInDays 0 means it doesn't expire.
+// TokenScopeRequest is what a caller asks for when minting a token: full (the
+// default, and every token minted before scopes existed) or submit-only, bound
+// to one team's inbox (AMP #3772; approved contract artifact 36 v2 §5).
+//
+// A submit-only token may send requests to TeamID's inbox and do nothing else —
+// no reads, no lists, no grant administration, no approvals — so a connector
+// holds one inbox's worth of reach instead of the account's whole authority.
+type TokenScopeRequest struct {
+	Scope  string // "" = full (domain.TokenScopeFull)
+	TeamID int    // required for submit, refused for full
+}
+
+// CreateToken mints a full-scope API token for userID (the caller, or an agent
+// they manage). expiresInDays 0 means it doesn't expire.
 func (s *Service) CreateToken(ctx context.Context, p authz.Principal, userID int, name string, expiresInDays int) (*NewToken, error) {
+	return s.CreateScopedToken(ctx, p, userID, name, expiresInDays, TokenScopeRequest{})
+}
+
+// CreateScopedToken is CreateToken with an explicit scope (AMP #3772).
+//
+// Two rules beyond CreateToken's:
+//
+//   - The scope is validated here and nowhere trusted from a caller: an
+//     unknown value is a 400, never a silently full token.
+//   - **Issuers cannot grant authority they lack.** A submit-only token for
+//     team T is only minted if the *issuer* may submit to T's inbox right now
+//     (Checker.TeamSubmit, the same capability the submission itself uses). A
+//     token is an attenuation of its account, so minting one for a team the
+//     account could not submit to would be an expansion by another name. The
+//     check runs against the issuer, not the token's owner, because an agent's
+//     manager mints on the agent's behalf and could otherwise hand the agent a
+//     reach it does not have itself.
+//
+// The scope is fixed for the token's life: nothing updates these columns, and
+// revocation is the only way a token stops (see the migration's comment).
+func (s *Service) CreateScopedToken(ctx context.Context, p authz.Principal, userID int, name string, expiresInDays int, req TokenScopeRequest) (*NewToken, error) {
 	if p.Agent {
 		return nil, authz.Forbidden("agent accounts can't create API tokens; the person who manages the agent can")
+	}
+	// A narrowed credential cannot mint credentials: that would be a way to
+	// turn the one submission it may make into a broader token.
+	if err := p.RequireUnscoped("mint API tokens"); err != nil {
+		return nil, err
+	}
+	scope, err := domain.NormalizeTokenScope(req.Scope)
+	if err != nil {
+		return nil, authz.BadRequest("%s", err.Error())
+	}
+	switch {
+	case scope == domain.TokenScopeSubmit && req.TeamID == 0:
+		return nil, authz.BadRequest("a submit-only token must name the team it may submit to (scope_team_id)")
+	case scope == domain.TokenScopeFull && req.TeamID != 0:
+		return nil, authz.BadRequest("a full-scope token can't be bound to one team; ask for scope \"submit\" or omit scope_team_id")
 	}
 	u, err := s.accountFor(ctx, p, userID, true)
 	if err != nil {
@@ -258,6 +308,14 @@ func (s *Service) CreateToken(ctx context.Context, p authz.Principal, userID int
 	if expiresInDays < 0 || expiresInDays > MaxTokenDays {
 		return nil, authz.BadRequest("expires_in_days must be between 0 (never) and %d", MaxTokenDays)
 	}
+	if scope == domain.TokenScopeSubmit {
+		// The issuer's own standing on the team, resolved from the rows on this
+		// call. Refusals follow TeamSubmit's shape (404 for a team the issuer
+		// has no relationship with, 403 for one they can see but not submit to).
+		if err := s.Authz.TeamSubmit(ctx, p, req.TeamID); err != nil {
+			return nil, err
+		}
+	}
 	var expires *time.Time
 	if expiresInDays > 0 {
 		t := time.Now().Add(time.Duration(expiresInDays) * 24 * time.Hour)
@@ -267,13 +325,24 @@ func (s *Service) CreateToken(ctx context.Context, p authz.Principal, userID int
 	if err != nil {
 		return nil, err
 	}
-	tok, err := s.Repo.CreateAPIToken(ctx, userID, name, hash, prefix, p.UserRef(), expires)
+	spec := repository.APITokenSpec{Name: name, Hash: hash, Prefix: prefix, CreatedBy: p.UserRef(), ExpiresAt: expires, Scope: scope}
+	if scope == domain.TokenScopeSubmit {
+		teamID := req.TeamID
+		spec.ScopeTeamID = &teamID
+	}
+	tok, err := s.Repo.CreateScopedAPIToken(ctx, userID, spec)
 	if err != nil {
 		return nil, err
 	}
+	summary := "created API token " + prefix + "… (" + name + ") for " + u.Email
+	details := map[string]any{"token_id": tok.ID, "expires_at": expires, "scope": scope}
+	if tok.ScopeTeamID != nil {
+		summary = "created submit-only API token " + prefix + "… (" + name + ") for " + u.Email +
+			", bound to team " + strconv.Itoa(*tok.ScopeTeamID)
+		details["scope_team_id"] = *tok.ScopeTeamID
+	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "token.create", TargetType: "user", TargetID: idStr(userID),
-		Summary: "created API token " + prefix + "… (" + name + ") for " + u.Email,
-		Details: map[string]any{"token_id": tok.ID, "expires_at": expires}})
+		Summary: summary, Details: details})
 	return &NewToken{APIToken: *tok, Token: raw}, nil
 }
 

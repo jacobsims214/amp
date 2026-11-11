@@ -62,6 +62,13 @@ type Identity struct {
 	AuthMethod string
 	// TokenID is the api_tokens.id of the API token used (never the token).
 	TokenID int64
+	// TokenScope and TokenScopeTeamID are the API token's scope
+	// (domain.TokenScopeFull or domain.TokenScopeSubmit) and, for a
+	// submit-only token, the one team it may submit to (AMP #3772). Empty
+	// for every other kind of request, which means full: only an API token
+	// can carry a narrower scope.
+	TokenScope       string
+	TokenScopeTeamID *int
 	// SessionID identifies the Dex sign-in a JWT belongs to, the same
 	// across refreshes when the token has auth_time or a nonce
 	// (DexSessionID). Never the token.
@@ -572,7 +579,7 @@ func (v *Verifier) identityFromAPIToken(w http.ResponseWriter, r *http.Request, 
 		fmt.Fprint(w, `{"error":"API tokens can't use remote control; sign in with `+"`amp-harness login`"+`","code":"token_not_allowed"}`)
 		return nil
 	}
-	u, tokenID, err := v.repo.UserAndTokenForAPIToken(r.Context(), HashAPIToken(rawToken))
+	u, tok, err := v.repo.UserAndTokenForAPIToken(r.Context(), HashAPIToken(rawToken))
 	if err != nil {
 		if !errors.Is(err, repository.ErrNotFound) {
 			slog.Error("API token lookup failed", "err", err)
@@ -592,7 +599,8 @@ func (v *Verifier) identityFromAPIToken(w http.ResponseWriter, r *http.Request, 
 		v.writeUnauthorized(w, "this token belongs to the Local Dev user, made while sign-in was off; it can't be used with sign-in on")
 		return nil
 	}
-	return &Identity{Subject: u.Subject, Email: u.Email, Name: u.DisplayName, User: u, APIToken: true, TokenID: tokenID}
+	return &Identity{Subject: u.Subject, Email: u.Email, Name: u.DisplayName, User: u, APIToken: true, TokenID: int64(tok.ID),
+		TokenScope: tok.Scope, TokenScopeTeamID: tok.ScopeTeamID}
 }
 
 // channelOf decides how a request reached AMP (see the Channel constants).

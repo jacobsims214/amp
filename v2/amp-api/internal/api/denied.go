@@ -23,7 +23,11 @@ type deniedMux struct {
 }
 
 func (m *deniedMux) HandleFunc(pattern string, fn http.HandlerFunc) {
-	m.mux.HandleFunc(pattern, m.h.denied(fn))
+	// The submit-scope gate is inside denied() so registration is what
+	// enforces it (AMP #3772): a scoped credential is refused before the
+	// handler runs, and the refusal is recorded as access.denied like every
+	// other 403 on this surface.
+	m.mux.HandleFunc(pattern, m.h.denied(m.h.submitScopeGate(fn)))
 }
 
 // statusRecorder notes the status a handler wrote and the start of its

@@ -918,15 +918,24 @@ func CanHoldOrgRole(kind, role string) bool {
 // accounts and for people running headless agents. Only a hash is stored;
 // the token itself is shown once, when it is created.
 type APIToken struct {
-	ID         int        `json:"id"`
-	UserID     int        `json:"user_id"`
-	Name       string     `json:"name"`
-	Prefix     string     `json:"prefix"` // first characters, to recognise it
-	CreatedBy  *int       `json:"created_by,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
-	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
-	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
-	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
+	ID     int    `json:"id"`
+	UserID int    `json:"user_id"`
+	Name   string `json:"name"`
+	Prefix string `json:"prefix"` // first characters, to recognise it
+	// Scope says how much of the account this token carries
+	// (TokenScopeFull or TokenScopeSubmit). Every token minted before
+	// scopes existed, and every token minted without asking for one, is
+	// full: its behaviour is unchanged (AMP #3772).
+	Scope string `json:"scope"`
+	// ScopeTeamID is the one team a submit-scoped token may send requests
+	// to, and nil for a full-scoped token. The scope and the team are
+	// inseparable (the schema's CHECK refuses one without the other).
+	ScopeTeamID *int       `json:"scope_team_id,omitempty"`
+	CreatedBy   *int       `json:"created_by,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
+	RevokedAt   *time.Time `json:"revoked_at,omitempty"`
 }
 
 const (

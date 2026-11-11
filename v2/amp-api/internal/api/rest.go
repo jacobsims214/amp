@@ -139,7 +139,10 @@ func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("/api/tasks/", h.taskSub)
 	mux.HandleFunc("/api/runs/", h.runSub)
 	mux.HandleFunc("/api/kb/", h.kbDoc)
-	mux.mux.HandleFunc("/api/events", h.events) // SSE: streams, never a 403 after it starts
+	// SSE: streams, never a 403 after it starts. The submit-scope gate runs
+	// before the stream opens, so a narrowed credential is refused with a
+	// body rather than being handed an empty stream (AMP #3772).
+	mux.mux.HandleFunc("/api/events", h.submitScopeGate(h.events))
 	mux.HandleFunc("/api/orgs", h.orgs)
 	mux.HandleFunc("/api/orgs/", h.orgSub)
 	mux.HandleFunc("/api/teams/", h.teamSub)
@@ -330,12 +333,18 @@ func (h *RestHandler) userSub(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Name          string `json:"name"`
 			ExpiresInDays int    `json:"expires_in_days"`
+			// Scope mints a narrowed credential (AMP #3772): "submit" makes
+			// a token that may only submit requests to ScopeTeamID's inbox.
+			// Absent means full, exactly as before.
+			Scope       string `json:"scope"`
+			ScopeTeamID int    `json:"scope_team_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			jsonErr(w, err, 400)
 			return
 		}
-		tok, err := h.svc.CreateToken(r.Context(), pr, userID, body.Name, body.ExpiresInDays)
+		tok, err := h.svc.CreateScopedToken(r.Context(), pr, userID, body.Name, body.ExpiresInDays,
+			service.TokenScopeRequest{Scope: body.Scope, TeamID: body.ScopeTeamID})
 		if err != nil {
 			fail(w, err, 500)
 			return

@@ -171,6 +171,20 @@ func presentTool(t mcpgo.Tool) mcpgo.Tool {
 // stay callable; they just aren't advertised.
 func (s *Server) listFilter(ctx context.Context, tools []mcpgo.Tool) []mcpgo.Tool {
 	p, err := authz.FromContext(ctx)
+	// A submit-scoped credential is shown the one tool it may call (AMP #3772):
+	// the list is the truth about the credential, not a broader surface it
+	// discovers by being refused. The gate in token_scope.go still refuses the
+	// others when called, since hidden tools stay callable.
+	if err == nil && p.SubmitOnly() {
+		allowed := submitScopeToolNames()
+		out := tools[:0:0]
+		for _, t := range tools {
+			if allowed[t.Name] {
+				out = append(out, t)
+			}
+		}
+		return out
+	}
 	admin := p.Super
 	if err == nil && !admin && p.HasUser() {
 		if orgs, err := s.repo.ListOrgs(ctx, p.UserRef()); err == nil {
@@ -216,7 +230,17 @@ func (s *Server) ServerOptions() []server.ServerOption {
 	return []server.ServerOption{
 		server.WithToolHandlerMiddleware(s.contactMiddleware()),
 		server.WithToolHandlerMiddleware(Middleware()),
+		// deniedMiddleware is registered BEFORE submitScopeGate because mcp-go
+		// applies middlewares in reverse (first registered = outermost), and a
+		// scope refusal must be recorded as access.denied like every other 403
+		// on this surface — the same row the REST gate's refusal gets (AMP
+		// #3772).
 		server.WithToolHandlerMiddleware(s.deniedMiddleware()),
+		// A submit-scoped credential reaches one tool. It runs outermost of
+		// the handler (after the deadline wrapper, which only sets a context),
+		// so a refused call costs no query, and it never has to remember
+		// anything: every tool call passes through it.
+		server.WithToolHandlerMiddleware(s.submitScopeGate()),
 		server.WithHooks(hooks),
 	}
 }

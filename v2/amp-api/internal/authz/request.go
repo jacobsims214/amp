@@ -166,6 +166,12 @@ func FilterRequests(reqs []domain.TeamRequest, view RequestView, me int) []domai
 // cannot see and a request that does not exist identically, so there is nothing
 // useful — or safe — to distinguish here.
 func (c *Checker) InboxRole(ctx context.Context, p Principal, teamID int) (InboxRole, error) {
+	// A submit-scoped credential reads no inbox, its own team's included
+	// (AMP #3772): the scope suppresses reading the same way it suppresses
+	// every other capability.
+	if role, scoped := scopedInboxRole(p); scoped {
+		return role, nil
+	}
 	// The team is loaded before anything else, even for a global admin, for the
 	// same reason TeamSubmit does it: asking about a team that does not exist
 	// must answer "no standing" rather than "global admin, so yes".

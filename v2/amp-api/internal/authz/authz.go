@@ -95,6 +95,15 @@ type Principal struct {
 	Agent bool
 	// ViaToken is set when the request authenticated with an API token.
 	ViaToken bool
+	// Scope and ScopeTeamID are the API token's scope (domain.TokenScopeFull
+	// or domain.TokenScopeSubmit) and, for a submit-only token, the one team
+	// it may send requests to (AMP #3772). A principal that did not arrive
+	// on an API token, and every full-scope token, is TokenScopeFull with no
+	// team — unchanged behaviour. Scope narrows the account's authority and
+	// never widens it: see AllowsSubmitScope and the guards in
+	// authz/token_scope.go.
+	Scope       string
+	ScopeTeamID int
 	// Channel is how the request reached AMP: auth.ChannelUI for a person in
 	// the web UI, otherwise mcp, token, rest-other, or empty (in-process).
 	// See RequireUI.
@@ -117,8 +126,15 @@ type Principal struct {
 
 // InUI reports whether p is a person acting in AMP's web UI: the only
 // caller that may approve a plan, approve an artifact, turn plan approval
-// off, or mark a person's own ticket done. Agent accounts never are.
-func (p Principal) InUI() bool { return p.Channel == auth.ChannelUI && !p.Agent }
+// off, or mark a person's own ticket done. Agent accounts never are, and
+// neither is a request that arrived on an API token (AMP #3772): a credential
+// is not a person, whatever channel label it was handed, so requester outcome
+// acceptance can never be a token's act. In production an API token is already
+// labeled auth.ChannelToken by channelOf; this makes the property structural
+// rather than a consequence of that labeling.
+func (p Principal) InUI() bool {
+	return p.Channel == auth.ChannelUI && !p.Agent && !p.ViaToken && !p.SubmitOnly()
+}
 
 // Label names the caller for history rows and audit details: its email,
 // or "local-dev" when auth is off.
@@ -196,7 +212,11 @@ func FromContext(ctx context.Context) (Principal, error) {
 		Super:    ident.HasRole(domain.RoleAdmin) && !ident.User.IsAgent(),
 		Agent:    ident.User.IsAgent(),
 		ViaToken: ident.APIToken,
-		Channel:  ident.Channel,
+		// The credential's scope. Empty (a Dex session, an in-process
+		// caller) is full: only an API token can carry a narrower one.
+		Scope:       tokenScopeOrFull(ident.TokenScope),
+		ScopeTeamID: tokenScopeTeam(ident.TokenScopeTeamID),
+		Channel:     ident.Channel,
 
 		AuthMethod: ident.AuthMethod,
 		TokenID:    ident.TokenID,
@@ -204,6 +224,25 @@ func FromContext(ctx context.Context) (Principal, error) {
 		ManagedBy:  ident.User.ManagedBy,
 		Req:        req,
 	}, nil
+}
+
+// tokenScopeOrFull normalizes a token's scope for a Principal: anything that
+// isn't the explicit submit scope is full, so a Dex session (no scope), a
+// pre-scope token row and a future value all behave exactly as before. Only
+// domain.TokenScopeSubmit narrows anything (AMP #3772).
+func tokenScopeOrFull(scope string) string {
+	if scope == domain.TokenScopeSubmit {
+		return domain.TokenScopeSubmit
+	}
+	return domain.TokenScopeFull
+}
+
+// tokenScopeTeam is a submit scope's team as a plain int, 0 when it has none.
+func tokenScopeTeam(teamID *int) int {
+	if teamID == nil {
+		return 0
+	}
+	return *teamID
 }
 
 // ---- Levels ----
@@ -251,8 +290,12 @@ type Checker struct {
 
 func NewChecker(repo *repository.Repo) *Checker { return &Checker{repo: repo} }
 
-// ProjectLevel returns p's level on projectID.
+// ProjectLevel returns p's level on projectID. A submit-scoped credential has
+// none, on every project, whatever its account's own level is (AMP #3772).
 func (c *Checker) ProjectLevel(ctx context.Context, p Principal, projectID int) (Level, error) {
+	if lvl, scoped := scopeProjectLevel(p, projectID); scoped {
+		return lvl, nil
+	}
 	if p.Super {
 		return Super, nil
 	}
@@ -280,23 +323,38 @@ func (c *Checker) RequireProject(ctx context.Context, p Principal, projectID int
 }
 
 // VisibleProjects returns the IDs of projects p can see, or nil meaning all.
+// A submit-scoped credential sees the empty set, never nil (AMP #3772): nil
+// means every project in that method's contract, which is the opposite of what
+// a narrowed credential may reach.
 func (c *Checker) VisibleProjects(ctx context.Context, p Principal) (map[int]bool, error) {
+	if visible, scoped := scopedVisibleProjects(p); scoped {
+		return visible, nil
+	}
 	if p.Super {
 		return nil, nil
 	}
 	return c.repo.AccessibleProjectIDs(ctx, p.UserID)
 }
 
-// OrgRole returns p's role in orgID ("" if not a member).
+// OrgRole returns p's role in orgID ("" if not a member). A submit-scoped
+// credential holds no org role, so every org-scoped capability is closed to it
+// (AMP #3772).
 func (c *Checker) OrgRole(ctx context.Context, p Principal, orgID int) (string, error) {
+	if role, scoped := scopedOrgRole(p); scoped {
+		return role, nil
+	}
 	if !p.HasUser() {
 		return "", nil
 	}
 	return c.repo.GetOrgRole(ctx, orgID, p.UserID)
 }
 
-// RequireOrgMember fails unless p is in orgID (or a global admin).
+// RequireOrgMember fails unless p is in orgID (or a global admin). A
+// submit-scoped credential administers no org, global admin or not (AMP #3772).
 func (c *Checker) RequireOrgMember(ctx context.Context, p Principal, orgID int) (string, error) {
+	if err := p.requireNotScoped(); err != nil {
+		return "", err
+	}
 	role, err := c.OrgRole(ctx, p, orgID)
 	if err != nil {
 		return "", err
@@ -308,6 +366,7 @@ func (c *Checker) RequireOrgMember(ctx context.Context, p Principal, orgID int) 
 }
 
 // RequireOrgAdmin fails unless p is an owner/admin of orgID or a global admin.
+// A submit-scoped credential is never one (AMP #3772).
 func (c *Checker) RequireOrgAdmin(ctx context.Context, p Principal, orgID int) (string, error) {
 	role, err := c.RequireOrgMember(ctx, p, orgID)
 	if err != nil {
@@ -320,8 +379,13 @@ func (c *Checker) RequireOrgAdmin(ctx context.Context, p Principal, orgID int) (
 }
 
 // RequireTeamManager fails unless p can manage team membership: org
-// owner/admin, global admin, or a lead of the team.
+// owner/admin, global admin, or a lead of the team. A submit-scoped credential
+// never manages a team — including the one it may submit to, because managing
+// it would let the credential hand itself more (AMP #3772).
 func (c *Checker) RequireTeamManager(ctx context.Context, p Principal, team *domain.Team) error {
+	if err := p.requireNotScoped(); err != nil {
+		return err
+	}
 	role, err := c.RequireOrgMember(ctx, p, team.OrgID)
 	if err != nil {
 		return err
@@ -370,6 +434,17 @@ func (c *Checker) RequireTeamManager(ctx context.Context, p Principal, team *dom
 // is not found, while an org member who can already see the team and simply may
 // not submit to it gets 403 with the reason.
 func (c *Checker) TeamSubmit(ctx context.Context, p Principal, teamID int) error {
+	// A submit-scoped credential may only submit to the one team it is bound
+	// to, and only while its account could submit there anyway (AMP #3772).
+	if scoped, err := c.scopeTeamSubmit(ctx, p, teamID); scoped {
+		return err
+	}
+	return c.teamSubmit(ctx, p, teamID)
+}
+
+// teamSubmit is TeamSubmit's ordinary path, for a principal that is not
+// narrowed by a credential scope.
+func (c *Checker) teamSubmit(ctx context.Context, p Principal, teamID int) error {
 	team, err := c.repo.GetTeam(ctx, teamID)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {

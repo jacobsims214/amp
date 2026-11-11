@@ -732,6 +732,14 @@ func (s *Service) ResolveOwnerRefs(ctx context.Context, p authz.Principal, proje
 // at most every 2s when an event arrives for an unknown project (e.g. one
 // just created or newly linked to one of p's teams).
 func (s *Service) EventFilter(p authz.Principal) hub.Allow {
+	// A submit-scoped credential sees no project's events, so its stream is
+	// empty rather than every project's: nil means "allow all" here, and a
+	// narrowed credential must never inherit that through `p.Super` (AMP
+	// #3772). The REST gate already refuses the SSE route outright; this keeps
+	// the capability honest for any other caller of EventFilter.
+	if p.SubmitOnly() {
+		return func(int) bool { return false }
+	}
 	if p.Super {
 		return nil
 	}
