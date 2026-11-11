@@ -33,6 +33,10 @@ type Service struct {
 	// Denied rate-limits refusal rows (nil: the limiter shared by every
 	// Service, which main uses).
 	Denied *DeniedLimiter
+	// RequestLimits rate-limits team-request submissions (nil: the limiter
+	// shared by every Service, which main uses). Same-process burst guard only;
+	// see request_limits.go.
+	RequestLimits *RequestLimiter
 	// Remote is the instance's remote control configuration (off unless
 	// RELAY_ENABLED and auth are on).
 	Remote RemoteConfig
