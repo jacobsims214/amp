@@ -29,9 +29,11 @@ package main
 // boundary, and it must hold whether or not the submit handler has landed.
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -202,6 +204,71 @@ func TestSubmitScopeRefusesEveryOtherRoute(t *testing.T) {
 	if code != 403 || body["code"] != authz.CodeTokenScopeDenied {
 		t.Fatalf("SSE with a submit-only token = %d %v, want a 403 %s", code, body, authz.CodeTokenScopeDenied)
 	}
+
+	// ...and that refusal is audited as access.denied, like every other 403 on
+	// this surface (AMP #3862). The route used to be registered outside
+	// denied(), so a leaked connector token probing the stream left no trace at
+	// all — the one unaudited refusal on a shared-credential boundary.
+	rows := auditRows(t, w.s.repo, domain.AuditFilter{
+		ActorUserID: w.alice.User.ID, Action: "access.denied", TargetType: "route",
+	})
+	var sse *domain.AuditEntry
+	var audited []string
+	for i := range rows {
+		audited = append(audited, rows[i].TargetID)
+		if rows[i].TargetID == "GET /api/events" {
+			sse = &rows[i]
+		}
+	}
+	if sse == nil {
+		t.Fatalf("a refused GET /api/events left no access.denied row; audited routes = %v", audited)
+	}
+	if sse.Outcome != domain.AuditOutcomeDenied || sse.Reason == "" {
+		t.Fatalf("access.denied for the SSE route = %+v, want outcome denied and the refusal reason", sse)
+	}
+}
+
+// TestSSE_SubmitScopeFullTokenStillStreams is the streaming side of the same
+// change: registering /api/events through denied() must not turn a working
+// stream into one that cannot flush. hub.ServeFiltered type-asserts
+// http.Flusher directly, so statusRecorder has to be streaming-transparent.
+// This opens a full-scope token's stream, reads the connected frame, publishes
+// an event and reads that too — an SSE endpoint that answered 500, buffered, or
+// never flushed fails here (AMP #3862).
+func TestSSE_SubmitScopeFullTokenStillStreams(t *testing.T) {
+	w := newSubmitScopeWorld(t)
+	srv := bearerServer(t, w.rbacWorld)
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api/events", nil)
+	req.Header.Set("Authorization", "Bearer "+w.full)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("a full-scope SSE connection = %d %q, want 200 and a stream", resp.StatusCode, b)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("SSE content type = %q, want text/event-stream", ct)
+	}
+	sc := bufio.NewScanner(resp.Body)
+	if !sc.Scan() || !strings.Contains(sc.Text(), "\"type\":\"connected\"") {
+		t.Fatalf("first SSE frame = %q, want the connected frame (err = %v)", sc.Text(), sc.Err())
+	}
+
+	// A live event reaches the same connection: the stream is not just open,
+	// it delivers.
+	w.s.hub.Publish(domain.Event{Type: "test.live", ProjectID: w.s.projectID})
+	for sc.Scan() {
+		if line := sc.Text(); strings.HasPrefix(line, "data:") && strings.Contains(line, "test.live") {
+			return
+		}
+	}
+	t.Fatalf("the SSE stream ended without delivering a published event (err = %v)", sc.Err())
 }
 
 // TestSubmitScopeAllowsOnlyItsOwnSubmission is the allow half. Submission's own
