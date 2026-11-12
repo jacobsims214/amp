@@ -37,6 +37,12 @@ type Service struct {
 	// shared by every Service, which main uses). Same-process burst guard only;
 	// see request_limits.go.
 	RequestLimits *RequestLimiter
+	// RequestDownloads mints the opaque reference a requester's ready file is
+	// downloaded with (nil: not configured, so a ready file degrades to
+	// "unavailable" — see request_views.go). The signed-grant implementation is
+	// slice G3's; the read path only asks it for a file the download rules
+	// already allow.
+	RequestDownloads RequestDownloadLinker
 	// Now is the clock the request-submission path reads (nil: time.Now), so a
 	// test can drive the submission limiter's window and its refund from one
 	// instant. It is deliberately narrow: this is the only clock the submit path
