@@ -110,6 +110,24 @@ func (s *Server) submitRequest(rctx context.Context, args map[string]interface{}
 	if err != nil {
 		return nil, err
 	}
+	// The two optional strings are read strictly. optStr (server.go) falls back
+	// to "" when the value is not a string, which for these two would be a
+	// silent lie about the submission: a client that sent idempotency_key as a
+	// number believes it holds a retry key, and its next retry with the same
+	// wrong-typed key submits a second request — the duplicate the key exists to
+	// prevent (contract §5: "a retry with the same key and the same payload ...
+	// writes nothing"). REST's strict decoder refuses the same shape, so
+	// refusing here is also what keeps the two surfaces one product.
+	inputBrief, err := optStrStrict(args, "input_brief",
+		"the detail the team triages from, so a wrong-typed value is refused rather than dropped")
+	if err != nil {
+		return nil, submitToolError(err)
+	}
+	idempotencyKey, err := optStrStrict(args, "idempotency_key",
+		"a key that was dropped would submit twice on the next retry; send the token as a JSON string, or omit it")
+	if err != nil {
+		return nil, submitToolError(err)
+	}
 	if err := refuseSpoofedSubmitArgs(args); err != nil {
 		return nil, submitToolError(err)
 	}
@@ -125,9 +143,9 @@ func (s *Server) submitRequest(rctx context.Context, args map[string]interface{}
 		// argument here: an MCP client's retries are the idempotency key.
 		Source:         domain.RequestSourceMCP,
 		Subject:        subject,
-		InputBrief:     optStr(args, "input_brief", ""),
+		InputBrief:     inputBrief,
 		Metadata:       metadata,
-		IdempotencyKey: optStr(args, "idempotency_key", ""),
+		IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {
 		return nil, submitToolError(err)
@@ -227,6 +245,59 @@ func refuseSpoofedSubmitArgs(args map[string]interface{}) error {
 			"idempotency_key, which is scoped to you and suppresses your own retries", key)
 	}
 	return nil
+}
+
+// optStrStrict reads an optional string argument and refuses a value of any
+// other type, naming the argument and the type the caller sent.
+//
+// It exists because optStr's fallback-to-default is only safe where a dropped
+// value means nothing to the caller. amp_submit_request's input_brief and
+// idempotency_key are the opposite: both are promises. An input_brief that is
+// silently dropped loses the content the team triages from, and an
+// idempotency_key that is silently dropped turns the caller's next retry into a
+// second request — a double submit the caller believes is impossible. So a
+// present-but-not-a-string value is refused (400 request.invalid) instead of
+// coerced, which is what REST's strict decoder does with the same JSON
+// (`json: cannot unmarshal number into Go struct field .input_brief of type
+// string`).
+//
+// A present null is absence, not a refusal: REST's decoder reads JSON null for a
+// string field as "" with no error, so {"input_brief": null} is an ordinary
+// keyless submission on both surfaces. args holds nil for a JSON null, so the
+// two cases are told apart by presence.
+//
+// why completes the refusal for a human reading it: what the argument is for and
+// what to send instead. The message names the argument and the wrong type, never
+// the value — an argument's value can be another party's content.
+func optStrStrict(args map[string]interface{}, key, why string) (string, error) {
+	v, ok := args[key]
+	if !ok || v == nil {
+		return "", nil
+	}
+	s, isStr := v.(string)
+	if !isStr {
+		return "", authz.RequestInvalid("%s must be a string (got a %s): %s", key, jsonKindOf(v), why)
+	}
+	return s, nil
+}
+
+// jsonKindOf names a decoded argument's JSON type the way the caller sent it, so
+// a refusal can say "got a number" instead of restating a Go type name the
+// caller never chose. Only the type is reported, never the value.
+func jsonKindOf(v interface{}) string {
+	switch v.(type) {
+	case float64, float32, int, int32, int64:
+		return "number"
+	case bool:
+		return "boolean"
+	case string:
+		return "string"
+	case map[string]interface{}:
+		return "object"
+	case []interface{}:
+		return "array"
+	}
+	return "value"
 }
 
 // argPresent reports whether args carries key with something in it. A null, an

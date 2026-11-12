@@ -1147,6 +1147,148 @@ func TestSubmitSurface_ErrorEnvelope(t *testing.T) {
 	})
 }
 
+// ---- 2b: a wrong-typed optional argument is refused, not coerced ----
+
+// TestSubmitSurface_WrongTypedOptionalArgumentsRefused: the one axis where the
+// two adapters actually diverged before AMP #3931.
+//
+// REST decodes into a typed struct with DisallowUnknownFields, so
+// `{"input_brief": 123}` is a 400 request.invalid naming the field. The MCP tool
+// read the same arguments through optStr, which type-asserts `v.(string)` and
+// **falls back to the default ("")** on a mismatch: `{"idempotency_key": 123}`
+// was accepted, keyless. A client that believes it sent a retry key did not, so
+// its next retry with the same (wrong-typed) key submits a second request — the
+// double submit the key exists to make impossible.
+//
+// So the assertions here are the product's, not the adapter's:
+//
+//   - a wrong-typed input_brief or idempotency_key is refused with the same
+//     status and stable code REST answers for the equivalent JSON (400
+//     request.invalid), naming the argument the caller has to fix;
+//   - the refusal writes nothing — no request row, no idempotency-key row, no
+//     audit row — and spends no limiter unit, so a client that spams the broken
+//     shape never locks itself out of its own budget;
+//   - a present null stays absence on both surfaces (REST's decoder reads JSON
+//     null for a string field as ""), so {{"input_brief": null}} is an ordinary
+//     briefless submission.
+//
+// One difference is documented rather than asserted as parity, because the shape
+// does not exist on the other surface: an idempotency key is a *header* over
+// REST (always a string) and a *body field* only on MCP, so the wrong-typed-key
+// case is MCP-only. REST is still checked, with the same JSON body, and answers
+// 400 request.invalid for its own reason (idempotency_key is an unknown body
+// field there) — the status and the code agree even though the rule behind them
+// differs.
+func TestSubmitSurface_WrongTypedOptionalArgumentsRefused(t *testing.T) {
+	// The MCP listener holds the package's shared default limiter (this fixture
+	// injects the 60/window one on the REST handler's Service only), so the
+	// "spends no limiter unit" half below is measured against the real default
+	// ceiling: more wrong-typed calls than one window allows, and not one 429.
+	w := newSubmitSurfaceWorld(t, 60)
+
+	requestsBefore := w.count(`SELECT count(*) FROM team_requests`)
+	keyRowsBefore := w.count(`SELECT count(*) FROM request_idempotency_keys`)
+
+	type row struct {
+		name string
+		// args is what the tool is called with; body is the equivalent REST
+		// submission (raw, so the decoder sees exactly these bytes).
+		args map[string]any
+		body rawJSON
+		// wantField must appear in both refusals: the caller is told what to fix.
+		wantField string
+	}
+	rows := []row{
+		{
+			name:      "a wrong-typed idempotency_key",
+			args:      map[string]any{"team_id": float64(w.team), "subject": "typed key", "idempotency_key": float64(123)},
+			body:      rawJSON(`{"subject":"typed key","idempotency_key":123}`),
+			wantField: "idempotency_key",
+		},
+		{
+			name:      "a wrong-typed input_brief",
+			args:      map[string]any{"team_id": float64(w.team), "subject": "typed brief", "input_brief": true},
+			body:      rawJSON(`{"subject":"typed brief","input_brief":true}`),
+			wantField: "input_brief",
+		},
+		{
+			name:      "an object input_brief",
+			args:      map[string]any{"team_id": float64(w.team), "subject": "object brief", "input_brief": map[string]any{"text": "x"}},
+			body:      rawJSON(`{"subject":"object brief","input_brief":{"text":"x"}}`),
+			wantField: "input_brief",
+		},
+	}
+
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			restOut := w.restDo(w.member.token, http.MethodPost, w.inbox(w.team), r.body, "").restOutcome()
+			mcpOut := w.mcpTool(w.member.token, "amp_submit_request", r.args).mcpOutcome()
+
+			// The product answer: refused, 400 request.invalid, on both surfaces.
+			// This is the assertion that fails on the pre-#3931 tool, where the call
+			// was *accepted* with the argument coerced to "".
+			wantRefusal(t, r.name+" over REST", restOut, 400, authz.CodeRequestInvalid)
+			wantRefusal(t, r.name+" over MCP", mcpOut, 400, authz.CodeRequestInvalid)
+			wantParity(t, r.name, restOut, mcpOut)
+			for _, o := range []surfaceOutcome{restOut, mcpOut} {
+				if !strings.Contains(o.message, r.wantField) {
+					t.Fatalf("%s (%s) refusal %q does not name %q", r.name, o.transport, o.message, r.wantField)
+				}
+			}
+			// Nothing written: not the request, and not the key row that would
+			// make the caller's next retry a replay. A stored key row for a
+			// refused submission would be the opposite failure: a retry answered
+			// by a request that was never created.
+			if n := w.count(`SELECT count(*) FROM team_requests`); n != requestsBefore {
+				t.Fatalf("%s wrote a request: %d rows, want the %d before", r.name, n, requestsBefore)
+			}
+			if n := w.count(`SELECT count(*) FROM request_idempotency_keys`); n != keyRowsBefore {
+				t.Fatalf("%s wrote an idempotency-key row: %d rows, want the %d before", r.name, n, keyRowsBefore)
+			}
+			if n := len(w.audits(domain.AuditFilter{Action: "request.submit"})); n != 0 {
+				t.Fatalf("%s wrote %d request.submit audit rows: a refusal to accept the payload is not a submission", r.name, n)
+			}
+		})
+	}
+
+	// The limiter half. The MCP listener's budget for (org, team, submitter, mcp)
+	// is the package's shared one, whose ceiling is DefaultRequestLimitPerWindow;
+	// if a wrong-typed argument spent a unit, the (ceiling+1)th call would be the
+	// coded 429 instead of the 400. The adapter refuses before the service is
+	// called, so nothing is charged — and a well-formed submission afterwards
+	// still creates its request.
+	t.Run("a wrong-typed argument spends no limiter unit", func(t *testing.T) {
+		for i := 0; i <= service.DefaultRequestLimitPerWindow; i++ {
+			o := w.mcpTool(w.member.token, "amp_submit_request", map[string]any{
+				"team_id": float64(w.team), "subject": "no quota " + strconv.Itoa(i), "idempotency_key": float64(i),
+			}).mcpOutcome()
+			wantRefusal(t, "wrong-typed key "+strconv.Itoa(i), o, 400, authz.CodeRequestInvalid)
+		}
+		if o := w.submit("mcp", w.member.token, w.team, subjectFor("after the broken shapes"), surfaceBrief, ""); !o.created {
+			t.Fatalf("a well-formed submission after %d refusals = %d %q %q; the refusals must not have spent the budget",
+				service.DefaultRequestLimitPerWindow+1, o.status, o.code, o.message)
+		}
+	})
+
+	// A present null is absence on both surfaces: REST's decoder reads JSON null
+	// for a string field as the empty string, so the submission is briefless and
+	// accepted, not refused. Mirroring that is what keeps a generic client that
+	// sends every optional field (null when it has no value) working.
+	t.Run("a present null input_brief is absence, not a refusal", func(t *testing.T) {
+		subject := subjectFor("null brief")
+		o := w.mcpTool(w.member.token, "amp_submit_request", map[string]any{
+			"team_id": float64(w.team), "subject": subject, "input_brief": nil,
+		}).mcpOutcome()
+		if !o.accepted || !o.created {
+			t.Fatalf("MCP {\"input_brief\": null} = accepted=%v created=%v %d %q %q, want an ordinary submission",
+				o.accepted, o.created, o.status, o.code, o.message)
+		}
+		if n := w.requestsWithSubject(subject); n != 1 {
+			t.Fatalf("%d requests for the null-brief subject, want 1", n)
+		}
+	})
+}
+
 // ---- 3: the scoped credential actually submits ----
 
 // TestSubmitSurface_ScopedCredential is the boundary the earlier waves only

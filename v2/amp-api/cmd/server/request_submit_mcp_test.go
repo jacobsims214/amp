@@ -690,6 +690,110 @@ func TestMCPSubmitRequest_CodedErrors(t *testing.T) {
 	})
 }
 
+// TestMCPSubmitRequest_RefusesWrongTypedOptionalArguments is AMP #3931: the two
+// optional string arguments are refused when they arrive with the wrong JSON
+// type, instead of being coerced to "" the way optStr's fall-back does.
+//
+// The divergence this closes is silent, which is why it needs a test: before
+// this, `amp_submit_request {"idempotency_key": 123}` was *accepted* and wrote a
+// keyless request, while REST's strict decoder refused the same shape with 400
+// request.invalid. A client that believed it held a retry key then retried with
+// the same wrong-typed key and submitted twice — the duplicate the key exists to
+// prevent.
+//
+// So each row asserts the three things the refusal promises: the coded 400 names
+// the argument, no request row is written, and no idempotency-key row is written
+// (a stored key for a refused submission would answer a retry with a request
+// that was never created). The limiter is not asserted here —
+// TestSubmitSurface_WrongTypedOptionalArgumentsRefused measures that on the full
+// listener — because the refusal happens in the adapter, before the service that
+// charges it.
+func TestMCPSubmitRequest_RefusesWrongTypedOptionalArguments(t *testing.T) {
+	w := newSubmitMCPWorld(t)
+
+	countKeys := func() int {
+		t.Helper()
+		var n int
+		if err := w.db(t).QueryRow(context.Background(),
+			`SELECT count(*) FROM request_idempotency_keys WHERE org_id = $1`, w.org).Scan(&n); err != nil {
+			t.Fatalf("count key rows: %v", err)
+		}
+		return n
+	}
+	countRequests := func() int {
+		t.Helper()
+		var n int
+		if err := w.db(t).QueryRow(context.Background(),
+			`SELECT count(*) FROM team_requests WHERE org_id = $1`, w.org).Scan(&n); err != nil {
+			t.Fatalf("count requests: %v", err)
+		}
+		return n
+	}
+	requestsBefore, keysBefore := countRequests(), countKeys()
+
+	rows := []struct {
+		name  string
+		arg   string
+		value interface{}
+	}{
+		{"wrong-typed idempotency_key", "idempotency_key", float64(123)},
+		{"wrong-typed input_brief", "input_brief", true},
+		{"an object input_brief", "input_brief", map[string]interface{}{"text": "x"}},
+		{"an array idempotency_key", "idempotency_key", []interface{}{"k"}},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			subject := "typed " + r.name + " " + uniq("s")
+			args := submitArgs(w.team, subject, "")
+			args[r.arg] = r.value
+
+			got := w.callTool(t, w.member, "amp_submit_request", args)
+			if got.errMessage == "" {
+				t.Fatalf("%s was accepted (created=%v); a wrong-typed argument must be refused, never coerced to empty",
+					r.name, got.result["created"])
+			}
+			if got.errData["status"] != float64(400) || got.errData["code"] != authz.CodeRequestInvalid {
+				t.Fatalf("refusal = %v %q, want 400 %s (REST's answer for the same JSON)",
+					got.errData, got.errMessage, authz.CodeRequestInvalid)
+			}
+			if !strings.Contains(got.errMessage, r.arg) {
+				t.Errorf("message %q doesn't name the argument %q", got.errMessage, r.arg)
+			}
+			if n := w.requestsWithSubject(t, subject); n != 0 {
+				t.Fatalf("%s wrote %d request row(s)", r.name, n)
+			}
+			if n := countKeys(); n != keysBefore {
+				t.Fatalf("%s wrote an idempotency-key row (%d before, %d after)", r.name, keysBefore, n)
+			}
+		})
+	}
+	// Nothing in the table reached the product at all: the adapter refused every
+	// row before the service that writes and charges.
+	if n := countRequests(); n != requestsBefore {
+		t.Fatalf("request rows in this org went %d -> %d across the refusal matrix", requestsBefore, n)
+	}
+
+	// The other side of the same contract, asserted so nobody "fixes" the
+	// refusal into refusing absence: a present null is absence (REST's decoder
+	// reads JSON null for a string field as ""), so the submission is accepted —
+	// briefless and keyless — rather than refused.
+	t.Run("a present null input_brief is absence", func(t *testing.T) {
+		subject := "null brief " + uniq("s")
+		args := submitArgs(w.team, subject, "")
+		args["input_brief"] = nil
+		got := w.callTool(t, w.member, "amp_submit_request", args)
+		if got.errMessage != "" {
+			t.Fatalf("a null input_brief was refused: %s %v", got.errMessage, got.errData)
+		}
+		if created, _ := got.result["created"].(bool); !created {
+			t.Fatalf("created = %v, want a fresh create", got.result["created"])
+		}
+		if n := w.requestsWithSubject(t, subject); n != 1 {
+			t.Fatalf("%d requests for the null-brief subject, want 1", n)
+		}
+	})
+}
+
 // TestMCPSubmitRequestSchemaOnTheWire: the schema a client receives declares the
 // two REQUIRED fields and the bounds, and offers no project or identity field —
 // read off the tools/list an MCP client actually makes, not off the Go values.

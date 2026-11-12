@@ -435,6 +435,101 @@ func TestSubmitResultLeaksNoInboxInternals(t *testing.T) {
 	}
 }
 
+// TestOptStrStrictRefusesWrongTypes is the unit half of the refusal this ticket
+// exists for: a present-but-not-a-string value for one of the submission's two
+// optional strings is a 400 request.invalid naming the argument, instead of the
+// silent fall-back to "" that optStr performs.
+//
+// The last three rows are the properties that make the refusal safe to add:
+// absent and null are still absence (REST's decoder reads JSON null for a string
+// field as ""), a string passes through untouched (including "" and a blank
+// value, which the service normalizes itself), and no extra argument refuses
+// because its name changed.
+func TestOptStrStrictRefusesWrongTypes(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    map[string]interface{}
+		key     string
+		want    string
+		wantErr bool
+		// wantKind, when set, must appear in the refusal: the caller is told the
+		// JSON type it sent, so it can fix the argument without guessing.
+		wantKind string
+	}{
+		{name: "absent is absent", args: map[string]interface{}{}, key: "input_brief"},
+		{name: "null is absence (REST decodes it as an empty string)",
+			args: map[string]interface{}{"input_brief": nil}, key: "input_brief"},
+		{name: "a string passes through", args: map[string]interface{}{"input_brief": "we need the export"}, key: "input_brief", want: "we need the export"},
+		{name: "a blank string passes (the service normalizes it)", args: map[string]interface{}{"idempotency_key": "   "}, key: "idempotency_key", want: "   "},
+		{name: "a number is refused", args: map[string]interface{}{"idempotency_key": float64(123)}, key: "idempotency_key", wantErr: true, wantKind: "number"},
+		{name: "a boolean is refused", args: map[string]interface{}{"input_brief": true}, key: "input_brief", wantErr: true, wantKind: "boolean"},
+		{name: "an object is refused", args: map[string]interface{}{"input_brief": map[string]interface{}{"text": "x"}}, key: "input_brief", wantErr: true, wantKind: "object"},
+		{name: "an array is refused", args: map[string]interface{}{"idempotency_key": []interface{}{"k"}}, key: "idempotency_key", wantErr: true, wantKind: "array"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := optStrStrict(tt.args, tt.key, "because it is a promise")
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("refused a value it should read: %v", err)
+				}
+				if got != tt.want {
+					t.Fatalf("got %q, want %q", got, tt.want)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("%v was read as %q; a wrong-typed value must be refused, never coerced", tt.args[tt.key], got)
+			}
+			if s, c := authz.StatusOf(err, 0), authz.CodeOf(err); s != 400 || c != authz.CodeRequestInvalid {
+				t.Fatalf("refusal = %d %q, want 400 %s", s, c, authz.CodeRequestInvalid)
+			}
+			if !strings.Contains(err.Error(), tt.key) {
+				t.Errorf("refusal %q doesn't name the argument %q", err, tt.key)
+			}
+			if tt.wantKind != "" && !strings.Contains(err.Error(), tt.wantKind) {
+				t.Errorf("refusal %q doesn't name the type %q the caller sent", err, tt.wantKind)
+			}
+		})
+	}
+}
+
+// TestSubmitRequestRefusesWrongTypedOptionalArguments is the handler-level half:
+// through the tool's own handler, both arguments are refused before the service
+// is reached (s.svc is nil here, so a value that reached the service would
+// panic rather than pass silently), the refusal is the coded 400 REST answers
+// for the same JSON, and it carries the status and code an MCP client reads.
+func TestSubmitRequestRefusesWrongTypedOptionalArguments(t *testing.T) {
+	s := &Server{}
+	cases := []struct {
+		name string
+		args map[string]interface{}
+		key  string
+	}{
+		{"wrong-typed idempotency_key",
+			map[string]interface{}{"team_id": float64(1), "subject": "x", "idempotency_key": float64(123)}, "idempotency_key"},
+		{"wrong-typed input_brief",
+			map[string]interface{}{"team_id": float64(1), "subject": "x", "input_brief": true}, "input_brief"},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := s.submitRequest(context.Background(), tt.args)
+			if err == nil {
+				t.Fatalf("%v was accepted; the argument must be refused, not coerced to empty", tt.args)
+			}
+			if s, c := authz.StatusOf(err, 0), authz.CodeOf(err); s != 400 || c != authz.CodeRequestInvalid {
+				t.Fatalf("refusal = %d %q, want the coded 400 %s REST answers for the same JSON", s, c, authz.CodeRequestInvalid)
+			}
+			if !strings.Contains(err.Error(), tt.key) {
+				t.Errorf("refusal %q doesn't name %q", err, tt.key)
+			}
+			// The wrapper is the same one every other refusal uses, so the client
+			// reads REST's status/code next to the message.
+			assertToolErrorData(t, err, 400, authz.CodeRequestInvalid, nil)
+		})
+	}
+}
+
 // TestSubmitRequestRejectsMissingArguments: the two REQUIRED arguments are
 // refused by the handler with the argument's name, before the service is
 // reached — so a client that dropped one gets a fixable message, not a 500 and
