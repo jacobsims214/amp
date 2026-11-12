@@ -84,13 +84,32 @@ import (
 // repository and surfacing as a server fault. The repository's own check stays
 // authoritative.
 //
-// The unit is BYTES, because that is what the two layers underneath count:
-// normalizeRequestIdempotencyKey in the repository measures len(key), and 061's
-// request_idempotency_keys_key_length CHECK is SQL length() over a TEXT column,
-// which is bytes in Postgres (ASCII encoding, no char semantics). Counting runes
-// here would let a multibyte key of ≤255 runes pass this check and be refused by
-// the repository as an untranslated server fault — the exact invariant the call
+// The unit is BYTES, and the reason is a DIRECTION, not a shared unit: the two
+// layers underneath do not count what this check counts.
+//   - normalizeRequestIdempotencyKey in the repository measures len(key) —
+//     bytes, the same measure as here.
+//   - 061's request_idempotency_keys_key_length CHECK is SQL length() over a
+//     TEXT column, which counts CHARACTERS under this deployment's UTF8
+//     encoding (it counts bytes only under SQL_ASCII).
+//
+// A byte count is never smaller than the character count of the same string, so
+// a key that fits 255 bytes fits 255 characters too: this check is the STRICTER
+// side, and "this check passed ⇒ 061 holds" follows from that inequality alone.
+// No key this check admits can be refused by the CHECK — the invariant the call
 // site below states it must never break.
+//
+// The converse is deliberately not true, and does not need to be: a key of 200
+// two-byte runes is 400 bytes and 200 characters, so it is refused here while
+// 061 would have accepted it. That is the intended trade — the stricter side owns
+// the refusal, so the caller gets the field-naming 400 instead of the CHECK's
+// opaque error deeper in the write.
+//
+// Counting runes here would invert the direction: a key of ≤255 runes can be
+// >255 bytes, so it would pass this check and be refused by the repository as an
+// untranslated server fault. The mirror image is the trap worth remembering: had
+// 061 counted the tighter side (say octet_length() ≤ 255 against a rune-based
+// service bound), this same "we bound it upstream" reasoning would have been a
+// live bug. Check which side is stricter; never assume both see the same unit.
 const maxRequestIdempotencyKeyLen = 255
 
 // requestPublicRefAttempts bounds the mint/retry loop for a reference

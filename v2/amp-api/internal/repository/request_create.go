@@ -340,8 +340,17 @@ func prepareRequestCreate(in CreateRequestInput) (*domain.TeamRequest, string, s
 // normalizeRequestIdempotencyKey trims the client's token and enforces 061's
 // bound. Only a blank key is "no key": an all-spaces header is the same as no
 // header rather than a key of spaces, and 255 bytes is the conventional
-// Idempotency-Key ceiling, which the column also enforces (061's length() CHECK
-// counts bytes, as this check does — the two agree on multibyte keys).
+// Idempotency-Key ceiling, which the column also enforces — but in a DIFFERENT
+// unit. 061's request_idempotency_keys_key_length CHECK is SQL length() over a
+// TEXT column, which counts CHARACTERS under this deployment's UTF8 encoding
+// (bytes only under SQL_ASCII); this check counts bytes with len(key).
+//
+// The two do NOT agree on multibyte keys, and they do not need to: bytes ≥
+// characters for the same ceiling, so this check is the stricter side and every
+// key it admits satisfies the CHECK. That one-way inequality is the whole reason
+// a byte count here is safe next to a character count there — if the CHECK were
+// ever changed to the tighter side (octet_length(key) <= 255, or a smaller
+// ceiling), this bound would have to move with it.
 func normalizeRequestIdempotencyKey(key string) (string, error) {
 	key = strings.TrimSpace(key)
 	if len(key) > 255 {
