@@ -43,6 +43,12 @@ type Service struct {
 	// slice G3's; the read path only asks it for a file the download rules
 	// already allow.
 	RequestDownloads RequestDownloadLinker
+	// RequestEvidence resolves what a request delivery is evidenced by (nil: the
+	// request_links table, verified at write time by LinkRequest). It exists so a
+	// test can state a request's delivered_by relations without writing four
+	// tables, and so the service's only source of delivery evidence is one named
+	// dependency; see request_lifecycle.go.
+	RequestEvidence RequestDeliveryEvidence
 	// Now is the clock the request-submission path reads (nil: time.Now), so a
 	// test can drive the submission limiter's window and its refund from one
 	// instant. It is deliberately narrow: this is the only clock the submit path
