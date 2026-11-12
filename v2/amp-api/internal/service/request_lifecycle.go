@@ -336,6 +336,12 @@ func (s *Service) transitionRequest(ctx context.Context, p authz.Principal, in T
 	if err != nil {
 		return nil, transitionRequestError(req.ID, err)
 	}
+	// The retention clock is the request's (D3), so a move that closes, reopens or
+	// accepts it restamps its files' expiry. It runs after the commit and its
+	// failure is logged, never returned: the move already happened, and the purge
+	// re-checks the request's state, so an unsynced row is repaired by the next
+	// pass rather than wrongly deleted. See request_retention.go.
+	s.syncAttachmentRetention(ctx, applied, plan.To, plan.Reopened)
 	s.recordTransition(ctx, p, team, applied, plan, comment)
 	return &TransitionRequestResult{Request: applied, Comment: comment, Changed: changed, Plan: plan}, nil
 }
