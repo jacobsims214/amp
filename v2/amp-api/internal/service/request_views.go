@@ -76,10 +76,12 @@ package service
 //     audit log records acts, and looking at a queue is not one.
 //   - no lifecycle. Which state a request is in is the record's; what a move
 //     means and who may make it is the one transition function's (S5).
-//   - no delivery aggregate. Milestones here come from the request's own
-//     lifecycle and its first-write-wins timestamps, never from linked tickets:
-//     the outcome aggregate (E2) is a different slice, and inferring delivery
-//     from finished work is the one thing contract §4 forbids.
+//   - no delivery decision. Milestones come from the request's own lifecycle
+//     and its first-write-wins timestamps. The details projection also asks the
+//     outcome aggregate (request_outcome.go, #3966) for its NOTES — how many
+//     items are finished — but the aggregate cannot mark a step done: the
+//     projection re-gates every step against the state, so inferring delivery
+//     from finished work stays impossible (contract §4, I8).
 //   - no signed download grants. The requester's ready files ask a
 //     RequestDownloadLinker for their reference (slice G3 ships one); with none
 //     configured a ready file degrades to "unavailable", which is the
@@ -639,9 +641,13 @@ func (s *Service) projectRequesterRequest(ctx context.Context, p authz.Principal
 		return nil, err
 	}
 	in := RequesterProjectionInput{
-		Request:    req,
-		TeamName:   team.Name,
-		Milestones: requesterMilestonesFor(req),
+		Request:  req,
+		TeamName: team.Name,
+		// The aggregate is the same one the team rail reads (#3966), so the
+		// requester's stepper notes and the desk's progress come from one
+		// definition. A read failure here costs the notes, never the view: the
+		// steps themselves are the lifecycle's and cannot be wrong.
+		Milestones: s.requesterMilestones(ctx, req),
 	}
 	if withThread {
 		comments, err := s.Repo.ListRequestComments(ctx, req.ID, req.OrgID, req.TeamID, 0, 0)
@@ -705,6 +711,26 @@ func requesterMilestonesFor(req *domain.TeamRequest) []domain.RequesterMilestone
 		out[i].Done = domain.RequesterMilestoneDoneAllowed(out[i].Key, req.State)
 	}
 	return out
+}
+
+// requesterMilestones is the detail projection's stepper: the same closed steps,
+// with the outcome aggregate's notes attached (RequesterMilestonesFor).
+//
+// The aggregate's read is best-effort on purpose. It adds a sentence about how
+// much work is finished; it decides nothing. So a failure to read the linked work
+// leaves the stepper exactly as it was before this slice existed — five steps
+// gated by the lifecycle — rather than failing a requester's read of their own
+// request. The list rows deliberately do NOT pay for this read (one aggregate per
+// row would turn a page into N queries); a row's stepper is the lifecycle's.
+func (s *Service) requesterMilestones(ctx context.Context, req *domain.TeamRequest) []domain.RequesterMilestoneInput {
+	if req == nil {
+		return nil
+	}
+	var out *RequestOutcome
+	if facts, err := s.Repo.RequestOutcomeFactsFor(ctx, req.ID, req.OrgID, req.TeamID); err == nil {
+		out = BuildRequestOutcome(requestOutcomeInput(facts))
+	}
+	return RequesterMilestonesFor(req, out)
 }
 
 // requesterSharedComments decides which of a request's comments the requester
