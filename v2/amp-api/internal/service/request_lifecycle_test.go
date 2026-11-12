@@ -114,8 +114,11 @@ func newLifecycleFixture(t *testing.T) *lifecycleFixture {
 	f.otherOrg = q(`INSERT INTO orgs (name, slug) VALUES ('Lifecycle other org', $1) RETURNING id`, fmt.Sprintf("life-other-%d", suffix))
 	f.foreign = q(`INSERT INTO teams (org_id, name) VALUES ($1, 'Foreign inbox') RETURNING id`, f.otherOrg)
 
+	// The code is the full suffix, not a truncation of it: projects.code is
+	// globally UNIQUE, so a shortened code collides across runs (1 in 100k per
+	// insert, which a suite that builds several projects per fixture hits).
 	f.project = q(`INSERT INTO projects (name, code, org_id) VALUES ('Delivered work', $1, $2) RETURNING id`,
-		fmt.Sprintf("LIF%d", suffix%100000), f.org)
+		fmt.Sprintf("LIF%d", suffix), f.org)
 	exec(`INSERT INTO project_teams (project_id, team_id, role) VALUES ($1, $2, 'member')`, f.project, f.team)
 	f.epic = q(`INSERT INTO epics (project_id, name) VALUES ($1, 'Inbox work') RETURNING id`, f.project)
 	f.story = q(`INSERT INTO stories (project_id, epic_id, name) VALUES ($1, $2, 'Slice') RETURNING id`, f.project, f.epic)
@@ -124,7 +127,7 @@ func newLifecycleFixture(t *testing.T) *lifecycleFixture {
 	f.task2 = q(`INSERT INTO tasks (project_id, epic_id, story_id, name) VALUES ($1, $2, $3, 'Verify it') RETURNING id`,
 		f.project, f.epic, f.story)
 	foreignProject := q(`INSERT INTO projects (name, code, org_id) VALUES ('Elsewhere', $1, $2) RETURNING id`,
-		fmt.Sprintf("LIFX%d", suffix%100000), f.otherOrg)
+		fmt.Sprintf("LIFX%d", suffix), f.otherOrg)
 	foreignEpic := q(`INSERT INTO epics (project_id, name) VALUES ($1, 'Foreign epic') RETURNING id`, foreignProject)
 	foreignStory := q(`INSERT INTO stories (project_id, epic_id, name) VALUES ($1, $2, 'Foreign story') RETURNING id`,
 		foreignProject, foreignEpic)

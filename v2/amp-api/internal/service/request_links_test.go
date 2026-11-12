@@ -96,8 +96,11 @@ func newLinkFixture(t *testing.T) *linkFixture {
 	// A second project in the fixture's own org, owned by a team the inbox team is
 	// not on: same tenant, none of the inbox team's business. The outsider joins
 	// that team, so they see the work and not the inbox.
+	// Full suffixes, not truncations: projects.code is globally UNIQUE and this
+	// fixture builds three projects, so a shortened code is a cross-run collision
+	// waiting for a busy database (it happened once in 20 local runs).
 	f.hiddenProject = q(`INSERT INTO projects (name, code, org_id) VALUES ('Hidden work', $1, $2) RETURNING id`,
-		fmt.Sprintf("HID%d", suffix%100000), f.org)
+		fmt.Sprintf("HID%d", suffix), f.org)
 	f.outsider = q(`INSERT INTO users (subject, email, kind) VALUES ($1, $2, $3) RETURNING id`,
 		fmt.Sprintf("link-outside-%d", suffix), fmt.Sprintf("link-outside-%d@link.test", suffix), domain.UserKindHuman)
 	hiddenTeam := q(`INSERT INTO teams (org_id, name) VALUES ($1, 'Hidden team') RETURNING id`, f.org)
@@ -114,7 +117,7 @@ func newLinkFixture(t *testing.T) *linkFixture {
 	// request's tenant. The repository treats it as a missing target; this service
 	// must too.
 	f.noOrgProject = q(`INSERT INTO projects (name, code) VALUES ('No org work', $1) RETURNING id`,
-		fmt.Sprintf("NOO%d", suffix%100000))
+		fmt.Sprintf("NOO%d", suffix))
 	noOrgEpic := q(`INSERT INTO epics (project_id, name) VALUES ($1, 'No org epic') RETURNING id`, f.noOrgProject)
 	noOrgStory := q(`INSERT INTO stories (project_id, epic_id, name) VALUES ($1, $2, 'No org story') RETURNING id`,
 		f.noOrgProject, noOrgEpic)
@@ -596,7 +599,7 @@ func (f *linkFixture) newLinkProject(label string) int {
 	var id int
 	if err := f.db.QueryRow(f.ctx,
 		`INSERT INTO projects (name, code, org_id) VALUES ($1, $2, $3) RETURNING id`,
-		label, fmt.Sprintf("LK%d", suffix%100000), f.org).Scan(&id); err != nil {
+		label, fmt.Sprintf("LK%d", suffix), f.org).Scan(&id); err != nil {
 		f.t.Fatalf("insert project %q: %v", label, err)
 	}
 	if _, err := f.db.Exec(f.ctx, `INSERT INTO project_teams (project_id, team_id, role) VALUES ($1, $2, 'member')`,
