@@ -11,6 +11,7 @@ import (
 	mcpserver "github.com/mark3labs/mcp-go/server"
 	"github.com/rs/cors"
 	"github.com/simstech/amp-api/internal/auth"
+	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/mcp"
 )
 
@@ -20,6 +21,28 @@ import (
 // cached privately (CacheScopePrivate), never shared between callers. A
 // deploy that changes tools is picked up within this window.
 const toolsListCacheTTLMs = 5 * 60 * 1000
+
+// maxMCPRequestBody bounds one request body on the public MCP listener before
+// mcp-go buffers it. It is the MCP listener's counterpart to REST's
+// maxRequestSubmitBody (internal/api/request_submit.go): the same memory guard,
+// sized for the largest payload a tool actually accepts rather than for a
+// submission.
+//
+// The number is domain.MaxArtifactBytes*2, the bound REST's own artifact route
+// already uses for the same payload (internal/api/artifacts.go). The largest
+// valid JSON-RPC on this listener is amp_publish_artifact: its content is capped
+// at domain.MaxArtifactBytes (10 MiB), which is at most ~13.4 MiB as
+// content_base64 plus the envelope. Every other tool is far smaller — the
+// submission tool's own domain bounds (subject 200 runes, input_brief 20000,
+// metadata 50 keys of 1000 characters) top out around 75 KB — so a bound that
+// fits a maximum artifact fits every AMP tool. 256 KiB (REST's submission
+// bound) would have refused publishing any mockup over a quarter of that size.
+//
+// It is a bound, not a promise the whole domain range is reachable: a 10 MiB
+// text artifact whose every byte needs JSON escaping can still inflate past 2x
+// and be refused here. That is the same trade REST's artifact route makes, and
+// the refusal is client-fixable (see limitMCPBody) rather than a 5xx.
+const maxMCPRequestBody = domain.MaxArtifactBytes * 2
 
 // mcpHTTPConfig is everything the public MCP listener needs beyond the
 // MCP server itself.
@@ -74,7 +97,7 @@ func newMCPHTTPHandler(srv *mcpserver.MCPServer, verifier *auth.Verifier, cfg mc
 			"resource_name":            "AMP",
 		})
 	})
-	mux.Handle("/", verifier.Middleware(streamable))
+	mux.Handle("/", verifier.Middleware(limitMCPBody(streamable)))
 
 	c := cors.New(cors.Options{
 		AllowOriginFunc: newOriginMatcher(cfg.AllowedOrigins),
@@ -89,6 +112,33 @@ func newMCPHTTPHandler(srv *mcpserver.MCPServer, verifier *auth.Verifier, cfg mc
 		ExposedHeaders: []string{"Mcp-Session-Id", "WWW-Authenticate"},
 	})
 	return originGuard(newOriginMatcher(cfg.AllowedOrigins), c.Handler(mux))
+}
+
+// limitMCPBody caps the bytes mcp-go may buffer off the wire. Without it the
+// Streamable HTTP transport does io.ReadAll(r.Body) with no limit (mcp-go v1.3.0
+// has no request-body-size ServerOption; WithToolResultSizeLimit bounds results,
+// not requests), so any AMP credential — including a submit-only scoped token,
+// whose scope narrows tools and not bytes — could force an arbitrarily large
+// allocation before the JSON-RPC decode.
+//
+// What a caller sees when the bound trips: mcp-go's own body-read error path
+// answers HTTP 400 with a JSON-RPC PARSE_ERROR (-32700) naming the read failure,
+// so the refusal is a clean, client-fixable 4xx. handlePost — and so every tool,
+// including amp_submit_request — never runs: nothing is invoked, nothing is
+// written.
+//
+// It sits INSIDE the bearer verifier (see newMCPHTTPHandler), so auth is still
+// decided first and without reading the body, exactly REST's order.
+func limitMCPBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Only POST carries a request body; GET (the SSE stream) and DELETE do not.
+		if r.Method == http.MethodPost && r.Body != nil {
+			r2 := *r
+			r2.Body = http.MaxBytesReader(w, r.Body, maxMCPRequestBody)
+			r = &r2
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // originGuard enforces the Streamable HTTP rule that servers MUST validate

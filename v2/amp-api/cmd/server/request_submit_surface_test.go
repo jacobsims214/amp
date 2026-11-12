@@ -1130,10 +1130,17 @@ func TestSubmitSurface_ErrorEnvelope(t *testing.T) {
 		t.Fatalf("%d requests exist after the error matrix, want the %d before it", after, before)
 	}
 
-	// The size guard is REST's alone (MCP has no body to bound): an over-bound
-	// body is the coded 400 naming the bound, not a 413 and not a 500 — the
-	// request.* vocabulary has no "too large" code, and a client branching on
-	// request.invalid is told the payload cannot be a submission.
+	// Both transports bound the body before the product reads it, and each names
+	// its own bound in its own refusal. REST wraps r.Body in MaxBytesReader in
+	// the submission handler, so an over-bound body is the coded 400
+	// request.invalid naming the bound — the request.* vocabulary has no "too
+	// large" code, and a client branching on request.invalid is told the payload
+	// cannot be a submission. The public MCP listener bounds bodies too
+	// (newMCPHTTPHandler -> limitMCPBody), so an over-bound body there is refused
+	// by the transport before mcp-go buffers it: HTTP 400 with a JSON-RPC
+	// PARSE_ERROR, carrying no request.* code because the product never saw it.
+	// Neither is a 413 and neither is a 500. What both must prove is that the
+	// refusal wrote nothing.
 	t.Run("an over-bound body", func(t *testing.T) {
 		huge := `{"subject":"x","input_brief":"` + strings.Repeat("a", (256<<10)+1024) + `"}`
 		o := w.restDo(w.member.token, http.MethodPost, w.inbox(w.team), rawJSON(huge), "").restOutcome()
@@ -1143,6 +1150,80 @@ func TestSubmitSurface_ErrorEnvelope(t *testing.T) {
 		}
 		if after := w.count(`SELECT count(*) FROM team_requests`); after != before {
 			t.Fatalf("an over-bound body wrote a request")
+		}
+	})
+
+	// The MCP arm: the same shape, one byte over the listener's bound
+	// (maxMCPRequestBody, so it is also far over the submission route's). The
+	// tool must not run, so the answer is a transport refusal with no
+	// request.* code, and nothing is written.
+	t.Run("an over-bound body over MCP", func(t *testing.T) {
+		// The body is padded with JSON whitespace, not with junk: it is a VALID
+		// tools/call for a submission that would be accepted at its real length.
+		// So "nothing was written" proves the listener's bound refused it, not
+		// that the domain rejected an oversized brief — without the guard this
+		// body submits.
+		//
+		// Sized to land just over the bound: the server reads bound+1 bytes and
+		// drains the small remainder (< 256 KiB), so the refusal reaches the
+		// client intact instead of the connection being closed mid-write.
+		subject := subjectFor("over-bound mcp")
+		body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+			"params": map[string]any{"name": "amp_submit_request", "_meta": modernMeta(),
+				"arguments": map[string]any{"team_id": float64(w.team), "subject": subject}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Whitespace between tokens is legal JSON everywhere; `{"jsonrpc":…`
+		// becomes `{<pad>"jsonrpc":…`.
+		pad := maxMCPRequestBody + 1024 - len(body)
+		if pad <= 0 {
+			t.Fatalf("the MCP envelope is already over the bound")
+		}
+		huge := "{" + strings.Repeat(" ", pad) + string(body[1:])
+		if len(huge) <= maxMCPRequestBody {
+			t.Fatalf("the body is %d bytes, not over the %d bound", len(huge), maxMCPRequestBody)
+		}
+		c := w.do(http.MethodPost, w.mcp.URL+"/mcp", w.member.token, modernHeaders("tools/call", "amp_submit_request"), rawJSON(huge))
+		if c.status != http.StatusBadRequest {
+			t.Fatalf("an over-bound MCP body = HTTP %d, want 400: %s", c.status, c.raw)
+		}
+		if c.status >= 500 {
+			t.Fatalf("an over-bound MCP body answered a server error: %s", c.raw)
+		}
+		// mcp-go's body-read failure is a JSON-RPC PARSE_ERROR, and it must not
+		// be the tool's coded refusal: the product never saw the body.
+		e, ok := c.body["error"].(map[string]any)
+		if !ok {
+			t.Fatalf("an over-bound MCP body answered no JSON-RPC error: %s", c.raw)
+		}
+		if code, _ := e["code"].(float64); code != -32700 {
+			t.Fatalf("an over-bound MCP body answered JSON-RPC code %v, want -32700 (PARSE_ERROR): %s", e["code"], c.raw)
+		}
+		if _, ok := e["data"].(map[string]any); ok {
+			t.Fatalf("an over-bound MCP body carried a product refusal's data envelope (a tool would have run): %s", c.raw)
+		}
+		// The uuid is the proof the tool never ran: the body was otherwise a
+		// submission that would have stored this subject.
+		if after := w.requestsWithSubject(subject); after != 0 {
+			t.Fatalf("an over-bound MCP body wrote %d requests, want 0", after)
+		}
+		if after := w.count(`SELECT count(*) FROM team_requests`); after != before {
+			t.Fatalf("an over-bound MCP body wrote a request")
+		}
+	})
+
+	// And the other side of the same bound: a body within it still submits, so the
+	// guard cannot be passing the arm above by refusing everything. The payload is
+	// a real maximum-size submission (a 20000-character brief), not a small one.
+	t.Run("a within-bound body over MCP", func(t *testing.T) {
+		subject := subjectFor("within bound")
+		o := w.submit("mcp", w.member.token, w.team, subject, strings.Repeat("b", domain.MaxRequestBriefLen), "")
+		if !o.accepted || !o.created {
+			t.Fatalf("a within-bound MCP body was refused: %d %q %q", o.status, o.code, o.message)
+		}
+		if after := w.count(`SELECT count(*) FROM team_requests WHERE subject = $1`, subject); after != 1 {
+			t.Fatalf("a within-bound MCP body wrote %d requests, want 1", after)
 		}
 	})
 }
