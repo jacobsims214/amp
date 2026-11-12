@@ -148,6 +148,13 @@ func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("/api/events", h.events)
 	mux.HandleFunc("/api/orgs", h.orgs)
 	mux.HandleFunc("/api/orgs/", h.orgSub)
+	// The inbox submission (request_submit.go): the one POST that is not the
+	// team's own sub-path router. It is registered as a method+path pattern so
+	// net/http gives it the team id as a path value and so the other methods on
+	// the same path still reach teamSub, which answers them. Registering it
+	// here, through deniedMux, is what puts the submit-scope gate and the
+	// access.denied audit in front of it (AMP #3772, #3862, #3919).
+	mux.HandleFunc("POST /api/teams/{id}/requests", h.teamRequestSubmit)
 	mux.HandleFunc("/api/teams/", h.teamSub)
 	mux.HandleFunc("/api/me", h.me)
 	mux.HandleFunc("/api/users", h.users)
