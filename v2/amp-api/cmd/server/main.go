@@ -428,6 +428,10 @@ func main() {
 	sweepSvc := service.New(repo, registry, kbSvc)
 	sweepSvc.Evidence = evidence
 	go sweepSvc.RunReceiptSweep(ctx, time.Hour, repo.TryNamedLock)
+	// Request attachments nobody kept are purged 90 days after their request
+	// closes (D3), and their stored expiry is reconciled against the request's
+	// posture first. Bounded batches, hourly, one replica at a time.
+	go service.New(repo, registry, kbSvc).RunRequestAttachmentPurge(ctx, time.Hour, repo.TryNamedLock)
 
 	// Audit log integrity (#2429): sign each chain's head hourly, and
 	// delete entries past AUDIT_RETENTION_DAYS daily through the anchored
