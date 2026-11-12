@@ -155,6 +155,13 @@ func (h *RestHandler) register(mux *deniedMux) {
 	// here, through deniedMux, is what puts the submit-scope gate and the
 	// access.denied audit in front of it (AMP #3772, #3862, #3919).
 	mux.HandleFunc("POST /api/teams/{id}/requests", h.teamRequestSubmit)
+	// Private attachment downloads (request_download.go, AMP #3963): the mint on a
+	// request's own team-scoped sub-path, and the short-lived URL it produces. Both go
+	// through deniedMux like every other route, so the auth verifier, the auth proxy,
+	// the submit-only scope gate and the access.denied audit all apply — a download URL
+	// is an additional capability, never a way around signing in.
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/attachments/{attachment}/download", h.requestTeamDownloadMint)
+	mux.HandleFunc("/api/request-downloads/", h.requestDownloadServe)
 	mux.HandleFunc("/api/teams/", h.teamSub)
 	mux.HandleFunc("/api/me", h.me)
 	mux.HandleFunc("/api/users", h.users)
