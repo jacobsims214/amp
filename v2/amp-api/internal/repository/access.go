@@ -704,9 +704,48 @@ func (r *Repo) ListPendingInvites(ctx context.Context, orgID int) ([]domain.Invi
 	return collect(rows, scanInvite)
 }
 
+// ListPendingRequesterInvites returns one team's pending requester invitations
+// (AMP #3975): the acknowledgment rows a manager needs to see "who has been
+// invited and has not signed in yet". It is the org listing above narrowed by
+// kind and team, so a caller never filters the org's membership invitations out
+// of a screen that is about requesters.
+//
+// Only kind='requester' rows with this team_id are returned. A requester
+// invitation is always bound to a team (the service refuses one without), so
+// this is every pending requester invitation for the inbox — and a requester
+// invitation whose team was deleted cascaded its team_id to NULL with it, so it
+// is not listed here (there is no inbox left to admit anyone to).
+func (r *Repo) ListPendingRequesterInvites(ctx context.Context, teamID int) ([]domain.Invite, error) {
+	rows, err := r.db.Query(ctx, `SELECT `+inviteCols+` FROM invites
+		WHERE team_id = $1 AND kind = $2 AND accepted_at IS NULL ORDER BY lower(email)`, teamID, domain.InviteKindRequester)
+	if err != nil {
+		return nil, err
+	}
+	return collect(rows, scanInvite)
+}
+
 func (r *Repo) DeleteInvite(ctx context.Context, id int) error {
 	_, err := r.db.Exec(ctx, `DELETE FROM invites WHERE id = $1 AND accepted_at IS NULL`, id)
 	return err
+}
+
+// DeleteRequesterInvite is DeleteInvite narrowed to one team's requester
+// invitation, and it is the one a team route uses (AMP #3975). The guards are
+// in the WHERE clause, so the check and the delete are one statement: a
+// concurrent acceptance cannot slip between "this is a pending requester
+// invitation of this team" and the removal, and a row that changed underneath
+// the caller deletes nothing (reported as ErrNotFound by the affected-row
+// count rather than removing the wrong row).
+func (r *Repo) DeleteRequesterInvite(ctx context.Context, teamID, inviteID int) error {
+	res, err := r.db.Exec(ctx, `DELETE FROM invites
+		WHERE id = $1 AND team_id = $2 AND kind = $3 AND accepted_at IS NULL`, inviteID, teamID, domain.InviteKindRequester)
+	if err != nil {
+		return err
+	}
+	if res.RowsAffected() == 0 {
+		return fmt.Errorf("requester invite %d of team %d: %w", inviteID, teamID, ErrNotFound)
+	}
+	return nil
 }
 
 // AcceptInvites applies every pending invite for the user's email: org

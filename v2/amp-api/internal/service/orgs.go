@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/kb"
+	"github.com/simstech/amp-api/internal/repository"
 )
 
 // Org and team administration, shared by the REST API (/api/orgs, /api/teams)
@@ -586,6 +588,81 @@ func (s *Service) inviteRequester(ctx context.Context, p authz.Principal, a orgA
 	s.audit(ctx, p, domain.AuditEntry{Action: "invite.create", OrgID: intRef(inv.OrgID), TargetType: "invite", TargetID: idStr(created.ID),
 		Summary: "invited " + inv.Email + " to send requests to team " + team.Name, Details: map[string]any{"kind": inv.Kind, "team_id": *inv.TeamID}})
 	return &MemberResult{Invited: true, Invite: created}, nil
+}
+
+// ListRequesterInvites returns one team's pending requester invitations, for the
+// inbox's submit-access administration view (AMP #3975): who has been invited as
+// a requester and has not signed in yet. It is manager-only, the same gate as
+// grant and revoke — the listing names people who will be able to send to this
+// inbox, which is administration (contract §2), not something a plain team
+// member's inbox access includes.
+//
+// It is narrower than ListInvites on purpose: that one is an org admin's whole
+// pending set (membership and requester invitations together), while this one
+// answers the team's own question and refuses a non-manager. A team lead with no
+// org role can therefore see the requester invitations of their own inbox.
+func (s *Service) ListRequesterInvites(ctx context.Context, p authz.Principal, teamID int) ([]domain.Invite, error) {
+	if _, err := s.loadSubmitGrantTeam(ctx, p, teamID); err != nil {
+		return nil, err
+	}
+	return s.Repo.ListPendingRequesterInvites(ctx, teamID)
+}
+
+// RevokeRequesterInvite revokes one pending requester invitation of teamID, for
+// the same administration view (AMP #3975). Manager-only, like the listing.
+//
+// It is not RevokeInvite: that one is org-admin-only and takes an org id, so a
+// team lead could not revoke their own inbox's invitation with it, and a
+// manager of one inbox could revoke another inbox's invitation by naming its
+// org. Here the team is in the path and in the delete's WHERE clause, so a
+// caller who may administer team A cannot revoke a row of team B — the row
+// simply isn't the one named, and the answer is not found.
+//
+// A row that was already accepted is not revocable (the delete keeps
+// accepted_at IS NULL), which is the same rule as before: revoking deletes the
+// pending intent, and there is no second copy of it once the person has signed
+// in.
+func (s *Service) RevokeRequesterInvite(ctx context.Context, p authz.Principal, teamID, inviteID int) error {
+	team, err := s.loadSubmitGrantTeam(ctx, p, teamID)
+	if err != nil {
+		return err
+	}
+	if err := s.Repo.DeleteRequesterInvite(ctx, teamID, inviteID); err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return authz.NotFound("invite %d not found for team %d", inviteID, teamID)
+		}
+		return err
+	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "invite.revoke", OrgID: intRef(team.OrgID), TargetType: "invite", TargetID: idStr(inviteID),
+		TargetName: team.Name, Summary: "revoked a requester invitation to team " + team.Name,
+		Details: map[string]any{"kind": domain.InviteKindRequester, "team_id": teamID}})
+	return nil
+}
+
+// InviteRequesterForTeam issues a requester invitation to one team's inbox,
+// bound to that team and its org (AMP #3975). It exists so the team-addressed
+// surface needs no second way to say the same thing: Service.Invite takes a
+// whole Invite, and an adapter that fills in the org, the team and the kind from
+// a path would be deciding the invitation's shape in the transport. Here the
+// team is loaded and gated first, and its org is read from its own row.
+//
+// Everything else is inviteRequester's: the manager gate (a team lead or the
+// org's owner/admin), the refusal of an email that already has an account, and
+// the audit row naming the team and the kind. Accepting the invitation
+// provisions a customer identity and grants no membership.
+func (s *Service) InviteRequesterForTeam(ctx context.Context, p authz.Principal, teamID int, email string) (*MemberResult, error) {
+	team, a, err := s.loadTeam(ctx, p, teamID)
+	if err != nil {
+		return nil, err
+	}
+	return s.inviteRequester(ctx, p, a, domain.Invite{
+		Email:    strings.ToLower(strings.TrimSpace(email)),
+		OrgID:    team.OrgID,
+		OrgRole:  domain.OrgRoleMember,
+		TeamID:   &team.ID,
+		TeamRole: domain.TeamRoleMember,
+		Kind:     domain.InviteKindRequester,
+	})
 }
 
 // invite validates and stores an invite; if the email already belongs to

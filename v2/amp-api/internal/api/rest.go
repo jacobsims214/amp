@@ -223,6 +223,25 @@ func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/attachments", h.teamRequestAttachmentUpload)
 	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/attachments/{attachment}/keep", h.teamRequestAttachmentKeep)
 	mux.HandleFunc("DELETE /api/teams/{id}/requests/{request}/attachments/{attachment}", h.teamRequestAttachmentDelete)
+	// Team requester access administration (request_grants.go, AMP #3975): who may
+	// submit to this inbox, and who has been invited as a requester. Six routes, all
+	// thin over the reviewed administration services — GrantSubmitAccess,
+	// RevokeSubmitAccess, ListSubmitGrants, InviteRequesterForTeam,
+	// ListRequesterInvites and RevokeRequesterInvite — so a refusal is the same code
+	// the service answers every other caller with. They are team-addressed and
+	// deliberately separate from /api/teams/{id}/members and /api/orgs/{id}/invites:
+	// submit access is a revocable grant that reaches no project, and a requester
+	// invitation provisions a customer identity and grants no membership. All through
+	// deniedMux, so a submit-only credential cannot administer the inbox it may submit
+	// to (token.scope_denied) and a 403 is audited. No route here mints a credential: a
+	// submit-scoped token is POST /api/users/{id}/tokens with scope "submit" (rest.go),
+	// which returns its secret once.
+	mux.HandleFunc("GET /api/teams/{id}/request-grants", h.teamRequestGrants)
+	mux.HandleFunc("POST /api/teams/{id}/request-grants", h.teamRequestGrants)
+	mux.HandleFunc("DELETE /api/teams/{id}/request-grants/{user}", h.teamRequestGrantRevoke)
+	mux.HandleFunc("GET /api/teams/{id}/request-invites", h.teamRequestInvites)
+	mux.HandleFunc("POST /api/teams/{id}/request-invites", h.teamRequestInvites)
+	mux.HandleFunc("DELETE /api/teams/{id}/request-invites/{invite}", h.teamRequestInviteRevoke)
 	mux.HandleFunc("/api/teams/", h.teamSub)
 	mux.HandleFunc("/api/me", h.me)
 	mux.HandleFunc("/api/users", h.users)
