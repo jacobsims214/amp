@@ -161,8 +161,11 @@ func newSubmitFixture(t *testing.T) *submitFixture {
 	f.org = q(`INSERT INTO orgs (name, slug) VALUES ('Submit org', $1) RETURNING id`, fmt.Sprintf("submit-%d", suffix))
 	f.team = q(`INSERT INTO teams (org_id, name) VALUES ($1, 'Inbox') RETURNING id`, f.org)
 	f.otherTeam = q(`INSERT INTO teams (org_id, name) VALUES ($1, 'Other desk') RETURNING id`, f.org)
+	// The code is the full suffix, not a truncation of it: projects.code is
+	// globally UNIQUE, so a shortened code collides across runs (1 in 100k per
+	// insert, which a suite that builds several projects per fixture hits).
 	f.project = q(`INSERT INTO projects (name, code, org_id) VALUES ('Delivered work', $1, $2) RETURNING id`,
-		fmt.Sprintf("SUB%d", suffix%100000), f.org)
+		fmt.Sprintf("SUB%d", suffix), f.org)
 	exec(`INSERT INTO project_teams (project_id, team_id, role) VALUES ($1, $2, 'member')`, f.project, f.team)
 	f.otherOrg = q(`INSERT INTO orgs (name, slug) VALUES ('Submit other org', $1) RETURNING id`, fmt.Sprintf("submit-other-%d", suffix))
 	f.foreign = q(`INSERT INTO teams (org_id, name) VALUES ($1, 'Foreign inbox') RETURNING id`, f.otherOrg)

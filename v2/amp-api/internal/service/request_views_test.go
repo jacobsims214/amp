@@ -129,8 +129,11 @@ func newViewsFixture(t *testing.T) *viewsFixture {
 	f.org = q(`INSERT INTO orgs (name, slug) VALUES ('Views org', $1) RETURNING id`, fmt.Sprintf("views-%d", suffix))
 	f.team = q(`INSERT INTO teams (org_id, name) VALUES ($1, 'Views desk') RETURNING id`, f.org)
 	f.otherTeam = q(`INSERT INTO teams (org_id, name) VALUES ($1, 'Views other desk') RETURNING id`, f.org)
+	// The code is the full suffix, not a truncation of it: projects.code is
+	// globally UNIQUE, so a shortened code collides across runs (1 in 100k per
+	// insert, which a suite that builds several projects per fixture hits).
 	f.project = q(`INSERT INTO projects (name, code, org_id) VALUES ('Views work', $1, $2) RETURNING id`,
-		fmt.Sprintf("VW%d", suffix%100000), f.org)
+		fmt.Sprintf("VW%d", suffix), f.org)
 	exec(`INSERT INTO project_teams (project_id, team_id, role) VALUES ($1, $2, 'member')`, f.project, f.team)
 	f.otherOrg = q(`INSERT INTO orgs (name, slug) VALUES ('Views other org', $1) RETURNING id`, fmt.Sprintf("views-other-%d", suffix))
 	f.foreign = q(`INSERT INTO teams (org_id, name) VALUES ($1, 'Views foreign desk') RETURNING id`, f.otherOrg)
