@@ -163,6 +163,18 @@ func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("GET /api/teams/{id}/requests", h.teamRequestQueue)
 	mux.HandleFunc("GET /api/teams/{id}/requests/summary", h.teamRequestSummary)
 	mux.HandleFunc("GET /api/teams/{id}/requests/{request}", h.teamRequestDetail)
+	// Team request writes (request_mutations.go, AMP #3971): the submitter's
+	// versioned edit and the four triage acts, each on its own sub-path so a
+	// method+path pair names exactly one act. All through deniedMux, so the
+	// submit-scope gate refuses a submit-only credential before any handler runs
+	// (its allow-list is the submission POST and nothing else) and a 403 is
+	// audited. No lifecycle, delivery, acceptance or attachment route is here:
+	// those are F3/F4/F5 and each has its own gate.
+	mux.HandleFunc("PATCH /api/teams/{id}/requests/{request}", h.teamRequestEdit)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/comments", h.teamRequestComment)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/claim", h.teamRequestClaim)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/release", h.teamRequestRelease)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/assign", h.teamRequestAssign)
 	// The requester surface (same file): a person's own requests, projected, and
 	// one of them by serial or by the opaque reference their submission answered
 	// with. Never the record, never another requester's request.
