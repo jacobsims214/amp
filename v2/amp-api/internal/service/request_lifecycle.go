@@ -250,6 +250,132 @@ func (s *Service) ReopenRequest(ctx context.Context, p authz.Principal, requestI
 	})
 }
 
+// RequesterRequestRef is how a requester names one of their own requests: the
+// opaque public reference their submission answered with, or its serial.
+// Exactly one is set.
+//
+// It exists because the two surfaces genuinely address a request differently.
+// A triager works from the team's record and has the serial; a requester holds
+// only the reference, and the requester projection (domain.RequesterRequestView)
+// deliberately carries neither the serial nor the team — it is a read shape, not
+// an addressing scheme. The requester acts therefore need a way to name their
+// request that is scoped by their own requester column, and that resolution
+// belongs here rather than in an adapter: a REST handler that looked a
+// reference up itself would be a second tenant-scoped lookup with a second
+// definition of what a reference may name (the reason request_mutations.go
+// refuses a reference on a team write path instead of searching for it).
+//
+// There is no team field on purpose. The team is read from the loaded row, which
+// the requester column already scoped to this person, so a caller cannot pair a
+// reference with someone else's inbox.
+type RequesterRequestRef struct {
+	// RequestID is the request's serial, 0 when PublicRef names it.
+	RequestID int
+	// PublicRef is the requester's opaque reference (the display form's REQ-
+	// prefix is accepted and stripped). Empty when RequestID names it.
+	PublicRef string
+}
+
+// AcceptRequestByRef is AcceptRequest for the way a requester actually holds
+// their request: by public reference (or serial), not by the team and serial a
+// triager's path carries.
+//
+// It is the same act and the same rules; only the addressing differs. The
+// person-in-the-web-UI check runs FIRST, before the reference is resolved, so an
+// agent account, an API token or a submit-only credential learns nothing about
+// whether a reference was ever minted — the answer it gets is the same bytes for
+// a real reference, an unknown one and someone else's. A requester who is not a
+// member of the team passes that check (they are the person) and is then
+// refused, if the request is not theirs, by the own-request load: one 404.
+func (s *Service) AcceptRequestByRef(ctx context.Context, p authz.Principal, ref RequesterRequestRef, expectedRev int) (*TransitionRequestResult, error) {
+	if err := requireRequesterUI(p, "Accepting a delivered request"); err != nil {
+		return nil, err
+	}
+	req, err := s.loadOwnTransitionTarget(ctx, p, ref)
+	if err != nil {
+		return nil, err
+	}
+	return s.AcceptRequest(ctx, p, req.ID, req.TeamID, expectedRev)
+}
+
+// AnswerRequestByRef is AnswerRequest for the requester's own request, named the
+// way they hold it.
+//
+// Like acceptance it refuses a non-person caller before the reference is
+// resolved (the same requireRequesterUI inside AnswerRequest, which runs first
+// here because this function does the person check itself before loading) — so a
+// credential cannot use a guessed reference to learn anything, and there is no
+// path by which an agent answers on a requester's behalf. The destination is
+// read from the request's history, never supplied by the caller.
+func (s *Service) AnswerRequestByRef(ctx context.Context, p authz.Principal, ref RequesterRequestRef, in TransitionRequestInput) (*TransitionRequestResult, error) {
+	if err := requireRequesterUI(p, "Answering a request's question"); err != nil {
+		return nil, err
+	}
+	req, err := s.loadOwnTransitionTarget(ctx, p, ref)
+	if err != nil {
+		return nil, err
+	}
+	in.RequestID, in.TeamID = req.ID, req.TeamID
+	return s.AnswerRequest(ctx, p, in)
+}
+
+// ReopenRequestByRef is ReopenRequest for the requester's own request, named the
+// way they hold it. The decision stays the policy's: a requester may reopen from
+// delivered or requester_accepted (D6), and a request the team closed is reopened
+// by the team, on the team's own path.
+//
+// Unlike acceptance this is not a person-only act in the policy (a team member
+// reopens too), so it does not pre-refuse a credential: a token acting for a
+// person who is the requester resolves through RequestCapabilityFor, which is the
+// one place that answers "is this caller the requester".
+func (s *Service) ReopenRequestByRef(ctx context.Context, p authz.Principal, ref RequesterRequestRef, expectedRev int) (*TransitionRequestResult, error) {
+	req, err := s.loadOwnTransitionTarget(ctx, p, ref)
+	if err != nil {
+		return nil, err
+	}
+	return s.ReopenRequest(ctx, p, req.ID, req.TeamID, expectedRev)
+}
+
+// loadOwnTransitionTarget loads a request the caller is the requester of, from
+// the reference they hold.
+//
+// Three properties, each one load-bearing:
+//
+//   - No user row means nothing can be theirs, so it is the surface's 404 rather
+//     than a lookup scoped by user 0.
+//   - The reference's shape is normalized by the domain's own rule (the display
+//     form's REQ- prefix is stripped, a value the domain could never have minted
+//     is refused request.invalid rather than searched for) — the same
+//     normalizeReadRef the reads use, so a write and a read cannot disagree about
+//     what a reference may name.
+//   - The load is the own-request read, scoped by the caller's own requester
+//     column (GetRequestByRequester / …Ref). Another person's reference, a
+//     service- or connector-submitted request with no requester, and a reference
+//     that was never minted are therefore all ErrNotFound, and the surface's one
+//     404 is the same bytes for all three.
+func (s *Service) loadOwnTransitionTarget(ctx context.Context, p authz.Principal, ref RequesterRequestRef) (*domain.TeamRequest, error) {
+	if !p.HasUser() {
+		return nil, authz.RequestNotFound()
+	}
+	named, err := normalizeReadRef(RequestReadInput{RequestID: ref.RequestID, PublicRef: ref.PublicRef})
+	if err != nil {
+		return nil, err
+	}
+	var req *domain.TeamRequest
+	if named.id > 0 {
+		req, err = s.Repo.GetRequestByRequester(ctx, named.id, p.UserID)
+	} else {
+		req, err = s.Repo.GetRequestByRequesterRef(ctx, named.publicRef, p.UserID)
+	}
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return nil, authz.RequestNotFound()
+		}
+		return nil, err
+	}
+	return req, nil
+}
+
 // requireRequesterUI refuses a requester act that did not arrive from a person in
 // the web UI. It runs before anything is loaded, so it cannot leak whether an id
 // exists, and its message names what a caller should do instead rather than
@@ -314,11 +440,14 @@ func (s *Service) transitionRequest(ctx context.Context, p authz.Principal, in T
 	} else if expectRev != req.Rev {
 		// The caller's copy of the request is stale before anything was decided:
 		// a 409 it can resolve, not a 404 (it may see the row) and not a write. The
-		// codedCause keeps repository.ErrConflict in the chain, so a caller that only
-		// branches on the package's conflict sentinels needs no special case.
+		// cause is the repository's own typed conflict — not a copy of its sentinel —
+		// so a surface can read the revision the row is actually at off the error
+		// and tell the client what to retry with (the same reason
+		// requestMutationRefusal carries the error), while errors.Is still matches
+		// ErrConflict through the type's Is method.
 		return nil, &codedCause{
 			err:   authz.RequestConflict("request %d is at revision %d, not %d: reload it, then decide again", req.ID, req.Rev, expectRev),
-			cause: repository.ErrConflict,
+			cause: &repository.RequestRevConflict{RequestID: req.ID, Expected: expectRev, Current: req.Rev},
 		}
 	}
 	plan, err := PlanRequestTransition(RequestTransitionInput{
@@ -631,12 +760,12 @@ func transitionRequestError(requestID int, err error) error {
 	case errors.As(err, &revConflict):
 		return &codedCause{
 			err:   authz.RequestConflict("request %d is at revision %d, not %d: it changed since it was read, so reload it and decide again", requestID, revConflict.Current, revConflict.Expected),
-			cause: repository.ErrConflict,
+			cause: err,
 		}
 	case errors.As(err, &stateConflict):
 		return &codedCause{
 			err:   authz.RequestConflict("request %d is now %s, not %s: it moved since this act was decided, so reload it and decide again", requestID, stateConflict.Current, stateConflict.Expected),
-			cause: repository.ErrConflict,
+			cause: err,
 		}
 	case errors.Is(err, repository.ErrRequestDeliveryUnEvidenced):
 		return authz.RequestInvalid("request %d is delivered only when the outcome exists: link what delivered it (a task, an artifact or a receipt), or say explicitly that there is nothing to link (I2). %s", requestID, err)

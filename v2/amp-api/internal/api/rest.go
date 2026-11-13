@@ -175,11 +175,31 @@ func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/claim", h.teamRequestClaim)
 	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/release", h.teamRequestRelease)
 	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/assign", h.teamRequestAssign)
+	// Team request lifecycle (request_lifecycle.go, AMP #3973): the working steps,
+	// the two closes that carry a reason, the question, the reopen and the
+	// delivery — each on its own sub-path, each a thin adapter over the one
+	// reviewed transition service. All through deniedMux, so a submit-only
+	// credential is refused before any handler runs and a 403 is audited. No route
+	// here accepts a requester's acceptance: that is the requester surface below.
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/transition", h.teamRequestTransition)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/needs-info", h.teamRequestNeedsInfo)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/reject", h.teamRequestReject)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/duplicate", h.teamRequestDuplicate)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/reopen", h.teamRequestReopen)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/deliver", h.teamRequestDeliver)
 	// The requester surface (same file): a person's own requests, projected, and
 	// one of them by serial or by the opaque reference their submission answered
 	// with. Never the record, never another requester's request.
 	mux.HandleFunc("GET /api/requests", h.ownRequests)
 	mux.HandleFunc("GET /api/requests/{request}", h.ownRequestDetail)
+	// The requester's own acts (request_lifecycle.go, AMP #3973): answering a
+	// question, accepting a delivery and reopening after delivery. Acceptance is
+	// a person's act alone and the service refuses a credential before it resolves
+	// the reference, so these three routes are the only path to `accept` and it
+	// reaches no agent, token or connector.
+	mux.HandleFunc("POST /api/requests/{request}/answer", h.ownRequestAnswer)
+	mux.HandleFunc("POST /api/requests/{request}/accept", h.ownRequestAccept)
+	mux.HandleFunc("POST /api/requests/{request}/reopen", h.ownRequestReopen)
 	// Private attachment downloads (request_download.go, AMP #3963): the mint on a
 	// request's own team-scoped sub-path, and the short-lived URL it produces. Both go
 	// through deniedMux like every other route, so the auth verifier, the auth proxy,
