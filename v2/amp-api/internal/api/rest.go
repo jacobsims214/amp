@@ -207,6 +207,22 @@ func (h *RestHandler) register(mux *deniedMux) {
 	// is an additional capability, never a way around signing in.
 	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/attachments/{attachment}/download", h.requestTeamDownloadMint)
 	mux.HandleFunc("/api/request-downloads/", h.requestDownloadServe)
+	// Request lineage and attachments (request_links.go and request_uploads.go, AMP
+	// #3974): the attach, the planning handoff, the file panel, the upload, and a
+	// file's keep and delete. Each is a thin adapter over one reviewed service —
+	// AttachRequest, HandoffRequest, ListRequestAttachmentsForDownload,
+	// AddRequestAttachment, KeepRequestAttachment, DeleteRequestAttachment — which
+	// are the same methods the MCP tools call, so a refusal is the same code on
+	// either surface. All through deniedMux, so a submit-only credential is refused
+	// before any handler runs and a 403 is audited. No route here approves, dispatches
+	// or fetches anything a caller names: a handoff creates tickets that await a
+	// person's approval, and an upload's bytes arrive in its body.
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/links", h.teamRequestLink)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/handoff", h.teamRequestHandoff)
+	mux.HandleFunc("GET /api/teams/{id}/requests/{request}/attachments", h.teamRequestAttachmentPanel)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/attachments", h.teamRequestAttachmentUpload)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/attachments/{attachment}/keep", h.teamRequestAttachmentKeep)
+	mux.HandleFunc("DELETE /api/teams/{id}/requests/{request}/attachments/{attachment}", h.teamRequestAttachmentDelete)
 	mux.HandleFunc("/api/teams/", h.teamSub)
 	mux.HandleFunc("/api/me", h.me)
 	mux.HandleFunc("/api/users", h.users)
