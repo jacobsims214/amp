@@ -155,6 +155,19 @@ func (h *RestHandler) register(mux *deniedMux) {
 	// here, through deniedMux, is what puts the submit-scope gate and the
 	// access.denied audit in front of it (AMP #3772, #3862, #3919).
 	mux.HandleFunc("POST /api/teams/{id}/requests", h.teamRequestSubmit)
+	// Team request reads (request_reads.go, AMP #3968): the queue with its pill
+	// counts and the caller's own claimed/assigned slice, the same counts without
+	// a page (My work's inbox panels), and one request by serial or public
+	// reference. All through deniedMux, so the submit-scope gate refuses a
+	// read-only credential and a 403 is audited like every other refusal.
+	mux.HandleFunc("GET /api/teams/{id}/requests", h.teamRequestQueue)
+	mux.HandleFunc("GET /api/teams/{id}/requests/summary", h.teamRequestSummary)
+	mux.HandleFunc("GET /api/teams/{id}/requests/{request}", h.teamRequestDetail)
+	// The requester surface (same file): a person's own requests, projected, and
+	// one of them by serial or by the opaque reference their submission answered
+	// with. Never the record, never another requester's request.
+	mux.HandleFunc("GET /api/requests", h.ownRequests)
+	mux.HandleFunc("GET /api/requests/{request}", h.ownRequestDetail)
 	// Private attachment downloads (request_download.go, AMP #3963): the mint on a
 	// request's own team-scoped sub-path, and the short-lived URL it produces. Both go
 	// through deniedMux like every other route, so the auth verifier, the auth proxy,
