@@ -132,6 +132,17 @@ var toolCatalog = map[string]toolInfo{
 	"amp_claim_request":   {title: "Claim team request", keywords: "take a request from the shared inbox, I am triaging it, claim conflict, who holds it", idempotent: true},
 	"amp_release_request": {title: "Release team request", keywords: "drop my triage claim, put a request back in the shared queue", idempotent: true},
 	"amp_assign_request":  {title: "Assign team request", keywords: "give a request to a person, own the outcome, unassign, hand over a request, transfer clears the claim", idempotent: true},
+	//
+	// The planning and attachment half (AMP #3972). Both writes are idempotent
+	// because the service makes a replay a no-op: an attach of a relation already
+	// stored writes nothing (changed=false), and a handoff retried with the same
+	// handoff_key reconciles against the ledger instead of planning the batch
+	// twice. A handoff with a NEW key is a deliberate re-plan, which is what the
+	// description says; the flag promises the retry, not the re-plan. None is
+	// destructive and none moves a lifecycle state.
+	"amp_attach_request":      {title: "Link team request", keywords: "attach a request to a project, plan items or delivery evidence, route a request, link work to a request, idempotent link", idempotent: true},
+	"amp_handoff_request":     {title: "Plan work for a team request", keywords: "plan a request, create tickets for a request, hand off a request to a project, plan items with dependencies, retry-safe planning", idempotent: true},
+	"amp_upload_request_file": {title: "Attach a file to a team request", keywords: "upload a file to a request, private attachment, requester file, base64 upload, bounded upload, no remote fetch"},
 
 	// Reports
 	"amp_day_report":          {title: "Draft day report", keywords: "end of day, wrap up today, standup draft", readOnly: true},

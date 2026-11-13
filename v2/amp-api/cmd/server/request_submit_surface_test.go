@@ -1877,12 +1877,19 @@ func TestSubmitSurface_RoutesNothing(t *testing.T) {
 	//
 	// amp_submit_request is listed for a team member, and so are the read and
 	// triage tools that #3969 landed beside it (a member triages their team's
-	// inbox). What must still be absent is anything from a later slice — the
-	// planning link and handoff (#3972) and the requester's acceptance, which is
-	// the person's own act in the web UI and has no tool at all (I1, D5). The
-	// submit-only credential's own boundary is asserted above and in
-	// internal/mcp/request_work_test.go: it is the scope set that trims its list
-	// to one tool, not the absence of every other request tool.
+	// inbox) and the planning and attachment tools #3972 landed after them (a
+	// triager attaches a request to work, plans a batch and puts a requester's
+	// file on it). What must still be absent is the requester's acceptance and the
+	// team's delivery, which are the lifecycle's acts (I1/D5: acceptance is the
+	// requester's own act in the web UI), and no tool may ever be named for them.
+	// The submit-only credential's own boundary is asserted above and in
+	// internal/mcp/request_work_test.go and request_planning_test.go: it is the
+	// scope set that trims its list to one tool, not the absence of every other
+	// request tool.
+	//
+	// This is the same edit this test needed when the triage tools landed: a
+	// slice's absence becomes the next slice's presence, and what outlives both is
+	// the guarantee — acceptance and delivery have no tool, ever.
 	listed := w.mcpTools(w.member.token)
 	if !contains(listed, mcp.SubmitScopeTool) {
 		t.Fatalf("amp_submit_request is not listed for a team member: %v", listed)
@@ -1890,17 +1897,17 @@ func TestSubmitSurface_RoutesNothing(t *testing.T) {
 	for _, built := range []string{
 		"amp_list_requests", "amp_get_request", "amp_update_request", "amp_comment_request",
 		"amp_claim_request", "amp_release_request", "amp_assign_request",
+		"amp_attach_request", "amp_handoff_request", "amp_upload_request_file",
 	} {
 		if !contains(listed, built) {
 			t.Errorf("%s is not listed for a team member: a triager must be able to find it", built)
 		}
 	}
 	for _, forbidden := range []string{
-		"amp_accept_request", "amp_deliver_request", "amp_add_request_attachment",
-		"amp_attach_request", "amp_link_request", "amp_handoff_request",
+		"amp_accept_request", "amp_deliver_request", "amp_link_request",
 	} {
 		if contains(listed, forbidden) {
-			t.Fatalf("%s is listed: that operation belongs to a later slice (or, for acceptance, to the requester's own web-UI act and never to a tool)", forbidden)
+			t.Fatalf("%s is listed: that operation belongs to a later slice (or, for acceptance and delivery, to the requester's and the team's own web-UI acts and never to a tool)", forbidden)
 		}
 	}
 }

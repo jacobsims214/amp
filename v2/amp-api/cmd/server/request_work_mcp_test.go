@@ -995,9 +995,16 @@ func TestMCPRequestWork_SubmitOnlyCredentialIsRefused(t *testing.T) {
 
 // TestMCPRequestWork_NoAcceptanceOrLifecycleTool is the negative boundary as a
 // property of the surface: there is no tool through which a credential can
-// accept a delivery, deliver one, move a state, attach a request to planning or
-// add a file — and after every act above, the request's state is still what the
-// submitter left it as.
+// accept a delivery, deliver one, or move a state — and after every act above,
+// the request's state is still what the submitter left it as.
+//
+// The list of forbidden verbs is deliberately the ones that stay forbidden: the
+// triage slice (#3969) may not attach or plan, and the planning slice (#3972)
+// may — so "attach", "link" and "handoff" left this list when those tools
+// landed, while acceptance, delivery and every lifecycle verb stayed. What the
+// two tests now share is the guarantee that outlives both slices: no request
+// tool can accept or deliver anything, because those are the requester's and the
+// team's own acts in the web UI (I1, D5).
 func TestMCPRequestWork_NoAcceptanceOrLifecycleTool(t *testing.T) {
 	w := newRequestWorkWorld(t)
 
@@ -1025,9 +1032,9 @@ func TestMCPRequestWork_NoAcceptanceOrLifecycleTool(t *testing.T) {
 		if !strings.Contains(tl.Name, "request") {
 			continue
 		}
-		for _, forbidden := range []string{"accept", "deliver", "attach", "link", "handoff", "transition", "reopen", "answer", "reject"} {
+		for _, forbidden := range []string{"accept", "deliver", "transition", "reopen", "answer", "reject"} {
 			if strings.Contains(tl.Name, forbidden) {
-				t.Fatalf("the request surface has %q, which belongs to a later slice or to the requester's own web-UI act (I1, D5)", tl.Name)
+				t.Fatalf("the request surface has %q, which belongs to the requester's own web-UI act or to the lifecycle (I1, D5)", tl.Name)
 			}
 		}
 	}
@@ -1045,15 +1052,23 @@ func TestMCPRequestWork_NoAcceptanceOrLifecycleTool(t *testing.T) {
 		t.Fatalf("state = %q, want new: this slice's tools change content, claims and assignees, never the lifecycle", state)
 	}
 
-	// No attachment or link row was written by anything in this slice.
-	var attachments, links int
-	if err := w.db(t).QueryRow(context.Background(), `SELECT count(*) FROM request_attachments`).Scan(&attachments); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.db(t).QueryRow(context.Background(), `SELECT count(*) FROM request_links`).Scan(&links); err != nil {
-		t.Fatal(err)
-	}
-	if attachments != 0 || links != 0 {
-		t.Fatalf("%d attachments and %d links exist: this slice has no tool that creates either", attachments, links)
+	// No attachment or link row was written for THESE requests by anything in this
+	// slice. The assertion is scoped to this world's requests rather than to the
+	// whole table: the suite shares one database, and later slices legitimately
+	// write both tables (the planning and attachment tools, #3972), so a
+	// count-of-zero over the table would assert "this slice does not exist" — the
+	// same trap request_links_test.go's assertNothingLinked documents. "Wrote no
+	// more" is the property, and it is checked for both of this fixture's
+	// requests.
+	for _, requestID := range []int{w.refID, w.stored(t, w.otherRef).ID} {
+		var attachments, links int
+		if err := w.db(t).QueryRow(context.Background(),
+			`SELECT (SELECT count(*) FROM request_attachments WHERE request_id = $1),
+			        (SELECT count(*) FROM request_links WHERE request_id = $1)`, requestID).Scan(&attachments, &links); err != nil {
+			t.Fatal(err)
+		}
+		if attachments != 0 || links != 0 {
+			t.Fatalf("request %d has %d attachments and %d links: this slice has no tool that creates either", requestID, attachments, links)
+		}
 	}
 }
