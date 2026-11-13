@@ -720,6 +720,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	s.registerReceipts(mcp)
 	s.registerDesign(mcp)
 	s.registerRequests(mcp)
+	s.registerRequestWork(mcp)
 
 	mcp.AddTool(tool("amp_add_task_comment", "Post a comment to a task's log. Used by agents to report progress.",
 		props{

@@ -1873,22 +1873,34 @@ func TestSubmitSurface_RoutesNothing(t *testing.T) {
 		})
 	}
 
-	// ---- the catalog offers no second request operation ----
+	// ---- the catalog's request surface, as built so far ----
 	//
-	// Reading, triaging, commenting, claiming and attaching are later slices with
-	// their own gates. Listing them here would advertise a surface no scope was
-	// designed around, and building them early would be reachable from a
-	// submission credential the moment the scope set widened.
+	// amp_submit_request is listed for a team member, and so are the read and
+	// triage tools that #3969 landed beside it (a member triages their team's
+	// inbox). What must still be absent is anything from a later slice — the
+	// planning link and handoff (#3972) and the requester's acceptance, which is
+	// the person's own act in the web UI and has no tool at all (I1, D5). The
+	// submit-only credential's own boundary is asserted above and in
+	// internal/mcp/request_work_test.go: it is the scope set that trims its list
+	// to one tool, not the absence of every other request tool.
 	listed := w.mcpTools(w.member.token)
 	if !contains(listed, mcp.SubmitScopeTool) {
 		t.Fatalf("amp_submit_request is not listed for a team member: %v", listed)
 	}
+	for _, built := range []string{
+		"amp_list_requests", "amp_get_request", "amp_update_request", "amp_comment_request",
+		"amp_claim_request", "amp_release_request", "amp_assign_request",
+	} {
+		if !contains(listed, built) {
+			t.Errorf("%s is not listed for a team member: a triager must be able to find it", built)
+		}
+	}
 	for _, forbidden := range []string{
-		"amp_list_requests", "amp_get_request", "amp_update_request", "amp_claim_request",
-		"amp_assign_request", "amp_comment_request", "amp_link_request", "amp_attach_request",
+		"amp_accept_request", "amp_deliver_request", "amp_add_request_attachment",
+		"amp_attach_request", "amp_link_request", "amp_handoff_request",
 	} {
 		if contains(listed, forbidden) {
-			t.Fatalf("%s is listed although intake is the only request operation this slice builds", forbidden)
+			t.Fatalf("%s is listed: that operation belongs to a later slice (or, for acceptance, to the requester's own web-UI act and never to a tool)", forbidden)
 		}
 	}
 }

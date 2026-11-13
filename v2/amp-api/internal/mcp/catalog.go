@@ -118,6 +118,20 @@ var toolCatalog = map[string]toolInfo{
 	// than the tool keeps (the condition is in the description instead), so the
 	// honest hint is "not idempotent" — the same way a write tool with no key is.
 	"amp_submit_request": {title: "Submit team request", keywords: "submit a request, intake, team inbox, send work to a team, no project needed, idempotency key replay"},
+	//
+	// The triage half (AMP #3969). The two reads are readOnly. The four writes
+	// are idempotent only where the service's own semantics make a replay a
+	// no-op — a claim you already hold, a release you already made, an assignee
+	// already set, a comment retried by the id it returned — which is what makes
+	// the hint true rather than optimistic. None is destructive: no tool here
+	// deletes anything, and none can move a request's lifecycle state.
+	"amp_list_requests":   {title: "List team requests", keywords: "team inbox queue, requests submitted to a team, triage queue, per-state counts, claim status, what has this person sent us", readOnly: true},
+	"amp_get_request":     {title: "Get team request", keywords: "read a request, a request's detail, my own request by reference, requester view, triage record, revision", readOnly: true},
+	"amp_update_request":  {title: "Edit team request", keywords: "change a request's subject or brief, fix what I submitted, versioned edit, stale revision conflict", idempotent: true},
+	"amp_comment_request": {title: "Comment on team request", keywords: "request discussion, ask the requester a question, reply in a request's thread, triage note", idempotent: true},
+	"amp_claim_request":   {title: "Claim team request", keywords: "take a request from the shared inbox, I am triaging it, claim conflict, who holds it", idempotent: true},
+	"amp_release_request": {title: "Release team request", keywords: "drop my triage claim, put a request back in the shared queue", idempotent: true},
+	"amp_assign_request":  {title: "Assign team request", keywords: "give a request to a person, own the outcome, unassign, hand over a request, transfer clears the claim", idempotent: true},
 
 	// Reports
 	"amp_day_report":          {title: "Draft day report", keywords: "end of day, wrap up today, standup draft", readOnly: true},

@@ -203,13 +203,18 @@ func TestSubmitRequestIsTheSubmitScopeTool(t *testing.T) {
 	if len(allowed) != 1 || !allowed[tl.Name] {
 		t.Fatalf("submitScopeToolNames() = %v, want only %q", allowed, tl.Name)
 	}
-	// And it is the only request tool: submission is this slice's whole surface.
+	// And a submit-only credential is shown exactly this one tool, however many
+	// other request tools the surface grows: the read/triage tools (AMP #3969)
+	// exist, and each of them must stay outside the scope's one-tool set — the
+	// scope is what trims tools/list for a bound credential, not the absence of
+	// the other tools. internal/mcp/request_work_test.go asserts the seven names
+	// individually; this keeps the two sets from ever overlapping.
 	for name := range toolCatalog {
 		if name == tl.Name {
 			continue
 		}
-		if strings.Contains(name, "_request") || strings.Contains(name, "requests") {
-			t.Errorf("the MCP surface has a second request tool %q; list/get/update/comment/claim/attach are later slices, and a submit-only credential must be shown exactly one tool", name)
+		if allowed[name] {
+			t.Errorf("a submit-only credential may call %q: submitting is not reading an inbox and it is not triage", name)
 		}
 	}
 }
