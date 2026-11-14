@@ -996,3 +996,97 @@ func (s *Service) ListRequestComments(ctx context.Context, p authz.Principal, in
 	out.NextAfterID = 0
 	return out, nil
 }
+
+// ---- The request's history ----
+
+// RequestHistoryInput names the request whose history is being read, and the
+// forward cursor into it.
+//
+// It embeds RequestReadInput for the same reason RequestThreadInput does: the
+// history is read through the detail read's name — a serial, or the opaque
+// reference — so whatever that type accepts is accepted here without a second
+// parsing decision, and a name added to it reaches this read too.
+type RequestHistoryInput struct {
+	RequestReadInput
+	// AfterID pages forward: 0 starts at the request's first act, because a
+	// history is read from where it began. It is the repository's cursor,
+	// passed through untouched.
+	AfterID int64
+	// Limit is the page size. 0 means the repository's default and anything
+	// above its ceiling is clamped there, so this field carries no second copy
+	// of either bound.
+	Limit int
+}
+
+// RequestHistory is one page of a request's history, with the view that
+// produced it.
+//
+// There is only ever one arm. History is an internal fact — it names internal
+// actors, internal state moves and (in `detail`) ids of work the requester's
+// projection has no field for — so the requester's view is refused rather than
+// filtered, and View is always the team's. It is carried anyway, because a
+// client branches on it exactly as it does for the detail read and the thread,
+// and a future arm would then be a change to this type rather than to every
+// caller.
+type RequestHistory struct {
+	// View is the decision that produced this answer: always "team" today.
+	View authz.RequestView
+	// RequestID is the request the history belongs to, so a caller can pin the
+	// answer to the request it asked about.
+	RequestID int
+	// Events is the page, in history order (by id). Always the stored rows.
+	Events []domain.RequestEvent
+	// NextAfterID is the cursor for the next page, 0 on the last one.
+	NextAfterID int64
+	// Count is how many rows this page holds.
+	Count int
+}
+
+// ListRequestEvents returns one page of a request's history.
+//
+// It authorizes through authorizeRequestRead — the same load-and-decide the
+// detail read runs — so "who may read a request's history" is exactly "who may
+// read the request", and a stranger, a sibling team's request, another
+// requester's request and an id that never existed are one 404
+// (authz.RequestNotFound), byte for byte.
+//
+// # A requester is refused, not filtered
+//
+// The requester's projection is a whitelist, and a history row is not on it: an
+// event carries the acting person's display name and AMP user id, the internal
+// state it moved between, and a `detail` whose ids (a previous assignee, a
+// linked ticket, a routed project) are exactly the facts the projection exists
+// to withhold. There is no requester-shaped event type to project into — the
+// page's requester arm renders milestones from the projection, not events (see
+// v2/ui/src/components/requests/RequestHistory.tsx) — so this read does not
+// invent one. A requester who reaches it gets the surface's one 404, which is
+// the same answer the detail read gives for anything they may not see: a 403
+// would confirm the request exists and that something is being kept from them,
+// which is precisely what the fail-closed 404 avoids.
+//
+// The refusal is after authorizeRequestRead rather than before it, so the two
+// reads cannot disagree about who the caller is: a requester who is also an
+// inbox member gets the team's view and the history with it, exactly as
+// GetRequest gives them the record.
+func (s *Service) ListRequestEvents(ctx context.Context, p authz.Principal, in RequestHistoryInput) (*RequestHistory, error) {
+	view, req, err := s.authorizeRequestRead(ctx, p, in.RequestReadInput, "read a request's history")
+	if err != nil {
+		return nil, err
+	}
+	if !view.Full() {
+		// The requester's projection has no field for a history row, and there
+		// is no filtered arm to build: fail closed with the surface's one 404.
+		return nil, authz.RequestNotFound()
+	}
+	page, err := s.Repo.ListRequestEventPage(ctx, req.ID, req.OrgID, req.TeamID, in.AfterID, in.Limit)
+	if err != nil {
+		return nil, err
+	}
+	return &RequestHistory{
+		View:        view,
+		RequestID:   req.ID,
+		Events:      page.Items,
+		NextAfterID: page.NextAfterID,
+		Count:       page.Count,
+	}, nil
+}

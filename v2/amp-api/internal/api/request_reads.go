@@ -14,12 +14,15 @@ package api
 //	GET /api/teams/:id/requests/:request/comments
 //	                                        one request's discussion, as the caller's view of that
 //	                                        request allows it (AMP #4270)
+//	GET /api/teams/:id/requests/:request/events
+//	                                        one request's history rows, team view only (AMP #4271)
 //	GET /api/requests                       the caller's OWN requests, projected, never the record
 //	GET /api/requests/:request              one of the caller's own, by serial or public reference
 //
 // Every one of them is a thin adapter over the one authorized read path
 // (internal/service/request_views.go, slice S2: ListRequests, GetRequest,
-// ListOwnRequests, and the discussion's ListRequestComments). It decodes a query
+// ListOwnRequests, and the two one-request reads ListRequestComments and
+// ListRequestEvents). It decodes a query
 // string or a path, maps the transport's own facts onto the service's input and
 // encodes the service's answer. It
 // decides nothing: who may read what, the tenant, the keyset cursor, the
@@ -313,6 +316,103 @@ type requestThreadAnswer struct {
 	Shared *[]domain.RequesterComment `json:"shared_comments,omitempty"`
 }
 
+// teamRequestEvents serves GET /api/teams/:id/requests/:request/events: one
+// request's history rows.
+//
+// It is the read `request_events` has never had (AMP #4271). Every act the
+// product performs appends one row — the submit, a transition, a claim, a
+// release, a transfer, a link or unlink, an edit — and until this route the
+// detail page's history rail had nothing to render (the temporary seam in
+// v2/ui/src/pages/RequestDetail.tsx).
+//
+// It decides nothing. The path value is decoded with requestReadTarget, the
+// same decoder the detail read and the thread read use, so the serial and the
+// requester's opaque reference are accepted exactly where they are accepted
+// there; the service runs the same load-and-decide, which is why an unknown
+// team, another team's request, another requester's request and a request in
+// another org are one 404 with one code, byte for byte.
+//
+// One view, one list. The history is an internal fact, so the requester's
+// projection is refused by the service (it has no field for a history row and
+// there is no requester-shaped event type to project into) and this handler
+// fails closed if a hand-assembled answer ever carried rows on a non-team view
+// — the writeRequestRead discipline, applied here for the same reason.
+//
+// after_id and limit page the history forward, exactly as they page a thread:
+// the rows are append-only, so id order is history order and a forward cursor
+// is stable under concurrent appends. The two parameters are decoded by
+// parseRequestHistoryQuery, which is parseRequestThreadQuery's rules over the
+// same two names — the answer's cursor is an event id, and a caller pages with
+// it.
+func (h *RestHandler) teamRequestEvents(w http.ResponseWriter, r *http.Request) {
+	teamID, ok := requestPathTeam(w, r)
+	if !ok {
+		return
+	}
+	ref, err := requestReadTarget(r.PathValue("request"))
+	if err != nil {
+		fail(w, err, http.StatusBadRequest)
+		return
+	}
+	p, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	in, err := parseRequestHistoryQuery(r.URL.Query())
+	if err != nil {
+		fail(w, err, http.StatusBadRequest)
+		return
+	}
+	ref.TeamID = teamID
+	in.RequestReadInput = ref
+	history, err := h.svc.ListRequestEvents(r.Context(), p, in)
+	if err != nil {
+		fail(w, err, http.StatusInternalServerError)
+		return
+	}
+	if history == nil || !history.View.Full() {
+		// Unreachable through ListRequestEvents, which refuses a requester and
+		// answers no other view. It is here so a future caller that skips the
+		// decision fails closed instead of encoding the history as a real
+		// answer for someone the whitelist excludes.
+		fail(w, authz.RequestNotFound(), http.StatusNotFound)
+		return
+	}
+	events := history.Events
+	if events == nil {
+		events = []domain.RequestEvent{}
+	}
+	jsonOK(w, requestHistoryAnswer{
+		View:        history.View.String(),
+		RequestID:   history.RequestID,
+		Count:       history.Count,
+		NextAfterID: history.NextAfterID,
+		Events:      &events,
+	})
+}
+
+// requestHistoryAnswer is one request's history page.
+//
+// Events is field-for-field the UI's existing `RequestEvent`
+// (v2/ui/src/types/index.ts) — domain.RequestEvent's JSON tags are that type's
+// fields — so this route adds nothing to the client's shapes. It is a pointer so
+// that an empty history encodes as [] rather than null: "this request has no
+// acts yet" is an answer a rail must be able to render, and null reads as "not
+// served".
+type requestHistoryAnswer struct {
+	// View is the decision that produced this answer: "team" today.
+	View string `json:"view"`
+	// RequestID is the request the history belongs to, so a caller can pin the
+	// answer to the request it asked about.
+	RequestID int `json:"request_id"`
+	// Count is how many rows this page holds.
+	Count int `json:"count"`
+	// NextAfterID is the forward cursor, absent on the last page.
+	NextAfterID int64 `json:"next_after_id,omitempty"`
+	// Events is the page, in history order (by id).
+	Events *[]domain.RequestEvent `json:"events,omitempty"`
+}
+
 // ownRequests serves GET /api/requests: the caller's own requests, projected.
 func (h *RestHandler) ownRequests(w http.ResponseWriter, r *http.Request) {
 	p, ok := h.principal(w, r)
@@ -547,6 +647,34 @@ func parseRequestQueueQuery(q url.Values, p authz.Principal) (service.RequestQue
 // act on, and the client would page forever.
 func parseRequestThreadQuery(q url.Values) (service.RequestThreadInput, error) {
 	var in service.RequestThreadInput
+	if v := strings.TrimSpace(q.Get("after_id")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return in, authz.RequestInvalid("after_id must be a whole number")
+		}
+		if n < 0 {
+			return in, authz.RequestInvalid("after_id must be zero or more")
+		}
+		in.AfterID = n
+	}
+	limit, err := requestQueryCount(q, "limit")
+	if err != nil {
+		return in, err
+	}
+	in.Limit = limit
+	return in, nil
+}
+
+// parseRequestHistoryQuery maps the history read's query string onto the
+// service's input: the forward cursor and the page size, nothing else.
+//
+// It has the thread decoder's two rules for the two same-named parameters, and
+// deliberately no third parameter: a history is one request's, so a filter term
+// could only ever be aimed at rows this read already scoped. A negative value is
+// refused rather than read as "unset" (requestQueryCount's rule) — quietly
+// reinterpreting -5 as the default is not an answer a pager can act on.
+func parseRequestHistoryQuery(q url.Values) (service.RequestHistoryInput, error) {
+	var in service.RequestHistoryInput
 	if v := strings.TrimSpace(q.Get("after_id")); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
