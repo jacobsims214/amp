@@ -68,7 +68,7 @@ use rpi_harness::{
     },
     skills::format_skill_invocation,
     system_prompt::compose_system_prompt,
-    types::{AgentHarnessOptions, AgentHarnessResources, HarnessTool, Skill},
+    types::{AgentHarnessOptions, AgentHarnessResources, CompactionSettings, HarnessTool, Skill},
 };
 use rpi_tools::{
     BashExecution, BashPrepare, BashToolOptions, ExecutionEnv, ExecutionToolContext,
@@ -773,7 +773,28 @@ impl Runtime {
                     from,
                     to,
                 });
+            } else if let (Ok(old), Ok(new)) = (
+                old_role.resolve_model(&old_models),
+                role.resolve_model(&models),
+            ) {
+                // #4225: same model, different window or output budget (its `context_window` /
+                // `max_tokens`, or a role cap). The live chat keeps the model it was switched to.
+                let budget = |r: &ResolvedRole| (r.model.context_window, r.model.max_tokens);
+                if budget(&old) != budget(&new) {
+                    report.budgets.push(BudgetChange {
+                        role: role.id.clone(),
+                        from: budget(&old),
+                        to: budget(&new),
+                    });
+                }
             }
+        }
+        let (old_compaction, new_compaction) = (
+            old_models.compaction_settings(),
+            models.compaction_settings(),
+        );
+        if old_compaction != new_compaction {
+            report.compaction = Some((old_compaction, new_compaction));
         }
 
         *self.catalog.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(catalog);
@@ -1036,6 +1057,10 @@ impl Runtime {
                 repeat
                     .after_tool_call_then(role.primary.then(crate::approval::end_turn_on_refusal)),
             ),
+            // #4225: `[compaction]` as configured (global, already checked against every built
+            // model's window). rpi takes it at construction only: a change reaches the sessions
+            // built after it (workers, a new chat), never a live one (see `Reloaded::budgets`).
+            compaction: models.compaction_settings(),
             ..Default::default()
         };
         let harness = Arc::new(
@@ -1274,6 +1299,21 @@ pub struct ModelChange {
     pub to: Option<String>,
 }
 
+/// A role whose model stayed the same but whose context window or output budget (`max_tokens`)
+/// a reload changed (#4225): `(context_window, max_tokens)` before and after.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BudgetChange {
+    pub role: String,
+    pub from: (u64, u64),
+    pub to: (u64, u64),
+}
+
+/// What a running session cannot take from a reload (#4225): rpi fixes the compaction settings
+/// when it builds a harness, and the live chat keeps the model it runs on unless its model ref
+/// changed. Workers are built per ticket, so they take it on their next dispatch.
+pub const BUDGET_APPLIES_LATER: &str = "context budget / compaction changes apply to new sessions \
+     and workers; this chat keeps its current budget until a new session";
+
 fn harness_error(e: impl std::fmt::Display) -> AgentError {
     AgentError::Harness(e.to_string())
 }
@@ -1302,6 +1342,11 @@ pub struct Reloaded {
     pub providers: Changes,
     /// Roles (that existed before) whose resolved model or thinking changed.
     pub models: Vec<ModelChange>,
+    /// Roles whose model stayed but whose window or output budget changed (#4225).
+    pub budgets: Vec<BudgetChange>,
+    /// `[compaction]` before and after, when it changed (#4225).
+    #[serde(skip)]
+    pub compaction: Option<(CompactionSettings, CompactionSettings)>,
     pub mcp: McpReload,
     /// Repo agents, skills and settings that are new or changed on disk but not trusted as they
     /// are now (#2310), so this reload left them out. Each is reported once.
@@ -1315,6 +1360,8 @@ impl Reloaded {
             && self.skills.is_empty()
             && self.providers.is_empty()
             && self.models.is_empty()
+            && self.budgets.is_empty()
+            && self.compaction.is_none()
             && self.mcp.is_empty()
             && self.untrusted.is_empty()
     }
@@ -1344,6 +1391,24 @@ impl Reloaded {
                 show(&m.from),
                 show(&m.to)
             ));
+        }
+        for b in &self.budgets {
+            out.push(format!(
+                "budget {}: context_window {} → {}, max_tokens {} → {}",
+                b.role, b.from.0, b.to.0, b.from.1, b.to.1
+            ));
+        }
+        if let Some((from, to)) = &self.compaction {
+            let show = |c: &CompactionSettings| {
+                format!(
+                    "enabled {}, reserve_tokens {}, keep_recent_tokens {}",
+                    c.enabled, c.reserve_tokens, c.keep_recent_tokens
+                )
+            };
+            out.push(format!("compaction: {} → {}", show(from), show(to)));
+        }
+        if !self.budgets.is_empty() || self.compaction.is_some() {
+            out.push(BUDGET_APPLIES_LATER.to_owned());
         }
         let mcp = Changes {
             added: self.mcp.added.clone(),

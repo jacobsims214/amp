@@ -1596,3 +1596,128 @@ fn symlinks_are_followed_before_the_rules_see_the_path() {
         );
     }
 }
+
+// ------------------------------------------------------------------------------------------------
+// Context budget (#4225): what `Runtime::build` hands rpi.
+// ------------------------------------------------------------------------------------------------
+
+/// The manager and worker-backend on a faux provider whose model sets its own window and output
+/// budget, plus `extra` (a `[compaction]` table).
+fn budget_config(extra: &str) -> String {
+    format!(
+        r#"
+[providers.wf]
+api = "faux"
+[providers.wf.models."wf-1"]
+context_window = 64000
+max_tokens = 4096
+
+[roles.manager]
+model = "wf/wf-1"
+[roles.worker-backend]
+model = "wf/wf-1"
+{extra}
+"#
+    )
+}
+
+/// A runtime over `config` (the user layer), offline (no AMP tools), with its state under this
+/// crate's target dir. Returns it with the repo dir sessions are built in.
+fn budget_runtime(name: &str, config: &str) -> (amp_core::agent::Runtime, PathBuf) {
+    let dir = path_scratch(&format!("budget-{name}"));
+    let home = dir.join("home");
+    let repo = dir.join("repo");
+    fs::create_dir_all(home.join(".config/amp-harness")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    let user = ModelsFile::parse(config, "test config").unwrap();
+    let models =
+        ModelsConfig::from_files(ModelsFile::defaults(), Some(user), "test config", &|_| None)
+            .unwrap();
+    let env = move |k: &str| match k {
+        "HOME" => Some(home.to_string_lossy().into_owned()),
+        "XDG_CONFIG_HOME" => Some(home.join(".config").to_string_lossy().into_owned()),
+        "XDG_STATE_HOME" => Some(home.join(".local/state").to_string_lossy().into_owned()),
+        _ => None,
+    };
+    let client = amp_mcp::AmpMcpClient::offline(
+        &amp_mcp::ClientOptions::new("http://127.0.0.1:9/mcp".to_owned()),
+        "test: no AMP",
+    );
+    let rt = amp_core::agent::Runtime::load(
+        Arc::new(client),
+        amp_core::agent::RuntimeOptions {
+            repo_root: Some(repo.clone()),
+            models: Some(models),
+            keys: &amp_core::providers::StaticKeys::default(),
+            env: &env,
+            state_dir: Some(dir.join("state")),
+        },
+    )
+    .expect("load the runtime");
+    (rt, repo)
+}
+
+/// T12: a non-default `[compaction]` reaches every harness `Runtime::build` makes, the manager's
+/// (the chat) and a worker's; T13: the model's configured window and output budget are what the
+/// harness compacts against (role caps, #4224, clamp the same `ResolvedRole.model`).
+#[tokio::test]
+async fn configured_compaction_and_budget_reach_every_harness() {
+    let (rt, repo) = budget_runtime(
+        "custom",
+        &budget_config(
+            "[compaction]\nenabled = true\nreserve_tokens = 8000\nkeep_recent_tokens = 12000\n",
+        ),
+    );
+    let want = rpi_harness::types::CompactionSettings {
+        enabled: true,
+        reserve_tokens: 8000,
+        keep_recent_tokens: 12000,
+    };
+    assert_ne!(
+        want,
+        rpi_harness::types::DEFAULT_COMPACTION_SETTINGS,
+        "the test needs non-default values"
+    );
+    for role in ["amp-manager", "worker-backend"] {
+        let built = rt
+            .build(amp_core::agent::AgentSpec::new(role, repo.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("build {role}: {e}"));
+        assert_eq!(built.harness.compaction_settings(), want, "{role}");
+        let model = rpi_harness::agent_harness::AgentLane::get_model(&*built.harness)
+            .await
+            .unwrap();
+        assert_eq!(model.context_window, 64000, "{role}");
+        assert_eq!(model.max_tokens, 4096, "{role}");
+    }
+    rt.mcp_hub.shutdown().await;
+}
+
+/// T-A5: `enabled = false` is what rpi gets, so neither automatic trigger (before a run, between
+/// tool-loop turns) compacts; without `[compaction]` the harness has rpi's defaults.
+#[tokio::test]
+async fn compaction_disabled_and_absent_reach_the_harness() {
+    let (rt, repo) = budget_runtime("off", &budget_config("[compaction]\nenabled = false\n"));
+    let built = rt
+        .build(amp_core::agent::AgentSpec::new("worker-backend", repo))
+        .await
+        .unwrap();
+    let got = built.harness.compaction_settings();
+    assert!(!got.enabled, "{got:?}");
+    assert_eq!(
+        got.reserve_tokens,
+        rpi_harness::types::DEFAULT_COMPACTION_SETTINGS.reserve_tokens
+    );
+    rt.mcp_hub.shutdown().await;
+
+    let (rt, repo) = budget_runtime("absent", &budget_config(""));
+    let built = rt
+        .build(amp_core::agent::AgentSpec::new("worker-backend", repo))
+        .await
+        .unwrap();
+    assert_eq!(
+        built.harness.compaction_settings(),
+        rpi_harness::types::DEFAULT_COMPACTION_SETTINGS
+    );
+    rt.mcp_hub.shutdown().await;
+}

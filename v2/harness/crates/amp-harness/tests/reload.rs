@@ -543,3 +543,72 @@ async fn a_broken_agent_file_changes_nothing() {
         "{report:#?}"
     );
 }
+
+/// T16 (#4225): `/reload` after editing only a model's `context_window`/`max_tokens` and
+/// `[compaction]` (no role changes model) reports both and says they apply to new sessions and
+/// workers, not to the chat already running; a session built after the reload has them.
+#[tokio::test]
+async fn budget_and_compaction_edits_apply_to_new_sessions_and_say_so() {
+    let dir = setup("budget");
+    let amp = spawn(MockAmp::new(), None).await;
+    let (rt, repo, env) = runtime(&dir, &amp.url).await;
+    let before = rt
+        .build(AgentSpec::new("worker-backend", repo.clone()))
+        .await
+        .expect("build a worker");
+    let old = before.harness.compaction_settings();
+
+    let config = CONFIG.replace(
+        "[providers.wf.models.\"wf-1\"]\n",
+        "[providers.wf.models.\"wf-1\"]\ncontext_window = 64000\nmax_tokens = 4096\n",
+    ) + "\n[compaction]\nreserve_tokens = 8000\nkeep_recent_tokens = 12000\n";
+    assert_ne!(config, CONFIG);
+    std::fs::write(dir.join("home/.config/amp-harness/config.toml"), config).unwrap();
+
+    let report = rt
+        .reload(&StaticKeys::default(), &env)
+        .await
+        .expect("reload");
+    assert!(
+        report.models.is_empty(),
+        "no model ref changed: {report:#?}"
+    );
+    let wb = report
+        .budgets
+        .iter()
+        .find(|b| b.role == "amp-worker-backend")
+        .unwrap_or_else(|| panic!("{report:#?}"));
+    assert_eq!(wb.to, (64000, 4096));
+    assert!(
+        !report.budgets.iter().any(|b| b.role == "amp-manager"),
+        "the manager's model is untouched: {report:#?}"
+    );
+    let (from, to) = report.compaction.expect("compaction changed");
+    assert_eq!(from, old);
+    assert_eq!((to.reserve_tokens, to.keep_recent_tokens), (8000, 12000));
+    let lines = report.lines().join("\n");
+    assert!(
+        lines.contains("budget amp-worker-backend: context_window")
+            && lines.contains("→ 64000, max_tokens"),
+        "{lines}"
+    );
+    assert!(lines.contains("compaction: "), "{lines}");
+    assert!(
+        lines.contains(amp_core::agent::BUDGET_APPLIES_LATER),
+        "says it does not reach the running chat: {lines}"
+    );
+
+    // The session built before keeps what it was built with; the next one takes the edits.
+    assert_eq!(before.harness.compaction_settings(), old);
+    let fresh = rt
+        .build(AgentSpec::new("worker-backend", repo.clone()))
+        .await
+        .unwrap();
+    assert_eq!(fresh.harness.compaction_settings(), to);
+    assert_eq!(fresh.resolved.model.context_window, 64000);
+
+    // Nothing changed since: no budget line.
+    let again = rt.reload(&StaticKeys::default(), &env).await.unwrap();
+    assert!(again.is_empty(), "{again:#?}");
+    rt.mcp_hub.shutdown().await;
+}
