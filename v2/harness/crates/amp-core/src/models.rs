@@ -225,6 +225,60 @@ pub struct RoleSpec {
     pub thinking: Option<String>,
     /// Extra JSON body fields for this role's requests (merged over the model's).
     pub extra_body: Option<toml::Table>,
+    /// Caps the role's model's context window (#4224): compaction and the footer use
+    /// `min(model's context_window, this)`. Never raises it.
+    pub context_window: Option<u64>,
+    /// Caps the role's model's `max_tokens` per turn (#4224). Never raises it.
+    pub max_tokens: Option<u64>,
+}
+
+impl RoleSpec {
+    fn caps(&self) -> RoleCaps {
+        RoleCaps {
+            context_window: self.context_window,
+            max_tokens: self.max_tokens,
+        }
+    }
+}
+
+/// A role's `context_window` / `max_tokens` caps (#4224): a budget for the role, applied to
+/// whatever model it runs on (also after `/model` switches the chat's model).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoleCaps {
+    pub context_window: Option<u64>,
+    pub max_tokens: Option<u64>,
+}
+
+impl RoleCaps {
+    /// No cap set.
+    pub fn is_empty(&self) -> bool {
+        self.context_window.is_none() && self.max_tokens.is_none()
+    }
+
+    /// Lowers `model`'s `context_window` / `max_tokens` to the caps (never raises them). Returns
+    /// one line per cap that is above the model's own value (it has no effect: W4).
+    pub fn apply(&self, model: &mut Model) -> Vec<String> {
+        let mut above = Vec::new();
+        for (key, cap, value) in [
+            (
+                "context_window",
+                self.context_window,
+                &mut model.context_window,
+            ),
+            ("max_tokens", self.max_tokens, &mut model.max_tokens),
+        ] {
+            let Some(cap) = cap else { continue };
+            if cap > *value {
+                above.push(format!(
+                    "{key} = {cap} is above {}/{}'s {key} ({}); using {}",
+                    model.provider, model.id, *value, *value
+                ));
+            } else {
+                *value = cap;
+            }
+        }
+        above
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -357,16 +411,22 @@ fn overlay_role(base: Option<RoleEntry>, top: RoleSpec, source: &str) -> RoleEnt
             let mut spec = base.spec;
             over(&mut spec.thinking, top.thinking);
             over_table(&mut spec.extra_body, top.extra_body);
+            over(&mut spec.context_window, top.context_window);
+            over(&mut spec.max_tokens, top.max_tokens);
             RoleEntry {
                 spec,
                 source: format!("{} + {source}", base.source),
             }
         }
+        // Caps are a budget for the role, not a model property: like thinking, they survive a
+        // new model (#4224; clamping makes a stale cap harmless).
         Some(base) => RoleEntry {
             spec: RoleSpec {
                 model: top.model,
                 thinking: top.thinking.or(base.spec.thinking),
                 extra_body: top.extra_body,
+                context_window: top.context_window.or(base.spec.context_window),
+                max_tokens: top.max_tokens.or(base.spec.max_tokens),
             },
             source: source.to_owned(),
         },
@@ -903,6 +963,9 @@ pub struct ResolvedRole {
     pub thinking: ThinkingLevel,
     /// Which layer set the model: `default`, `profile anthropic`, `inherit ...`, `config <path>`.
     pub source: String,
+    /// The role's caps (#4224), already applied to `model`; kept to apply them again when the
+    /// chat switches models (`/model`).
+    pub caps: RoleCaps,
 }
 
 impl ResolvedRole {
@@ -1037,9 +1100,12 @@ pub enum WarningKind {
     ReserveBelowOutput,
     /// W3: no catalog entry and no `context_window`: the window is assumed to be 128000.
     AssumedWindow,
-    /// The default `reserve_tokens + keep_recent_tokens` do not fit a model's window (when the
-    /// user sets them it is an error instead).
+    /// The default `reserve_tokens + keep_recent_tokens` do not fit a model's window, or a role's
+    /// capped window (when the user sets them it is an error instead).
     CompactionDoesNotFit,
+    /// W4: a role's `context_window` / `max_tokens` cap is above its model's value (#4224): it is
+    /// clamped to the model's, so it does nothing.
+    RoleCapAboveModel,
 }
 
 impl WarningKind {
@@ -1287,7 +1353,7 @@ impl ModelsConfig {
                     spec: RoleSpec {
                         model: Some(model.clone()),
                         thinking: user.models.inherit_thinking.clone(),
-                        extra_body: None,
+                        ..Default::default()
                     },
                     source: source.clone(),
                 };
@@ -1332,6 +1398,27 @@ impl ModelsConfig {
             let entry = overlay_role(roles.remove(&role), top, &repo_label);
             roles.insert(role, entry);
         }
+        // Role caps (#4224). Inherit mode runs every role on one model as the user's own
+        // setup: caps do not apply there (and are not shown).
+        let inherit = matches!(selection, Selection::Inherit { .. });
+        for (role, entry) in &mut roles {
+            if inherit {
+                entry.spec.context_window = None;
+                entry.spec.max_tokens = None;
+                continue;
+            }
+            for (key, cap) in [
+                ("context_window", entry.spec.context_window),
+                ("max_tokens", entry.spec.max_tokens),
+            ] {
+                if cap == Some(0) {
+                    return err(format!(
+                        "[roles.{role}] {key} = 0 ({}): must be greater than 0 (leave it out for the model's own value)",
+                        entry.source
+                    ));
+                }
+            }
+        }
 
         let fallback = user
             .models
@@ -1362,8 +1449,68 @@ impl ModelsConfig {
             warnings,
             roles,
         };
+        config.check_role_caps()?;
         config.warn_reserve_below_output();
         Ok(config)
+    }
+
+    /// Role caps (#4224): W4 for a cap above its model's value (clamped: it does nothing), and
+    /// `[compaction]` must fit the capped window (V2 on `W_eff`: an error when the user set the
+    /// sizes, a warning on the default ones, as for a model's own window).
+    fn check_role_caps(&mut self) -> Result<(), ModelsError> {
+        let mut found = Vec::new();
+        for (role, entry) in &self.roles {
+            let caps = entry.spec.caps();
+            if caps.is_empty() {
+                continue;
+            }
+            let Ok(resolved) = self.resolve_role(role) else {
+                continue;
+            };
+            let Some(mut model) = self
+                .providers
+                .get(&resolved.provider)
+                .and_then(|p| p.models.get(&resolved.model_id))
+                .cloned()
+            else {
+                continue;
+            };
+            let subject = format!("role {role}");
+            for above in caps.apply(&mut model) {
+                found.push(ModelsWarning {
+                    kind: WarningKind::RoleCapAboveModel,
+                    subject: subject.clone(),
+                    message: format!("[roles.{role}] {above} ({})", entry.source),
+                });
+            }
+            if caps.context_window.is_some()
+                && let Err(problem) = self.compaction.check_fits(&resolved.model)
+            {
+                let problem = format!(
+                    "role {role}: {problem} (capped by [roles.{role}] context_window, {})",
+                    entry.source
+                );
+                if self.compaction.user_set_sizes() {
+                    return err(problem);
+                }
+                found.push(ModelsWarning {
+                    kind: WarningKind::CompactionDoesNotFit,
+                    subject,
+                    message: format!("{problem} (rpi compacts on every run for this role)"),
+                });
+            }
+        }
+        self.warnings.extend(found);
+        Ok(())
+    }
+
+    /// `role`'s `context_window` / `max_tokens` caps (#4224), for applying them to another model
+    /// (`/model`). Empty for a role with no assignment and in inherit mode.
+    pub fn role_caps(&self, role: &str) -> RoleCaps {
+        self.roles
+            .get(normalize_role(role))
+            .map(|entry| entry.spec.caps())
+            .unwrap_or_default()
     }
 
     /// W2: a configured role whose model can write more in one turn than `reserve_tokens` leaves.
@@ -1431,11 +1578,15 @@ impl ModelsConfig {
         if let Some(t) = thinking {
             parse_thinking(t)?;
         }
+        // The role's caps stay: they are its budget on any model (#4224).
+        let caps = self.role_caps(role);
         let entry = RoleEntry {
             spec: RoleSpec {
                 model: Some(model_ref.trim().to_owned()),
                 thinking: thinking.map(str::to_owned),
-                extra_body: None,
+                context_window: caps.context_window,
+                max_tokens: caps.max_tokens,
+                ..Default::default()
             },
             source: source.to_owned(),
         };
@@ -1480,7 +1631,7 @@ impl ModelsConfig {
                     spec: RoleSpec {
                         model: Some(model_ref.trim().to_owned()),
                         thinking,
-                        extra_body: None,
+                        ..Default::default()
                     },
                     source: "agent file model".to_owned(),
                 },
@@ -1505,7 +1656,7 @@ impl ModelsConfig {
                     spec: RoleSpec {
                         model: Some(value.clone()),
                         thinking,
-                        extra_body: None,
+                        ..Default::default()
                     },
                     source: format!("[models] fallback ({source})"),
                 },
@@ -1551,7 +1702,7 @@ impl ModelsConfig {
                 spec: RoleSpec {
                     model: Some(model.clone()),
                     thinking: thinking.clone(),
-                    extra_body: None,
+                    ..Default::default()
                 },
                 source: format!("inherit ({source})"),
             },
@@ -1588,6 +1739,9 @@ impl ModelsConfig {
         if let Some(extra) = &entry.spec.extra_body {
             merge_extra_body(&mut model, extra)?;
         }
+        // Role caps (#4224): above the model's own value they do nothing (W4, warned at load).
+        let caps = entry.spec.caps();
+        caps.apply(&mut model);
         let requested_thinking = entry
             .spec
             .thinking
@@ -1608,6 +1762,7 @@ impl ModelsConfig {
             requested_thinking,
             thinking,
             source: entry.source,
+            caps,
         })
     }
 
@@ -2889,5 +3044,208 @@ thinking = "high"
         )
         .unwrap_err();
         assert!(e.0.contains("compaction"), "{e}");
+    }
+
+    // ---- role caps (#4224, spec specs/harness-model-budget-config.md §3/§4, T9-T11) ----
+
+    /// T9: a cap below the model's value lowers the resolved model; above it is clamped to the
+    /// model's with a W4 warning (shown on load); 0 is an error.
+    #[test]
+    fn role_caps_lower_the_model_and_clamp() {
+        let c = config("[roles.manager]\ncontext_window = 100000\nmax_tokens = 8000\n").unwrap();
+        let manager = c.resolve_role("manager").unwrap();
+        assert_eq!(manager.model_ref(), "openrouter/openai/gpt-6.1-sol");
+        assert_eq!(manager.model.context_window, 100_000);
+        assert_eq!(manager.model.max_tokens, 8000);
+        assert_eq!(
+            manager.caps,
+            RoleCaps {
+                context_window: Some(100_000),
+                max_tokens: Some(8000)
+            }
+        );
+        assert!(kinds(&c, WarningKind::RoleCapAboveModel).is_empty());
+        // The capped output is what W2 compares (8000 < 16384: no warning for the manager).
+        assert!(
+            !kinds(&c, WarningKind::ReserveBelowOutput)
+                .iter()
+                .any(|w| w.subject == "role manager")
+        );
+        // Other roles keep their model's values.
+        let reviewer = c.resolve_role("reviewer").unwrap();
+        assert!(reviewer.caps.is_empty());
+
+        // Above the model's: the model's value, and a warning naming role, key and layer.
+        let c = config("[roles.manager]\ncontext_window = 2000000\nmax_tokens = 4000\n").unwrap();
+        let manager = c.resolve_role("manager").unwrap();
+        assert_eq!(manager.model.context_window, 1_050_000);
+        assert_eq!(manager.model.max_tokens, 4000);
+        let w4 = kinds(&c, WarningKind::RoleCapAboveModel);
+        assert_eq!(w4.len(), 1, "{:?}", c.warnings);
+        assert_eq!(w4[0].subject, "role manager");
+        assert!(
+            w4[0].message.contains(
+                "[roles.manager] context_window = 2000000 is above openrouter/openai/gpt-6.1-sol's context_window (1050000); using 1050000"
+            ),
+            "{}",
+            w4[0]
+        );
+        assert!(w4[0].message.contains("config test"), "{}", w4[0]);
+        assert!(c.load_warnings().any(|w| w == w4[0]), "shown on load");
+
+        for key in ["context_window", "max_tokens"] {
+            let e = config(&format!("[roles.manager]\n{key} = 0\n")).unwrap_err();
+            assert!(
+                e.0.contains(&format!("[roles.manager] {key} = 0"))
+                    && e.0.contains("greater than 0"),
+                "{e}"
+            );
+        }
+        let e = config("[roles.manager]\ncontext_window = -1\n").unwrap_err();
+        assert!(e.0.contains("context_window"), "{e}");
+    }
+
+    /// V2 on the capped window: user-set [compaction] sizes must fit it (error); the default
+    /// sizes only warn.
+    #[test]
+    fn compaction_must_fit_the_capped_window() {
+        // Default 16384 + 20000 = 36384 does not fit 30000: a warning naming the role.
+        let c = config("[roles.manager]\ncontext_window = 30000\n").unwrap();
+        let fit = kinds(&c, WarningKind::CompactionDoesNotFit);
+        assert_eq!(fit.len(), 1, "{:?}", c.warnings);
+        assert_eq!(fit[0].subject, "role manager");
+        assert!(
+            fit[0].message.contains("context_window (30000)"),
+            "{}",
+            fit[0]
+        );
+        // User-set sizes: an error.
+        let e = config(
+            "[compaction]\nreserve_tokens = 10000\nkeep_recent_tokens = 20000\n[roles.manager]\ncontext_window = 30000\n",
+        )
+        .unwrap_err();
+        assert!(e.0.contains("role manager"), "{e}");
+        assert!(e.0.contains("does not fit"), "{e}");
+        // One more token of window fits.
+        assert!(
+            config(
+                "[compaction]\nreserve_tokens = 10000\nkeep_recent_tokens = 20000\n[roles.manager]\ncontext_window = 30001\n",
+            )
+            .is_ok()
+        );
+    }
+
+    /// T10: caps merge like thinking: a higher layer that changes only the model keeps them
+    /// (extra_body is dropped); a higher layer can change one cap; inherit mode ignores them.
+    #[test]
+    fn role_caps_survive_a_model_change_and_skip_inherit() {
+        let user = ModelsFile::parse(
+            "[roles.reviewer]\ncontext_window = 64000\nmax_tokens = 4000\nextra_body = { a = 1 }\n",
+            "user",
+        )
+        .unwrap();
+        let repo = crate::repo_config::RepoConfig::parse(
+            "[roles.reviewer]\nmodel = \"openrouter/xiaomi/mimo-v2.6-pro\"\n",
+            Path::new("/r/.amp/harness/config.toml"),
+        )
+        .unwrap();
+        let c = ModelsConfig::from_layers(
+            ModelsFile::defaults(),
+            Some(user.clone()),
+            "config u",
+            Some(&repo),
+            &no_env,
+        )
+        .unwrap();
+        let reviewer = c.resolve_role("reviewer").unwrap();
+        assert_eq!(reviewer.model_ref(), "openrouter/xiaomi/mimo-v2.6-pro");
+        assert_eq!(reviewer.model.context_window, 64_000);
+        assert_eq!(reviewer.model.max_tokens, 4000);
+        assert!(
+            reviewer
+                .model
+                .sampling_params
+                .as_ref()
+                .is_none_or(|p| p.get("a").is_none())
+        );
+
+        // The repo lowers one cap; the other stays the user's.
+        let repo = crate::repo_config::RepoConfig::parse(
+            "[roles.reviewer]\nmax_tokens = 2000\n",
+            Path::new("/r/.amp/harness/config.toml"),
+        )
+        .unwrap();
+        let c = ModelsConfig::from_layers(
+            ModelsFile::defaults(),
+            Some(user),
+            "config u",
+            Some(&repo),
+            &no_env,
+        )
+        .unwrap();
+        let reviewer = c.resolve_role("reviewer").unwrap();
+        assert_eq!(reviewer.model.context_window, 64_000);
+        assert_eq!(reviewer.model.max_tokens, 2000);
+
+        // /model <role> keeps the role's caps on the new model.
+        let mut c = config("[roles.reviewer]\ncontext_window = 64000\n").unwrap();
+        let switched = c
+            .override_role("reviewer", "openrouter/openai/gpt-6.1-sol", None, "/model")
+            .unwrap();
+        assert_eq!(switched.model.context_window, 64_000);
+        assert_eq!(c.role_caps("reviewer").context_window, Some(64_000));
+
+        // Inherit mode: caps are dropped and not reported.
+        let c = config(
+            "[models]\nprofile = \"inherit\"\ninherit = \"openrouter/openai/gpt-6.1-sol\"\n[roles.manager]\ncontext_window = 100000\n",
+        )
+        .unwrap();
+        let manager = c.resolve_role("manager").unwrap();
+        assert_eq!(manager.model.context_window, 1_050_000);
+        assert!(manager.caps.is_empty());
+        assert!(c.role_caps("manager").is_empty());
+    }
+
+    /// T11: a repo `[roles.x] context_window` counts from a trusted repo only; based_on and
+    /// fallback copies carry the base role's caps.
+    #[test]
+    fn repo_role_caps_need_trust() {
+        let text = "[roles.manager]\ncontext_window = 120000\n";
+        let path = Path::new("/r/.amp/harness/config.toml");
+        for (trusted, want) in [(true, 120_000), (false, 1_050_000)] {
+            let mut repo = crate::repo_config::RepoConfig::parse(text, path).unwrap();
+            repo.retain_allowed(&|_, _, _| trusted);
+            let c = ModelsConfig::from_layers(
+                ModelsFile::defaults(),
+                None,
+                "config u",
+                Some(&repo),
+                &no_env,
+            )
+            .unwrap();
+            assert_eq!(
+                c.resolve_role("manager").unwrap().model.context_window,
+                want,
+                "trusted = {trusted}"
+            );
+        }
+
+        let c = config("[roles.worker-backend]\nmax_tokens = 3000\n").unwrap();
+        let hints = ModelHints {
+            based_on: Some("worker-backend".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.resolve_with("my-agent", &hints).unwrap().model.max_tokens,
+            3000
+        );
+        // [models] fallback defaults to worker-backend's entry.
+        assert_eq!(
+            c.resolve_with("other-agent", &ModelHints::default())
+                .unwrap()
+                .model
+                .max_tokens,
+            3000
+        );
     }
 }

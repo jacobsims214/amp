@@ -1205,6 +1205,69 @@ mod compact {
         assert_eq!(rig.script.pending_count(), 0);
     }
 
+    /// T-A7 (AMP #4224, auto-compaction spec A7): after `/model` to a model whose window the
+    /// role caps to 40 000, the next prompt compacts automatically against that window
+    /// (threshold 40 000 - reserve), before its reply; reserve/keep_recent stay as built.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn model_switch_to_a_smaller_window_compacts_on_the_next_prompt() {
+        use amp_core::models::RoleCaps;
+        use rpi_harness::agent_harness::AgentLane;
+
+        let mut rig = rig(
+            vec![
+                FauxStep::text("first answer"),
+                FauxStep::text("second answer"),
+                FauxStep::text("SUMMARY-OF-EARLIER-TURNS"),
+                FauxStep::text("third answer"),
+            ],
+            false,
+        )
+        .await;
+        let settings = rig.harness.compaction_settings();
+        let base = AgentLane::get_model(&*rig.harness).await.unwrap();
+        let mut big = base.clone();
+        big.id = "faux-big".into();
+        big.context_window = 400_000;
+        let reference = format!("{}/{}", big.provider, big.id);
+        let info = rig.shell.info().clone();
+        let (shell, done) = Shell::new(
+            Arc::clone(&rig.harness),
+            info,
+            vec![amp_tui::ModelChoice {
+                reference: reference.clone(),
+                model: big,
+            }],
+        );
+        rig.shell = shell;
+        rig.done = done;
+        rig.shell.set_role_caps(RoleCaps {
+            context_window: Some(40_000),
+            max_tokens: None,
+        });
+
+        // ~30k tokens each (faux usage is chars/4): far below the starting window.
+        rig.say(&"lots of earlier context ".repeat(5_000)).await;
+        rig.say(&"some more context ".repeat(6_500)).await;
+        assert!(compactions(&rig).await.is_empty(), "{}", flat(&rig));
+
+        rig.say(&format!("/model {reference}")).await;
+        assert_eq!(
+            AgentLane::get_model(&*rig.harness)
+                .await
+                .unwrap()
+                .context_window,
+            40_000
+        );
+        rig.say("short follow-up").await;
+        let found = compactions(&rig).await;
+        assert_eq!(found.len(), 1, "{}", flat(&rig));
+        assert!(found[0].summary.contains("SUMMARY-OF-EARLIER-TURNS"));
+        assert!(found[0].tokens_before > 40_000 - settings.reserve_tokens);
+        assert!(flat(&rig).contains("third answer"), "{}", flat(&rig));
+        assert_eq!(rig.script.pending_count(), 0);
+        assert_eq!(rig.harness.compaction_settings(), settings, "R/K as built");
+    }
+
     /// Case 3 (O2): nothing to compact on an empty chat; no model call.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn compact_on_an_empty_chat_is_declined() {
@@ -1319,4 +1382,98 @@ mod compact {
         assert!(!screen.contains("compacted: ~"), "{screen}");
         assert!(compactions(&rig).await.is_empty());
     }
+}
+
+/// A `/reload` that moves the chat's role to `switch_to` (one of `models`).
+struct SwitchReload {
+    models: Vec<amp_tui::ModelChoice>,
+    switch_to: String,
+}
+
+impl amp_tui::ReloadControl for SwitchReload {
+    fn reload(&self) -> amp_tui::ReloadFuture {
+        let reply = amp_tui::ReloadReply {
+            lines: vec!["manager: model changed".to_owned()],
+            providers: Vec::new(),
+            models: self.models.clone(),
+            switch_to: Some(self.switch_to.clone()),
+            stays: None,
+            warnings: Vec::new(),
+        };
+        Box::pin(async move { Ok(reply) })
+    }
+}
+
+/// T15 (AMP #4224, spec M2): `/model` and the `/reload` switch keep the chat role's
+/// context_window / max_tokens caps: the harness gets the capped model and the footer's window is
+/// the capped one; a cap above the new model's value leaves the model's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_switches_keep_the_role_caps() {
+    use amp_core::models::RoleCaps;
+    use rpi_harness::agent_harness::AgentLane;
+
+    let mut rig = rig(Vec::new(), false).await;
+    let base = AgentLane::get_model(&*rig.harness).await.unwrap();
+    let mut big = base.clone();
+    big.id = "faux-big".into();
+    big.context_window = 400_000;
+    big.max_tokens = 64_000;
+    let mut small = base.clone();
+    small.id = "faux-small".into();
+    small.context_window = 30_000;
+    small.max_tokens = 500;
+    let r = |m: &rpi_ai::Model| format!("{}/{}", m.provider, m.id);
+    let models = vec![
+        amp_tui::ModelChoice {
+            reference: r(&big),
+            model: big.clone(),
+        },
+        amp_tui::ModelChoice {
+            reference: r(&small),
+            model: small.clone(),
+        },
+    ];
+    // The rig's shell has no /model choices: a new one on the same harness with them.
+    let info = rig.shell.info().clone();
+    let (shell, done) = Shell::new(Arc::clone(&rig.harness), info, models.clone());
+    rig.shell = shell;
+    rig.done = done;
+    rig.shell.set_role_caps(RoleCaps {
+        context_window: Some(50_000),
+        max_tokens: Some(1000),
+    });
+
+    // /model: the bigger model, capped.
+    rig.say(&format!("/model {}", r(&big))).await;
+    let now = AgentLane::get_model(&*rig.harness).await.unwrap();
+    assert_eq!(now.id, "faux-big");
+    assert_eq!(now.context_window, 50_000);
+    assert_eq!(now.max_tokens, 1000);
+    assert_eq!(rig.shell.info().context_window, 50_000, "footer window");
+
+    // /reload switching the chat's model: the smaller one keeps its own (lower) values.
+    rig.shell.set_reload(Arc::new(SwitchReload {
+        models,
+        switch_to: r(&small),
+    }));
+    rig.say("/reload").await;
+    let mut now = AgentLane::get_model(&*rig.harness).await.unwrap();
+    for _ in 0..100 {
+        if now.id == "faux-small" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        now = AgentLane::get_model(&*rig.harness).await.unwrap();
+    }
+    assert_eq!(now.id, "faux-small", "{}", rig.screen());
+    assert_eq!(now.context_window, 30_000);
+    assert_eq!(now.max_tokens, 500);
+    assert_eq!(rig.shell.info().context_window, 30_000);
+
+    // No caps: the model's own values.
+    rig.shell.set_role_caps(RoleCaps::default());
+    rig.say(&format!("/model {}", r(&big))).await;
+    let now = AgentLane::get_model(&*rig.harness).await.unwrap();
+    assert_eq!((now.context_window, now.max_tokens), (400_000, 64_000));
+    assert_eq!(rig.shell.info().context_window, 400_000);
 }

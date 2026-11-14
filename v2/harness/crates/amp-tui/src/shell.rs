@@ -1278,6 +1278,9 @@ pub struct Shell {
     harness: Arc<AgentHarness>,
     info: ShellInfo,
     models: Vec<ModelChoice>,
+    /// The chat role's `context_window` / `max_tokens` caps (#4224), applied to every model
+    /// `/model` or `/reload` switches this chat to (spec M2).
+    role_caps: amp_core::models::RoleCaps,
     totals: Totals,
     prompts: u32,
     /// A model chosen in the `/model` picker, switched to by [`Shell::key`] / [`Shell::press`]
@@ -1460,6 +1463,7 @@ impl Shell {
                 harness,
                 info,
                 models,
+                role_caps: amp_core::models::RoleCaps::default(),
                 totals: Totals::default(),
                 prompts: 0,
                 pending_model: None,
@@ -1540,6 +1544,20 @@ impl Shell {
     pub fn set_feed(&mut self, feed: Option<Arc<amp_core::manager_feed::ManagerFeed>>) {
         self.view.set_feed(feed);
         self.fed_workers = None;
+    }
+
+    /// The chat role's caps (#4224, `ResolvedRole::caps`): `/model` and `/reload` apply them to
+    /// the model they switch to, so the role's budget (and the footer's window) survives a switch.
+    /// Changed caps reach new sessions, not this one (spec M3).
+    pub fn set_role_caps(&mut self, caps: amp_core::models::RoleCaps) {
+        self.role_caps = caps;
+    }
+
+    /// `choice`'s model with the chat role's caps applied.
+    fn capped(&self, choice: &ModelChoice) -> Model {
+        let mut model = choice.model.clone();
+        self.role_caps.apply(&mut model);
+        model
     }
 
     /// Sends a prompt to the agent as a user turn, never as a slash command (#2370: the remote
@@ -5421,8 +5439,9 @@ impl Shell {
             let (provider, model_id) = reference.split_once('/').unwrap_or(("", &reference));
             self.info.provider = provider.to_owned();
             self.info.model_id = model_id.to_owned();
+            let model = self.capped(&choice);
             self.info.thinking = thinking;
-            self.info.context_window = choice.model.context_window;
+            self.info.context_window = model.context_window;
             self.view.set_footer(&self.info.footer(self.footer_ticket));
             lines.push(format!(
                 "this chat now runs on {} • thinking {} (from the next reply)",
@@ -5430,7 +5449,6 @@ impl Shell {
                 thinking_name(thinking)
             ));
             let harness = Arc::clone(&self.harness);
-            let model = choice.model.clone();
             let tx = self.msgs_tx.clone();
             tokio::spawn(async move {
                 let mut failed = harness.set_model(model).await.err().map(|e| e.to_string());
@@ -5501,7 +5519,8 @@ impl Shell {
         } else {
             ThinkingLevel::Off
         };
-        let model = choice.model.clone();
+        let model = self.capped(&choice);
+        let window = model.context_window;
         if let Err(e) = self.harness.set_model(model).await {
             self.view.add_error(&format!("/model: {e}"));
             return;
@@ -5513,7 +5532,7 @@ impl Shell {
         self.info.provider = provider.to_owned();
         self.info.model_id = model_id.to_owned();
         self.info.thinking = thinking;
-        self.info.context_window = choice.model.context_window;
+        self.info.context_window = window;
         self.view.set_footer(&self.info.footer(self.footer_ticket));
         self.view.add_notice(&format!(
             "model: {} • thinking {} (this session only)",
