@@ -353,20 +353,29 @@ fn new(ctx: &Ctx, args: NewArgs) -> Result<(), CliError> {
     let name = args.name.trim().to_owned();
     let scope = args.scope.scope();
     let description = args.description.as_deref().map(one_line);
-    let files = match &args.from {
-        None => vec![(
-            SKILL_FILE.to_owned(),
-            templates::render_skill(
+    let dest = match &args.from {
+        None => {
+            let mut text = templates::render_skill(
                 &name,
                 description
                     .as_deref()
                     .unwrap_or(&format!("{name}: say when an agent should use this skill.")),
-            )
-            .into_bytes(),
-        )],
-        Some(dir) => read_skill_dir(dir)?,
+            );
+            if let Some(d) = description.as_deref() {
+                text = set_frontmatter_key(&text, "description", Some(&yaml_string(d)))
+                    .map_err(CliError::new)?;
+            }
+            write_skill_in(ctx, scope, &name, &text, true)?.dir
+        }
+        // A copied directory can hold more than SKILL.md: CLI only (#4245).
+        Some(dir) => install(
+            ctx,
+            &name,
+            read_skill_dir(dir)?,
+            description.as_deref(),
+            scope,
+        )?,
     };
-    let dest = install(ctx, &name, files, description.as_deref(), scope)?;
     if args.edit {
         edit_skill_md(ctx, &name, scope)?;
     }
@@ -506,6 +515,120 @@ fn install(
     Ok(dest)
 }
 
+/// Under `<layer>/.edit/`: earlier versions of a layer's SKILL.md, one directory per write
+/// (`<name>.<unix ms>/SKILL.md`). Not under `skills/`: `Assets::load` takes every directory there
+/// as a skill, and `.edit` is not a valid skill name.
+const BACKUP_DIR: &str = "backup";
+
+/// What [`write_skill_in`] wrote (#4245).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WrittenSkill {
+    pub(crate) name: String,
+    pub(crate) scope: Scope,
+    /// The skill's directory in the layer (`<layer>/skills/<name>`).
+    pub(crate) dir: PathBuf,
+    /// The SKILL.md written.
+    pub(crate) path: PathBuf,
+    /// A new skill, not a change to one.
+    pub(crate) created: bool,
+    /// The copy of the layer's SKILL.md as it was before this write, under
+    /// `<layer>/.edit/backup/skills/`. `None` for a new skill, and when the layer had no SKILL.md
+    /// yet (the first override of a built-in or another layer's skill).
+    pub(crate) backup: Option<PathBuf>,
+}
+
+/// Writes a skill's SKILL.md into the `scope` layer without `$EDITOR` or stdout, validated first
+/// (nothing is written when it doesn't load or the roster no longer builds) (#4245). The core of
+/// `skills new` and `skills edit`, for callers with no terminal (the manager's tools).
+///
+/// - `create`: [`install`]'s rules. Refuses a name that is invalid or already loaded (any
+///   layer) and an existing directory; sets the frontmatter `name`; writes SKILL.md only (a
+///   multi-file `new --from` / `import` stays CLI-only).
+/// - update: `skills edit`'s rules. The skill must be loaded; only SKILL.md is written, as given
+///   (a built-in skill gets an override in the layer). The layer's previous SKILL.md, if any, is
+///   copied to a backup first.
+pub(crate) fn write_skill_in(
+    ctx: &Ctx,
+    scope: Scope,
+    name: &str,
+    content: &str,
+    create: bool,
+) -> Result<WrittenSkill, CliError> {
+    let name = name.trim();
+    if create {
+        let dir = install(
+            ctx,
+            name,
+            vec![(SKILL_FILE.to_owned(), content.as_bytes().to_vec())],
+            None,
+            scope,
+        )?;
+        return Ok(WrittenSkill {
+            name: name.to_owned(),
+            scope,
+            path: dir.join(SKILL_FILE),
+            dir,
+            created: true,
+            backup: None,
+        });
+    }
+    // Before any path is built from it.
+    if !valid_name(name) {
+        return Err(no_skill(name));
+    }
+    if ctx.load_assets()?.skill(name).is_none() {
+        return Err(no_skill(name));
+    }
+    let dir = ctx.scope_dir(scope)?.join(SKILLS_DIR).join(name);
+    check_skill(
+        ctx,
+        name,
+        &[(SKILL_FILE.to_owned(), content.as_bytes().to_vec())],
+        scope,
+        &dir,
+    )
+    .map_err(CliError::new)?;
+    let path = dir.join(SKILL_FILE);
+    let backup = if path.is_file() {
+        Some(back_up(ctx, scope, name, &path)?)
+    } else {
+        None
+    };
+    write_file(&path, content.as_bytes())?;
+    Ok(WrittenSkill {
+        name: name.to_owned(),
+        scope,
+        dir,
+        path,
+        created: false,
+        backup,
+    })
+}
+
+/// Copies the layer's `current` SKILL.md to `<layer>/.edit/backup/skills/<name>.<unix ms>/`.
+fn back_up(ctx: &Ctx, scope: Scope, name: &str, current: &Path) -> Result<PathBuf, CliError> {
+    let root = ctx
+        .scope_dir(scope)?
+        .join(EDIT_DIR)
+        .join(BACKUP_DIR)
+        .join(SKILLS_DIR);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let mut dir = root.join(format!("{name}.{stamp}"));
+    let mut n = 1;
+    while dir.exists() {
+        dir = root.join(format!("{name}.{stamp}-{n}"));
+        n += 1;
+    }
+    let bytes = std::fs::read(current)
+        .map_err(|e| CliError::new(format!("read {}: {e}", current.display())))?;
+    let file = dir.join(SKILL_FILE);
+    write_file(&file, &bytes)?;
+    Ok(file)
+}
+
 fn edit(ctx: &Ctx, name: &str, scope: Scope) -> Result<(), CliError> {
     if ctx.load_assets()?.skill(name).is_none() {
         return Err(no_skill(name));
@@ -540,8 +663,8 @@ fn edit_skill_md(ctx: &Ctx, name: &str, scope: Scope) -> Result<(), CliError> {
     match edit_loop(&editor_command(), &scratch, &initial, &validate, &ask_again)? {
         None => println!("No changes to {name}."),
         Some(text) => {
-            write_file(&path, text.as_bytes())?;
-            println!("Saved {name}: {}", path.display());
+            let written = write_skill_in(ctx, scope, name, &text, false)?;
+            println!("Saved {name}: {}", written.path.display());
         }
     }
     Ok(())
@@ -651,4 +774,143 @@ fn validate(ctx: &Ctx, json: bool) -> Result<(), CliError> {
         }
     }
     if ok { Ok(()) } else { Err(CliError::silent(1)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use amp_mcp::config_paths::ConfigPaths;
+
+    /// A user layer only, under the crate's target dir (never the person's config).
+    fn ctx(name: &str) -> Ctx {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/unit-skills-cmd")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        Ctx {
+            paths: ConfigPaths {
+                user_dir: Some(d.clone()),
+                ..Default::default()
+            },
+            cwd: d,
+        }
+    }
+
+    fn user(ctx: &Ctx) -> PathBuf {
+        ctx.paths.user_dir.clone().unwrap()
+    }
+
+    fn backups(ctx: &Ctx) -> Vec<PathBuf> {
+        let root = user(ctx).join(EDIT_DIR).join(BACKUP_DIR).join(SKILLS_DIR);
+        let mut out: Vec<PathBuf> = std::fs::read_dir(root)
+            .map(|r| r.filter_map(|e| e.ok().map(|e| e.path())).collect())
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    const GOOD: &str = "---\nname: wrong\ndescription: Does things\n---\n\nDo the thing.\n";
+
+    #[test]
+    fn create_installs_skill_md_and_refuses_existing_or_invalid() {
+        let ctx = ctx("create");
+        let w = write_skill_in(&ctx, Scope::User, "my-skill", GOOD, true).unwrap();
+        assert!(w.created && w.backup.is_none());
+        assert_eq!(w.path, user(&ctx).join("skills/my-skill/SKILL.md"));
+        let md = std::fs::read_to_string(&w.path).unwrap();
+        assert!(md.contains("name: \"my-skill\""), "{md}");
+        let assets = ctx.load_assets().unwrap();
+        assert_eq!(assets.skill("my-skill").unwrap().description, "Does things");
+
+        // Already loaded: this layer, or built in.
+        for name in ["my-skill", "go-engineer"] {
+            let e = write_skill_in(&ctx, Scope::User, name, GOOD, true).unwrap_err();
+            assert!(e.message.contains("already exists"), "{}", e.message);
+        }
+        assert!(!user(&ctx).join("skills/go-engineer").exists());
+
+        // Invalid names and invalid content: nothing written.
+        for name in ["../escape", "Bad_Name", ""] {
+            assert!(write_skill_in(&ctx, Scope::User, name, GOOD, true).is_err());
+        }
+        assert!(!user(&ctx).join("escape").exists());
+        let e = write_skill_in(
+            &ctx,
+            Scope::User,
+            "no-desc",
+            "---\nname: no-desc\n---\nbody\n",
+            true,
+        )
+        .unwrap_err();
+        assert!(e.message.contains("description"), "{}", e.message);
+        assert!(!user(&ctx).join("skills/no-desc").exists());
+    }
+
+    #[test]
+    fn update_backs_up_the_layer_file_and_refuses_invalid_before_writing() {
+        let ctx = ctx("update");
+        let skill_md = user(&ctx).join("skills/go-engineer/SKILL.md");
+        let builtin = String::from_utf8(
+            Assets::load(&Default::default())
+                .unwrap()
+                .skill("go-engineer")
+                .unwrap()
+                .files[SKILL_FILE]
+                .bytes
+                .clone(),
+        )
+        .unwrap();
+        let v1 = builtin.replacen("description:", "description: v1", 1);
+        let v2 = builtin.replacen("description:", "description: v2", 1);
+
+        // First override of a built-in: nothing in the layer to back up.
+        let w = write_skill_in(&ctx, Scope::User, "go-engineer", &v1, false).unwrap();
+        assert!(!w.created && w.backup.is_none());
+        assert_eq!(std::fs::read_to_string(&skill_md).unwrap(), v1);
+
+        // A change backs up the layer's SKILL.md first.
+        let w = write_skill_in(&ctx, Scope::User, "go-engineer", &v2, false).unwrap();
+        let backup = w.backup.expect("backup");
+        assert!(backup.starts_with(user(&ctx).join(".edit/backup/skills")));
+        assert!(
+            backup
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("go-engineer.")
+        );
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), v1);
+        assert_eq!(std::fs::read_to_string(&skill_md).unwrap(), v2);
+        // Two writes in the same millisecond keep both backups.
+        write_skill_in(&ctx, Scope::User, "go-engineer", &v1, false).unwrap();
+        assert_eq!(backups(&ctx).len(), 2);
+
+        // Backups are never loaded as skills.
+        let assets = ctx.load_assets().unwrap();
+        assert!(assets.skills().all(|s| !s.name.starts_with('.')));
+        RoleRegistry::from_assets(&assets).unwrap();
+
+        // Invalid content, an unknown skill, a bad name: refused, nothing written or backed up.
+        let before = std::fs::read_to_string(&skill_md).unwrap();
+        let renamed = before.replacen("name: go-engineer", "name: other-name", 1);
+        assert_ne!(renamed, before);
+        let e = write_skill_in(&ctx, Scope::User, "go-engineer", &renamed, false).unwrap_err();
+        assert!(
+            e.message.contains("must match its directory"),
+            "{}",
+            e.message
+        );
+        for name in ["nope", "../go-engineer"] {
+            let e = write_skill_in(&ctx, Scope::User, name, &before, false).unwrap_err();
+            assert!(e.message.contains("no skill"), "{}", e.message);
+        }
+        assert_eq!(std::fs::read_to_string(&skill_md).unwrap(), before);
+        assert_eq!(backups(&ctx).len(), 2);
+
+        // The repo layer is refused when there is none.
+        assert!(write_skill_in(&ctx, Scope::Repo, "go-engineer", &before, false).is_err());
+    }
 }

@@ -595,6 +595,88 @@ async fn skills_crud_at_user_and_repo_scope() {
 }
 
 // ------------------------------------------------------------------------------------------------
+// #4245: `skills new` / `skills edit` through the non-interactive writer (`write_skill_in`), which
+// backs up the layer's SKILL.md before an edit.
+// ------------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn skills_edit_backs_up_the_layer_skill_md_4245() {
+    let dir = setup("skills-write-4245");
+    let skill_md = user_dir(&dir).join("skills/my-skill/SKILL.md");
+    let backups = || -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = std::fs::read_dir(user_dir(&dir).join(".edit/backup/skills"))
+            .map(|r| r.filter_map(|e| e.ok().map(|e| e.path())).collect())
+            .unwrap_or_default();
+        out.sort();
+        out
+    };
+
+    let out = cli(
+        &dir,
+        &["skills", "new", "my-skill", "--description", "Does things"],
+    )
+    .await;
+    ok(&out, "skills new");
+    assert!(
+        out.stdout.contains("Created skill my-skill (user)"),
+        "{}",
+        out.stdout
+    );
+    assert!(backups().is_empty(), "a new skill has nothing to back up");
+    let original = std::fs::read_to_string(&skill_md).unwrap();
+
+    let good = editor(&dir, "good", "s/^description: .*/description: Edited/");
+    let out = cli_env(&dir, &["skills", "edit", "my-skill"], &[("EDITOR", &good)]).await;
+    ok(&out, "edit");
+    assert!(out.stdout.contains("Saved my-skill: "), "{}", out.stdout);
+    assert!(
+        std::fs::read_to_string(&skill_md)
+            .unwrap()
+            .contains("description: Edited")
+    );
+    let saved = backups();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert!(
+        saved[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("my-skill."),
+        "{saved:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(saved[0].join("SKILL.md")).unwrap(),
+        original
+    );
+
+    // An invalid edit writes nothing and backs nothing up.
+    let edited = std::fs::read_to_string(&skill_md).unwrap();
+    let bad = editor(&dir, "bad", "s/^name: .*/name: other-name/");
+    let out = cli_env(&dir, &["skills", "edit", "my-skill"], &[("EDITOR", &bad)]).await;
+    assert!(
+        out.code == 1 && out.stderr.contains("must match its directory"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(std::fs::read_to_string(&skill_md).unwrap(), edited);
+    assert_eq!(backups().len(), 1);
+
+    // Backups are not skills: everything still loads.
+    let out = cli(&dir, &["skills", "validate", "--json"]).await;
+    ok(&out, "validate");
+    assert_eq!(out.json()["ok"], true);
+    let list = cli(&dir, &["skills", "list", "--json"]).await.json();
+    assert!(
+        list["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| !s["name"].as_str().unwrap().starts_with('.')),
+        "{list:#}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
 // A new agent, dispatched by the manager on faux models.
 // ------------------------------------------------------------------------------------------------
 
