@@ -1,7 +1,7 @@
 import { PageHeader } from '../components/ui/PageHeader'
 import { useState, useEffect, useCallback } from 'react'
 import { Link } from 'react-router-dom'
-import { Loader2, Plus, Trash2, Pencil, UserPlus, Users, Mail, ChevronDown, ChevronRight, X, Check, BookOpen } from 'lucide-react'
+import { Loader2, Plus, Trash2, Pencil, UserPlus, Users, Mail, ChevronDown, ChevronRight, X, Check, BookOpen, Inbox } from 'lucide-react'
 import { api } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal'
@@ -11,6 +11,7 @@ import { WebhooksPanel } from '../components/WebhooksPanel'
 import { OrgRemoteControlSetting } from '../components/remote/OrgRemoteControlSetting'
 import { OrgReceiptsSetting } from '../components/receipt/OrgReceiptsSetting'
 import { personName } from '../lib/people'
+import { teamInboxPath } from '../lib/requestRoutes'
 import type { AddMemberResult, Invite, Member, Org, OrgRole, Team, TeamRole } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
 import { errMsg } from '../lib/adminStyles'
@@ -565,10 +566,19 @@ function TeamRow({ team, first, canManageOrg, meId, expanded, onToggle, onChange
           {!renaming && <span className="text-sm text-ink truncate">{team.name}</span>}
         </button>
         {!renaming && (
-          <Link to={`/teams/${team.id}/kb`} title="The team's knowledge base (team members only)"
-            className="amp-btn amp-btn-ghost amp-btn-sm">
-            <BookOpen size={12} />KB
-          </Link>
+          <>
+            {/* The team's request inbox (AMP #3988). Beside the KB because this is the
+                page that lists teams and their members: the two team-scoped surfaces
+                a person gets to from "Teams & orgs" belong together. */}
+            <Link to={teamInboxPath(team.id)} title="The team's request inbox (team members, and its org's owners and admins)"
+              className="amp-btn amp-btn-ghost amp-btn-sm">
+              <Inbox size={12} />Inbox
+            </Link>
+            <Link to={`/teams/${team.id}/kb`} title="The team's knowledge base (team members only)"
+              className="amp-btn amp-btn-ghost amp-btn-sm">
+              <BookOpen size={12} />KB
+            </Link>
+          </>
         )}
         {renaming ? (
           <div className="flex items-center gap-1.5">

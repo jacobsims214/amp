@@ -27,6 +27,7 @@
 import type { Me, RequestOwnership, RequestStateTotals, RequestStatus, TeamRequest } from '../types'
 import { REQUEST_STATUSES } from '../types'
 import { claimAge, REQUEST_STATE_LABEL } from './requestState'
+import { teamInboxPath } from './requestRoutes'
 
 /** A team as the panels need it: an id to read and a name to show. */
 export interface InboxTeam {
@@ -179,16 +180,20 @@ export function inboxFailures(inboxes: TeamInbox[]): TeamInbox[] {
  * Where "Open inbox" and a claimed row go: the team's queue, the entry point
  * approved mockup 37 v1 view 3 draws.
  *
- * One helper, deliberately, because **no request route exists yet**. J1 built
- * the queue as a page that takes `teamId` as a prop and #3988 registers the
- * routes; until it does, `/teams/:id/requests` is the path that ticket will
- * own. A row pointing at `/teams/:id/requests/:serial` today would be a dead
- * link to a route nobody registered, so the claimed row opens the queue and
- * #3988 retargets this one function to the detail path. Every link in both
- * panels is built here so that is a one-line change, not a hunt.
+ * One helper, deliberately, for two reasons that outlived the ticket that wrote
+ * it. First, every link in both panels is built here, so retargeting either one
+ * is a one-line change rather than a hunt through two components. Second, the
+ * destination and the URL builder now live in different files but must not
+ * diverge: `lib/requestRoutes.ts` owns every request path in the app, and this
+ * is the one call that reaches it. (The J3 handover note said #3988 would
+ * "retarget one function to the detail path". It retargets this one to the
+ * *queue* instead: a claimed row is one line of a request, and opening the
+ * queue the request lives in is what the approved My work panel draws. A row
+ * that jumped straight to the detail would leave the panel with no way into the
+ * inbox it summarises.)
  */
 export function teamInboxLink(teamId: number): string {
-  return `/teams/${teamId}/requests`
+  return teamInboxPath(teamId)
 }
 
 /** A claimed row's destination: its team's queue (see `teamInboxLink`). */

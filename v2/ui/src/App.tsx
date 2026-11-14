@@ -24,6 +24,7 @@ import { Session } from './pages/Session'
 import { Sessions } from './pages/Sessions'
 import { TicketPage } from './pages/TicketPage'
 import { RunRedirect, TicketRedirect } from './pages/TicketRedirect'
+import { TeamInboxRoute, TeamRequestRoute, RequesterNewRequestRoute, RequesterRequestsRoute, RequesterStatusRoute } from './pages/RequestRoutes'
 import { RemoteProvider } from './remote/RemoteProvider'
 import { AuthProvider } from './contexts/AuthContext'
 import { AppShell } from './components/shell/AppShell'
@@ -62,6 +63,15 @@ export default function App() {
         <Routes>
           {/* Standalone (no sidebar) so it works on a phone; served with a strict CSP. */}
           <Route path="/sessions/:sessionId" element={<Session />} />
+          {/* The requester surfaces, deliberately OUTSIDE the app shell (AMP #3988).
+              A requester is a customer — possibly in no org at all — and the shell is
+              the team's frame: project tree, org admin, trace, agents, every internal
+              name. Mounting these in their own tree is what makes "a requester route
+              reveals no internal nav" structural rather than a matter of hiding
+              things. Their frame is components/requests/RequesterChrome. */}
+          <Route path="/requests" element={<RequesterRequestsRoute />} />
+          <Route path="/requests/new" element={<RequesterNewRequestRoute />} />
+          <Route path="/request/:publicRef" element={<RequesterStatusRoute />} />
           <Route element={<AppShell />}>
             <Route path="/" element={<MyWork />} />
             <Route path="/sessions" element={<Sessions />} />
@@ -83,6 +93,11 @@ export default function App() {
             <Route path="/artifacts/:artifactId" element={<ArtifactView />} />
             <Route path="/project/:projectId/settings" element={<ProjectSettings />} />
             <Route path="/teams/:teamId/kb" element={<KB />} />
+            {/* The team's workstream inbox (AMP #3988): the shared queue, then one
+                request in it. Inside the shell on purpose — this is the team's own
+                surface, and its rows are the team's work. */}
+            <Route path="/teams/:teamId/requests" element={<TeamInboxRoute />} />
+            <Route path="/teams/:teamId/requests/:ref" element={<TeamRequestRoute />} />
             <Route path="/orgs/:orgId/kb" element={<KB />} />
             <Route path="/reports" element={<DayReports />} />
             <Route path="/admin/users" element={<Users />} />
