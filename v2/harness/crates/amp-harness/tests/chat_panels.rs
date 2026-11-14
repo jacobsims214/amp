@@ -10,6 +10,9 @@
 //!   saved to config.toml with `--save` or `s` in the picker; the chat's own role switches the chat.
 //! - `/agents`, `/skills`, `/config` (with sources; a provider key shows its source, never itself).
 //! - `/help` lists them; the AMP status line shows `mcp 1/1`.
+//! - `/mcp login amp` (#4250): AMP's own browser login against a mock OAuth server (this test
+//!   binary plays the browser), then the session reconnects (offline and online chats); a denied
+//!   login changes nothing; AMP_TOKEN is refused.
 //!
 //! Panels with no machine-specific paths are compared with `tests/snapshots/chat-*.txt`;
 //! regenerate with `UPDATE_SNAPSHOTS=1 cargo test -p amp-harness --test chat_panels`.
@@ -26,7 +29,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::Router;
+use axum::{
+    Form, Json, Router,
+    extract::{Query, Request, State},
+    http::{HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Redirect, Response},
+    routing::{get, post},
+};
 use common::{MockAmp, Output, spawn};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
@@ -43,6 +53,10 @@ use rmcp::{
 use serde_json::{Value, json};
 
 const SERVER_FLAG: &str = "--stdio-server";
+/// The test binary as the chat's browser (`AMP_HARNESS_SNAPSHOT_BROWSER`): approves the login.
+const BROWSER_FLAG: &str = "--browser";
+/// The same, but the person denies the login.
+const DENY_FLAG: &str = "--browser-deny";
 const NO_AMP: &str = "http://127.0.0.1:9/mcp";
 /// A provider key planted in the environment: `/config` names its source, never the value.
 const PLANTED: &str = "sk-or-v1-chatpanels-planted-0123456789abcdef";
@@ -141,6 +155,214 @@ async fn serve_http() -> Served {
         url: format!("http://{addr}/mcp"),
         task,
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A mock AMP behind a mock OAuth authorization server (#4250), like tests/mcp_cli.rs's
+
+#[derive(Default)]
+struct AsState {
+    /// Set once the server listens ([`spawn_oauth_amp`]).
+    base: std::sync::OnceLock<String>,
+    seq: std::sync::atomic::AtomicUsize,
+    clients: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    codes: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    tokens: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl AsState {
+    fn next(&self, prefix: &str) -> String {
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        format!("{prefix}-{n}")
+    }
+
+    fn base(&self) -> &str {
+        self.base.get().expect("listening")
+    }
+
+    fn registered(&self) -> usize {
+        self.clients.lock().unwrap().len()
+    }
+}
+
+/// [`MockAmp`] at `/mcp`, which wants a bearer token the authorization server issued.
+async fn spawn_oauth_amp() -> (common::Running, Arc<AsState>) {
+    let state = Arc::new(AsState::default());
+    let mock = MockAmp::new();
+    let resource =
+        common::app(&mock, None).layer(middleware::from_fn_with_state(state.clone(), bearer_gate));
+    let app = Router::new()
+        .route("/.well-known/oauth-protected-resource/mcp", get(prm))
+        .route("/.well-known/oauth-authorization-server", get(as_metadata))
+        .route("/register", post(register))
+        .route("/authorize", get(authorize))
+        .route("/token", post(token))
+        .with_state(state.clone())
+        .merge(resource);
+    let running = common::serve(app, mock).await;
+    let base = running.url.strip_suffix("/mcp").unwrap().to_owned();
+    state.base.set(base).unwrap();
+    (running, state)
+}
+
+async fn bearer_gate(State(s): State<Arc<AsState>>, req: Request, next: Next) -> Response {
+    let ok = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|t| s.tokens.lock().unwrap().contains(t));
+    if ok {
+        return next.run(req).await;
+    }
+    let mut response = (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    let challenge = format!(
+        r#"Bearer resource_metadata="{}/.well-known/oauth-protected-resource/mcp""#,
+        s.base()
+    );
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_str(&challenge).unwrap(),
+    );
+    response
+}
+
+async fn prm(State(s): State<Arc<AsState>>) -> Json<Value> {
+    Json(json!({
+        "resource": format!("{}/mcp", s.base()),
+        "authorization_servers": [s.base()],
+        "bearer_methods_supported": ["header"],
+    }))
+}
+
+async fn as_metadata(State(s): State<Arc<AsState>>) -> Json<Value> {
+    Json(json!({
+        "issuer": s.base(),
+        "authorization_endpoint": format!("{}/authorize", s.base()),
+        "token_endpoint": format!("{}/token", s.base()),
+        "registration_endpoint": format!("{}/register", s.base()),
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    }))
+}
+
+async fn register(State(s): State<Arc<AsState>>, Json(body): Json<Value>) -> Response {
+    let uris: Vec<String> = body["redirect_uris"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let id = s.next("client");
+    s.clients.lock().unwrap().insert(id.clone(), uris.clone());
+    (
+        StatusCode::CREATED,
+        Json(json!({"client_id": id, "redirect_uris": uris, "token_endpoint_auth_method": "none"})),
+    )
+        .into_response()
+}
+
+async fn authorize(
+    State(s): State<Arc<AsState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let get = |k: &str| q.get(k).cloned().unwrap_or_default();
+    let known = s
+        .clients
+        .lock()
+        .unwrap()
+        .get(&get("client_id"))
+        .is_some_and(|uris| uris.contains(&get("redirect_uri")));
+    if !known || get("response_type") != "code" || get("state").is_empty() {
+        return (StatusCode::BAD_REQUEST, "bad authorization request").into_response();
+    }
+    let code = s.next("code");
+    s.codes
+        .lock()
+        .unwrap()
+        .insert(code.clone(), get("client_id"));
+    Redirect::to(&format!(
+        "{}?code={code}&state={}",
+        get("redirect_uri"),
+        get("state")
+    ))
+    .into_response()
+}
+
+async fn token(
+    State(s): State<Arc<AsState>>,
+    Form(form): Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    let get = |k: &str| form.get(k).cloned().unwrap_or_default();
+    let ok = match get("grant_type").as_str() {
+        "authorization_code" => s.codes.lock().unwrap().remove(&get("code")).is_some(),
+        "refresh_token" => true,
+        _ => false,
+    };
+    if !ok {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid_grant"})),
+        )
+            .into_response();
+    }
+    let access = s.next("at");
+    s.tokens.lock().unwrap().insert(access.clone());
+    Json(json!({
+        "access_token": access, "token_type": "Bearer", "expires_in": 3600,
+        "refresh_token": s.next("rt"),
+    }))
+    .into_response()
+}
+
+/// `--browser <url>` / `--browser-deny <url>`: what a person's browser does with a login URL.
+/// Approve: follow the authorization server's redirect back to the chat's loopback listener.
+/// Deny: send the listener `error=access_denied` with the request's state.
+fn run_browser(deny: bool, url: &str) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap();
+        let back = if deny {
+            let url = reqwest::Url::parse(url).unwrap();
+            let q: std::collections::HashMap<String, String> =
+                url.query_pairs().into_owned().collect();
+            format!(
+                "{}?error=access_denied&state={}",
+                q["redirect_uri"], q["state"]
+            )
+        } else {
+            let r = http.get(url).send().await.unwrap();
+            r.headers()[header::LOCATION].to_str().unwrap().to_owned()
+        };
+        let _ = http.get(&back).send().await;
+    });
+}
+
+/// A "browser" program for `AMP_HARNESS_SNAPSHOT_BROWSER`: this test binary with `flag`.
+fn browser_script(dir: &Path, flag: &str) -> String {
+    let path = dir.join(format!("browser{flag}.sh"));
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\nexec {} {flag} \"$1\"\n", toml_str(&exe())),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path.display().to_string()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -577,6 +799,125 @@ async fn mcp_add_details_test_and_restart() {
     );
 }
 
+/// #4250: `/mcp login amp` logs in to AMP from inside the chat (the browser prompt in the
+/// transcript, never stderr) and the session reconnects with the new login:
+/// - a chat that started without a usable login connects, and its header heals;
+/// - an online chat swaps its connection;
+/// - a denied login changes nothing (stored login, connection);
+/// - AMP_TOKEN is refused (a browser login would not replace it).
+///
+/// The mock authorization server and the file credential store live in this test's temp HOME;
+/// no real browser, keychain or AMP login is touched.
+async fn mcp_login_amp_logs_in_and_reconnects() {
+    let dir = setup("amp-login", "", "");
+    let (amp, auth) = spawn_oauth_amp().await;
+    let approve = browser_script(&dir, BROWSER_FLAG);
+    let deny = browser_script(&dir, DENY_FLAG);
+    let creds = dir.join(format!(
+        "home/.config/amp-harness/{}",
+        amp_mcp::CREDENTIALS_FILE_NAME
+    ));
+
+    // 1. No login yet: the chat starts offline and the header says re-login needed.
+    let out = chat(
+        &dir,
+        Some(&amp.url),
+        &["/mcp login amp", "exec:sleep 1"],
+        &[("AMP_HARNESS_SNAPSHOT_BROWSER", &approve)],
+    )
+    .await;
+    let screen = flat(&out.stdout);
+    assert!(
+        screen.contains("AMP at 127.0.0.1") && screen.contains("Opened your browser to log in"),
+        "{}",
+        out.stdout
+    );
+    assert!(screen.contains("logged in to AMP at"), "{}", out.stdout);
+    assert!(
+        screen.contains("Connected to AMP at") && screen.contains("AMP tools now"),
+        "the offline session connected: {}",
+        out.stdout
+    );
+    assert!(!screen.contains("re-login needed"), "{}", out.stdout);
+    assert!(
+        !out.stderr.contains("authorize"),
+        "nothing on stderr: {}",
+        out.stderr
+    );
+    assert!(
+        !amp.mock.calls_to("amp_whoami").is_empty(),
+        "the poller reconnected and polled"
+    );
+    let stored = std::fs::read_to_string(&creds).expect("the login is in the file store");
+    assert_eq!(auth.registered(), 1);
+
+    // 2. Online with that login: a new login swaps the connection.
+    let out = chat(
+        &dir,
+        Some(&amp.url),
+        &["/mcp login amp"],
+        &[("AMP_HARNESS_SNAPSHOT_BROWSER", &approve)],
+    )
+    .await;
+    let screen = flat(&out.stdout);
+    assert!(
+        screen.contains("logged in to AMP at")
+            && screen.contains("the session reconnected with it"),
+        "{}",
+        out.stdout
+    );
+    assert!(!screen.contains("re-login needed"), "{}", out.stdout);
+    assert_eq!(auth.registered(), 2);
+    let stored = {
+        let now = std::fs::read_to_string(&creds).unwrap();
+        assert_ne!(now, stored, "the new login replaced the old one");
+        now
+    };
+
+    // 3. Denied in the browser: an error, and nothing changed.
+    let out = chat(
+        &dir,
+        Some(&amp.url),
+        &["/mcp login amp"],
+        &[("AMP_HARNESS_SNAPSHOT_BROWSER", &deny)],
+    )
+    .await;
+    let screen = flat(&out.stdout);
+    assert!(
+        screen.contains("/mcp login amp: OAuth: authorization failed: access_denied"),
+        "{}",
+        out.stdout
+    );
+    assert!(!screen.contains("logged in to AMP"), "{}", out.stdout);
+    assert!(
+        !screen.contains("re-login needed"),
+        "still connected: {}",
+        out.stdout
+    );
+    assert_eq!(std::fs::read_to_string(&creds).unwrap(), stored);
+
+    // 4. AMP_TOKEN: refused before any browser.
+    let registered = auth.registered();
+    let out = chat(
+        &dir,
+        Some(&amp.url),
+        &["/mcp login amp"],
+        &[
+            ("AMP_TOKEN", "planted-static-token"),
+            ("AMP_HARNESS_SNAPSHOT_BROWSER", &approve),
+        ],
+    )
+    .await;
+    let screen = flat(&out.stdout);
+    assert!(
+        screen.contains("set a new token in AMP_TOKEN and restart the chat"),
+        "{}",
+        out.stdout
+    );
+    assert_eq!(auth.registered(), registered, "no login was started");
+    assert_eq!(std::fs::read_to_string(&creds).unwrap(), stored);
+}
+
 /// `/model roles` lists every role's model and source; `/model <role> <p/m>` sets it for this
 /// chat only (kept by `/reload`, not written); `s` in the picker saves it to config.toml; the
 /// chat's own role switches the chat.
@@ -879,6 +1220,11 @@ fn main() {
     if args.iter().any(|a| a == SERVER_FLAG) {
         return run_stdio_server();
     }
+    if let [flag, url] = args.as_slice()
+        && (flag == BROWSER_FLAG || flag == DENY_FLAG)
+    {
+        return run_browser(flag == DENY_FLAG, url);
+    }
     if args.iter().any(|a| a == "--list") {
         return;
     }
@@ -888,6 +1234,7 @@ fn main() {
         mcp_enable_disable_apply_through_reload,
         mcp_trust_and_untrust_a_repo_server,
         mcp_add_details_test_and_restart,
+        mcp_login_amp_logs_in_and_reconnects,
         model_per_role,
         model_roles_show_the_fallback,
         agents_and_skills,

@@ -325,6 +325,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
             theme_flag: args.theme.clone(),
             notes: shell.notifier(),
             browser: args.snapshot.is_none(),
+            switcher: Some(Arc::clone(&switcher)),
         },
     )));
     // AMP unreachable (#2178): say why and what to do, and keep trying in the background.

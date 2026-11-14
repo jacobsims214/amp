@@ -357,6 +357,9 @@ pub struct ConfigReply {
     pub note: Option<(String, bool)>,
     /// The configuration files changed: run the `/reload` path now so the session takes it.
     pub reload: bool,
+    /// A fresh AMP login was stored (`/mcp login amp`, #4250): the metadata poller reconnects
+    /// now ([`MetaHandle::reconnect`]), so the header's "re-login needed" clears at once.
+    pub amp_relogin: bool,
 }
 
 impl ConfigReply {
@@ -3065,6 +3068,11 @@ impl Shell {
         }
         for line in &reply.errors {
             self.view.add_error(line);
+        }
+        if reply.amp_relogin
+            && let Some(meta) = &self.meta
+        {
+            meta.reconnect();
         }
         if reply.reload {
             self.reload_command(ReloadCause::Panel);

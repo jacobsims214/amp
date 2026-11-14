@@ -6,7 +6,8 @@
 //! - **`/mcp`**: every MCP server with its health, live from the session's hub (`health()`, so a
 //!   server turning ready shows at once). `/mcp <name>` shows one server in detail (what it runs or
 //!   connects to, where it is configured, secrets as their source only, trust, roles, its tools).
-//!   `/mcp restart|test|enable|disable|login|trust|untrust <name>` act on it; `/mcp add <name>
+//!   `/mcp restart|test|enable|disable|login|trust|untrust <name>` act on it (`/mcp login amp`
+//!   logs in to AMP itself and reconnects the session, #4250); `/mcp add <name>
 //!   <url> [--sse]` adds an HTTP (or SSE) server to the user config. Adding a stdio server,
 //!   editing, removing, importing and secrets stay in the terminal (`amp-harness mcp …`): the
 //!   panel names the command to copy.
@@ -48,7 +49,7 @@ use amp_core::{
     providers::SystemKeys,
     supervisor::SupervisorConfig,
 };
-use amp_mcp::oauth;
+use amp_mcp::{Auth, CredentialBackend, oauth};
 use amp_tui::{
     Cell, ConfigControl, ConfigFuture, ConfigReply, InfoPanel, InfoRow, Notifier, Tone,
     shell::short_role,
@@ -59,7 +60,13 @@ use crate::{
     agents_cmd::{self, Ctx, Scope},
     mcp_crud,
     models_cmd::{self, ScopeArgs},
+    server_cmd::Switcher,
 };
+
+/// `--snapshot` only (tests): a program run with a login's authorization URL in place of a
+/// browser, so a test can complete `/mcp login` against a local mock OAuth server. Never read in
+/// an interactive chat, which opens the real browser.
+pub const ENV_SNAPSHOT_BROWSER: &str = "AMP_HARNESS_SNAPSHOT_BROWSER";
 
 /// How long `/mcp test` waits for a server's attempt (on top of its own startup timeout).
 const TEST_GRACE: Duration = Duration::from_secs(2);
@@ -85,6 +92,9 @@ struct Inner {
     notes: Notifier,
     /// `/mcp login` opens the browser (not in `--snapshot`).
     browser: bool,
+    /// The session's AMP connection (`/server`): `/mcp login amp` logs in to its current server
+    /// and reconnects through it. `None`: `/mcp login amp` is not available.
+    switcher: Option<Arc<Switcher>>,
 }
 
 /// What the chat hands [`ChatConfig::new`].
@@ -97,6 +107,7 @@ pub struct ChatConfigParts {
     pub theme_flag: Option<String>,
     pub notes: Notifier,
     pub browser: bool,
+    pub switcher: Option<Arc<Switcher>>,
 }
 
 impl ChatConfig {
@@ -110,6 +121,7 @@ impl ChatConfig {
             theme_flag: parts.theme_flag,
             notes: parts.notes,
             browser: parts.browser,
+            switcher: parts.switcher,
         }))
     }
 }
@@ -170,6 +182,8 @@ impl Inner {
             "test" => self.mcp_test(&one(verb)?).await,
             "enable" => self.mcp_enable(&one(verb)?, true),
             "disable" => self.mcp_enable(&one(verb)?, false),
+            // AMP is not an `[mcp.*]` server (`amp` is a reserved name): its own login.
+            "login" if rest == ["amp"] => self.amp_login().await,
             "login" => self.mcp_login(&one(verb)?).await,
             "trust" => self.mcp_trust(&one(verb)?, true),
             "untrust" => self.mcp_trust(&one(verb)?, false),
@@ -376,26 +390,104 @@ impl Inner {
         Ok(reply)
     }
 
-    async fn mcp_login(&self, name: &str) -> Result<ConfigReply, String> {
+    /// The browser prompt of a login, in the transcript (never stderr: it would break the TUI's
+    /// screen). Opens the browser unless in `--snapshot`, where [`ENV_SNAPSHOT_BROWSER`] (tests)
+    /// may stand in for it.
+    fn login_prompt(&self, label: String) -> impl FnOnce(&oauth::LoginPrompt) + Send + 'static {
         let notes = self.notes.clone();
         let browser = self.browser;
-        let label = name.to_owned();
+        move |prompt: &oauth::LoginPrompt| {
+            let opened = if browser {
+                oauth::open_browser(&prompt.authorization_url).is_ok()
+            } else {
+                snapshot_browser(&prompt.authorization_url)
+            };
+            let how = if opened {
+                "Opened your browser to log in"
+            } else {
+                "Open this URL in a browser to log in"
+            };
+            notes.notice(format!(
+                "{label}: {how} (waiting on {}):\n  {}",
+                prompt.redirect_uri, prompt.authorization_url
+            ));
+        }
+    }
+
+    /// `/mcp login amp` (#4250): the browser login to the session's current AMP server (after
+    /// any `/server`), as `amp-harness login` does, then the session reconnects with it: an
+    /// offline chat connects ([`Switcher::connect_offline`]); an online one swaps its connection
+    /// without cutting off the manager's or workers' calls in flight
+    /// ([`amp_mcp::AmpMcpClient::reconnect_after_login`]); the reply makes the shell reconnect
+    /// the metadata poller now ([`ConfigReply::amp_relogin`]). A failed, cancelled or timed-out
+    /// login changes nothing: the stored login, the connection and the poller stay as they were.
+    async fn amp_login(&self) -> Result<ConfigReply, String> {
+        let Some(switcher) = &self.switcher else {
+            return Err("logging in to AMP is not available in this session; run \
+                        `amp-harness login` in a terminal"
+                .to_owned());
+        };
+        let settings = switcher.current();
+        if let Auth::Static { env, .. } = &settings.auth {
+            return Err(format!(
+                "AMP uses the token in {env}, which a browser login would not replace: set a new \
+                 token in {env} and restart the chat"
+            ));
+        }
+        let backend = CredentialBackend::resolve().map_err(|e| e.to_string())?;
+        let options = oauth::LoginOptions::new(settings.url.clone(), backend)
+            .with_ca_file(settings.ca_file.clone())
+            .with_timeout(oauth::DEFAULT_LOGIN_TIMEOUT);
+        let host = crate::setup::host_of(&settings.url);
+        let outcome = oauth::login(options, self.login_prompt(format!("AMP at {host}")))
+            .await
+            .map_err(|e| e.to_string())?;
+        // Keychain reads are cached per process (#2165): the reconnects read the new login.
+        if let Ok(backend) = CredentialBackend::resolve() {
+            backend.forget_cached(&settings.url);
+        }
+        let stored = format!(
+            "logged in to AMP at {host} ({}; stored in {})",
+            outcome.key, outcome.stored_in
+        );
+        if switcher.current().url != settings.url {
+            // A `/server` switch landed during the login: the session is on another server now.
+            return Ok(ConfigReply::done(format!(
+                "{stored}; the chat has switched servers since, so nothing was reconnected"
+            )));
+        }
+        let mcp = &self.rt.mcp;
+        let reconnected = if !mcp.is_online() {
+            switcher
+                .connect_offline()
+                .await
+                .map(|line| line.unwrap_or_else(|| "the session is connected".to_owned()))
+        } else {
+            mcp.reconnect_after_login()
+                .await
+                .map(|()| "the session reconnected with it".to_owned())
+        };
+        let mut reply = match reconnected {
+            Ok(line) => ConfigReply::done(format!("{stored}; {line}")),
+            Err(e) => {
+                let mut reply = ConfigReply::done(stored);
+                reply.errors.push(format!(
+                    "AMP: reconnecting with the new login failed ({}); the chat keeps retrying",
+                    e.reason()
+                ));
+                reply
+            }
+        };
+        reply.amp_relogin = true;
+        Ok(reply)
+    }
+
+    async fn mcp_login(&self, name: &str) -> Result<ConfigReply, String> {
         let (server, outcome) = mcp_crud::login_in(
             &self.ctx(),
             name,
             oauth::DEFAULT_LOGIN_TIMEOUT,
-            move |prompt: &oauth::LoginPrompt| {
-                let opened = browser && oauth::open_browser(&prompt.authorization_url).is_ok();
-                let how = if opened {
-                    "Opened your browser to log in"
-                } else {
-                    "Open this URL in a browser to log in"
-                };
-                notes.notice(format!(
-                    "MCP server `{label}`: {how} (waiting on {}):\n  {}",
-                    prompt.redirect_uri, prompt.authorization_url
-                ));
-            },
+            self.login_prompt(format!("MCP server `{name}`")),
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -1946,6 +2038,28 @@ fn permission_lines(frontmatter: Option<&Value>) -> Vec<String> {
             .collect(),
         Some(Value::String(a)) => vec![format!("everything: {a}")],
         _ => vec!["(none: every tool allowed)".to_owned()],
+    }
+}
+
+/// `--snapshot`'s stand-in for a browser ([`ENV_SNAPSHOT_BROWSER`]): runs that program with
+/// `url` in the background. False when it is not set or could not start.
+fn snapshot_browser(url: &str) -> bool {
+    let Some(program) = std::env::var_os(ENV_SNAPSHOT_BROWSER).filter(|p| !p.is_empty()) else {
+        return false;
+    };
+    match std::process::Command::new(program)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            // Reaped in the background; the login waits for its redirect, not for it.
+            std::thread::spawn(move || child.wait());
+            true
+        }
+        Err(_) => false,
     }
 }
 

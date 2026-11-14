@@ -5,6 +5,7 @@
 //! - Enter and the letter keys run the panel's slash commands for the selected row, and only the
 //!   keys that apply to that row (the hint says which);
 //! - a reply that changed files runs the `/reload` path once, saying "applied";
+//! - a reply after `/mcp login amp` makes the metadata poller reconnect now (#4250);
 //! - errors go to the transcript and the panel's note;
 //! - a panel longer than it shows scrolls past its last selectable row;
 //! - the AMP status line shows `mcp 3/4`.
@@ -83,6 +84,11 @@ impl ConfigControl for FakeConfig {
                 Ok(r)
             }
             ("mcp", "restart fs") => Ok(ConfigReply::done("MCP server `fs`: restarting")),
+            ("mcp", "login amp") => {
+                let mut r = ConfigReply::done("logged in to AMP; reconnected");
+                r.amp_relogin = true;
+                Ok(r)
+            }
             ("mcp", "nope") => Err("no MCP server `nope` (/mcp lists them)".to_owned()),
             ("config", "") => {
                 let rows = (0..40)
@@ -393,4 +399,34 @@ fn the_status_line_shows_mcp_health() {
     assert!(line.contains("mcp 3/4"), "{line}");
     let colors = rpi_tui::theme().colors;
     assert!(chrome::render_status(&data, &p, 160)[0].contains(&colors.warning.fg("mcp 3/4")));
+}
+
+/// #4250: `/mcp login amp`'s reply asks the shell to reconnect the metadata poller at once;
+/// other replies never do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_amp_relogin_reconnects_the_metadata_poller() {
+    let mut rig = rig(true).await;
+    let meta = amp_core::meta::MetaHandle::stub(
+        amp_core::meta::AmpMeta::default(),
+        Arc::new(|tool, _| Err(format!("{tool}: not in the stub"))),
+    );
+    rig.shell.set_meta(meta.clone());
+    let reconnects = |meta: &amp_core::meta::MetaHandle| {
+        meta.stub_calls()
+            .iter()
+            .filter(|(tool, _)| tool == "reconnect")
+            .count()
+    };
+    rig.submit("/mcp restart fs").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(reconnects(&meta), 0, "{:?}", meta.stub_calls());
+
+    rig.submit("/mcp login amp").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while reconnects(&meta) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "no reconnect");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(reconnects(&meta), 1);
+    assert!(flat(&rig.screen()).contains("logged in to AMP; reconnected"));
 }

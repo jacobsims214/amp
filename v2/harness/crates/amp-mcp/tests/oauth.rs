@@ -783,6 +783,56 @@ async fn login_times_out_when_the_browser_never_returns() {
     );
 }
 
+/// #4250 (`/mcp login amp` in the chat): a re-login that is denied in the browser or times out
+/// leaves the stored login as it was, and it still connects. Only a completed code exchange
+/// writes the store.
+#[tokio::test]
+async fn a_failed_or_timed_out_relogin_keeps_the_stored_login() {
+    let mock = spawn_mock_as(3600).await;
+    let backend = file_backend("relogin-fails");
+    login(&mock, &backend).await.expect("first login");
+    let before = stored_access_token(&backend, &mock.url).await;
+
+    let deny: fn(String) -> Vec<String> = |location| {
+        let (base, query) = location.split_once('?').unwrap();
+        let state = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("state="))
+            .unwrap()
+            .to_owned();
+        vec![format!("{base}?error=access_denied&state={state}")]
+    };
+    let err = oauth::login(
+        LoginOptions::new(&mock.url, backend.clone()).with_timeout(Duration::from_secs(20)),
+        browser(Some(deny)),
+    )
+    .await
+    .expect_err("denied");
+    assert!(
+        matches!(&err, McpError::OAuth(m) if m.contains("access_denied")),
+        "{err:?}"
+    );
+    assert_eq!(stored_access_token(&backend, &mock.url).await, before);
+
+    let err = oauth::login(
+        LoginOptions::new(&mock.url, backend.clone()).with_timeout(Duration::from_millis(300)),
+        |_prompt: &LoginPrompt| {},
+    )
+    .await
+    .expect_err("timeout");
+    assert!(
+        matches!(&err, McpError::OAuth(m) if m.contains("no answer")),
+        "{err:?}"
+    );
+    assert_eq!(stored_access_token(&backend, &mock.url).await, before);
+    assert_eq!(mock.state.code_exchanges.load(Ordering::SeqCst), 1);
+
+    let client = oauth::connect(options(&mock.url), &backend)
+        .await
+        .expect("the old login still connects");
+    client.call_tool("amp_whoami", None).await.expect("call");
+}
+
 /// How long a stalled-AS test may take before we call it a hang.
 const HANG: Duration = Duration::from_secs(10);
 
