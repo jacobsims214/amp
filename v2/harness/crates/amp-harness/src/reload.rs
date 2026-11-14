@@ -124,9 +124,15 @@ impl Live {
             .reload(&SystemKeys::from_env(), &env)
             .await
             .map_err(|e| format!("{e}; nothing was changed"))?;
-        // amp_run_ticket's description lists the roster: a fresh one lists the new one.
+        // amp_run_ticket's description lists the roster: a fresh one lists the new one. The
+        // worker-control tools (#4233) come back with it, so /reload never drops them.
         let refreshed = self
-            .refresh(self.supervisor.iter().map(|s| s.tool()).collect())
+            .refresh(
+                self.supervisor
+                    .iter()
+                    .flat_map(crate::session::manager_tools)
+                    .collect(),
+            )
             .await?;
         let mut lines = report.lines();
         if lines.is_empty() && refreshed.prompt_changed {

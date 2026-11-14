@@ -6,7 +6,8 @@
 //! Covers: dispatch → worktree → worker on its own model → result back to the manager; unknown
 //! and non-dispatchable agents and AMP refusals; the parallel cap; the wall-clock timeout; the
 //! turn budget; cancelling the manager cancels its worker; `cancel_all` cancels running and
-//! queued workers.
+//! queued workers; the manager's `amp_stop_worker` (#4233) stops a launched worker, records the
+//! abandoned run with its reason and hands the ticket back.
 
 mod common;
 
@@ -23,10 +24,12 @@ use amp_core::{
     faux::StepSpec,
     project::ProjectMarker,
     providers::StaticKeys,
+    run_report::RunReporter,
     supervisor::{
-        ManagerContext, RunRequest, RunTicketError, Supervisor, SupervisorConfig, WorkerHooks,
-        WorkerInfo, WorkerOutcome, WorkerReport, live_tickets,
+        DispatchMode, ManagerContext, RunRequest, RunTicketError, Supervisor, SupervisorConfig,
+        WorkerHooks, WorkerInfo, WorkerOutcome, WorkerReport, live_tickets,
     },
+    worker_control,
     workspace::{Isolation, Placement},
 };
 use amp_mcp::{AmpMcpClient, ClientOptions};
@@ -1069,4 +1072,169 @@ async fn worktree_isolation_refuses_a_folder_without_a_usable_repository() {
         .await
         .unwrap();
     assert_eq!(r.cwd, child);
+}
+
+// ------------------------------------------------------------------------------------------------
+// #4233: the manager's amp_stop_worker.
+// ------------------------------------------------------------------------------------------------
+
+impl Fixture {
+    /// A launched-mode supervisor whose hooks are the real run reporter (abandoned runs and
+    /// hand-backs go to the mock AMP).
+    fn reporting_launcher(&self, max_parallel: usize) -> Arc<Supervisor> {
+        Supervisor::with_hooks(
+            Arc::clone(&self.rt),
+            self.manager(),
+            SupervisorConfig {
+                max_parallel,
+                abort_grace: Duration::from_secs(5),
+                dispatch: DispatchMode::Launch,
+                ..SupervisorConfig::default()
+            },
+            Some(RunReporter::new(Arc::clone(&self.rt.mcp)) as Arc<dyn WorkerHooks>),
+        )
+    }
+
+    async fn wait_for_calls(&self, tool: &str, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while self.amp.mock.calls_to(tool).len() < n {
+            assert!(Instant::now() < deadline, "no {n} {tool} calls in time");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// Calls the manager's `amp_stop_worker` the way its model would, returning the result's details.
+async fn stop_tool(sup: &Arc<Supervisor>, args: Value) -> Value {
+    let tools = worker_control::tools(sup);
+    let tool = tools
+        .iter()
+        .find(|t| t.tool.schema().name == "amp_stop_worker")
+        .expect("amp_stop_worker is registered");
+    tool.tool
+        .execute("call-1", args, CancellationToken::new(), Arc::new(|_| {}))
+        .await
+        .expect("amp_stop_worker answers")
+        .details
+}
+
+/// The manager stops a launched worker: the run ends cancelled with `stopped by manager:
+/// <reason>`, exactly one abandoned run is reported with that note and the ticket is handed back
+/// once with the run's dispatch, nothing completes it, and the person-at-chat "ask them" note is
+/// not added. A second stop is idempotent; a ticket this chat never ran is not_found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_manager_stops_a_launched_worker_and_its_ticket_comes_back_abandoned() {
+    let f = fixture("manager-stop").await;
+    let sup = f.reporting_launcher(2);
+    f.script(
+        "wf",
+        vec![bash_then_done("sleep 30"), bash_then_done("sleep 30")],
+    );
+    sup.launch(req(4233, "worker-backend"), CancellationToken::new())
+        .await
+        .expect("launched");
+    f.wait_for_calls("amp_claim_task", 1).await;
+
+    let out = stop_tool(
+        &sup,
+        json!({"task_id": 4233, "reason": "wrong approach,\n restart later"}),
+    )
+    .await;
+    assert_eq!(out["status"], "stopped", "{out}");
+    assert_eq!(out["action"], "stop");
+    assert_eq!(out["outcome"], "cancelled");
+    assert_eq!(out["returned"], true);
+    assert!(
+        live_tickets(&sup).is_empty(),
+        "not live once the tool answered"
+    );
+
+    let reported = f.amp.mock.calls_to("amp_report_run");
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert_eq!(reported[0]["outcome"], "abandoned");
+    let note = reported[0]["run_note"].as_str().unwrap_or_default();
+    assert_eq!(
+        note, "abandoned: cancelled: stopped by manager: wrong approach, restart later",
+        "the reason is on the run"
+    );
+    let returned = f.amp.mock.calls_to("amp_return_task");
+    assert_eq!(returned.len(), 1, "{returned:?}");
+    assert_eq!(returned[0]["task_id"], 4233);
+    assert!(
+        returned[0]["dispatch_id"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "handed back with this run's dispatch: {returned:?}"
+    );
+    assert!(f.amp.mock.calls_to("amp_complete_task").is_empty());
+
+    let session = sup.finished_session(4233).expect("a finished session");
+    assert_eq!(session.outcome, Some(WorkerOutcome::Cancelled));
+    assert_eq!(session.stopped_by.as_deref(), Some("the manager"));
+    let end = tokio::time::timeout(Duration::from_secs(10), sup.next_launch_end())
+        .await
+        .expect("the launch end");
+    let report = end.result.expect("a report");
+    assert_eq!(
+        report.error.as_deref(),
+        Some("stopped by manager: wrong approach, restart later")
+    );
+    assert!(
+        report
+            .notes
+            .iter()
+            .all(|n| !n.contains("ask them") && !n.contains("from the chat")),
+        "no person-at-chat wording: {:?}",
+        report.notes
+    );
+
+    // Again: nothing more happens in AMP.
+    let again = stop_tool(&sup, json!({"task_id": 4233, "reason": "again"})).await;
+    assert_eq!(again["status"], "already_finished", "{again}");
+    assert_eq!(f.amp.mock.calls_to("amp_report_run").len(), 1);
+    assert_eq!(f.amp.mock.calls_to("amp_return_task").len(), 1);
+
+    let unknown = stop_tool(&sup, json!({"task_id": 999, "reason": "x"})).await;
+    assert_eq!(unknown["status"], "not_found", "{unknown}");
+}
+
+/// A worker still waiting for a slot is stopped before AMP hears of it: `not_dispatched`, no
+/// second dispatch, and its launch end says the manager stopped it (not "ask them").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_worker_the_manager_stops_is_never_dispatched() {
+    let f = fixture("manager-stop-queued").await;
+    let sup = f.reporting_launcher(1);
+    f.script(
+        "wf",
+        vec![bash_then_done("sleep 30"), bash_then_done("sleep 30")],
+    );
+    sup.launch(req(4301, "worker-backend"), CancellationToken::new())
+        .await
+        .expect("first launched");
+    f.wait_for_calls("amp_claim_task", 1).await;
+    sup.launch(req(4302, "worker-backend"), CancellationToken::new())
+        .await
+        .expect("second launched (queued)");
+
+    let out = stop_tool(&sup, json!({"task_id": 4302, "reason": "not needed"})).await;
+    assert_eq!(out["status"], "not_dispatched", "{out}");
+    assert_eq!(
+        f.dispatched().len(),
+        1,
+        "the queued worker was never dispatched"
+    );
+    let end = tokio::time::timeout(Duration::from_secs(10), sup.next_launch_end())
+        .await
+        .expect("the launch end");
+    assert_eq!(end.task_id, 4302);
+    let err = end.result.expect_err("nothing was dispatched");
+    assert!(
+        err.contains("the manager stopped") && err.contains("not needed"),
+        "{err}"
+    );
+    assert!(!err.contains("Ask them"), "{err}");
+
+    // Clean up the running one the same way.
+    let first = stop_tool(&sup, json!({"task_id": 4301, "reason": "done testing"})).await;
+    assert_eq!(first["status"], "stopped", "{first}");
 }

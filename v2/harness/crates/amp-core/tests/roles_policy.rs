@@ -13,8 +13,8 @@ use amp_core::{
     assets::{Assets, OverrideDirs},
     models::{ModelsConfig, ModelsFile},
     policy::{
-        DISPATCH_TOOL, DenialReason, Policy, QUESTION_TOOL, ToolPolicy, resolve_read_tool_path,
-        resolve_symlinks, resolve_tool_path,
+        DISPATCH_TOOL, DenialReason, Policy, QUESTION_TOOL, STOP_WORKER_TOOL, ToolPolicy,
+        WORKER_CONTROL_TOOLS, resolve_read_tool_path, resolve_symlinks, resolve_tool_path,
     },
     roles::{RoleError, RoleRegistry},
 };
@@ -418,6 +418,14 @@ fn manager_policy() {
         DenialReason::BadArguments
     );
 
+    // #4233: the manager stops its own workers, without a prompt (no rule asks or denies it).
+    assert!(p.exposes(STOP_WORKER_TOOL));
+    assert!(allowed(
+        &p,
+        STOP_WORKER_TOOL,
+        json!({"task_id": 1, "reason": "wrong approach"})
+    ));
+
     // Reads and AMP tools: allowed.
     assert!(allowed(&p, "read", json!({"path": "README.md"})));
     assert!(allowed(&p, "grep", json!({"pattern": "x"})));
@@ -730,6 +738,17 @@ fn every_worker_policy_matches_its_frontmatter() {
             !p.exposes(QUESTION_TOOL) && !p.exposes(DISPATCH_TOOL),
             "{id}"
         );
+
+        // Never: the manager's worker-control tools (#4233), with their own denial.
+        for tool in WORKER_CONTROL_TOOLS {
+            let d = p
+                .check(tool, &json!({"task_id": 7, "reason": "x"}))
+                .unwrap_err();
+            assert_eq!(d.reason, DenialReason::ChildWorkerControl, "{id} {tool}");
+            assert_eq!(d.subject, "7", "{id} {tool}");
+            assert!(d.to_string().contains("Only the manager"), "{id} {tool}");
+            assert!(!p.exposes(tool), "{id} {tool}");
+        }
 
         // AMP tools and reads: allowed.
         assert!(

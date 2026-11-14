@@ -909,6 +909,25 @@ pub enum RunTicketError {
         "{by} stopped the worker on #{task_id} from the chat before it started; nothing was dispatched. Ask them before running it again"
     )]
     Stopped { task_id: i64, by: String },
+    /// The manager stopped the worker with `amp_stop_worker` while it waited for a slot (#4233).
+    #[error(
+        "the manager stopped the worker on #{task_id} before it started ({reason}); nothing was dispatched"
+    )]
+    StoppedByManager { task_id: i64, reason: String },
+}
+
+impl RunTicketError {
+    /// The end of a run stopped while it waited its turn, in the words of whoever stopped it.
+    fn stopped_while_queued(task_id: i64, by: Option<StopBy>) -> Self {
+        match by {
+            Some(StopBy::Manager { reason }) => Self::StoppedByManager { task_id, reason },
+            Some(StopBy::Person(by)) => Self::Stopped { task_id, by },
+            None => Self::Stopped {
+                task_id,
+                by: String::new(),
+            },
+        }
+    }
 }
 
 /// Why [`Supervisor::stop_worker`] did nothing.
@@ -1004,6 +1023,56 @@ pub fn stopped_from_chat(by: &str) -> String {
     format!("stopped by {by} from the chat")
 }
 
+/// What a stop by the manager says (#4233): the worker's error, so the abandoned run's note reads
+/// `abandoned: cancelled: stopped by manager: <reason>`.
+pub fn stopped_by_manager(reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        "stopped by manager".to_owned()
+    } else {
+        format!("stopped by manager: {reason}")
+    }
+}
+
+/// Who asked a live worker to stop, and so what its end says (#4233).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopBy {
+    /// The person at the chat (#2252), by name.
+    Person(String),
+    /// The manager, with `amp_stop_worker`'s reason.
+    Manager { reason: String },
+}
+
+impl StopBy {
+    /// Who stopped it, as the `/workers` panel says it ([`WorkerSessionInfo::stopped_by`]).
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Person(name) => name,
+            Self::Manager { .. } => "the manager",
+        }
+    }
+
+    /// The stopped run's error: [`stopped_from_chat`] or [`stopped_by_manager`].
+    pub fn error(&self) -> String {
+        match self {
+            Self::Person(name) => stopped_from_chat(name),
+            Self::Manager { reason } => stopped_by_manager(reason),
+        }
+    }
+
+    /// The note the manager reads about the stop, if any. A person's stop tells the manager to
+    /// ask them first (#2252); the manager's own stop has nobody else to ask.
+    fn note(&self, task_id: i64) -> Option<String> {
+        match self {
+            Self::Person(by) => Some(format!(
+                "{by} watched this worker and stopped it from the chat; ask them \
+                 before running #{task_id} again"
+            )),
+            Self::Manager { .. } => None,
+        }
+    }
+}
+
 /// A worker's phase, for a `/workers` view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1044,9 +1113,9 @@ struct LiveWorker {
     totals: Option<Arc<Mutex<Totals>>>,
     /// Every event the worker emitted, for the chat's session view (#2252).
     feed: Arc<WorkerFeed>,
-    /// Cancelled by [`Supervisor::stop_worker`]; `stopped_by` says who.
+    /// Cancelled by [`Supervisor::stop_worker_as`]; `stopped_by` says who.
     stop: CancellationToken,
-    stopped_by: Arc<Mutex<Option<String>>>,
+    stopped_by: Arc<Mutex<Option<StopBy>>>,
     branch: Option<String>,
     context_window: Option<u64>,
 }
@@ -1459,6 +1528,22 @@ impl Supervisor {
     /// `[worker summaries]` ([`LaunchEnd::summary`]) in Launch mode. A worker still waiting for a
     /// slot is never dispatched.
     pub fn stop_worker(&self, task_id: i64, by: &str) -> Result<(), StopError> {
+        let by = by.trim();
+        self.stop_worker_as(
+            task_id,
+            StopBy::Person(if by.is_empty() {
+                "the person".to_owned()
+            } else {
+                by.to_owned()
+            }),
+        )
+    }
+
+    /// [`Supervisor::stop_worker`] for any [`StopBy`]: the manager's `amp_stop_worker` stops a
+    /// worker with [`StopBy::Manager`] (#4233), whose end says `stopped by manager: <reason>` and
+    /// carries no "ask them" note. Fire-and-forget like `stop_worker`:
+    /// [`Supervisor::wait_not_live`] waits for the run's end and hand-back.
+    pub fn stop_worker_as(&self, task_id: i64, by: StopBy) -> Result<(), StopError> {
         let live = self.live.lock().unwrap();
         let Some(w) = live.get(&task_id) else {
             return Err(if self.finished.lock().unwrap().contains_key(&task_id) {
@@ -1470,14 +1555,37 @@ impl Supervisor {
         if w.stop.is_cancelled() {
             return Err(StopError::AlreadyStopping(task_id));
         }
-        let by = by.trim();
-        *w.stopped_by.lock().unwrap() = Some(if by.is_empty() {
-            "the person".to_owned()
-        } else {
-            by.to_owned()
-        });
+        *w.stopped_by.lock().unwrap() = Some(by);
         w.stop.cancel();
         Ok(())
+    }
+
+    /// Waits at most `bound` for ticket `task_id` to have no live worker in this process (#4233).
+    /// A run leaves the live map only after its end was reported and its ticket handed back, so
+    /// `true` means AMP has been told (or [`WorkerSessionInfo::returned`] says why not). `false`:
+    /// still live when `bound` ran out.
+    pub async fn wait_not_live(&self, task_id: i64, bound: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + bound;
+        loop {
+            if !self.live.lock().unwrap().contains_key(&task_id) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// The last finished run of ticket `task_id` in this process, whether or not another is live
+    /// now (#4233): how it ended (`outcome`, `error`), who stopped it, and what handing its ticket
+    /// back did (`returned`). `None` when no run of it reached AMP and ended here.
+    pub fn finished_session(&self, task_id: i64) -> Option<WorkerSessionInfo> {
+        self.finished
+            .lock()
+            .unwrap()
+            .get(&task_id)
+            .map(|f| f.info.clone())
     }
 
     /// Hands `text` to the running worker on `task_id`, verbatim, as a steering message from
@@ -1530,7 +1638,11 @@ impl Supervisor {
                 Some(w) => (
                     Arc::clone(&w.feed),
                     w.since,
-                    w.stopped_by.lock().unwrap().clone(),
+                    w.stopped_by
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|b| b.name().to_owned()),
                     w.context_window,
                 ),
                 None => (WorkerFeed::new(), SystemTime::now(), None, None),
@@ -1770,8 +1882,8 @@ impl Supervisor {
                 _ = signal.cancelled() => return Err(RunTicketError::Cancelled),
                 _ = self.cancel.cancelled() => return Err(RunTicketError::Cancelled),
                 _ = stops.stop.cancelled() => {
-                    let by = stops.stopped_by.lock().unwrap().clone().unwrap_or_default();
-                    return Err(RunTicketError::Stopped { task_id: req.task_id, by });
+                    let by = stops.stopped_by.lock().unwrap().clone();
+                    return Err(RunTicketError::stopped_while_queued(req.task_id, by));
                 }
                 g = Arc::clone(&self.writer).lock_owned() => g,
             })
@@ -1785,8 +1897,8 @@ impl Supervisor {
             _ = signal.cancelled() => return Err(RunTicketError::Cancelled),
             _ = self.cancel.cancelled() => return Err(RunTicketError::Cancelled),
             _ = stops.stop.cancelled() => {
-                let by = stops.stopped_by.lock().unwrap().clone().unwrap_or_default();
-                return Err(RunTicketError::Stopped { task_id: req.task_id, by });
+                let by = stops.stopped_by.lock().unwrap().clone();
+                return Err(RunTicketError::stopped_while_queued(req.task_id, by));
             }
             p = Arc::clone(&self.slots).acquire_owned() => p.map_err(|_| RunTicketError::Cancelled)?,
         };
@@ -2298,8 +2410,11 @@ impl Supervisor {
             _ = &mut deadline => Stop::Ended(WorkerOutcome::Timeout, format!("no result after {}", human_duration(self.config.timeout))),
             _ = budget.cancelled() => Stop::Ended(WorkerOutcome::TurnBudget, format!("turn budget of {} turns used up", self.config.max_turns)),
             _ = stop.cancelled() => {
-                let by = stopped_by.lock().unwrap().clone().unwrap_or_default();
-                Stop::Ended(WorkerOutcome::Cancelled, stopped_from_chat(&by))
+                let why = match stopped_by.lock().unwrap().as_ref() {
+                    Some(by) => by.error(),
+                    None => stopped_from_chat(""),
+                };
+                Stop::Ended(WorkerOutcome::Cancelled, why)
             }
         };
         let result = match stop {
@@ -2329,15 +2444,15 @@ impl Supervisor {
                 // Read after the abort settled: a closing call can end during the grace period.
                 let closed = *watch.closed.lock().unwrap();
                 if closed.is_none()
-                    && let Some(by) = stopped_by.lock().unwrap().clone()
+                    && let Some(note) = stopped_by
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|by| by.note(req.task_id))
                 {
                     // #2252: the manager reads this in amp_run_ticket's result (Await mode) or
                     // in a later turn's [worker summaries] via LaunchEnd::summary (Launch mode).
-                    notes.push(format!(
-                        "{by} watched this worker and stopped it from the chat; ask them \
-                         before running #{} again",
-                        req.task_id
-                    ));
+                    notes.push(note);
                 }
                 let finish = finish.after_closing(closed, &mut notes);
                 self.end_steering(req.task_id, &harness, &watch, &mut notes)
@@ -2576,7 +2691,7 @@ async fn worktree_start(path: &Path) -> Option<String> {
 struct StopHandle {
     signal: CancellationToken,
     stop: CancellationToken,
-    stopped_by: Arc<Mutex<Option<String>>>,
+    stopped_by: Arc<Mutex<Option<StopBy>>>,
 }
 
 struct Where {
@@ -2993,7 +3108,12 @@ fn live_info(task_id: i64, w: &LiveWorker) -> WorkerSessionInfo {
             .unwrap_or_default(),
         outcome: None,
         error: None,
-        stopped_by: w.stopped_by.lock().unwrap().clone(),
+        stopped_by: w
+            .stopped_by
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|b| b.name().to_owned()),
         returned: None,
         session_file: None,
         branch: w.branch.clone(),

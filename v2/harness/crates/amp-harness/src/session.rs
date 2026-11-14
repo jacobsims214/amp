@@ -8,7 +8,7 @@
 //! [`Session::fanout`], or reads the numbered chat from [`Session::feed`].
 //!
 //! A primary role (the manager) also gets a worker [`Supervisor`] and its `amp_run_ticket` tool
-//! (D7, M2-5), limited by config.toml `[workers]` and `AMP_HARNESS_MAX_WORKERS` /
+//! (D7, M2-5) with its worker-control tools ([`manager_tools`]: `amp_stop_worker`, #4233), limited by config.toml `[workers]` and `AMP_HARNESS_MAX_WORKERS` /
 //! `AMP_HARNESS_WORKER_TIMEOUT_SECS` / `AMP_HARNESS_WORKER_MAX_TURNS`. Aborting the manager's run
 //! cancels the workers its tool calls started; [`Supervisor::cancel_all`] cancels every worker.
 //!
@@ -111,6 +111,15 @@ pub struct Session {
     pub mcp_events: tokio::sync::broadcast::Receiver<amp_core::mcp_hub::HubEvent>,
     /// MCP servers still on their first attempt when the session was built.
     pub mcp_starting: Vec<String>,
+}
+
+/// The manager's tools that come with its [`Supervisor`]: `amp_run_ticket` and the worker-control
+/// tools (`amp_stop_worker`, #4233; restart/resume join [`amp_core::worker_control::tools`] without
+/// touching this). The session and `/reload` both register exactly this list.
+pub(crate) fn manager_tools(sup: &Arc<Supervisor>) -> Vec<rpi_harness::types::HarnessTool> {
+    let mut tools = vec![sup.tool()];
+    tools.extend(amp_core::worker_control::tools(sup));
+    tools
 }
 
 /// The manager's `[workers]` settings for this front end: `dispatch` decides the mode (see
@@ -265,7 +274,8 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
     spec.project = project.clone();
     // #2364: where its workers work (git worktrees, a folder each, or this folder shared).
     spec.extra_context = supervisor.as_ref().map(|s| s.workspace_context());
-    spec.extra_tools = supervisor.iter().map(|s| s.tool()).collect();
+    // #4233: amp_run_ticket, then the manager's worker-control tools (amp_stop_worker, ...).
+    spec.extra_tools = supervisor.iter().flat_map(manager_tools).collect();
     spec.extra_tools.push(SessionUsageTool::harness_tool(
         model,
         Arc::clone(&totals),
