@@ -163,6 +163,12 @@ func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("GET /api/teams/{id}/requests", h.teamRequestQueue)
 	mux.HandleFunc("GET /api/teams/{id}/requests/summary", h.teamRequestSummary)
 	mux.HandleFunc("GET /api/teams/{id}/requests/{request}", h.teamRequestDetail)
+	// The request's discussion (request_reads.go, AMP #4270): the read the POST
+	// beside it never had. Registered here, in the reads block, rather than next
+	// to its write, so the read routes stay one list a reviewer can compare
+	// against the view matrix above — and through deniedMux, so the submit-scope
+	// gate refuses a submit-only credential before the handler runs.
+	mux.HandleFunc("GET /api/teams/{id}/requests/{request}/comments", h.teamRequestComments)
 	// Team request writes (request_mutations.go, AMP #3971): the submitter's
 	// versioned edit and the four triage acts, each on its own sub-path so a
 	// method+path pair names exactly one act. All through deniedMux, so the

@@ -1026,12 +1026,16 @@ func TestAppendRequestCommentRetryIsIdempotent(t *testing.T) {
 // if someone adds a method that happens to build its SQL dynamically.
 func TestRequestCommentsHaveNoEditOrDeleteSurface(t *testing.T) {
 	// The exported surface on *Repo that names a request comment. Only these
-	// three may exist: append, and the two reads the retry path and the thread
-	// need.
+	// three may exist: append, and the two reads the thread needs — the rows
+	// (which the requester projection and any caller without a cursor use) and
+	// the paged view whose cursor is the repository's own clamped bound
+	// (AMP #4270). A third read added later must be named here too, which is
+	// exactly the review this test is for.
 	typ := reflect.TypeOf(&Repo{})
 	allowed := map[string]bool{
-		"AppendRequestComment": true,
-		"ListRequestComments":  true,
+		"AppendRequestComment":   true,
+		"ListRequestComments":    true,
+		"ListRequestCommentPage": true,
 	}
 	var commentMethods []string
 	for i := 0; i < typ.NumMethod(); i++ {
@@ -1044,8 +1048,8 @@ func TestRequestCommentsHaveNoEditOrDeleteSurface(t *testing.T) {
 			t.Errorf("*Repo.%s names a request comment and is not one of the append/read methods: the thread is append-only, so an edit or a delete must be a new row, never a method", name)
 		}
 	}
-	if len(commentMethods) < 2 {
-		t.Fatalf("found %v on *Repo: expected AppendRequestComment and ListRequestComments", commentMethods)
+	if len(commentMethods) < 3 {
+		t.Fatalf("found %v on *Repo: expected AppendRequestComment, ListRequestComments and ListRequestCommentPage", commentMethods)
 	}
 
 	// And the column list stays in step with the table it scans, the way

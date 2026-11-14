@@ -11,13 +11,17 @@ package api
 //	GET /api/teams/:id/requests/summary     the same counts without a page (My work's inbox panels)
 //	GET /api/teams/:id/requests/:request    one request — by serial or by public reference — with
 //	                                        its delivery aggregate
+//	GET /api/teams/:id/requests/:request/comments
+//	                                        one request's discussion, as the caller's view of that
+//	                                        request allows it (AMP #4270)
 //	GET /api/requests                       the caller's OWN requests, projected, never the record
 //	GET /api/requests/:request              one of the caller's own, by serial or public reference
 //
 // Every one of them is a thin adapter over the one authorized read path
 // (internal/service/request_views.go, slice S2: ListRequests, GetRequest,
-// ListOwnRequests). It decodes a query string or a path, maps the transport's
-// own facts onto the service's input and encodes the service's answer. It
+// ListOwnRequests, and the discussion's ListRequestComments). It decodes a query
+// string or a path, maps the transport's own facts onto the service's input and
+// encodes the service's answer. It
 // decides nothing: who may read what, the tenant, the keyset cursor, the
 // cursor-free counts, the requester whitelist and every 404 are the service's,
 // so the codes a client branches on are the same ones the MCP reads (slice I1)
@@ -62,9 +66,9 @@ package api
 //   - no writes. Nothing here submits, edits, comments, claims, assigns,
 //     transitions, links, delivers or accepts; a read never writes an audit row,
 //     because looking at a queue is not an act on it.
-//   - no attachment or comment reads. Files are slice G3's (the mint and serve
-//     routes already exist in request_download.go) and the thread is the detail
-//     page's own read (J2/F2), not this ticket's.
+//   - no attachment reads. Files are slice G3's (the mint and serve routes
+//     already exist in request_download.go); the thread read is here because it
+//     is one request's read, and it is the discussion's only read (AMP #4270).
 //   - no surrogate counts. Every number here is the service's aggregate over the
 //     same predicate as the page it sits beside, so a pill can never describe a
 //     different queue than the list beneath it (request_summaries.go).
@@ -186,6 +190,127 @@ func (h *RestHandler) teamRequestDetail(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	h.writeRequestRead(w, r, read)
+}
+
+// teamRequestComments serves GET /api/teams/:id/requests/:request/comments:
+// one request's discussion.
+//
+// It is the read the POST beside it has always lacked (AMP #4270): the wire
+// list of the write route, in the shape the client already types
+// (RequestComment: id, request_id, kind, body, author, author_user_id,
+// created_at), so the detail page can render the thread without a second shape
+// to keep in step.
+//
+// It decides nothing. The path value is decoded with requestReadTarget — the
+// same decoder the detail read uses, so the serial and the requester's opaque
+// reference are accepted exactly where they are accepted there — and the service
+// runs the same load-and-decide, which is why an unknown team, another team's
+// request, another requester's request and a request in another org are one 404
+// with one code, byte for byte, rather than a 403 from this route alone.
+//
+// Two views, one envelope, and exactly one of the two item fields is ever
+// filled (the same discipline as writeRequestRead): the team's answer is
+// `comments` — every row, including internal remarks; the requester's is
+// `shared_comments`, the projection's kind filter and two-word attribution, in
+// domain.RequesterComment's shape (kind, from, body, at), which has no field
+// for an id, an author's name or a user id. Absent, not null: a client can tell
+// "this view has no such list" from "the list is empty", which is the
+// distinction the detail page's seam already relies on.
+//
+// after_id and limit page the team's thread forward. A requester's rows carry no
+// id, so the service drops their cursor and their page is the repository's
+// bounded first page: the answer says next_after_id is absent rather than
+// handing them a number that is not theirs to use.
+func (h *RestHandler) teamRequestComments(w http.ResponseWriter, r *http.Request) {
+	teamID, ok := requestPathTeam(w, r)
+	if !ok {
+		return
+	}
+	ref, err := requestReadTarget(r.PathValue("request"))
+	if err != nil {
+		fail(w, err, http.StatusBadRequest)
+		return
+	}
+	p, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	in, err := parseRequestThreadQuery(r.URL.Query())
+	if err != nil {
+		fail(w, err, http.StatusBadRequest)
+		return
+	}
+	ref.TeamID = teamID
+	in.RequestReadInput = ref
+	thread, err := h.svc.ListRequestComments(r.Context(), p, in)
+	if err != nil {
+		fail(w, err, http.StatusInternalServerError)
+		return
+	}
+	if thread == nil || thread.View.None() {
+		// Unreachable through ListRequestComments, which refuses both. It is
+		// here so a future caller that skips the decision fails closed instead
+		// of encoding an empty thread as a real answer.
+		fail(w, authz.RequestNotFound(), http.StatusNotFound)
+		return
+	}
+	answer := requestThreadAnswer{
+		View:        thread.View.String(),
+		Count:       thread.Count,
+		NextAfterID: thread.NextAfterID,
+	}
+	if thread.View.Full() {
+		answer.RequestID = thread.RequestID
+		comments := thread.Comments
+		if comments == nil {
+			comments = []domain.RequestComment{}
+		}
+		answer.Comments = &comments
+	} else {
+		if thread.Comments != nil {
+			// Fail closed rather than encode the team's thread to a requester:
+			// the service guarantees this, so reaching it means a caller
+			// assembled a RequestThread by hand.
+			fail(w, authz.RequestNotFound(), http.StatusNotFound)
+			return
+		}
+		shared := thread.Shared
+		if shared == nil {
+			shared = []domain.RequesterComment{}
+		}
+		answer.Shared = &shared
+	}
+	jsonOK(w, answer)
+}
+
+// requestThreadAnswer is one request's discussion, as the caller's view of that
+// request allows it.
+//
+// View says which of the two item fields is set, and exactly one ever is. The
+// two shapes are the product's, not this route's invention: Comments is the
+// stored row (identical to the POST's own record and to the UI's RequestComment)
+// and Shared is the requester's projection of a comment, which can say only
+// "you" or "the desk" and carries no id.
+type requestThreadAnswer struct {
+	// View is the decision that produced this answer: "team" or "requester".
+	View string `json:"view"`
+	// RequestID is the request the thread belongs to, for the team's answer
+	// only. A requester's rows and projection have no field for the internal
+	// serial (they address their request by its public reference), so this answer
+	// does not hand it to them — the same whitelist rule the rest of the
+	// requester's surface follows.
+	RequestID int `json:"request_id,omitempty"`
+	// Count is how many rows this page holds.
+	Count int `json:"count"`
+	// NextAfterID is the forward cursor, absent on the last page and on a
+	// requester's answer (whose rows carry no id).
+	NextAfterID int64 `json:"next_after_id,omitempty"`
+	// Comments is the team's whole thread, in append order. Pointer so that an
+	// empty thread encodes as [] and a requester's answer omits it entirely.
+	Comments *[]domain.RequestComment `json:"comments,omitempty"`
+	// Shared is the requester's thread: the shared kinds, attributed "you"/"the
+	// desk", with no id, author name or user id.
+	Shared *[]domain.RequesterComment `json:"shared_comments,omitempty"`
 }
 
 // ownRequests serves GET /api/requests: the caller's own requests, projected.
@@ -409,6 +534,34 @@ func parseRequestQueueQuery(q url.Values, p authz.Principal) (service.RequestQue
 	if in.MineLimit, err = requestQueryCount(q, "mine_limit"); err != nil {
 		return in, err
 	}
+	return in, nil
+}
+
+// parseRequestThreadQuery maps the discussion read's query string onto the
+// service's input: the forward cursor and the page size, nothing else. A term
+// the read does not have is a term that could not be aimed at somebody else's
+// rows, which is why there is no filter here — a thread is one request's.
+//
+// A negative value is refused rather than read as "unset" (requestQueryCount's
+// rule): quietly reinterpreting -5 as the default is not an answer a pager can
+// act on, and the client would page forever.
+func parseRequestThreadQuery(q url.Values) (service.RequestThreadInput, error) {
+	var in service.RequestThreadInput
+	if v := strings.TrimSpace(q.Get("after_id")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return in, authz.RequestInvalid("after_id must be a whole number")
+		}
+		if n < 0 {
+			return in, authz.RequestInvalid("after_id must be zero or more")
+		}
+		in.AfterID = n
+	}
+	limit, err := requestQueryCount(q, "limit")
+	if err != nil {
+		return in, err
+	}
+	in.Limit = limit
 	return in, nil
 }
 

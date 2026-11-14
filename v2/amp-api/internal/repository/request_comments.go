@@ -212,44 +212,88 @@ func getRequestComment(ctx context.Context, q queryRower, commentID int64, reque
 	return c, nil
 }
 
-// ListRequestComments returns one request's thread: append order (by id, never
-// created_at, which several rows in one transaction share — 054's header), the
-// order its index (request_id, id) serves.
+// RequestCommentPage is one forward page of a request's thread: the rows and
+// the cursor for the next page, in the {items, count, next_after_id} shape the
+// queue's {items, count, next_before_id} already uses — only the direction
+// differs, because a thread is read from where it began and the queue from its
+// newest row.
 //
-// afterID pages forward: 0 starts at the oldest comment. limit bounds a page
-// (0 means the default, above the ceiling is clamped), because a long thread is
-// read a page at a time by both the team view and the requester's.
+// NextAfterID is set only when there really is another page (the limit+1
+// probe), so a reader never has to ask for an empty page to learn it is done.
+type RequestCommentPage struct {
+	// Items is the page, in append order (by id).
+	Items []domain.RequestComment `json:"items"`
+	// Count is how many rows this page holds.
+	Count int `json:"count"`
+	// NextAfterID is the cursor for the next page, 0 on the last one.
+	NextAfterID int64 `json:"next_after_id,omitempty"`
+}
+
+// ListRequestCommentPage returns one forward page of one request's thread:
+// append order (by id, never created_at, which several rows in one transaction
+// share — 054's header), the order its index (request_id, id) serves.
+//
+// afterID pages forward: 0 starts at the oldest comment, because a thread is
+// read from where it began rather than from its newest row. limit bounds a page
+// (0 means the default, above the ceiling is clamped) — and the clamp lives
+// here rather than in the caller, which is why this read answers the cursor: a
+// caller re-deriving requestListMaxLimit above the repository would be a second
+// copy of the bound, and a caller that did not would silently truncate a long
+// thread with no way for its reader to ask for the rest.
 //
 // The tenant is required and enforced by the join, so a foreign or unknown
 // request yields an empty thread rather than another team's discussion; callers
 // that need "does this request exist?" ask GetRequest, whose answer distinguishes
 // missing-row from load failure (this read does not have to).
-func (r *Repo) ListRequestComments(ctx context.Context, requestID, orgID, teamID int, afterID int64, limit int) ([]domain.RequestComment, error) {
+func (r *Repo) ListRequestCommentPage(ctx context.Context, requestID, orgID, teamID int, afterID int64, limit int) (*RequestCommentPage, error) {
 	if requestID <= 0 {
 		return nil, fmt.Errorf("comments of request %d: %w", requestID, ErrNotFound)
 	}
 	if orgID <= 0 || teamID <= 0 {
 		return nil, fmt.Errorf("comments of request %d: %w", requestID, ErrRequestTenantScope)
 	}
-	if limit <= 0 {
-		limit = requestListDefaultLimit
-	}
-	if limit > requestListMaxLimit {
-		limit = requestListMaxLimit
-	}
+	limit = requestListLimit(limit)
 	query := `SELECT ` + requestCommentCols("c") + `
 		  FROM request_comments c
 		  JOIN team_requests r ON r.id = c.request_id
 		 WHERE c.request_id = $1 AND r.org_id = $2 AND r.team_id = $3 AND c.id > $4
 		 ORDER BY c.id
 		 LIMIT $5`
-	rows, err := r.db.Query(ctx, query, requestID, orgID, teamID, afterID, limit)
+	// One row more than the page: that extra row is how the caller learns there
+	// is another page without a second count query, and it is never returned.
+	rows, err := r.db.Query(ctx, query, requestID, orgID, teamID, afterID, limit+1)
 	if err != nil {
 		return nil, fmt.Errorf("list comments of request %d: %w", requestID, err)
 	}
-	out, err := collect(rows, scanRequestComment)
+	items, err := collect(rows, scanRequestComment)
 	if err != nil {
 		return nil, fmt.Errorf("list comments of request %d: %w", requestID, err)
 	}
-	return out, nil
+	page := &RequestCommentPage{Items: items, Count: len(items)}
+	if len(items) > limit {
+		page.Items = items[:limit]
+		page.Count = limit
+		page.NextAfterID = page.Items[limit-1].ID
+	}
+	if page.Items == nil {
+		// An empty page is "the thread has nothing after this cursor", which is
+		// an answer; nil would encode as null and read as "no read happened".
+		page.Items = []domain.RequestComment{}
+	}
+	return page, nil
+}
+
+// ListRequestComments returns one request's thread as rows, without the page
+// envelope: what the requester projection reads (it filters the rows itself)
+// and what any caller that wants the discussion rather than a cursor uses.
+//
+// It is ListRequestCommentPage with the envelope dropped, so there is exactly
+// one statement and one clamp behind both reads — a second query here would be
+// a second place for the tenant join to be forgotten.
+func (r *Repo) ListRequestComments(ctx context.Context, requestID, orgID, teamID int, afterID int64, limit int) ([]domain.RequestComment, error) {
+	page, err := r.ListRequestCommentPage(ctx, requestID, orgID, teamID, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	return page.Items, nil
 }

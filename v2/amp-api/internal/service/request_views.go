@@ -5,14 +5,16 @@ package service
 // approved mockups artifact 37 v1 (team side) and artifact 38 v1 (requester
 // side); build slice S2 of discoveries/team-inbox-approved-build-slices.md).
 //
-// Three reads, one decision:
+// Four reads, one decision:
 //
-//	ListRequests      the team's queue: one keyset page, the per-state counts
-//	                  beside it, and (when asked) the caller's own claimed and
-//	                  assigned slice of the same queue.
-//	GetRequest        one request: the team's whole record, or the requester's
-//	                  whitelist projection of the one request that is theirs.
-//	ListOwnRequests   a requester's own requests, projected, never the record.
+//	ListRequests        the team's queue: one keyset page, the per-state counts
+//	                    beside it, and (when asked) the caller's own claimed and
+//	                    assigned slice of the same queue.
+//	GetRequest          one request: the team's whole record, or the requester's
+//	                    whitelist projection of the one request that is theirs.
+//	ListOwnRequests     a requester's own requests, projected, never the record.
+//	ListRequestComments one request's discussion: the team's whole thread, or
+//	                    only the shared kinds of the requester's own (AMP #4270).
 //
 // They are one file because they share one question — *what may this caller
 // see of this request?* — and that question is answered in one place:
@@ -437,12 +439,38 @@ func requestQueueFilter(team *domain.Team, in RequestQueueInput) repository.Requ
 // decision ranks the team's standing first, because a triager must see the
 // record they triage, and the projection is not that record.
 func (s *Service) GetRequest(ctx context.Context, p authz.Principal, in RequestReadInput) (*RequestRead, error) {
-	if err := p.RequireUnscoped("read a request"); err != nil {
+	view, req, err := s.authorizeRequestRead(ctx, p, in, "read a request")
+	if err != nil {
 		return nil, err
+	}
+	return s.buildRequestRead(ctx, p, view, req)
+}
+
+// authorizeRequestRead is GetRequest's load-and-decide block, and it is the only
+// copy of it: GetRequest and the request's discussion read (ListRequestComments)
+// both call it, so "the same decision as the detail read" is a call rather than a
+// resemblance. A second copy of these four steps is how a route added later
+// answers 403 instead of the surface's one 404, or pairs a team with the wrong
+// org.
+//
+// The order is GetRequest's, and it is the order because it is the contract:
+//
+//  1. the scope gate (a submit-only credential reads nothing);
+//  2. the name (exactly one of serial and reference, the reference normalized);
+//  3. the load, scoped by the surface that named the request;
+//  4. one decision, ViewForLoad — a failed load and an unauthorized view are the
+//     same bytes.
+//
+// what names the operation in the scope gate's refusal — "read a request" for
+// the detail read, "read a request's discussion" for the thread — and never the
+// request itself.
+func (s *Service) authorizeRequestRead(ctx context.Context, p authz.Principal, in RequestReadInput, what string) (authz.RequestView, *domain.TeamRequest, error) {
+	if err := p.RequireUnscoped(what); err != nil {
+		return authz.NoRequestView(), nil, err
 	}
 	ref, err := normalizeReadRef(in)
 	if err != nil {
-		return nil, err
+		return authz.NoRequestView(), nil, err
 	}
 
 	var req *domain.TeamRequest
@@ -454,7 +482,7 @@ func (s *Service) GetRequest(ctx context.Context, p authz.Principal, in RequestR
 		var team *domain.Team
 		team, err = s.readTeamForRead(ctx, in.TeamID)
 		if err != nil {
-			return nil, err
+			return authz.NoRequestView(), nil, err
 		}
 		if ref.id > 0 {
 			req, loadErr = s.Repo.GetRequest(ctx, ref.id, team.OrgID, team.ID)
@@ -466,21 +494,21 @@ func (s *Service) GetRequest(ctx context.Context, p authz.Principal, in RequestR
 		// request could belong to, so it is simply not yours — the not-found
 		// answer, never a hint that the id exists.
 		if !p.HasUser() {
-			return nil, authz.RequestNotFound()
+			return authz.NoRequestView(), nil, authz.RequestNotFound()
 		}
 		req, loadErr = s.Repo.GetRequestByRequester(ctx, ref.id, p.UserID)
 	case ref.publicRef != "":
 		if !p.HasUser() {
-			return nil, authz.RequestNotFound()
+			return authz.NoRequestView(), nil, authz.RequestNotFound()
 		}
 		req, loadErr = s.Repo.GetRequestByRequesterRef(ctx, ref.publicRef, p.UserID)
 	}
 
 	view, err := s.Authz.ViewForLoad(ctx, p, req, loadErr)
 	if err != nil {
-		return nil, err
+		return authz.NoRequestView(), nil, err
 	}
-	return s.buildRequestRead(ctx, p, view, req)
+	return view, req, nil
 }
 
 // requestReadRef is one way of naming a request: its serial, or the requester's
@@ -858,5 +886,113 @@ func (s *Service) requesterOutputs(ctx context.Context, p authz.Principal, req *
 			DownloadRef: ref,
 		})
 	}
+	return out, nil
+}
+
+// ---- The request's discussion ----
+
+// RequestThreadInput names the request whose discussion is being read, and the
+// forward cursor into it.
+//
+// It embeds RequestReadInput rather than repeating its three fields, because the
+// thread is read through the same name: whatever the detail read accepts (a
+// serial, or the opaque reference a requester holds) is accepted here, and a
+// name added to that type reaches this read without a second decision about how
+// to parse it.
+type RequestThreadInput struct {
+	RequestReadInput
+	// AfterID pages forward: 0 starts at the oldest comment, because a thread is
+	// read from where it began. It is the repository's cursor, passed through
+	// untouched — a comment id the caller already has, or 0.
+	AfterID int64
+	// Limit is the page size. 0 means the repository's default and anything
+	// above its ceiling is clamped there, so this field carries no second copy
+	// of either bound.
+	Limit int
+}
+
+// RequestThread is one page of a request's discussion, with the view that
+// produced it.
+//
+// The view is in the answer because there are two: the team's thread is the
+// whole record of what was said, and the requester's is the shared kinds of it.
+// A client that only saw a list of comments could not tell "the desk has said
+// nothing" from "the desk said nothing to *you*", which is the distinction the
+// discussion panel exists to make. Items is always the one shape the caller's
+// view allows — domain.RequestComment for the team, domain.RequesterComment for
+// a requester — and never both.
+type RequestThread struct {
+	// View is the decision that produced this answer: "team" or "requester".
+	View authz.RequestView
+	// RequestID is the request the thread belongs to, so a caller can pin the
+	// answer to the request it asked about (the panel guards a stale read with
+	// it).
+	RequestID int
+	// Comments is the team's thread: every row, in append order.
+	Comments []domain.RequestComment
+	// Shared is the requester's thread: the comments the team chose to share,
+	// reduced to the projection's two-word attribution. Nil on the team view.
+	Shared []domain.RequesterComment
+	// NextAfterID is the cursor for the next page, 0 on the last one.
+	NextAfterID int64
+	// Count is how many rows this page holds.
+	Count int
+}
+
+// ListRequestComments returns one page of a request's discussion, as the caller
+// may see it.
+//
+// It authorizes through authorizeRequestRead — the same load-and-decide the
+// detail read runs — and not through a second decision of its own, so "who may
+// read a request's thread" is exactly "who may read the request". That is the
+// whole authorization requirement: a stranger, a sibling team's request, another
+// requester's request and an id that never existed are one 404
+// (authz.RequestNotFound), byte for byte, because the check that produced it is
+// the same check.
+//
+// The two views answer differently, and the difference is the product's:
+//
+//   - the team's view is the thread. Every row, whatever its kind, including the
+//     `system` notes and the internal remarks a triager wrote for the desk.
+//     Curation is not this read's: triage works from the record.
+//   - the requester's view is the shared kinds only, decided by
+//     requesterSharedComments — the one filter the projection already uses, so
+//     this read cannot share a row the detail page would then hide, or hide one
+//     it shows. The reducer is requesterComments (the projection's), so the body
+//     is sanitized and bounded and the attribution is "you"/"the desk" here too,
+//     rather than a second implementation of the same two rules.
+//
+// A requester is never shown a row's id, its request id, its author's name or
+// its author's user id: domain.RequesterComment has no field for any of them, so
+// that is structural rather than a promise. A requester therefore has no cursor
+// to page with (there is no id in what they receive), which is why their page is
+// bounded by the repository's ceiling and the cursor is not advertised to them —
+// see the handler's own note.
+func (s *Service) ListRequestComments(ctx context.Context, p authz.Principal, in RequestThreadInput) (*RequestThread, error) {
+	view, req, err := s.authorizeRequestRead(ctx, p, in.RequestReadInput, "read a request's discussion")
+	if err != nil {
+		return nil, err
+	}
+	page, err := s.Repo.ListRequestCommentPage(ctx, req.ID, req.OrgID, req.TeamID, in.AfterID, in.Limit)
+	if err != nil {
+		return nil, err
+	}
+	out := &RequestThread{View: view, RequestID: req.ID, Count: page.Count, NextAfterID: page.NextAfterID}
+	if view.Full() {
+		out.Comments = page.Items
+		return out, nil
+	}
+	// The requester's arm. requesterSharedComments takes the rows and returns the
+	// projection's own input type; requesterComments is the projection's reducer,
+	// so what a requester reads here and what they read on the detail page are
+	// produced by the same two functions.
+	out.Shared = requesterComments(s.requesterSharedComments(req, page.Items))
+	if out.Shared == nil {
+		out.Shared = []domain.RequesterComment{}
+	}
+	// The cursor is a comment id, and a requester's rows carry no id. Returning
+	// one would be a number they cannot use and could correlate with someone
+	// else's — so it is dropped with the rest of the team's facts.
+	out.NextAfterID = 0
 	return out, nil
 }
