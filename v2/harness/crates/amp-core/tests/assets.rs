@@ -387,3 +387,109 @@ fn changing_a_skill_materializes_a_new_directory_and_leaves_the_old_one_alone() 
     want.sort();
     assert_eq!(entries(&dest), want, "no leftover temp dir");
 }
+
+/// Set `dir`'s mtime to `age` ago (AMP #4278's pruning reads directory mtimes).
+fn backdate(dir: &Path, age: std::time::Duration) {
+    fs::File::open(dir)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - age)
+        .unwrap();
+}
+
+/// A directory under `dest` holding one file, with its mtime set to `age` ago.
+fn aged_dir(dest: &Path, name: &str, age: std::time::Duration) -> PathBuf {
+    let dir = dest.join(name);
+    write(&dir.join("amp-execution/SKILL.md"), "stale");
+    backdate(&dir, age);
+    dir
+}
+
+const HOUR: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+#[test]
+fn materialize_prunes_old_skill_dirs_and_stale_temp_dirs_but_keeps_current_and_recent_ones() {
+    use amp_core::assets::{SKILL_DIR_GRACE, SKILL_TMP_GRACE};
+    assert_eq!(SKILL_DIR_GRACE, 7 * DAY);
+    assert_eq!(SKILL_TMP_GRACE, HOUR);
+
+    let dest = scratch("materialize-prune");
+    let mut assets = Assets::embedded().unwrap();
+    let first = assets.materialize_skills(&dest).unwrap();
+    let previous = materialized_root(&dest, &first);
+    let previous_files = snapshot(&previous);
+
+    // Removed: another skill set untouched past the grace period, and a crash-left temp dir.
+    let old = aged_dir(&dest, "0123456789ab", 8 * DAY);
+    let stale_tmp = aged_dir(&dest, ".tmp-deadbeefdeadbeef", 2 * HOUR);
+    // Kept: a set still inside the grace period, a temp dir a live materialize may be writing,
+    // and entries that aren't ours (a non-hash name, a hash-named file, uppercase hex).
+    let recent = aged_dir(&dest, "ba9876543210", 6 * DAY);
+    let live_tmp = aged_dir(
+        &dest,
+        ".tmp-0000000000000001",
+        10 * 60 * std::time::Duration::from_secs(1),
+    );
+    let foreign = aged_dir(&dest, "notes", 30 * DAY);
+    let upper = aged_dir(&dest, "ABCDEF012345", 30 * DAY);
+    let hash_file = dest.join("fedcba987654");
+    write(&hash_file, "not a dir");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&hash_file)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - 30 * DAY)
+        .unwrap();
+
+    let exec = assets.skill("amp-execution").unwrap();
+    let mut md = exec.files["SKILL.md"].bytes.clone();
+    md.extend_from_slice(b"\nChanged body for #4278.\n");
+    let origin = Origin::User(dest.join("override/SKILL.md"));
+    assets
+        .put_skill_file("amp-execution", "SKILL.md", md, origin)
+        .unwrap();
+    let second = assets.materialize_skills(&dest).unwrap();
+    let current = materialized_root(&dest, &second);
+    assert_ne!(current, previous);
+
+    assert!(
+        !old.exists(),
+        "a skill dir past the grace period is removed"
+    );
+    assert!(!stale_tmp.exists(), "a stale .tmp-* dir is removed");
+    for kept in [
+        &current, &previous, &recent, &live_tmp, &foreign, &upper, &hash_file,
+    ] {
+        assert!(kept.exists(), "{} must be kept", kept.display());
+    }
+    assert_eq!(
+        snapshot(&previous),
+        previous_files,
+        "a recent skill dir is untouched"
+    );
+    for s in &second {
+        assert!(Path::new(&s.file_path).is_file(), "{}", s.file_path);
+    }
+}
+
+#[test]
+fn reusing_an_aged_skill_dir_refreshes_its_mtime_and_never_prunes_it() {
+    let dest = scratch("materialize-reuse-aged");
+    let assets = Assets::embedded().unwrap();
+    let first = assets.materialize_skills(&dest).unwrap();
+    let root = materialized_root(&dest, &first);
+    let files = snapshot(&root);
+    backdate(&root, 30 * DAY);
+
+    let again = assets.materialize_skills(&dest).unwrap();
+    assert_eq!(again, first);
+    assert!(root.is_dir(), "the returned dir is never pruned");
+    assert_eq!(snapshot(&root), files, "reuse rewrites no file");
+    let age = std::time::SystemTime::now()
+        .duration_since(fs::metadata(&root).unwrap().modified().unwrap())
+        .unwrap_or_default();
+    assert!(
+        age < HOUR,
+        "reuse refreshes the dir's mtime, got age {age:?}"
+    );
+}
