@@ -430,3 +430,41 @@ async fn an_amp_relogin_reconnects_the_metadata_poller() {
     assert_eq!(reconnects(&meta), 1);
     assert!(flat(&rig.screen()).contains("logged in to AMP; reconnected"));
 }
+
+/// #4251: with AMP's login expired, `/amp` opens on a row whose Enter runs `/mcp login amp` (the
+/// panel closes; the reply reconnects the poller), instead of sending the person to another
+/// terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn amp_panel_enter_runs_mcp_login_amp_when_the_login_expired() {
+    let mut rig = rig(true).await;
+    let mut m = amp_core::meta::AmpMeta::default();
+    m.health.connection = amp_core::meta::Connection::AuthRequired;
+    let meta = amp_core::meta::MetaHandle::stub(
+        m,
+        Arc::new(|tool, _| Err(format!("{tool}: not in the stub"))),
+    );
+    rig.shell.set_meta(meta.clone());
+    rig.submit("/amp").await;
+    let screen = flat(&rig.screen());
+    assert!(screen.contains("Enter runs /mcp login amp"), "{screen}");
+    assert!(!screen.contains("another terminal"), "{screen}");
+    assert!(rig.calls.lock().unwrap().is_empty());
+
+    rig.code(KeyCode::Enter).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !meta
+        .stub_calls()
+        .iter()
+        .any(|(tool, _)| tool == "reconnect")
+    {
+        assert!(tokio::time::Instant::now() < deadline, "no reconnect");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        rig.calls.lock().unwrap().clone(),
+        vec![("mcp".to_owned(), "login amp".to_owned())]
+    );
+    let screen = flat(&rig.screen());
+    assert!(screen.contains("logged in to AMP; reconnected"), "{screen}");
+    assert!(!screen.contains("AMP · connection"), "{screen}");
+}

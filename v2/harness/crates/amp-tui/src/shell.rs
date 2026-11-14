@@ -5095,6 +5095,12 @@ impl Shell {
                                 self.pending_command = Some(command);
                             }
                         }
+                        // #4251: `/amp`'s login row runs `/mcp login amp`, whose browser prompt
+                        // and reply go to the transcript, so the panel closes.
+                        Some(Target::Command(command)) => {
+                            panel.close();
+                            self.pending_command = Some(command);
+                        }
                         // #2252: Enter on a worker opens its session (o still opens AMP).
                         Some(Target::Ticket { id, .. })
                             if state.kind == PanelKind::Workers && self.has_session(id) =>
@@ -5190,7 +5196,10 @@ impl Shell {
     }
 
     fn open_target(&mut self, target: &Target) {
-        if matches!(target, Target::Model(_) | Target::Item(_)) {
+        if matches!(
+            target,
+            Target::Model(_) | Target::Item(_) | Target::Command(_)
+        ) {
             return;
         }
         let Some(meta) = &self.meta else { return };
