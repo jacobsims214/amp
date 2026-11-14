@@ -550,19 +550,9 @@ fn new(ctx: &Ctx, args: NewArgs) -> Result<(), CliError> {
         )));
     }
     let scope = args.scope.scope();
-    let mut loaded = ctx.load()?;
-    if let Some(existing) = loaded.assets.agent(&id) {
-        return Err(CliError::usage(format!(
-            "agent {id} already exists ({}); change it with `amp-harness agents edit {id}`",
-            existing.origin
-        )));
-    }
+    let loaded = ctx.load()?;
+    refuse_taken_id(&loaded, &id)?;
     let model_role = normalize_role(&id).to_owned();
-    if loaded.roles.get(&model_role).is_some_and(|r| r.id != id) {
-        return Err(CliError::usage(format!(
-            "agent id {id} would share the model settings [roles.{model_role}] of agent amp-{model_role}; pick another id"
-        )));
-    }
     let description = args
         .description
         .clone()
@@ -634,29 +624,16 @@ fn new(ctx: &Ctx, args: NewArgs) -> Result<(), CliError> {
         }
     }
 
-    let dir = ctx.scope_dir(scope)?;
-    let path = dir.join(AGENTS_DIR).join(format!("{id}.md"));
-    if path.exists() {
-        return Err(CliError::usage(format!(
-            "{} already exists; nothing was written",
-            path.display()
-        )));
-    }
-    // Validate before writing: the file parses, the roster builds, and (without --model) the
-    // agent resolves to a model through the fallback chain.
-    loaded
-        .assets
-        .put_agent(&id, &text, scope.origin(path.clone()))
-        .map_err(|e| CliError::new(e.to_string()))?;
-    loaded.roles =
-        RoleRegistry::from_assets(&loaded.assets).map_err(|e| CliError::new(e.to_string()))?;
-    if args.model.is_none() {
-        let role = loaded.role(&id)?;
-        role.resolve_model(&loaded.models)
-            .map_err(|e| CliError::new(format!("{e}; pass --model provider/model")))?;
-    }
-
-    write_file(&path, text.as_bytes())?;
+    // Validated before it is written (the file parses, the roster builds, and without --model the
+    // agent resolves to a model through the fallback chain); `--model` writes [roles] after it.
+    let model_check = if args.model.is_some() {
+        ModelCheck::Skip
+    } else {
+        ModelCheck::Resolve {
+            hint: "; pass --model provider/model",
+        }
+    };
+    let path = write_agent(ctx, scope, &id, &text, true, model_check)?.path;
     if let Some(model) = &args.model {
         let file = ctx.scope_config_file(scope)?;
         if scope == Scope::Repo && !file.exists() {
@@ -751,8 +728,11 @@ fn edit_file(ctx: &Ctx, path: &Path, id: &str, scope: Scope) -> Result<(), CliEr
     match edit_loop(&editor_command(), &scratch, &initial, &validate, &ask_again)? {
         None => println!("No changes to {id}."),
         Some(text) => {
-            write_file(path, text.as_bytes())?;
-            println!("Saved {id}: {}", path.display());
+            let written = write_agent_in(ctx, scope, id, &text, false)?;
+            println!("Saved {id}: {}", written.path.display());
+            if let Some(backup) = &written.backup {
+                println!("  previous version: {}", backup.display());
+            }
             if scope == Scope::User
                 && let Some(repo) = ctx.agent_file(Scope::Repo, id)
                 && repo.is_file()
@@ -762,6 +742,201 @@ fn edit_file(ctx: &Ctx, path: &Path, id: &str, scope: Scope) -> Result<(), CliEr
         }
     }
     Ok(())
+}
+
+// ------------------------------------------------------------------------------------------------
+// The non-interactive writer (#4244): no `$EDITOR`, no stdout. `new` and `edit` call it after
+// their own prompts and templates; manager tools call it directly.
+// ------------------------------------------------------------------------------------------------
+
+/// Where [`write_agent_in`] keeps the previous version of an agent file it overwrites:
+/// `<layer>/agents/.edit/backup/`. A dot dir, so neither `Assets::load` nor the reload watcher
+/// reads it (a backup next to the agent file would load as a second agent). Backups are kept.
+pub const BACKUP_DIR: &str = "backup";
+
+/// What [`write_agent_in`] wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WrittenAgent {
+    /// The canonical agent id.
+    pub id: String,
+    pub scope: Scope,
+    /// `<layer>/agents/<id>.md`.
+    pub path: PathBuf,
+    /// `true` when the file is new (`create`).
+    pub created: bool,
+    /// The previous layer file, copied aside before it was overwritten (none when the layer had
+    /// no file yet, e.g. the first override of a built-in agent).
+    pub backup: Option<PathBuf>,
+}
+
+/// How [`write_agent`] checks the agent's model.
+#[derive(Clone, Copy)]
+enum ModelCheck<'a> {
+    /// The agent must resolve to a model; `hint` is appended to the error.
+    Resolve { hint: &'a str },
+    /// The caller writes `[roles.<id>]` right after (`agents new --model`).
+    Skip,
+}
+
+/// Writes agent `id`'s file in `scope`'s layer from `text`, without `$EDITOR` or stdout.
+///
+/// `create: true` refuses an id that already exists in any layer (or whose `[roles.<x>]` model
+/// settings belong to another agent) and an existing file; `create: false` refuses an id that
+/// does not exist (a built-in agent counts: its first edit creates the layer override).
+///
+/// The text is validated with the checks the harness runs at start (`Assets::put_agent`, the
+/// role registry, and the model the role resolves to) **before** anything is touched. Only then
+/// is the previous layer file copied to `<layer>/agents/.edit/backup/<id>.<UTC stamp>.md` and the
+/// new text written (atomically).
+pub(crate) fn write_agent_in(
+    ctx: &Ctx,
+    scope: Scope,
+    id: &str,
+    text: &str,
+    create: bool,
+) -> Result<WrittenAgent, CliError> {
+    write_agent(
+        ctx,
+        scope,
+        id,
+        text,
+        create,
+        ModelCheck::Resolve { hint: "" },
+    )
+}
+
+fn write_agent(
+    ctx: &Ctx,
+    scope: Scope,
+    id: &str,
+    text: &str,
+    create: bool,
+    model: ModelCheck<'_>,
+) -> Result<WrittenAgent, CliError> {
+    let mut loaded = ctx.load()?;
+    let id = id.trim();
+    let id = if create {
+        if !valid_name(id) {
+            return Err(CliError::usage(format!(
+                "agent id {id:?} must be lowercase letters, digits and single hyphens"
+            )));
+        }
+        refuse_taken_id(&loaded, id)?;
+        id.to_owned()
+    } else {
+        loaded.roles.get(id).map(|r| r.id.clone()).ok_or_else(|| {
+            CliError::usage(format!(
+                "no agent {id} (`amp-harness agents list` shows them); create it instead"
+            ))
+        })?
+    };
+    let path = ctx
+        .scope_dir(scope)?
+        .join(AGENTS_DIR)
+        .join(format!("{id}.md"));
+    if create && path.exists() {
+        return Err(CliError::usage(format!(
+            "{} already exists; nothing was written",
+            path.display()
+        )));
+    }
+
+    // Validate before touching anything.
+    loaded
+        .assets
+        .put_agent(&id, text, scope.origin(path.clone()))
+        .map_err(|e| CliError::new(e.to_string()))?;
+    loaded.roles =
+        RoleRegistry::from_assets(&loaded.assets).map_err(|e| CliError::new(e.to_string()))?;
+    let role = loaded
+        .roles
+        .get(&id)
+        .ok_or_else(|| CliError::new(format!("agent {id} does not load from this text")))?;
+    if let ModelCheck::Resolve { hint } = model {
+        role.resolve_model(&loaded.models)
+            .map_err(|e| CliError::new(format!("{e}{hint}")))?;
+    }
+
+    let backup = if !create && path.is_file() {
+        Some(backup_agent_file(&path, &id)?)
+    } else {
+        None
+    };
+    write_file(&path, text.as_bytes())?;
+    Ok(WrittenAgent {
+        id,
+        scope,
+        path,
+        created: create,
+        backup,
+    })
+}
+
+/// Refuses a new agent id that is taken: an agent in any layer, or another agent's
+/// `[roles.<x>]` model settings.
+fn refuse_taken_id(loaded: &Loaded, id: &str) -> Result<(), CliError> {
+    if let Some(existing) = loaded.assets.agent(id) {
+        return Err(CliError::usage(format!(
+            "agent {id} already exists ({}); change it with `amp-harness agents edit {id}`",
+            existing.origin
+        )));
+    }
+    let model_role = normalize_role(id);
+    if loaded.roles.get(model_role).is_some_and(|r| r.id != id) {
+        return Err(CliError::usage(format!(
+            "agent id {id} would share the model settings [roles.{model_role}] of agent amp-{model_role}; pick another id"
+        )));
+    }
+    Ok(())
+}
+
+/// Copies `path` (`<layer>/agents/<id>.md`) to `<layer>/agents/.edit/backup/<id>.<stamp>.md`
+/// and returns the copy's path. Never overwrites an earlier backup.
+fn backup_agent_file(path: &Path, id: &str) -> Result<PathBuf, CliError> {
+    let agents_dir = path
+        .parent()
+        .ok_or_else(|| CliError::new(format!("{}: no parent directory", path.display())))?;
+    let dir = agents_dir.join(EDIT_DIR).join(BACKUP_DIR);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| CliError::new(format!("create {}: {e}", dir.display())))?;
+    let stamp = utc_stamp(std::time::SystemTime::now());
+    let mut backup = dir.join(format!("{id}.{stamp}.md"));
+    let mut n = 1;
+    while backup.exists() {
+        n += 1;
+        backup = dir.join(format!("{id}.{stamp}-{n}.md"));
+    }
+    std::fs::copy(path, &backup).map_err(|e| {
+        CliError::new(format!(
+            "back up {} to {}: {e}; nothing was written",
+            path.display(),
+            backup.display()
+        ))
+    })?;
+    Ok(backup)
+}
+
+/// `YYYYMMDDTHHMMSS.mmmZ` (UTC) for `t`: sorts in time order, down to the millisecond.
+fn utc_stamp(t: std::time::SystemTime) -> String {
+    let since = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let (secs, millis) = (since.as_secs(), since.subsec_millis());
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}.{millis:03}Z",
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60
+    )
 }
 
 fn remove(ctx: &Ctx, id: &str, scope: Scope) -> Result<(), CliError> {
@@ -1300,5 +1475,128 @@ mod tests {
             e.message
         );
         assert!(!scratch.exists());
+    }
+
+    // #4244: write_agent_in, called directly (no CLI, no $EDITOR, no stdout).
+
+    /// A user layer at `d` whose config gives every role a faux model.
+    fn ctx_in(d: &Path) -> Ctx {
+        std::fs::write(
+            d.join("config.toml"),
+            "[providers.f]\napi = \"faux\"\n[providers.f.models.\"f-1\"]\n\n[roles.manager]\nmodel = \"f/f-1\"\n[roles.worker-backend]\nmodel = \"f/f-1\"\n",
+        )
+        .unwrap();
+        Ctx {
+            paths: ConfigPaths {
+                user_file: Some(d.join("config.toml")),
+                user_dir: Some(d.to_path_buf()),
+                ..ConfigPaths::default()
+            },
+            cwd: d.to_path_buf(),
+        }
+    }
+
+    fn worker_text(id: &str, description: &str) -> String {
+        templates::render_agent("worker", id, description).unwrap()
+    }
+
+    #[test]
+    fn write_agent_in_create_and_edit_rules() {
+        let d = dir("write-agent-in");
+        let ctx = ctx_in(&d);
+        let file = d.join("agents/sql-expert.md");
+
+        // create: false refuses an id that does not exist; nothing is written.
+        let e = write_agent_in(
+            &ctx,
+            Scope::User,
+            "sql-expert",
+            &worker_text("sql-expert", "x"),
+            false,
+        )
+        .unwrap_err();
+        assert!(e.message.contains("no agent sql-expert"), "{}", e.message);
+        assert!(!file.exists());
+
+        // create: true writes the file, with no backup.
+        let w = write_agent_in(
+            &ctx,
+            Scope::User,
+            "sql-expert",
+            &worker_text("sql-expert", "SQL"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            w,
+            WrittenAgent {
+                id: "sql-expert".into(),
+                scope: Scope::User,
+                path: file.clone(),
+                created: true,
+                backup: None,
+            }
+        );
+        let first = std::fs::read_to_string(&file).unwrap();
+
+        // create: true refuses an existing id, a built-in id, and a [roles.<x>] clash.
+        for (id, want) in [
+            ("sql-expert", "already exists"),
+            ("amp-reviewer", "already exists"),
+            ("worker-backend", "would share the model settings"),
+        ] {
+            let e = write_agent_in(&ctx, Scope::User, id, &worker_text(id, "x"), true).unwrap_err();
+            assert!(e.message.contains(want), "{id}: {}", e.message);
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), first);
+
+        // Invalid text is refused before anything is written or backed up.
+        let bad: String = first
+            .lines()
+            .map(|l| {
+                if l.starts_with("description:") {
+                    "description:"
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_ne!(bad, first);
+        let e = write_agent_in(&ctx, Scope::User, "sql-expert", &bad, false).unwrap_err();
+        assert!(e.message.contains("description"), "{}", e.message);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), first);
+        assert!(!d.join("agents/.edit").exists());
+
+        // create: false backs the old file up into the hidden dir, then writes.
+        let edited = worker_text("sql-expert", "SQL, edited");
+        let w = write_agent_in(&ctx, Scope::User, "sql-expert", &edited, false).unwrap();
+        assert!(!w.created);
+        let backup = w.backup.expect("a backup of the previous file");
+        assert_eq!(backup.parent().unwrap(), d.join("agents/.edit/backup"));
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), first);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), edited);
+
+        // The backup is not loaded as an agent.
+        let loaded = ctx.load().unwrap();
+        assert_eq!(
+            loaded.role("sql-expert").unwrap().description,
+            "SQL, edited"
+        );
+        assert!(loaded.assets.agents().all(
+            |a| !matches!(&a.origin, Origin::User(p) if p.starts_with(d.join("agents/.edit")))
+        ));
+    }
+
+    #[test]
+    fn utc_stamp_is_a_civil_utc_time() {
+        let at = |s: u64| utc_stamp(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s));
+        assert_eq!(at(0), "19700101T000000.000Z");
+        assert_eq!(at(951_782_400), "20000229T000000.000Z");
+        assert_eq!(at(1_794_674_385), "20261114T163945.000Z");
+        assert_eq!(
+            utc_stamp(std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_794_674_385_042)),
+            "20261114T163945.042Z"
+        );
     }
 }
