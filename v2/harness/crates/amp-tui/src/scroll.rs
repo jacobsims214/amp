@@ -15,7 +15,13 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use rpi_tui::{LayoutBox, LayoutFrame, ScrollView, composite_tui_line, theme, visible_width};
+use rpi_tui::{
+    Component, LayoutBox, LayoutFrame, ScrollView, composite_tui_line, theme, visible_width,
+};
+
+use crate::inset::{FLUSH_LEFT, Padding};
+use crate::selection::{self, Press, Selection};
+use crate::wrap::{RowMeta, take_row_meta};
 
 /// The pill shown while the transcript is scrolled up and new output has arrived below.
 pub const NEW_OUTPUT: &str = " ↓ new output · End ";
@@ -213,9 +219,234 @@ pub fn paint_pill(frame: &LayoutFrame, lines: &mut [String], pill: &str) {
     *line = composite_tui_line(line, &label, column, width, frame.width);
 }
 
+/// Select-to-copy's highlight (story #580, #4215): sits between the transcript's [`ScrollView`]
+/// and its [`crate::inset::Inset`], so every chat (the manager's, a worker's session, a restored
+/// one) goes through it.
+///
+/// On every render it takes the in-band row markers ([`crate::wrap::encode_row_meta`]) off the
+/// rows, so none reaches the scroll view's cache or the terminal, and keeps the rows and their
+/// [`RowMeta`] for [`Self::text`]. A marked row's `prefix` gets the inset's padding added, since
+/// it is measured inside the inset. The selection is held in content coordinates and painted in
+/// reverse video ([`selection::paint`]), so it scrolls with the text.
+///
+/// A selection change needs a full render of the scroll view's child (amp's `repaint()`), not
+/// a pure-scroll frame, which reuses the cached rows. A render at another width clears the
+/// selection: its coordinates belong to the old wrapping.
+pub struct SelectionLayer {
+    child: Arc<dyn Component>,
+    padding: Padding,
+    state: Mutex<LayerState>,
+}
+
+#[derive(Default)]
+struct LayerState {
+    /// The width of the last render, and its rows (markers taken out) with their meta.
+    width: Option<usize>,
+    rows: Vec<String>,
+    meta: Vec<RowMeta>,
+    /// The press in progress or the selection made, in content coordinates.
+    press: Option<Press>,
+}
+
+impl SelectionLayer {
+    /// `padding` is the wrapped inset's, to add to marked rows' prefixes.
+    pub fn new(child: Arc<dyn Component>, padding: Padding) -> Self {
+        Self {
+            child,
+            padding,
+            state: Mutex::new(LayerState::default()),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, LayerState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Button down at content cell `at`: a pending press, nothing selected or painted yet.
+    pub fn start(&self, at: selection::Pos) {
+        self.state().press = Some(Press::down(at));
+    }
+
+    /// The pointer moved to `to`. Moving to another cell than the press starts the selection.
+    /// Without a press first, this does nothing.
+    pub fn extend(&self, to: selection::Pos) {
+        let mut state = self.state();
+        state.press = state.press.map(|p| p.drag(to));
+    }
+
+    /// The selection, once the pointer has left the pressed cell.
+    pub fn selection(&self) -> Option<Selection> {
+        self.state().press.and_then(|p| p.selection())
+    }
+
+    /// Forgets the press and the selection.
+    pub fn clear(&self) {
+        self.state().press = None;
+    }
+
+    /// The selected text as the last render showed it ([`selection::extract`]). `None` for no
+    /// selection, or one of nothing but whitespace.
+    pub fn text(&self) -> Option<String> {
+        let state = self.state();
+        let sel = state.press?.selection()?;
+        selection::extract(&state.rows, &state.meta, sel)
+    }
+
+    /// Rows in the last render (0 before one).
+    pub fn rows(&self) -> usize {
+        self.state().rows.len()
+    }
+
+    /// The visible width of content row `row` in the last render.
+    pub fn row_width(&self, row: usize) -> usize {
+        self.state().rows.get(row).map_or(0, |r| visible_width(r))
+    }
+}
+
+/// `line` without any row markers, and the meta of its last (outermost) one.
+fn strip_markers(line: String) -> (String, Option<RowMeta>) {
+    let (mut row, meta) = take_row_meta(&line);
+    if meta.is_none() {
+        return (line, None);
+    }
+    loop {
+        match take_row_meta(&row) {
+            (rest, Some(_)) => row = rest,
+            _ => return (row, meta),
+        }
+    }
+}
+
+impl Component for SelectionLayer {
+    fn render(&self, width: usize) -> Vec<String> {
+        let lines = self.child.render(width);
+        let pad = self.padding.at(width);
+        let mut rows = Vec::with_capacity(lines.len());
+        let mut meta = Vec::with_capacity(lines.len());
+        for line in lines {
+            let (row, m) = strip_markers(line);
+            let m = m.map(|mut m| {
+                if !row.is_empty() && !row.starts_with(FLUSH_LEFT) {
+                    m.prefix += pad;
+                }
+                m
+            });
+            meta.push(m.unwrap_or_default());
+            rows.push(row);
+        }
+        let mut state = self.state();
+        if state.width.is_some_and(|w| w != width) {
+            state.press = None;
+        }
+        state.width = Some(width);
+        let sel = state.press.and_then(|p| p.selection());
+        let mut out = rows.clone();
+        state.rows = rows;
+        state.meta = meta;
+        drop(state);
+        if let Some(sel) = sel {
+            selection::paint(&mut out, sel);
+        }
+        out
+    }
+
+    fn handle_input(&self, data: &str) -> bool {
+        self.child.handle_input(data)
+    }
+
+    fn wants_key_release(&self) -> bool {
+        self.child.wants_key_release()
+    }
+
+    fn invalidate(&self) {
+        self.child.invalidate();
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 fn primary_box(node: &LayoutBox) -> Option<&LayoutBox> {
     if node.scroll_view.as_ref().is_some_and(|s| s.is_primary()) {
         return Some(node);
     }
     node.children.iter().find_map(primary_box)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inset::Inset;
+    use crate::selection::Pos;
+    use crate::wrap::{encode_row_meta, reflow_row_marked, wrap_marked};
+
+    struct Marked(String, bool);
+
+    impl Component for Marked {
+        fn render(&self, width: usize) -> Vec<String> {
+            let (rows, meta) = if self.1 {
+                reflow_row_marked(&self.0, width)
+            } else {
+                wrap_marked(&self.0, width)
+            };
+            rows.into_iter()
+                .zip(meta)
+                .map(|(r, m)| format!("{r}{}", encode_row_meta(&m)))
+                .collect()
+        }
+
+        fn invalidate(&self) {}
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn layer(text: &str, reflow: bool, pad: usize) -> SelectionLayer {
+        let padding = Padding::new(pad);
+        let inset = Arc::new(Inset::new(
+            Arc::new(Marked(text.into(), reflow)),
+            padding.clone(),
+        ));
+        SelectionLayer::new(inset, padding)
+    }
+
+    #[test]
+    fn inset_padding_is_part_of_marked_rows_prefix() {
+        let words: Vec<String> = (0..30).map(|i| format!("w{i:02}")).collect();
+        let text = words.join(" ");
+        let item = format!("• {text}");
+        for (text, reflow) in [(text.as_str(), false), (item.as_str(), true)] {
+            let layer = layer(text, reflow, 4);
+            let rows = layer.render(50);
+            assert!(rows.len() > 2, "{rows:?}");
+            assert_eq!(layer.rows(), rows.len());
+            assert!(rows.iter().all(|r| !r.contains("\x1b_amp:")));
+            // Padding 4 is halved at 80 columns or fewer.
+            assert!(
+                rows.iter()
+                    .all(|r| r.starts_with("  ") && !r.starts_with("   w"))
+            );
+            layer.start(Pos::new(0, 0));
+            layer.extend(Pos::new(rows.len(), 0));
+            assert_eq!(layer.text().as_deref(), Some(text));
+        }
+    }
+
+    #[test]
+    fn width_change_clears_and_unmarked_rows_default_to_newlines() {
+        let layer = SelectionLayer::new(
+            Arc::new(Marked(String::new(), false)) as Arc<dyn Component>,
+            Padding::new(0),
+        );
+        layer.render(60);
+        layer.start(Pos::new(0, 0));
+        layer.extend(Pos::new(0, 1));
+        assert!(layer.selection().is_some());
+        layer.render(60);
+        assert!(layer.selection().is_some());
+        layer.render(61);
+        assert_eq!(layer.selection(), None);
+    }
 }

@@ -224,9 +224,100 @@ pub fn extract(rows: &[String], meta: &[RowMeta], sel: Selection) -> Option<Stri
     }
 }
 
+/// The cells of `plain` that overlap `[from, to)`, snapped outwards to whole glyphs: the start
+/// column, the text and its width. `None` when nothing visible is in range.
+fn span(plain: &str, from: usize, to: usize) -> Option<(usize, String, usize)> {
+    let mut col = 0;
+    let mut start = None;
+    let mut end = 0;
+    let mut take = false;
+    let mut text = String::new();
+    for c in plain.chars() {
+        let w = c.width().unwrap_or(0);
+        if w > 0 {
+            take = col + w > from && col < to;
+            if take {
+                start.get_or_insert(col);
+                end = col + w;
+            }
+            col += w;
+        }
+        if take {
+            text.push(c);
+        }
+    }
+    let start = start?;
+    Some((start, text, end - start))
+}
+
+/// Paints `sel` over `rows` (rendered content rows, row markers already taken out) in reverse
+/// video (`ESC[7m` … `ESC[27m`), so inner `ESC[0m` resets in the row can't cancel it. The
+/// selected cells are the ones [`extract`] copies: whole glyphs (a wide character half in range
+/// is painted whole), up to each row's visible end. Rows outside the selection are unchanged.
+pub fn paint(rows: &mut [String], sel: Selection) {
+    let (start, end) = sel.normalized();
+    if start.row >= rows.len() {
+        return;
+    }
+    let last = end.row.min(rows.len() - 1);
+    for (r, row) in rows.iter_mut().enumerate().take(last + 1).skip(start.row) {
+        let from = if r == start.row { start.col } else { 0 };
+        let to = if r == end.row {
+            end.col.saturating_add(1)
+        } else {
+            usize::MAX
+        };
+        let Some((col, text, width)) = span(&wrap::plain(row), from, to) else {
+            continue;
+        };
+        let total = rpi_tui::visible_width(row).max(col + width);
+        *row =
+            rpi_tui::composite_tui_line(row, &format!("\x1b[7m{text}\x1b[27m"), col, width, total);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn painted(rows: &[&str], a: (usize, usize), h: (usize, usize)) -> Vec<String> {
+        let mut rows = s(rows);
+        paint(&mut rows, sel(a, h));
+        rows
+    }
+
+    #[test]
+    fn paint_inverts_exactly_the_selected_cells() {
+        let rows = painted(&["hello world", "second row", "third"], (0, 6), (1, 5));
+        assert_eq!(rpi_tui::strip_ansi(&rows[0]), "hello world");
+        // composite_tui_line closes styles and links around the overlay.
+        assert!(rows[0].starts_with("hello "), "{:?}", rows[0]);
+        assert!(rows[0].contains("\x1b[7mworld\x1b[27m"), "{:?}", rows[0]);
+        assert_eq!(rpi_tui::strip_ansi(&rows[1]), "second row");
+        assert!(rows[1].contains("\x1b[7msecond\x1b[27m"), "{:?}", rows[1]);
+        assert_eq!(rows[2], "third");
+    }
+
+    #[test]
+    fn paint_snaps_wide_glyphs_whole_and_keeps_width() {
+        // Column 1 is the right half of 日, column 3 the right half of 本.
+        let rows = painted(&["日本語"], (0, 1), (0, 3));
+        assert!(rows[0].contains("\x1b[7m日本\x1b[27m"), "{:?}", rows[0]);
+        assert_eq!(rpi_tui::visible_width(&rows[0]), 6);
+        let rows = painted(&["a😀b"], (0, 2), (0, 2));
+        assert!(rows[0].contains("\x1b[7m😀\x1b[27m"), "{:?}", rows[0]);
+    }
+
+    #[test]
+    fn paint_backwards_and_past_the_end() {
+        let rows = painted(&["abc", "def"], (1, 1), (0, 1));
+        assert!(rows[0].contains("\x1b[7mbc\x1b[27m"), "{:?}", rows[0]);
+        assert!(rows[1].contains("\x1b[7mde\x1b[27m"), "{:?}", rows[1]);
+        // An empty row, and a selection reaching beyond the rows, paint nothing extra.
+        let rows = painted(&["", "x"], (0, 0), (9, 9));
+        assert_eq!(rows[0], "");
+        assert!(rows[1].contains("\x1b[7mx\x1b[27m"));
+    }
 
     fn s(rows: &[&str]) -> Vec<String> {
         rows.iter().map(|r| r.to_string()).collect()
