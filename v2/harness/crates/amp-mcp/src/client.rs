@@ -234,8 +234,9 @@ impl Connection {
 enum Retire {
     /// An explicit [`AmpMcpClient::reconnect`] / [`AmpMcpClient::replace`]: cut off its calls now.
     Cancel,
-    /// The automatic reconnect after a "login required": let its calls finish (their 401s), so
-    /// callers that failed together all heal on the new connection.
+    /// The automatic reconnect after a "login required", and [`AmpMcpClient::reconnect_after_login`]:
+    /// let its calls finish (their 401s), so callers that failed together all heal on the new
+    /// connection.
     Drop,
 }
 
@@ -558,6 +559,23 @@ impl AmpMcpClient {
         *last = Some(Instant::now());
         let client = run_connector(&connector).await?;
         self.adopt(client, Retire::Cancel);
+        Ok(())
+    }
+
+    /// Reconnects now through the [`Reconnector`] after a fresh login (`/mcp login amp`, #4250),
+    /// ignoring the rate limit. Unlike [`Self::reconnect`], calls still running on the old
+    /// connection are not cut off: one that finishes there keeps its answer, and one rejected as
+    /// "login required" sees the newer connection and is sent again there (as after the automatic
+    /// reconnect, #2194). So the manager's and in-process workers' calls lose nothing. On failure
+    /// the current connection stays.
+    pub async fn reconnect_after_login(&self) -> Result<(), McpError> {
+        let connector = self.reconnect_config().connector.clone().ok_or_else(|| {
+            McpError::Config("this connection has no reconnector (static token)".to_owned())
+        })?;
+        let mut last = self.last_attempt.lock().await;
+        *last = Some(Instant::now());
+        let client = run_connector(&connector).await?;
+        self.adopt(client, Retire::Drop);
         Ok(())
     }
 
