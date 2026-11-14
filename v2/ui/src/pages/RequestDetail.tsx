@@ -35,17 +35,21 @@
  *     Reopen is the page's, because it changes what the page is showing and its
  *     destination is fixed by the lifecycle (rejected/duplicate → triaging).
  *
- * # The read this build does not have
+ * # The read this build does not have (TEMPORARY SCAFFOLDING)
  *
  * The detail read answers the record and the delivery aggregate — not the
  * request's discussion rows, its `request_events` history, or its
- * `request_link` rows. No other route in `internal/api/rest.go` serves them
- * either (the only request reads are the queue, the summary, the detail and the
- * attachments panel), which is the gap #3980 recorded from the rails' side. So
- * the three affected panels take their rows from an optional `reads` seam and,
+ * `request_link` rows. Nothing else serves them either: `POST …/comments` and
+ * `POST …/links` exist with no GET counterpart, and `request_events` has no list
+ * read in the repository at all. That is a gap in the product, not in the
+ * request, and it is tracked by the read tickets filed alongside this page.
+ *
+ * So the three affected panels take their rows from an optional `reads` seam and,
  * when the seam is empty, each states that the rows are not served by this
  * build's read. They are **not** rendered as empty: "No discussion yet" is a
- * claim about the record, and this page has no basis for it.
+ * claim about the record, and this page has no basis for it. The seam and its
+ * notices are scaffolding for review, not the approved end state — when the read
+ * routes land, the page passes real rows in and the notices disappear.
  *
  * Two things are reconstructed rather than left blank, because the shipped read
  * genuinely carries them: the route row (`outcome.routed_project_id`, titled by
@@ -485,7 +489,9 @@ export function RequestDetail(props: RequestDetailProps) {
                     isTeamLead={standing.manager}
                   />
 
-                  {/* The internal thread. Served or not, it is stated, never faked. */}
+                  {/* The internal thread. Served or not, it is stated, never faked.
+                      TEMPORARY: the notice branch is scaffolding until the
+                      comments read route exists. */}
                   {served.comments ? (
                     <RequestDiscussion
                       mode="team"
@@ -544,7 +550,8 @@ export function RequestDetail(props: RequestDetailProps) {
                   {/* When the seam served no links, say which half the read is
                       missing — the rail is then showing only the aggregate's
                       route, and its "not routed" copy must never stand in for
-                      rows the page simply does not have. */}
+                      rows the page simply does not have. TEMPORARY scaffolding:
+                      goes away with the links read route. */}
                   {panels.planning && !linksServed(reads ?? {}) && (
                     <p className="m-0 -mt-2 px-1 text-[11.5px] text-ink-3 leading-snug" data-testid="unserved-links">
                       {unservedReadSentence('links')}
@@ -570,6 +577,7 @@ export function RequestDetail(props: RequestDetailProps) {
                   {panels.history && served.events && (
                     <RequestHistory mode="team" events={reads?.events ?? []} />
                   )}
+                  {/* TEMPORARY scaffolding: goes away with the events read route. */}
                   {!served.events && (
                     <RequestPanelSection label="History" note="Append-only: one row per act">
                       <p className="m-0 text-[12.5px] text-ink-3 leading-snug" data-testid="unserved-history">

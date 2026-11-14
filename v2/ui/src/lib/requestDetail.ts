@@ -314,21 +314,34 @@ export function detailPanels(state: RequestStatus): DetailPanels {
 // ---- The links the shipped read does not carry ----
 
 /**
- * What the detail read does **not** answer, and therefore what a page cannot
- * render from the shipped API.
+ * TEMPORARY SCAFFOLDING — not the approved end state.
  *
- * `GET /api/teams/{id}/requests/{request}` answers the record and the delivery
- * aggregate. It does not answer the request's discussion rows, its
- * `request_events` history, or its `request_link` rows — and nothing else does
- * either: the only request reads registered in `internal/api/rest.go` are the
- * queue, the summary, the detail and the attachments panel. This is the same
- * gap #3980 recorded for the rails, now seen from the page.
+ * The approved detail design (artifact 37 v1) shows a request's discussion, its
+ * history and its linked work. This build cannot render them, because the reads
+ * do not exist yet:
  *
- * So the page takes these as an optional seam (`reads`). With the shipped server
- * the seam is empty and every affected panel says so in one sentence. What the
- * page must never do is the other two options: invent an empty thread (which
- * reads as "nobody has said anything" — a statement about the record), or let a
- * panel fetch (opening a request would then perform a write-capable mount).
+ *   - `GET /api/teams/{id}/requests/{request}` answers the record and the
+ *     delivery aggregate only. The only other request reads registered in
+ *     `internal/api/rest.go` are the queue, the summary and the attachments
+ *     panel.
+ *   - `POST …/comments` exists but there is no GET for the thread.
+ *   - `POST …/links` exists but there is no GET for the link rows.
+ *   - `request_events` is written all over the repository layer and has no list
+ *     read at all (`domain.RequestEvent` exists; no `Repo` method returns one).
+ *
+ * These are gaps in the product, not in the request. They are tracked by the
+ * read tickets filed alongside this page (comments, events, links) and this
+ * seam exists only so the page can be assembled and reviewed before they land.
+ * When those routes ship, the page passes real rows into `reads` and every
+ * "not served" notice below disappears — no other change to this page.
+ *
+ * What the page must never do, while the gap is open, is the other two options:
+ * invent an empty thread (which reads as "nobody has said anything" — a claim
+ * about the record), or let a panel fetch (opening a request would then perform
+ * a write-capable mount).
+ *
+ * Removing this seam is the acceptance bar for the read tickets, not an
+ * optional cleanup.
  */
 export interface DetailReads {
   comments?: import('../types').RequestComment[]
@@ -345,11 +358,18 @@ export function servedReads(reads: DetailReads): { comments: boolean; events: bo
   }
 }
 
-/** The one sentence a panel says instead of a fake empty list. */
+/**
+ * The one sentence a panel says instead of a fake empty list.
+ *
+ * TEMPORARY: this notice is the seam's visible face and goes away when the read
+ * tickets land. It says three things on purpose — which rows are missing, that
+ * the gap is in this build rather than in the request, and that "empty" is not
+ * what the reader is looking at.
+ */
 export function unservedReadSentence(what: 'discussion' | 'history' | 'links'): string {
   const noun = what === 'discussion' ? 'discussion' : what === 'history' ? 'history' : 'linked work'
   return `The request read that reaches this page answers the record and the delivery summary, not its ${noun}. `
-    + 'Nothing is missing from the request: this build has no route that returns the rows, so they are not shown '
+    + 'Nothing is missing from the request: this build has no route that returns the rows yet, so they are not shown '
     + 'rather than shown as empty.'
 }
 
