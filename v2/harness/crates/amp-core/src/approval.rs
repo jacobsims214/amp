@@ -618,15 +618,33 @@ pub struct PendingConfirm {
 }
 
 impl PendingConfirm {
-    /// The person's answer: `true` for yes. Dropping a `PendingConfirm` unanswered denies it.
-    pub fn answer(self, yes: bool) {
-        let _ = self.reply.send(yes);
+    /// Whether the tool that asked has already given up: [`confirm_or_deny`] timed out or the tool
+    /// call was cancelled, and it has already reported the write as not done. A stale prompt must
+    /// not be shown (or must be closed if it is on screen): any answer to it is ignored.
+    pub fn is_stale(&self) -> bool {
+        self.reply.is_closed()
+    }
+
+    /// The person's answer: `true` for yes. Returns whether the tool that asked received it;
+    /// `false` means the prompt was stale and nothing happened, so the front end should say so
+    /// (e.g. "that request already timed out; nothing was written") rather than imply a yes took
+    /// effect. Dropping a `PendingConfirm` unanswered denies it.
+    #[must_use = "a false return means the request had already timed out and the answer was dropped"]
+    pub fn answer(self, yes: bool) -> bool {
+        self.reply.send(yes).is_ok()
     }
 }
 
 /// A [`Confirmer`] that hands each request to the front end over a channel and waits for its
 /// answer. The front end (#4259) keeps the receiver from [`ChannelConfirmer::new`], shows each
 /// [`PendingConfirm`] as a y/N prompt and calls [`PendingConfirm::answer`].
+///
+/// A prompt can go stale while it waits in the channel or on screen: [`confirm_or_deny`] stops
+/// waiting after its timeout (and a cancelled tool call stops too), and the tool reports the write
+/// as not done. The front end must skip a received prompt whose [`PendingConfirm::is_stale`] is
+/// true, close one on screen when it becomes stale, and treat a `false` from
+/// [`PendingConfirm::answer`] as "that request already timed out; nothing was written". The person
+/// must only ever see live prompts, and a yes must never seem to approve a denied write.
 #[derive(Debug, Clone)]
 pub struct ChannelConfirmer {
     tx: tokio::sync::mpsc::Sender<PendingConfirm>,

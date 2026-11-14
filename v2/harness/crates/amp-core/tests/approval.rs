@@ -594,6 +594,40 @@ mod confirm {
     }
 
     #[tokio::test]
+    async fn a_prompt_whose_requester_timed_out_is_stale_and_its_yes_is_not_delivered() {
+        let (c, mut rx) = ChannelConfirmer::new();
+        let got = confirm_or_deny(Some(&c), request(), Duration::from_millis(30)).await;
+        assert_eq!(got, Confirmed::Denied(DenyReason::TimedOut));
+
+        // The prompt is still in the channel, but the tool has already reported "not written".
+        let p = rx.try_recv().expect("the prompt was delivered");
+        assert!(
+            p.is_stale(),
+            "the requester gave up, so the prompt is stale"
+        );
+        assert!(
+            !p.answer(true),
+            "a yes to a timed-out request reaches nobody"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_tool_call_leaves_a_stale_prompt() {
+        let (c, mut rx) = ChannelConfirmer::new();
+        let asking =
+            tokio::spawn(
+                async move { confirm_or_deny(Some(&c), request(), CONFIRM_TIMEOUT).await },
+            );
+        let p = rx.recv().await.expect("a prompt");
+        assert!(!p.is_stale(), "the tool is still waiting");
+
+        asking.abort();
+        assert!(asking.await.unwrap_err().is_cancelled());
+        assert!(p.is_stale(), "the cancelled tool call dropped its receiver");
+        assert!(!p.answer(true));
+    }
+
+    #[tokio::test]
     async fn no_tui_listening_or_a_dropped_prompt_denies() {
         // The front end's receiver is gone (no TUI attached).
         let (c, rx) = ChannelConfirmer::new();
@@ -620,7 +654,8 @@ mod confirm {
                 let p = rx.recv().await.expect("a prompt");
                 assert_eq!(p.request.summary, "create agent amp-foo");
                 assert_eq!(p.request.scope, "user");
-                p.answer(yes);
+                assert!(!p.is_stale(), "the tool is still waiting");
+                assert!(p.answer(yes), "the waiting tool received the answer");
             });
             let got = confirm_or_deny(Some(&c), request(), CONFIRM_TIMEOUT).await;
             front.await.unwrap();
