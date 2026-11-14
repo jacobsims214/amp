@@ -1238,3 +1238,133 @@ async fn a_queued_worker_the_manager_stops_is_never_dispatched() {
     let first = stop_tool(&sup, json!({"task_id": 4301, "reason": "done testing"})).await;
     assert_eq!(first["status"], "stopped", "{first}");
 }
+
+// ------------------------------------------------------------------------------------------------
+// #4240: the manager's amp_restart_worker / amp_resume_worker.
+// ------------------------------------------------------------------------------------------------
+
+/// Calls one of the manager's worker-control tools the way its model would.
+async fn control_tool(sup: &Arc<Supervisor>, name: &str, args: Value) -> Value {
+    let tools = worker_control::tools(sup);
+    let tool = tools
+        .iter()
+        .find(|t| t.tool.schema().name == name)
+        .unwrap_or_else(|| panic!("{name} is registered"));
+    tool.tool
+        .execute("call-1", args, CancellationToken::new(), Arc::new(|_| {}))
+        .await
+        .unwrap_or_else(|e| panic!("{name} answers: {e:?}"))
+        .details
+}
+
+/// Restart of a running launched worker: the old run is stopped and handed back first, then
+/// exactly one new dispatch and claim follow, and the ticket never has two live workers. A
+/// concurrent second restart is `busy` and dispatches nothing; the new run is recorded
+/// `restarted`. A resume refused before dispatch (no session for a ticket) dispatches nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_manager_restarts_a_worker_through_one_new_dispatch() {
+    let f = fixture("manager-restart").await;
+    let sup = f.reporting_launcher(2);
+    f.script("wf", (0..6).map(|_| bash_then_done("sleep 30")).collect());
+    sup.launch(req(4240, "worker-backend"), CancellationToken::new())
+        .await
+        .expect("launched");
+    f.wait_for_calls("amp_claim_task", 1).await;
+
+    // Watch the live map for the whole restart: never two workers on one ticket.
+    let watching = CancellationToken::new();
+    let watch = tokio::spawn({
+        let (sup, watching) = (Arc::clone(&sup), watching.clone());
+        async move {
+            let mut most = 0;
+            while !watching.is_cancelled() {
+                most = most.max(live_tickets(&sup).len());
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            most
+        }
+    });
+
+    let (first, second) = tokio::join!(
+        control_tool(
+            &sup,
+            "amp_restart_worker",
+            json!({"task_id": 4240, "reason": "went the wrong way"})
+        ),
+        control_tool(
+            &sup,
+            "amp_restart_worker",
+            json!({"task_id": 4240, "reason": "same again"})
+        ),
+    );
+    assert_eq!(first["status"], "restarted", "{first}");
+    assert_eq!(first["action"], "restart");
+    assert_eq!(first["stop"]["status"], "stopped", "{first}");
+    assert_eq!(second["status"], "busy", "{second}");
+    assert!(second.get("run").is_none(), "{second}");
+
+    // The old run: abandoned with the reason, handed back once, never completed.
+    let reported = f.amp.mock.calls_to("amp_report_run");
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert!(
+        reported[0]["run_note"]
+            .as_str()
+            .is_some_and(|n| n.contains("stopped by manager: went the wrong way")),
+        "{reported:?}"
+    );
+    assert_eq!(f.amp.mock.calls_to("amp_return_task").len(), 1);
+    assert!(f.amp.mock.calls_to("amp_complete_task").is_empty());
+
+    // The new run: one more dispatch, claimed with its dispatch.
+    f.wait_for_calls("amp_claim_task", 2).await;
+    assert_eq!(f.dispatched().len(), 2, "exactly one new dispatch");
+    let claims = f.amp.mock.calls_to("amp_claim_task");
+    assert!(
+        claims[1]["dispatch_id"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "{claims:?}"
+    );
+    assert_eq!(live_tickets(&sup).len(), 1);
+
+    // Stop it, and its end carries the restarted note.
+    let stop = control_tool(
+        &sup,
+        "amp_stop_worker",
+        json!({"task_id": 4240, "reason": "done testing"}),
+    )
+    .await;
+    assert_eq!(stop["status"], "stopped", "{stop}");
+    watching.cancel();
+    assert_eq!(watch.await.unwrap(), 1, "never two live workers");
+    let mut notes = Vec::new();
+    while notes.is_empty() {
+        let end = tokio::time::timeout(Duration::from_secs(10), sup.next_launch_end())
+            .await
+            .expect("a launch end");
+        if let Ok(r) = end.result
+            && r.notes.iter().any(|n| n == "restarted")
+        {
+            notes = r.notes;
+        }
+    }
+    assert_eq!(notes[0], "restarted", "{notes:?}");
+
+    // A ticket this chat never ran: not_found, nothing dispatched.
+    let unknown = control_tool(
+        &sup,
+        "amp_resume_worker",
+        json!({"task_id": 999, "mode": "continue", "reason": "x"}),
+    )
+    .await;
+    assert_eq!(unknown["status"], "not_found", "{unknown}");
+    // Named agent but no session to resume: refused before any dispatch.
+    let none = control_tool(
+        &sup,
+        "amp_resume_worker",
+        json!({"task_id": 998, "mode": "continue", "reason": "x", "agent_id": "worker-backend"}),
+    )
+    .await;
+    assert_eq!(none["status"], "no_session", "{none}");
+    assert_eq!(f.dispatched().len(), 2, "no dispatch for refusals");
+}
