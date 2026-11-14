@@ -40,6 +40,7 @@ async fn server_answering(dir: &Path, args: &[&str], stdin: &str) -> Output {
         .current_dir(dir.join("project"))
         .env("HOME", dir.join("home"))
         .env("XDG_CONFIG_HOME", dir.join("home/.config"))
+        .envs(common::xdg_env(&dir.join("home")))
         .env("AMP_CREDENTIAL_STORE", "file")
         .env("AMP_HARNESS_CEILING_DIR", dir)
         .env("AMP_HARNESS_PROMPTS", "stdin")

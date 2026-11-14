@@ -720,6 +720,9 @@ async fn versions_report_pins_assets_and_protocol() {
     // `--version` carries the asset commit too (D11).
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_amp-harness"))
         .arg("--version")
+        .env("HOME", dir.join("home"))
+        .env("XDG_CONFIG_HOME", dir.join("home/.config"))
+        .envs(common::xdg_env(&dir.join("home")))
         .output()
         .unwrap();
     let text = String::from_utf8(out.stdout).unwrap();

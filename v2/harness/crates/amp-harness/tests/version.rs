@@ -27,8 +27,15 @@ fn workspace_pin(manifest: &str, name: &str) -> String {
 }
 
 fn run(args: &[&str]) -> String {
+    // Never the developer's HOME or XDG dirs (#4279), even for `--version`.
+    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join("version-home");
     let out = Command::new(env!("CARGO_BIN_EXE_amp-harness"))
         .args(args)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
         .output()
         .expect("run amp-harness");
     assert!(out.status.success(), "amp-harness {args:?} failed: {out:?}");

@@ -618,7 +618,21 @@ pub fn pty_command() -> std::process::Command {
     cmd
 }
 
-/// Runs the binary in `dir/project` with HOME in `dir/home`, the file credential store,
+/// `XDG_STATE_HOME`, `XDG_CACHE_HOME` and `XDG_DATA_HOME` under `home`, for every amp-harness
+/// child a test spawns (#4279). Left inherited, a developer's or CI's exported XDG_STATE_HOME
+/// sends trust records, MCP logs and sessions into that real state dir (with
+/// `~/.local/state`, the live harness's), and the child disagrees with the in-process runtime
+/// that looks under `home/.local/state`. Pass to `Command::envs` before per-test overrides.
+pub fn xdg_env(home: &Path) -> [(&'static str, PathBuf); 3] {
+    [
+        ("XDG_STATE_HOME", home.join(".local/state")),
+        ("XDG_CACHE_HOME", home.join(".cache")),
+        ("XDG_DATA_HOME", home.join(".local/share")),
+    ]
+}
+
+/// Runs the binary in `dir/project` with HOME in `dir/home` (and XDG_CONFIG_HOME,
+/// XDG_STATE_HOME, XDG_CACHE_HOME, XDG_DATA_HOME under it), the file credential store,
 /// `AMP_MCP_URL=url` and no other AMP_* settings. `env` adds variables.
 pub async fn run(dir: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_amp-harness"));
@@ -626,6 +640,7 @@ pub async fn run(dir: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> 
         .current_dir(dir.join("project"))
         .env("HOME", dir.join("home"))
         .env("XDG_CONFIG_HOME", dir.join("home/.config"))
+        .envs(xdg_env(&dir.join("home")))
         .env("AMP_CREDENTIAL_STORE", "file")
         .env("AMP_MCP_URL", url)
         // The worktree's own .amp.json sits above target/; never find it.
