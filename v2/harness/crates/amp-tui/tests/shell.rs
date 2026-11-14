@@ -590,3 +590,181 @@ async fn a_compaction_that_frees_nothing_warns_once_per_run() {
         "{screen}"
     );
 }
+
+// AMP #4259: self-management confirmations as a y/N question in the chat.
+
+mod confirm {
+    use super::*;
+    use amp_core::approval::{
+        ChannelConfirmer, ConfirmRequest, Confirmed, DenyReason, confirm_or_deny,
+    };
+
+    fn request(name: &str) -> ConfirmRequest {
+        ConfirmRequest::self_management(
+            "amp_manage_agent",
+            format!("/home/me/.config/amp-harness/agents/{name}.md"),
+            "user",
+            format!("create agent {name}"),
+        )
+        .detail("+ description: reviews Go code")
+    }
+
+    /// The rig with the session's confirmer wired to its shell, as the chat does.
+    async fn wired() -> (Rig, Arc<ChannelConfirmer>) {
+        let mut rig = rig(vec![]).await;
+        let (confirmer, confirms) = ChannelConfirmer::new();
+        rig.shell.set_confirms(confirms);
+        (rig, Arc::new(confirmer))
+    }
+
+    /// A tool asking with `timeout`, as `confirm_or_deny` is called from a manager tool.
+    fn ask(
+        c: &Arc<ChannelConfirmer>,
+        name: &str,
+        timeout: Duration,
+    ) -> tokio::task::JoinHandle<Confirmed> {
+        let c = Arc::clone(c);
+        let req = request(name);
+        tokio::spawn(async move { confirm_or_deny(Some(c.as_ref()), req, timeout).await })
+    }
+
+    /// Polls (bounded) until a question is on screen.
+    async fn until_shown(rig: &mut Rig) {
+        for _ in 0..200 {
+            rig.shell.poll();
+            if rig.shell.confirm_pending() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no confirmation shown:\n{}", rig.screen());
+    }
+
+    async fn outcome(h: tokio::task::JoinHandle<Confirmed>) -> Confirmed {
+        tokio::time::timeout(WAIT, h)
+            .await
+            .expect("the tool got an answer")
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_shows_a_y_n_question_and_y_approves() {
+        let (mut rig, c) = wired().await;
+        let h = ask(&c, "amp-foo", WAIT);
+        until_shown(&mut rig).await;
+        let screen = rig.screen();
+        assert!(
+            screen.contains("Allow amp_manage_agent to create agent amp-foo? [y/N]"),
+            "{screen}"
+        );
+        assert!(screen.contains("user scope:"), "{screen}");
+        assert!(screen.contains("agents/amp-foo.md"), "{screen}");
+        assert!(
+            screen.contains("+ description: reviews Go code"),
+            "{screen}"
+        );
+        assert!(screen.contains("Press y to allow it"), "{screen}");
+        assert!(
+            !rig.shell.input_focused(),
+            "the editor does not take the key"
+        );
+        assert!(rig.shell.press("y").await.unwrap());
+        assert_eq!(outcome(h).await, Confirmed::Approved);
+        assert!(!rig.shell.confirm_pending());
+        assert!(rig.screen().contains("Allowed: amp_manage_agent may write"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_y_approves_esc_n_and_enter_refuse() {
+        let (mut rig, c) = wired().await;
+        for key in ["n", "esc", "enter", "x"] {
+            let h = ask(&c, "amp-foo", WAIT);
+            until_shown(&mut rig).await;
+            assert!(rig.shell.press(key).await.unwrap());
+            assert_eq!(
+                outcome(h).await,
+                Confirmed::Denied(DenyReason::Declined),
+                "key {key}"
+            );
+            assert!(!rig.shell.confirm_pending());
+        }
+        assert!(
+            rig.screen()
+                .contains("Refused: amp_manage_agent did not write")
+        );
+        // A modified y (Ctrl+Y) is not a yes either.
+        let h = ask(&c, "amp-foo", WAIT);
+        until_shown(&mut rig).await;
+        let ctrl_y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL);
+        assert!(rig.shell.key(&ctrl_y, true).await);
+        assert_eq!(outcome(h).await, Confirmed::Denied(DenyReason::Declined));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_question_closes_and_a_late_y_writes_nothing() {
+        let (mut rig, c) = wired().await;
+        // On screen, then the tool gives up: the next poll closes it.
+        let h = ask(&c, "amp-slow", Duration::from_millis(200));
+        until_shown(&mut rig).await;
+        assert_eq!(outcome(h).await, Confirmed::Denied(DenyReason::TimedOut));
+        rig.shell.poll();
+        assert!(!rig.shell.confirm_pending());
+        let screen = rig.screen();
+        assert!(
+            screen.contains(
+                "The request from amp_manage_agent timed out before an answer; nothing was written."
+            ),
+            "{screen}"
+        );
+
+        // On screen, the tool gives up, and a `y` lands before the next poll: it says so.
+        let h = ask(&c, "amp-late", Duration::from_millis(200));
+        until_shown(&mut rig).await;
+        assert_eq!(outcome(h).await, Confirmed::Denied(DenyReason::TimedOut));
+        assert!(rig.shell.press("y").await.unwrap());
+        let screen = rig.screen();
+        assert!(
+            screen.contains("That request already timed out; nothing was written."),
+            "{screen}"
+        );
+        assert!(!screen.contains("Allowed:"), "{screen}");
+
+        // Stale before it was ever shown: skipped.
+        let h = ask(&c, "amp-never", Duration::from_millis(50));
+        assert_eq!(outcome(h).await, Confirmed::Denied(DenyReason::TimedOut));
+        rig.shell.poll();
+        assert!(!rig.shell.confirm_pending());
+        assert!(!rig.screen().contains("amp-never"), "{}", rig.screen());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_question_at_a_time_the_next_waits_its_turn() {
+        let (mut rig, c) = wired().await;
+        let first = ask(&c, "amp-one", WAIT);
+        until_shown(&mut rig).await;
+        let second = ask(&c, "amp-two", WAIT);
+        for _ in 0..20 {
+            rig.shell.poll();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(rig.screen().contains("create agent amp-one"));
+        assert!(
+            !rig.screen().contains("create agent amp-two"),
+            "{}",
+            rig.screen()
+        );
+        assert!(rig.shell.press("n").await.unwrap());
+        assert_eq!(
+            outcome(first).await,
+            Confirmed::Denied(DenyReason::Declined)
+        );
+        until_shown(&mut rig).await;
+        assert!(
+            rig.screen().contains("create agent amp-two"),
+            "{}",
+            rig.screen()
+        );
+        assert!(rig.shell.press("y").await.unwrap());
+        assert_eq!(outcome(second).await, Confirmed::Approved);
+    }
+}

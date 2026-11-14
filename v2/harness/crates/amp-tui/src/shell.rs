@@ -59,6 +59,15 @@
 //! Esc and `/abort` still just stop the reply, with a note that the worker stops too. A stopped or abandoned worker's ticket is handed back to ready in
 //! AMP (run reporting's `on_finish`; [`Supervisor::release_unfinished`] when quitting without
 //! waiting), so it is not left in progress with nobody on it. Signals still quit at once.
+//!
+//! **Self-management confirmations (AMP #4259).** A manager tool that writes the harness's own
+//! agents, skills or MCP servers asks the person first (`amp_core::approval`, #4247). The binary
+//! hands the shell the receiver of its `ChannelConfirmer` ([`Shell::set_confirms`]); each live
+//! request is shown in the transcript as a y/N question (tool, summary, scope and path, then the
+//! diff or other details), one at a time, while the reply that asked keeps running. The next key
+//! answers it: only `y` allows; Esc, `n` or any other key refuses. A request whose tool already
+//! gave up (timed out or cancelled) is never shown, one on screen that goes stale is closed, and a
+//! `y` that arrives too late says nothing was written.
 
 use std::{
     future::Future,
@@ -81,6 +90,8 @@ use rpi_harness::agent_harness::{
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+
+use amp_core::approval::{CONFIRM_TIMEOUT, PendingConfirm};
 
 use crate::amp_render::{self, ApprovalNotice};
 use crate::history::{PromptHistory, Recall};
@@ -582,6 +593,17 @@ const COMPACTION_FAILED: &str = "compaction_failed";
 /// worker's session during a run (#2181, #2354). With this chat's workers live it names them
 /// ([`esc_hint`]).
 pub const ESC_HINT: &str = "Esc again to stop the reply";
+
+/// What a `y` to a confirmation that had already timed out says (AMP #4259, #4277).
+pub const CONFIRM_TOO_LATE: &str = "That request already timed out; nothing was written.";
+/// At most this many detail rows (a diff, a TOML block) of a confirmation are shown (AMP #4259).
+const CONFIRM_DETAIL_ROWS: usize = 24;
+
+/// A confirmation's text as the terminal shows it: no control or escape characters, at most
+/// 300 characters a row (it comes from the model's tool call).
+fn confirm_text(s: &str) -> String {
+    amp_core::remote::pairing::sanitize_for_terminal(s, 300)
+}
 
 /// At most this many prompts wait for the running reply, here as on a paired device (AMP #2889).
 pub use amp_core::remote::link::QUEUE_MAX;
@@ -1368,6 +1390,11 @@ pub struct Shell {
     viewing: Option<i64>,
     /// A stop waiting for its `y` (#2252).
     stop_confirm: Option<i64>,
+    /// Self-management confirmation requests (AMP #4259) from the session's `ChannelConfirmer`,
+    /// taken one at a time.
+    confirms: Option<tokio::sync::mpsc::Receiver<PendingConfirm>>,
+    /// The confirmation on screen, waiting for its `y`/`N`.
+    confirm: Option<PendingConfirm>,
     /// The person clicked into the editor while a panel was open (#2344): the editor has the
     /// keys (↑↓ and Enter included) until the panel closes or something is sent.
     editor_clicked: bool,
@@ -1508,6 +1535,8 @@ impl Shell {
                 sessions: Default::default(),
                 viewing: None,
                 stop_confirm: None,
+                confirms: None,
+                confirm: None,
                 editor_clicked: false,
                 person: None,
                 scroll_back: None,
@@ -1713,6 +1742,120 @@ impl Shell {
             (false, _) => format!("Refused \"{name}\": it was not paired."),
         };
         self.view.add_notice(&line);
+    }
+
+    /// The receiver of the session's `ChannelConfirmer` (AMP #4259): its requests are shown as
+    /// y/N questions, one at a time ([`Shell::poll`] takes the next).
+    pub fn set_confirms(&mut self, confirms: tokio::sync::mpsc::Receiver<PendingConfirm>) {
+        self.confirms = Some(confirms);
+    }
+
+    /// A self-management confirmation is on screen, waiting for its `y`/`N` (AMP #4259).
+    pub fn confirm_pending(&self) -> bool {
+        self.confirm.is_some()
+    }
+
+    /// Answers the confirmation on screen (AMP #4259): `yes` only from a `y` typed on this
+    /// keyboard. A request that had already timed out says nothing was written; then the next
+    /// waiting request, if any, is shown.
+    pub fn answer_confirm(&mut self, yes: bool) {
+        let Some(prompt) = self.confirm.take() else {
+            return;
+        };
+        let tool = confirm_text(&prompt.request.tool);
+        let path = confirm_text(&prompt.request.path.display().to_string());
+        let line = match (prompt.answer(yes), yes) {
+            (false, _) => CONFIRM_TOO_LATE.to_owned(),
+            (true, true) => format!("Allowed: {tool} may write {path}."),
+            (true, false) => format!("Refused: {tool} did not write {path}."),
+        };
+        self.view.add_notice(&line);
+        self.poll_confirms();
+    }
+
+    /// Closes the confirmation on screen once its tool has given up, and shows the next live
+    /// one (stale ones waiting in the channel are skipped: their tools already said "not
+    /// written"). Returns whether anything changed.
+    fn poll_confirms(&mut self) -> bool {
+        let mut changed = false;
+        if self.confirm.as_ref().is_some_and(PendingConfirm::is_stale) {
+            let prompt = self.confirm.take();
+            let tool = prompt
+                .map(|p| confirm_text(&p.request.tool))
+                .unwrap_or_default();
+            self.view.add_notice(&format!(
+                "The request from {tool} timed out before an answer; nothing was written."
+            ));
+            changed = true;
+        }
+        if self.confirm.is_some() {
+            return changed;
+        }
+        let Some(rx) = self.confirms.as_mut() else {
+            return changed;
+        };
+        loop {
+            match rx.try_recv() {
+                // Dropping it is a "no" nobody waits for.
+                Ok(prompt) if prompt.is_stale() => continue,
+                Ok(prompt) => {
+                    self.show_confirm(&prompt);
+                    self.confirm = Some(prompt);
+                    return true;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return changed,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    self.confirms = None;
+                    return changed;
+                }
+            }
+        }
+    }
+
+    /// The confirmation question, on this terminal only: what the tool wants, where, the
+    /// details (capped at [`CONFIRM_DETAIL_ROWS`]), and how to answer.
+    fn show_confirm(&mut self, prompt: &PendingConfirm) {
+        let r = &prompt.request;
+        self.view.add_local_line(
+            &format!(
+                "Allow {} to {}? [y/N]",
+                confirm_text(&r.tool),
+                confirm_text(&r.summary)
+            ),
+            true,
+        );
+        self.view.add_local_line(
+            &format!(
+                "{} scope: {}",
+                confirm_text(&r.scope),
+                confirm_text(&r.path.display().to_string())
+            ),
+            false,
+        );
+        let rows: Vec<String> = r
+            .details
+            .iter()
+            .flat_map(|d| d.lines().map(confirm_text).collect::<Vec<_>>())
+            .collect();
+        for row in rows.iter().take(CONFIRM_DETAIL_ROWS) {
+            self.view.add_local_line(&format!("  {row}"), false);
+        }
+        if rows.len() > CONFIRM_DETAIL_ROWS {
+            self.view.add_local_line(
+                &format!("  … {} more lines", rows.len() - CONFIRM_DETAIL_ROWS),
+                false,
+            );
+        }
+        let minutes = CONFIRM_TIMEOUT.as_secs().div_ceil(60);
+        self.view.add_local_line(
+            &format!(
+                "Press y to allow it; Esc or any other key refuses. Only this keyboard can \
+                 answer; with no answer within {minutes} minute{} it is refused.",
+                if minutes == 1 { "" } else { "s" }
+            ),
+            false,
+        );
+        self.view.scroll().to_end();
     }
 
     /// The screen's size for the QR code: the last one seen, else the terminal's, else 80x24.
@@ -2109,6 +2252,7 @@ impl Shell {
         if self.secret.is_some()
             || self.stop_confirm.is_some()
             || self.pairing_pending()
+            || self.confirm_pending()
             || self.viewing.is_some()
             || self.view.strip().is_focused()
         {
@@ -2650,6 +2794,11 @@ impl Shell {
                 "this chat is waiting to carry on when the plan is approved — press Esc to stop \
                  waiting, then try again."
                     .to_owned(),
+            );
+        }
+        if self.confirm_pending() {
+            return Some(
+                "a write is waiting for your y/N — answer it first, then try again.".to_owned(),
             );
         }
         if self.pairing_pending() {
@@ -4202,6 +4351,16 @@ impl Shell {
             self.answer_pairing(allow);
             return true;
         }
+        // AMP #4259: a self-management confirmation takes the next key, also while the reply
+        // that asked is running: `y` allows, anything else (Esc, `n`, Enter) refuses.
+        if self.confirm_pending() {
+            let plain = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            let yes = plain && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+            self.answer_confirm(yes);
+            return true;
+        }
         // #2252: a stop waiting for its answer takes the next key; a worker's session takes
         // every key while it is shown (the editor is hidden).
         if self.stop_confirm.is_some() {
@@ -5002,6 +5161,7 @@ impl Shell {
         }
         if self.stop_confirm.is_some()
             || self.pairing_pending()
+            || self.confirm_pending()
             || self.viewing.is_some()
             || self.view.strip().is_focused()
         {
@@ -5062,6 +5222,7 @@ impl Shell {
     pub fn poll(&mut self) -> bool {
         let mut changed = self.expire_hints(Instant::now());
         changed |= self.poll_remote();
+        changed |= self.poll_confirms();
         changed |= self.build_roster();
         changed |= self.show_launch_ends();
         changed |= self.pump_sessions();

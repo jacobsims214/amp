@@ -64,6 +64,10 @@ pub struct SessionRequest<'a> {
     /// How `amp_run_ticket` picks its [`DispatchMode`]: [`HEADLESS_DISPATCH`] for `run -p`,
     /// [`CHAT_DISPATCH`] for the interactive chat.
     pub dispatch: Dispatch,
+    /// Who confirms the manager's self-management writes (AMP #4247, #4259): the chat's y/N
+    /// prompt. `None` (headless `run -p`) denies every such write ("no person can confirm it
+    /// here").
+    pub confirmer: Option<Arc<dyn amp_core::approval::Confirmer>>,
 }
 
 /// How a front end chooses the manager's [`DispatchMode`] against `[workers] dispatch` and
@@ -111,6 +115,9 @@ pub struct Session {
     pub mcp_events: tokio::sync::broadcast::Receiver<amp_core::mcp_hub::HubEvent>,
     /// MCP servers still on their first attempt when the session was built.
     pub mcp_starting: Vec<String>,
+    /// [`SessionRequest::confirmer`], for the self-management tools (#4252) and `/reload`.
+    #[allow(dead_code, reason = "the self-management tools (AMP #4252) take it")]
+    pub confirmer: Option<Arc<dyn amp_core::approval::Confirmer>>,
 }
 
 /// The manager's tools that come with its [`Supervisor`]: `amp_run_ticket` and the worker-control
@@ -321,6 +328,7 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         offline,
         mcp_events,
         mcp_starting,
+        confirmer: req.confirmer,
     })
 }
 

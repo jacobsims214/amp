@@ -350,6 +350,8 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         // AMP #2884: the process ends with the manager's reply, so `amp_run_ticket` must wait for
         // its worker here whatever `[workers] dispatch` or AMP_HARNESS_WORKER_DISPATCH says.
         dispatch: session::HEADLESS_DISPATCH,
+        // AMP #4259: no person to ask, so every self-management write is denied.
+        confirmer: None,
     });
     let session = tokio::select! {
         s = build => s?,

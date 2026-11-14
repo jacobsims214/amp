@@ -210,6 +210,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         None
     };
 
+    let (confirmer, confirms) = confirm_channel();
     let session = session::build(session::SessionRequest {
         conn: &args.conn,
         role: args.role.as_deref(),
@@ -223,6 +224,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         // AMP #2837: workers run in the background, so the person can keep talking to the manager
         // while they work; an explicit `[workers] dispatch = "await"` (or the env var) still wins.
         dispatch: session::CHAT_DISPATCH,
+        // AMP #4259: the manager's self-management writes ask the person here (below).
+        confirmer: Some(confirmer),
     })
     .await?;
     let settings = args.conn.settings()?;
@@ -233,6 +236,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         &session.rt.current_providers(),
     );
     let (mut shell, mut done) = Shell::new(session.agent.harness.clone(), info, models);
+    // AMP #4259: each self-management write the manager asks for is a y/N question in the chat.
+    shell.set_confirms(confirms);
     // AMP #4224 (spec M2): the role's context_window / max_tokens caps hold on any model /model
     // or /reload switches this chat to.
     shell.set_role_caps(session.agent.resolved.caps);
@@ -530,6 +535,19 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     }
     hub.shutdown().await;
     Ok(())
+}
+
+/// The chat's side of self-management confirmations (AMP #4247, #4259): the [`Confirmer`] the
+/// session's tools ask, and the receiver the shell shows each request from as a y/N question.
+/// Headless `run -p` has neither, so its writes are denied.
+///
+/// [`Confirmer`]: amp_core::approval::Confirmer
+fn confirm_channel() -> (
+    Arc<dyn amp_core::approval::Confirmer>,
+    tokio::sync::mpsc::Receiver<amp_core::approval::PendingConfirm>,
+) {
+    let (confirmer, confirms) = amp_core::approval::ChannelConfirmer::new();
+    (Arc::new(confirmer), confirms)
 }
 
 /// Puts each MCP hub change in the transcript until the hub goes away. A server's failure is
@@ -1006,8 +1024,59 @@ fn git_branch(cwd: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_line, parse_size, session_banner, session_id, tilde};
+    use super::{confirm_channel, exit_line, parse_size, session_banner, session_id, tilde};
     use std::path::Path;
+
+    use amp_core::approval::{ConfirmRequest, Confirmed, DenyReason, confirm_or_deny};
+
+    fn write_request() -> ConfirmRequest {
+        ConfirmRequest::self_management(
+            "amp_manage_agent",
+            "/tmp/agents/amp-foo.md",
+            "user",
+            "create agent amp-foo",
+        )
+    }
+
+    /// AMP #4259: the chat's confirmer delivers each request to the shell's receiver, and the
+    /// answer given there is what the tool gets: only a yes approves.
+    #[tokio::test]
+    async fn the_chat_confirmer_hands_requests_to_the_shell_and_takes_its_answer() {
+        for (yes, want) in [
+            (true, Confirmed::Approved),
+            (false, Confirmed::Denied(DenyReason::Declined)),
+        ] {
+            let (confirmer, mut confirms) = confirm_channel();
+            let ask = tokio::spawn(async move {
+                confirm_or_deny(
+                    Some(confirmer.as_ref()),
+                    write_request(),
+                    std::time::Duration::from_secs(10),
+                )
+                .await
+            });
+            let prompt = tokio::time::timeout(std::time::Duration::from_secs(5), confirms.recv())
+                .await
+                .expect("prompt in time")
+                .expect("prompt");
+            assert_eq!(prompt.request.summary, "create agent amp-foo");
+            assert!(prompt.answer(yes), "the tool is still waiting");
+            assert_eq!(ask.await.unwrap(), want);
+        }
+    }
+
+    /// AMP #4259: headless `run -p` builds its session without a confirmer, so a write is
+    /// denied with a message that says why.
+    #[tokio::test]
+    async fn headless_has_no_confirmer_and_denies_with_a_clear_message() {
+        let got = confirm_or_deny(None, write_request(), std::time::Duration::from_secs(1)).await;
+        assert_eq!(got, Confirmed::Denied(DenyReason::NoResponder));
+        let msg = got.denial_message().unwrap();
+        assert!(
+            msg.contains("not written") && msg.contains("headless"),
+            "{msg}"
+        );
+    }
 
     #[test]
     fn the_exit_line_names_the_session_file_with_a_tilde() {
