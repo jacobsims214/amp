@@ -654,12 +654,23 @@ export interface APIToken {
   user_id: number
   name: string
   prefix: string
+  /**
+   * How much of the account this token carries: `full`, or `submit` for a
+   * credential attenuated to one team's inbox (AMP #3772). Every token minted
+   * before scopes existed is `full`. Absent on an older API — read it as full.
+   */
+  scope?: TokenScope
+  /** The one team a `submit` credential may send requests to; absent on a full-scope token. */
+  scope_team_id?: number | null
   created_by?: number
   created_at: string
   expires_at?: string
   last_used_at?: string
   revoked_at?: string
 }
+
+/** A token's reach (AMP #3772): the whole account, or submission to one inbox. */
+export type TokenScope = 'full' | 'submit'
 
 /** A token as just created: the only time `token` is shown. */
 export interface NewAPIToken extends APIToken {

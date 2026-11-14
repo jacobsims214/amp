@@ -4,7 +4,7 @@ import type {
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
-  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, GitHubCredentialInfo, GitHubCredentialChange, Run, RunView, Usage, UpstreamDecision, DecisionAsk, DecisionDoc, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
+  Artifact, ArtifactVersion, APIToken, NewAPIToken, TokenScope, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, GitHubCredentialInfo, GitHubCredentialChange, Run, RunView, Usage, UpstreamDecision, DecisionAsk, DecisionDoc, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
   ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork, MyWorkCounts, PeopleWaiting,
   GettingStarted, ReceiptsMode, ReceiptMinLevel, ReceiptSummary, ReceiptView, TaskReceipt,
   RequestQueueFilter, RequestQueue, RequestQueueSummary, RequestReadAnswer, OwnRequestFilter, OwnRequestPage,
@@ -499,8 +499,20 @@ export const api = {
   createAgent: (name: string, teamIds: number[]) =>
     post<{ agent: AmpUser }>('/agents', { name, team_ids: teamIds }).then(r => r.agent),
   listTokens: (user: number | 'me') => get<{ tokens: APIToken[] | null }>(`/users/${user}/tokens`).then(r => r.tokens ?? []),
-  createToken: (user: number | 'me', name: string, expiresInDays = 0) =>
-    post<{ token: NewAPIToken }>(`/users/${user}/tokens`, { name, expires_in_days: expiresInDays }).then(r => r.token),
+  /**
+   * Mint a token. `scope` narrows it (AMP #3772): `submit` makes a credential
+   * that may only send requests to `scopeTeamId`'s inbox. Omitting it mints a
+   * full-scope token, exactly as before.
+   *
+   * The secret is in the answer and nowhere else — there is no route that
+   * returns one (`service.ListTokens` never carries it), so a caller that drops
+   * it has to mint another.
+   */
+  createToken: (user: number | 'me', name: string, expiresInDays = 0, scope?: { scope: TokenScope; scopeTeamId?: number }) =>
+    post<{ token: NewAPIToken }>(`/users/${user}/tokens`, {
+      name, expires_in_days: expiresInDays,
+      ...(scope ? { scope: scope.scope, ...(scope.scopeTeamId != null ? { scope_team_id: scope.scopeTeamId } : {}) } : {}),
+    }).then(r => r.token),
   revokeToken: (tokenId: number) => del(`/tokens/${tokenId}`),
 
   // Audit log: global admins any; org admins pass orgId; project owners projectId
