@@ -41,6 +41,7 @@ use rpi_ai::{
     Api, InputModality, Model, ModelCost, ModelCostRates, ThinkingLevel,
     model::{AnthropicMessagesCompat, OpenaiCompletionsCompat, StreamingProtocolCompat},
 };
+use rpi_harness::types::{CompactionSettings, DEFAULT_COMPACTION_SETTINGS};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -92,6 +93,10 @@ pub struct ModelsFile {
     pub roles: BTreeMap<String, RoleSpec>,
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileSpec>,
+    /// `[compaction]` (#4221): when rpi compacts a chat's history. Global (one value per harness),
+    /// layered shipped -> user only; a repo config may not set it.
+    #[serde(default)]
+    pub compaction: CompactionSpec,
 }
 
 /// `[models]`: which assignment mode is active.
@@ -228,6 +233,19 @@ pub struct ProfileSpec {
     pub description: Option<String>,
     #[serde(default)]
     pub roles: BTreeMap<String, RoleSpec>,
+}
+
+/// `[compaction]`: rpi's `CompactionSettings`, field by field. Unset fields keep the lower layer's
+/// value, and in the end rpi's [`DEFAULT_COMPACTION_SETTINGS`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionSpec {
+    /// Master switch for rpi's automatic compaction (before each run and between tool-loop turns).
+    pub enabled: Option<bool>,
+    /// Headroom kept below the model's context window: compaction starts at `window - reserve`.
+    pub reserve_tokens: Option<i64>,
+    /// Recent history kept verbatim after a compaction.
+    pub keep_recent_tokens: Option<i64>,
 }
 
 impl ModelsFile {
@@ -851,6 +869,11 @@ pub struct ModelsConfig {
     pub profiles: BTreeMap<String, Option<String>>,
     /// `[models] fallback` and the layer that set it; `None` means [`DEFAULT_FALLBACK_ROLE`].
     pub fallback: Option<(String, String)>,
+    /// `[compaction]`, merged and validated against every built model (#4221).
+    pub compaction: CompactionConfig,
+    /// Problems that do not stop loading (#4221): doctor shows all of them, the chat's load
+    /// notice [`ModelsConfig::load_warnings`].
+    pub warnings: Vec<ModelsWarning>,
     roles: BTreeMap<String, RoleEntry>,
 }
 
@@ -910,6 +933,172 @@ pub struct FallbackModel {
     pub source: String,
     /// The model it resolves to (`Err` when it does not resolve).
     pub resolved: Result<ResolvedRole, ModelsError>,
+}
+
+/// The merged `[compaction]` table (#4221) and where each field came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionConfig {
+    /// What the harness is built with ([`ModelsConfig::compaction_settings`]).
+    pub settings: CompactionSettings,
+    /// Source of `enabled`: `default` (rpi's), `shipped` or `config <path>`.
+    pub enabled_source: String,
+    /// Source of `reserve_tokens`.
+    pub reserve_tokens_source: String,
+    /// Source of `keep_recent_tokens`.
+    pub keep_recent_tokens_source: String,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            settings: DEFAULT_COMPACTION_SETTINGS,
+            enabled_source: COMPACTION_DEFAULT_SOURCE.to_owned(),
+            reserve_tokens_source: COMPACTION_DEFAULT_SOURCE.to_owned(),
+            keep_recent_tokens_source: COMPACTION_DEFAULT_SOURCE.to_owned(),
+        }
+    }
+}
+
+/// The source of a `[compaction]` field nobody set: rpi's `DEFAULT_COMPACTION_SETTINGS`.
+pub const COMPACTION_DEFAULT_SOURCE: &str = "default";
+/// The source of a `[compaction]` field set by the shipped `models.toml`.
+pub const COMPACTION_SHIPPED_SOURCE: &str = "shipped";
+
+impl CompactionConfig {
+    /// Layers `spec` (labelled `source`) over `self`, field by field. `reserve_tokens` and
+    /// `keep_recent_tokens` must be positive.
+    fn overlay(&mut self, spec: CompactionSpec, source: &str) -> Result<(), ModelsError> {
+        for (key, value) in [
+            ("reserve_tokens", spec.reserve_tokens),
+            ("keep_recent_tokens", spec.keep_recent_tokens),
+        ] {
+            if let Some(v) = value
+                && v <= 0
+            {
+                return err(format!(
+                    "[compaction] {key} = {v} ({source}): must be greater than 0"
+                ));
+            }
+        }
+        if let Some(v) = spec.enabled {
+            self.settings.enabled = v;
+            self.enabled_source = source.to_owned();
+        }
+        if let Some(v) = spec.reserve_tokens {
+            self.settings.reserve_tokens = v;
+            self.reserve_tokens_source = source.to_owned();
+        }
+        if let Some(v) = spec.keep_recent_tokens {
+            self.settings.keep_recent_tokens = v;
+            self.keep_recent_tokens_source = source.to_owned();
+        }
+        Ok(())
+    }
+
+    /// True when the user file set `reserve_tokens` or `keep_recent_tokens` (then a model they
+    /// do not fit is an error, not a warning).
+    fn user_set_sizes(&self) -> bool {
+        [&self.reserve_tokens_source, &self.keep_recent_tokens_source]
+            .iter()
+            .any(|s| {
+                s.as_str() != COMPACTION_DEFAULT_SOURCE && s.as_str() != COMPACTION_SHIPPED_SOURCE
+            })
+    }
+
+    /// `reserve_tokens + keep_recent_tokens` must be below `model`'s context window. `Err` says
+    /// by how much it is not.
+    pub fn check_fits(&self, model: &Model) -> Result<(), String> {
+        let need = self.settings.reserve_tokens as i128 + self.settings.keep_recent_tokens as i128;
+        let window = model.context_window as i128;
+        if need < window {
+            return Ok(());
+        }
+        Err(format!(
+            "[compaction] reserve_tokens ({}, {}) + keep_recent_tokens ({}, {}) = {need} does not fit in {}/{}'s context_window ({window}); lower them or raise the model's context_window",
+            self.settings.reserve_tokens,
+            self.reserve_tokens_source,
+            self.settings.keep_recent_tokens,
+            self.keep_recent_tokens_source,
+            model.provider,
+            model.id,
+        ))
+    }
+}
+
+/// What a [`ModelsWarning`] is about. Never fatal; doctor lists all of them, the chat's load
+/// notice only those that are not [`WarningKind::doctor_only`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WarningKind {
+    /// W1: a model's `max_tokens` is above its `context_window`.
+    MaxTokensOverWindow,
+    /// W2: `[compaction] reserve_tokens` is below a role model's `max_tokens`, so one long turn
+    /// can run past the window between compaction checks. True for most shipped models, so
+    /// doctor-only.
+    ReserveBelowOutput,
+    /// W3: no catalog entry and no `context_window`: the window is assumed to be 128000.
+    AssumedWindow,
+    /// The default `reserve_tokens + keep_recent_tokens` do not fit a model's window (when the
+    /// user sets them it is an error instead).
+    CompactionDoesNotFit,
+}
+
+impl WarningKind {
+    /// Shown by doctor only, not on every chat load.
+    pub fn doctor_only(self) -> bool {
+        matches!(self, Self::ReserveBelowOutput)
+    }
+}
+
+/// A config problem worth showing that does not stop the config loading (#4221).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelsWarning {
+    pub kind: WarningKind,
+    /// `provider/model` (or `role <id>` for W2).
+    pub subject: String,
+    pub message: String,
+}
+
+impl fmt::Display for ModelsWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Errors on `context_window = 0` (rpi then never compacts) in one layer's models.
+fn check_zero_windows(
+    providers: &BTreeMap<String, ProviderSpec>,
+    source: &str,
+) -> Result<(), ModelsError> {
+    for (provider, spec) in providers {
+        for (model, m) in &spec.models {
+            if m.context_window == Some(0) {
+                return err(format!(
+                    "[providers.{provider}.models.\"{model}\"] context_window = 0 ({source}): must be greater than 0 (0 turns automatic compaction off without saying so)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The models whose window `build_model` assumes (no catalog entry, no `context_window`), as
+/// `provider/model`. Faux providers are left out (scripted, no real window).
+fn assumed_windows(providers: &BTreeMap<String, ProviderSpec>) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (provider, spec) in providers {
+        let api = spec.api.as_deref().and_then(ProviderApi::parse);
+        if matches!(api, None | Some(ProviderApi::Faux)) {
+            continue;
+        }
+        for (id, m) in &spec.models {
+            let catalog = api == Some(ProviderApi::AnthropicMessages)
+                && rpi_ai::providers::anthropic::models::get_model(id).is_some();
+            if m.context_window.is_none() && !catalog {
+                out.insert(format!("{provider}/{id}"));
+            }
+        }
+    }
+    out
 }
 
 impl ModelsConfig {
@@ -988,13 +1177,57 @@ impl ModelsConfig {
         let repo_layer = repo.map(RepoConfig::models_file).unwrap_or_default();
 
         // Providers and models.
+        check_zero_windows(&defaults.providers, "shipped models.toml")?;
+        check_zero_windows(&user.providers, user_label)?;
         let mut provider_specs = defaults.providers;
         for (id, spec) in user.providers {
             merge_provider(provider_specs.entry(id).or_default(), spec);
         }
+        let assumed = assumed_windows(&provider_specs);
         let mut providers = BTreeMap::new();
         for (id, spec) in provider_specs {
             providers.insert(id.clone(), build_provider(&id, spec)?);
+        }
+
+        // [compaction]: shipped, then the user file (a repo config may not set it).
+        let mut compaction = CompactionConfig::default();
+        compaction.overlay(defaults.compaction, COMPACTION_SHIPPED_SOURCE)?;
+        compaction.overlay(user.compaction, user_label)?;
+        let mut warnings = Vec::new();
+        for provider in providers.values() {
+            for model in provider.models.values() {
+                let subject = format!("{}/{}", provider.id, model.id);
+                if let Err(problem) = compaction.check_fits(model) {
+                    if compaction.user_set_sizes() {
+                        return err(problem);
+                    }
+                    warnings.push(ModelsWarning {
+                        kind: WarningKind::CompactionDoesNotFit,
+                        subject: subject.clone(),
+                        message: format!("{problem} (rpi compacts on every run for this model)"),
+                    });
+                }
+                if model.max_tokens > model.context_window {
+                    warnings.push(ModelsWarning {
+                        kind: WarningKind::MaxTokensOverWindow,
+                        subject: subject.clone(),
+                        message: format!(
+                            "{subject}: max_tokens ({}) is above context_window ({})",
+                            model.max_tokens, model.context_window
+                        ),
+                    });
+                }
+                if assumed.contains(&subject) {
+                    warnings.push(ModelsWarning {
+                        kind: WarningKind::AssumedWindow,
+                        subject: subject.clone(),
+                        message: format!(
+                            "context_window not set for {subject}; assuming {}",
+                            model.context_window
+                        ),
+                    });
+                }
+            }
         }
 
         // Profiles.
@@ -1114,7 +1347,7 @@ impl ModelsConfig {
                 .map_err(|e| ModelsError(format!("[models] fallback ({source}): {e}")))?;
         }
 
-        Ok(Self {
+        let mut config = Self {
             providers,
             selection,
             config_file: None,
@@ -1125,8 +1358,49 @@ impl ModelsConfig {
                 .into_iter()
                 .map(|(name, spec)| (name, spec.description))
                 .collect(),
+            compaction,
+            warnings,
             roles,
-        })
+        };
+        config.warn_reserve_below_output();
+        Ok(config)
+    }
+
+    /// W2: a configured role whose model can write more in one turn than `reserve_tokens` leaves.
+    fn warn_reserve_below_output(&mut self) {
+        let settings = self.compaction.settings;
+        if !settings.enabled {
+            return;
+        }
+        let mut found = Vec::new();
+        for (role, resolved) in self.resolve_all() {
+            let Ok(resolved) = resolved else { continue };
+            if (resolved.model.max_tokens as i128) > settings.reserve_tokens as i128 {
+                found.push(ModelsWarning {
+                    kind: WarningKind::ReserveBelowOutput,
+                    subject: format!("role {role}"),
+                    message: format!(
+                        "role {role}: {}'s max_tokens ({}) is above [compaction] reserve_tokens ({}, {}); one long turn can pass the context window before compaction runs",
+                        resolved.model_ref(),
+                        resolved.model.max_tokens,
+                        settings.reserve_tokens,
+                        self.compaction.reserve_tokens_source,
+                    ),
+                });
+            }
+        }
+        self.warnings.extend(found);
+    }
+
+    /// The `CompactionSettings` every harness is built with (#4221). Global: the same for every
+    /// model, already checked against each built model's context window.
+    pub fn compaction_settings(&self) -> CompactionSettings {
+        self.compaction.settings
+    }
+
+    /// The warnings the chat shows when the config loads: all but the doctor-only ones.
+    pub fn load_warnings(&self) -> impl Iterator<Item = &ModelsWarning> {
+        self.warnings.iter().filter(|w| !w.kind.doctor_only())
     }
 
     /// Which layers set `role`'s assignment (`default`, `profile anthropic`, `config <path>`,
@@ -2389,5 +2663,231 @@ thinking = "high"
             missing.resolve_role("manager").unwrap().provider,
             "openrouter"
         );
+    }
+
+    // ---- [compaction] (#4221, spec specs/harness-model-budget-config.md §9 T1-T7) ----
+
+    const LOCAL: &str = "[providers.local]\napi = \"openai-completions\"\nbase_url = \"http://localhost:2276/v1\"\nauth = \"none\"\n";
+
+    fn kinds(c: &ModelsConfig, kind: WarningKind) -> Vec<&ModelsWarning> {
+        c.warnings.iter().filter(|w| w.kind == kind).collect()
+    }
+
+    /// T1: no `[compaction]` anywhere: rpi's defaults, every field from `default`.
+    #[test]
+    fn compaction_defaults_to_rpi() {
+        let c = config("").unwrap();
+        assert_eq!(c.compaction_settings(), DEFAULT_COMPACTION_SETTINGS);
+        assert_eq!(
+            c.compaction_settings(),
+            CompactionSettings {
+                enabled: true,
+                reserve_tokens: 16384,
+                keep_recent_tokens: 20000
+            }
+        );
+        assert_eq!(c.compaction, CompactionConfig::default());
+        assert_eq!(c.compaction.enabled_source, "default");
+        assert_eq!(c.compaction.reserve_tokens_source, "default");
+        assert_eq!(c.compaction.keep_recent_tokens_source, "default");
+    }
+
+    /// T2: the user file over the shipped one, field by field, each field naming its layer.
+    #[test]
+    fn compaction_layers_field_by_field() {
+        let shipped = ModelsFile::parse(
+            &format!(
+                "{DEFAULTS_TOML}\n[compaction]\nreserve_tokens = 9000\nkeep_recent_tokens = 15000\n"
+            ),
+            "shipped",
+        )
+        .unwrap();
+        let user = ModelsFile::parse("[compaction]\nreserve_tokens = 5000\n", "user").unwrap();
+        let c = ModelsConfig::from_files(
+            shipped.clone(),
+            Some(user),
+            "config /u/config.toml",
+            &no_env,
+        )
+        .unwrap();
+        assert_eq!(
+            c.compaction_settings(),
+            CompactionSettings {
+                enabled: true,
+                reserve_tokens: 5000,
+                keep_recent_tokens: 15000
+            }
+        );
+        assert_eq!(c.compaction.enabled_source, "default");
+        assert_eq!(c.compaction.reserve_tokens_source, "config /u/config.toml");
+        assert_eq!(c.compaction.keep_recent_tokens_source, "shipped");
+
+        let user = ModelsFile::parse("[compaction]\nenabled = false\n", "user").unwrap();
+        let c = ModelsConfig::from_files(shipped, Some(user), "config u", &no_env).unwrap();
+        assert!(!c.compaction_settings().enabled);
+        assert_eq!(c.compaction.enabled_source, "config u");
+        assert_eq!(c.compaction.reserve_tokens_source, "shipped");
+    }
+
+    /// T3: unknown keys in `[compaction]` are errors naming the key; no extra knobs exist.
+    #[test]
+    fn compaction_typos_are_errors() {
+        for key in ["bogus", "threshold_pct", "target_tokens", "summary_tokens"] {
+            let e = config(&format!("[compaction]\n{key} = 1\n")).unwrap_err();
+            assert!(e.0.contains(key), "{e}");
+        }
+        let e = config("[compaction]\nreserve_tokens = \"lots\"\n").unwrap_err();
+        assert!(e.0.contains("reserve_tokens"), "{e}");
+    }
+
+    /// T4: zero or negative sizes are errors.
+    #[test]
+    fn compaction_sizes_must_be_positive() {
+        for (text, key) in [
+            ("reserve_tokens = 0", "reserve_tokens"),
+            ("reserve_tokens = -5", "reserve_tokens"),
+            ("keep_recent_tokens = 0", "keep_recent_tokens"),
+            ("keep_recent_tokens = -1", "keep_recent_tokens"),
+        ] {
+            let e = config(&format!("[compaction]\n{text}\n")).unwrap_err();
+            assert!(
+                e.0.contains(&format!("[compaction] {key}")) && e.0.contains("greater than 0"),
+                "{text}: {e}"
+            );
+            assert!(e.0.contains("config test"), "names the layer: {e}");
+        }
+    }
+
+    /// T5: user-set sizes that do not fit a built model's window are errors naming the model.
+    /// The window is the built one: haiku has no `context_window` but 200000 from rpi's catalog;
+    /// an openai-compatible model with none gets the 128000 fallback.
+    #[test]
+    fn user_compaction_must_fit_every_built_model() {
+        // 180000 + 20000 = 200000: not below haiku's window (from the catalog).
+        let e = config("[compaction]\nreserve_tokens = 180000\n").unwrap_err();
+        assert!(e.0.contains("anthropic/claude-haiku-4-5"), "{e}");
+        assert!(e.0.contains("context_window (200000)"), "{e}");
+        assert!(e.0.contains("does not fit"), "{e}");
+        // One below fits.
+        assert!(config("[compaction]\nreserve_tokens = 179999\n").is_ok());
+
+        // 100000 + 28000 = 128000 = the assumed window of local/m.
+        let text = format!(
+            "{LOCAL}[providers.local.models.m]\n[compaction]\nreserve_tokens = 100000\nkeep_recent_tokens = 28000\n"
+        );
+        let e = config(&text).unwrap_err();
+        assert!(e.0.contains("local/m"), "{e}");
+        assert!(e.0.contains("context_window (128000)"), "{e}");
+        assert!(
+            e.0.contains("config test"),
+            "names where the sizes came from: {e}"
+        );
+        // A configured window counts.
+        let text = format!(
+            "{LOCAL}[providers.local.models.m]\ncontext_window = 200000\n[compaction]\nreserve_tokens = 100000\nkeep_recent_tokens = 28000\n"
+        );
+        assert!(config(&text).is_ok());
+    }
+
+    /// T6: with the default sizes, a small model loads with a warning (shown on load), not an
+    /// error; W1 and W3 are reported too.
+    #[test]
+    fn default_compaction_on_a_small_model_warns() {
+        let text = format!(
+            "{LOCAL}[providers.local.models.small]\ncontext_window = 32768\nmax_tokens = 65536\n[providers.local.models.unknown]\n"
+        );
+        let c = config(&text).unwrap();
+        let fit = kinds(&c, WarningKind::CompactionDoesNotFit);
+        assert_eq!(fit.len(), 1, "{:?}", c.warnings);
+        assert_eq!(fit[0].subject, "local/small");
+        assert!(
+            fit[0].message.contains("context_window (32768)"),
+            "{}",
+            fit[0]
+        );
+        let over = kinds(&c, WarningKind::MaxTokensOverWindow);
+        assert_eq!(over.len(), 1, "{:?}", c.warnings);
+        assert!(
+            over[0]
+                .message
+                .contains("local/small: max_tokens (65536) is above context_window (32768)")
+        );
+        let assumed = kinds(&c, WarningKind::AssumedWindow);
+        assert_eq!(
+            assumed
+                .iter()
+                .map(|w| w.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["local/unknown"]
+        );
+        assert_eq!(
+            assumed[0].message,
+            "context_window not set for local/unknown; assuming 128000"
+        );
+        for w in fit.iter().chain(&over).chain(&assumed) {
+            assert!(c.load_warnings().any(|l| l == *w), "{w} is shown on load");
+        }
+
+        // The same model with user-set sizes is an error.
+        let e = config(&format!("{text}[compaction]\nkeep_recent_tokens = 20000\n")).unwrap_err();
+        assert!(e.0.contains("local/small"), "{e}");
+    }
+
+    /// The shipped config loads without load-time warnings (haiku is in rpi's catalog); W2 shows
+    /// for roles whose model writes more per turn than reserve_tokens, in doctor only.
+    #[test]
+    fn shipped_config_warnings() {
+        let c = config("").unwrap();
+        assert_eq!(c.load_warnings().count(), 0, "{:?}", c.warnings);
+        let w2 = kinds(&c, WarningKind::ReserveBelowOutput);
+        assert!(!w2.is_empty());
+        assert!(w2.iter().all(|w| w.kind.doctor_only()));
+        let manager = w2.iter().find(|w| w.subject == "role manager").unwrap();
+        assert!(
+            manager.message.contains(
+                "max_tokens (65536) is above [compaction] reserve_tokens (16384, default)"
+            ),
+            "{manager}"
+        );
+        // Turned off, compaction can't fall behind.
+        let off = config("[compaction]\nenabled = false\n").unwrap();
+        assert!(kinds(&off, WarningKind::ReserveBelowOutput).is_empty());
+    }
+
+    /// `context_window = 0` silently turns rpi's compaction off: an error in any layer.
+    #[test]
+    fn zero_context_window_is_an_error() {
+        let e = config(&format!(
+            "{LOCAL}[providers.local.models.m]\ncontext_window = 0\n"
+        ))
+        .unwrap_err();
+        assert!(
+            e.0.contains("[providers.local.models.\"m\"] context_window = 0 (config test)"),
+            "{e}"
+        );
+        let e = config("[providers.anthropic.models.\"claude-haiku-4-5\"]\ncontext_window = 0\n")
+            .unwrap_err();
+        assert!(e.0.contains("claude-haiku-4-5"), "{e}");
+        let shipped = ModelsFile::parse(
+            &DEFAULTS_TOML.replacen("context_window = 1000000", "context_window = 0", 1),
+            "shipped",
+        )
+        .unwrap();
+        let e = ModelsConfig::from_files(shipped, None, "config", &no_env).unwrap_err();
+        assert!(
+            e.0.contains("context_window = 0 (shipped models.toml)"),
+            "{e}"
+        );
+    }
+
+    /// T7: a repo config may not set `[compaction]` (shipped + user only); it stays an error.
+    #[test]
+    fn repo_compaction_is_an_error() {
+        let e = crate::repo_config::RepoConfig::parse(
+            "[compaction]\nenabled = false\n",
+            Path::new("/r/.amp/harness/config.toml"),
+        )
+        .unwrap_err();
+        assert!(e.0.contains("compaction"), "{e}");
     }
 }
