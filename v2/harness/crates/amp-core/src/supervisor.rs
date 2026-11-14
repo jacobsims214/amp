@@ -64,12 +64,14 @@ use tokio::{sync::Semaphore, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    agent::{AgentSpec, Runtime, SessionKind},
+    agent::{AgentError, AgentSpec, Runtime, SessionKind},
     dispatch_ledger::{DispatchRecord, Ledger, server_key},
     events::{RunEvent, Totals, assistant_text},
     policy::DISPATCH_TOOL,
     project::ProjectMarker,
     roles::Role,
+    run_report::ResumeMode,
+    session_store::OpenError,
     tools::call_json,
     worker_session::{self, WorkerFeed},
     workspace::{self, ENV_ISOLATION, Isolation, Placement, Repo, WORK_DIR},
@@ -312,7 +314,72 @@ pub struct RunRequest {
     /// Where a new branch starts. Default `HEAD` of the manager's repo.
     #[serde(default)]
     pub base: Option<String>,
+    /// Resume the ticket's last worker session instead of starting a fresh one (AMP #4239). Set by
+    /// the manager's worker-control tools only: `amp_run_ticket` refuses it ([`parse_request`]).
+    #[serde(default)]
+    pub resume: Option<ResumeMode>,
+    /// What the manager did, recorded on the run (`restarted`, `resumed:<mode>`; story 582). With
+    /// `resume` and no `control`, the run is recorded `resumed:<mode>`. Not for `amp_run_ticket`.
+    #[serde(default)]
+    pub control: Option<ControlNote>,
 }
+
+impl RunRequest {
+    /// The run note this run carries ([`ControlNote::note`]), if the manager restarted or resumed it.
+    pub fn control_note(&self) -> Option<String> {
+        self.control
+            .or(self.resume.map(ControlNote::Resumed))
+            .map(ControlNote::note)
+    }
+}
+
+/// What the manager did to a worker that a run records (story 582, #4237's notes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlNote {
+    /// `amp_restart_worker`: a fresh session.
+    Restarted,
+    /// `amp_resume_worker`: the last session, continued or replayed.
+    Resumed(ResumeMode),
+}
+
+impl ControlNote {
+    /// `"restarted"` or `"resumed:<continue|replay>"`.
+    pub fn note(self) -> String {
+        match self {
+            Self::Restarted => crate::run_report::restarted_note(),
+            Self::Resumed(mode) => crate::run_report::resumed_note(mode),
+        }
+    }
+}
+
+/// Why a resume was refused (AMP #4239). [`ResumeRefusal::code`] is the status a manager tool
+/// reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeRefusal {
+    /// No session of the ticket's to resume: none was ever written here, its header is
+    /// unreadable, or it was started in another working directory (a resume needs the same
+    /// worktree/folder).
+    NoSession,
+    /// The old run is still live, or another writer holds the session's lock.
+    Busy,
+    /// Replay with nothing interrupted to replay: the session's last run ended (a normal stop
+    /// finishes it as aborted), or its resume budget ([`MAX_RESUME_ATTEMPTS`]) is used up.
+    NothingToReplay,
+}
+
+impl ResumeRefusal {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NoSession => "no_session",
+            Self::Busy => "busy",
+            Self::NothingToReplay => "nothing_to_replay",
+        }
+    }
+}
+
+/// rpi's bound on resuming one interrupted run (re-exported for the refusal's words).
+pub use rpi_harness::agent_harness::MAX_RESUME_ATTEMPTS;
 
 /// How a worker's run ended. M2-6 reports a run for each; every outcome but `Completed` and
 /// `Blocked` is an abnormal end (D8: "abandoned: <reason>").
@@ -914,6 +981,13 @@ pub enum RunTicketError {
         "the manager stopped the worker on #{task_id} before it started ({reason}); nothing was dispatched"
     )]
     StoppedByManager { task_id: i64, reason: String },
+    /// A resume could not start (AMP #4239); nothing was dispatched.
+    #[error("cannot resume #{task_id} ({}): {detail}; nothing was dispatched", refusal.code())]
+    ResumeRefused {
+        task_id: i64,
+        refusal: ResumeRefusal,
+        detail: String,
+    },
 }
 
 impl RunTicketError {
@@ -1803,6 +1877,12 @@ impl Supervisor {
         let role = self.resolve_role(&req.agent_id)?;
         let agent_id = format!("amp:{}", role.id);
         let slot = self.claim(req.task_id, &agent_id)?;
+        // AMP #4239: the session to resume, found before anything is built (a build makes a newer,
+        // empty file that would sort last) and before anything happens in AMP.
+        let resume = match req.resume {
+            Some(mode) => Some((mode, resume_target(&self.rt.state_dir, req.task_id)?)),
+            None => None,
+        };
         let stops = self.stop_handle(req.task_id, signal);
         let model = role
             .resolve_model(&self.rt.current_models())
@@ -1834,6 +1914,7 @@ impl Supervisor {
             stops,
             slot,
             progress: Arc::default(),
+            resume,
         })
     }
 
@@ -1859,6 +1940,7 @@ impl Supervisor {
             stops,
             slot,
             progress,
+            resume,
             ..
         } = prepared;
         // Held until this returns, however it returns: the ticket leaves the live map (so it can
@@ -1955,7 +2037,7 @@ impl Supervisor {
         }
 
         let report = self
-            .run_dispatched(&req, &role, &agent_id, &dispatch, at, execution)
+            .run_dispatched(&req, &role, &agent_id, &dispatch, at, execution, resume)
             .await;
         drop(permit);
         Ok(report)
@@ -2171,6 +2253,8 @@ impl Supervisor {
         Ok(LiveSlot(Arc::clone(self), task_id))
     }
 
+    // One argument per piece of a prepared run; bundling them would only rename `Prepared`.
+    #[allow(clippy::too_many_arguments)]
     async fn run_dispatched(
         &self,
         req: &RunRequest,
@@ -2179,6 +2263,7 @@ impl Supervisor {
         dispatch: &Dispatch,
         at: Where,
         stops: StopHandle,
+        resume: Option<(ResumeMode, PathBuf)>,
     ) -> WorkerReport {
         let StopHandle {
             signal,
@@ -2194,6 +2279,11 @@ impl Supervisor {
             .map(|w| Arc::clone(&w.feed))
             .unwrap_or_default();
         let mut notes = Vec::new();
+        // Story 582: what the manager did, first in the run's notes (and on its AMP run below).
+        let control = req.control_note();
+        if let Some(note) = &control {
+            notes.push(note.clone());
+        }
         let totals = Arc::new(Mutex::new(Totals::default()));
         let resolved = role.resolve_model(&self.rt.current_models()).ok();
         let model = resolved.as_ref().map(|r| r.model_ref()).unwrap_or_default();
@@ -2304,12 +2394,19 @@ impl Supervisor {
         let mut spec = AgentSpec::new(role.id.clone(), info.cwd.clone());
         spec.project = self.project();
         spec.extra_context = Some(worker_context(&info, &self.manager.role));
-        spec.session = SessionKind::Jsonl {
-            dir: self
-                .rt
-                .state_dir
-                .join("sessions")
-                .join(req.task_id.to_string()),
+        spec.session = match &resume {
+            // AMP #4239: the pre-build latest session, opened in place in the same cwd.
+            Some((mode, path)) => SessionKind::Existing {
+                path: path.clone(),
+                replay: *mode == ResumeMode::Replay,
+            },
+            None => SessionKind::Jsonl {
+                dir: self
+                    .rt
+                    .state_dir
+                    .join("sessions")
+                    .join(req.task_id.to_string()),
+            },
         };
         spec.emitter = Some(Arc::new(WorkerEmitter {
             watch: Arc::clone(&watch),
@@ -2317,6 +2414,13 @@ impl Supervisor {
         if let Some(hooks) = &self.hooks {
             spec.before_tool_call = hooks.before_tool_call(&info);
             spec.extra_tools.extend(hooks.extra_tools(&info));
+        }
+        if let Some(note) = &control {
+            spec.before_tool_call = Some(with_run_note(
+                spec.before_tool_call.take(),
+                req.task_id,
+                note,
+            ));
         }
         // #2239: a worker waits for shared MCP servers still on their first attempt (a no-op once
         // they are up) and gets its own instances of worktree-scoped ones, released in finish().
@@ -2329,17 +2433,34 @@ impl Supervisor {
         let built = match self.rt.build(spec).await {
             Ok(b) => b,
             Err(e) => {
+                let why = match (&resume, resume_refusal(&e)) {
+                    (Some(_), Some(refusal)) => format!("resume refused ({}): {e}", refusal.code()),
+                    _ => format!("build the worker: {e}"),
+                };
                 return self
-                    .finish(
-                        &info,
-                        started,
-                        notes,
-                        Finish::error(format!("build the worker: {e}")),
-                        dispatch,
-                    )
+                    .finish(&info, started, notes, Finish::error(why), dispatch)
                     .await;
             }
         };
+        // AMP #4239: Replay runs only what rpi's recovery left resumable, with attempts left.
+        // Checked before the claim, so a refusal leaves the ticket returnable.
+        if let Some((ResumeMode::Replay, _)) = &resume
+            && let Some(refusal) = replay_refusal(&built.harness)
+        {
+            return self
+                .finish(
+                    &info,
+                    started,
+                    notes,
+                    Finish::error(format!(
+                        "resume refused ({}): {}",
+                        refusal.code(),
+                        NOTHING_TO_REPLAY
+                    )),
+                    dispatch,
+                )
+                .await;
+        }
         info.model = built.resolved.model_ref();
         let session_file = built.session_file.clone();
         let harness = Arc::clone(&built.harness);
@@ -2385,7 +2506,15 @@ impl Supervisor {
                 }
             }
         }
-        let prompt = worker_prompt(&info, req, self.project().as_ref());
+        let prompt = match &resume {
+            None => worker_prompt(&info, req, self.project().as_ref()),
+            Some((ResumeMode::Continue, _)) => continue_prompt(&info, req),
+            // rpi continues the interrupted run itself, with an empty prompt; this is the feed's.
+            Some((ResumeMode::Replay, _)) => format!(
+                "[resumed: replay] continuing the interrupted run on #{}",
+                req.task_id
+            ),
+        };
         // The chat's session view starts with the prompt (#2252); rpi doesn't emit it.
         watch.feed.push(&AgentEvent::MessageStart {
             message: rpi_agent::AgentMessage::User(rpi_ai::types::UserMessage {
@@ -2398,7 +2527,23 @@ impl Supervisor {
         });
 
         // Run it in the foreground of this call.
-        let run = harness.prompt_text(&prompt, Vec::new());
+        let run = {
+            let harness = Arc::clone(&harness);
+            let replay = matches!(resume, Some((ResumeMode::Replay, _)));
+            let prompt = prompt.clone();
+            async move {
+                if !replay {
+                    return harness.prompt_text(&prompt, Vec::new()).await;
+                }
+                // AMP #4239: rpi's own resume (Safe tools already re-ran in recovery). `None`
+                // here means its budget or the branch refused at the last moment.
+                match harness.resume_pending().await {
+                    Ok(Some(r)) => Ok(r),
+                    Ok(None) => Err(rpi_harness::result::HarnessError::io(NOTHING_TO_REPLAY)),
+                    Err(e) => Err(e),
+                }
+            }
+        };
         tokio::pin!(run);
         let deadline = tokio::time::sleep(self.config.timeout);
         tokio::pin!(deadline);
@@ -2718,6 +2863,8 @@ struct Prepared {
     slot: LiveSlot,
     /// How far the run got, readable after it panicked (AMP #2885).
     progress: Arc<LaunchProgress>,
+    /// AMP #4239: how to resume, and the pre-build latest session it resumes.
+    resume: Option<(ResumeMode, PathBuf)>,
 }
 
 /// How far a prepared run got, kept outside it so [`Supervisor::launch`] can tell after a panic
@@ -3303,6 +3450,152 @@ fn worker_prompt(info: &WorkerInfo, req: &RunRequest, project: Option<&ProjectMa
     text
 }
 
+/// Why a replay is refused when rpi's recovery left nothing resumable (AMP #4239).
+const NOTHING_TO_REPLAY: &str = "nothing interrupted to replay: the session's last run ended \
+     (a stop finishes it), or it has been resumed the most times allowed; use continue";
+
+/// The prompt that continues a resumed session (AMP #4239): the session already holds the ticket,
+/// the earlier prompt and everything done so far, so this says only what is new.
+fn continue_prompt(info: &WorkerInfo, req: &RunRequest) -> String {
+    let mut text = format!(
+        "[resumed: continue] Your run on AMP ticket #{} was stopped, and you are being resumed in \
+         the same session and working directory ({}). Nothing you did before was re-run. First \
+         read the ticket's newest comments (amp_get_task with comments): they may change what \
+         to do. Check the state of your work, then carry on from where you stopped, and finish \
+         by completing the ticket (amp_complete_task) or blocking it with a question \
+         (amp_block_task).",
+        info.task_id,
+        info.cwd.display()
+    );
+    if !info.dispatch_id.is_empty() {
+        text.push_str(&format!(
+            "\n\nThis is a new dispatch: the harness started the ticket again with dispatch_id \
+             \"{}\". Pass that dispatch_id (not any earlier one) to amp_complete_task and \
+             amp_block_task.",
+            info.dispatch_id
+        ));
+    }
+    if let Some(extra) = req
+        .instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        text.push_str("\n\nFrom the manager:\n");
+        text.push_str(extra);
+    }
+    text
+}
+
+/// The pre-build latest session of `task_id`'s workers under `state_dir` (AMP #4239), checked as
+/// far as it can be without opening it: it exists, its header is readable, and no live writer
+/// holds its lock (the lock is taken and dropped at once). Resolved before the worker is built,
+/// because a build makes a newer, empty file that would sort last. The cwd is checked when the
+/// file is opened, in the worker's own place.
+fn resume_target(state_dir: &Path, task_id: i64) -> Result<PathBuf, RunTicketError> {
+    let refuse = |refusal, detail: String| RunTicketError::ResumeRefused {
+        task_id,
+        refusal,
+        detail,
+    };
+    let path = worker_session::latest_session(state_dir, task_id).ok_or_else(|| {
+        refuse(
+            ResumeRefusal::NoSession,
+            "no worker session of this ticket was saved here".to_owned(),
+        )
+    })?;
+    match crate::session_index::inspect(&path) {
+        Ok(entry) if entry.status == crate::session_index::EntryStatus::Ok => {}
+        Ok(entry) => {
+            return Err(refuse(
+                ResumeRefusal::NoSession,
+                format!("{} cannot be resumed: {:?}", path.display(), entry.status),
+            ));
+        }
+        Err(why) => return Err(refuse(ResumeRefusal::NoSession, why)),
+    }
+    crate::session_lock::claim_session_lock(&path)
+        .map(drop)
+        .map_err(|busy| refuse(ResumeRefusal::Busy, busy.to_string()))?;
+    Ok(path)
+}
+
+/// Whether a harness built on an existing session ([`SessionKind::Existing`] with `replay`) may
+/// replay (AMP #4239): only when rpi's recovery left an interrupted run to continue with resume
+/// attempts left ([`AgentHarness::pending_resume`] filters out a chain at
+/// [`MAX_RESUME_ATTEMPTS`]). A run a stop ended was finished as aborted: nothing to replay.
+fn replay_refusal(harness: &AgentHarness) -> Option<ResumeRefusal> {
+    harness
+        .pending_resume()
+        .is_none()
+        .then_some(ResumeRefusal::NothingToReplay)
+}
+
+/// The refusal a failed resume build is (AMP #4239), when it is one: the session is held by a
+/// live writer (`busy`), or it cannot be opened here (`no_session`: another cwd, a damaged or
+/// foreign file).
+fn resume_refusal(e: &AgentError) -> Option<ResumeRefusal> {
+    match e {
+        AgentError::Session(OpenError::Busy(_)) => Some(ResumeRefusal::Busy),
+        AgentError::Session(
+            OpenError::OtherDirectory { .. }
+            | OpenError::NotASession { .. }
+            | OpenError::Unreadable { .. }
+            | OpenError::Incompatible { .. },
+        ) => Some(ResumeRefusal::NoSession),
+        _ => None,
+    }
+}
+
+/// `inner`, then `run_note: <note>` filled into the worker's own `amp_complete_task` /
+/// `amp_block_task` on `task_id` when it is left out (story 582: a restarted or resumed run says
+/// so in AMP's run record). Only fills: a note the worker wrote is kept.
+fn with_run_note(inner: Option<BeforeToolCall>, task_id: i64, note: &str) -> BeforeToolCall {
+    let note = note.to_owned();
+    Arc::new(move |ctx, signal| {
+        let closing = matches!(ctx.tool_call.name.as_str(), COMPLETE_TOOL | BLOCK_TOOL)
+            && task_id_arg(ctx.args) == Some(task_id);
+        let original = ctx.args.clone();
+        let inner = inner.as_ref().map(|h| h(ctx, signal));
+        let note = note.clone();
+        Box::pin(async move {
+            let mut result = match inner {
+                Some(f) => f.await,
+                None => None,
+            };
+            if !closing || result.as_ref().is_some_and(|r| r.block) {
+                return result;
+            }
+            let args = result
+                .as_ref()
+                .and_then(|r| r.args.clone())
+                .unwrap_or(original);
+            let Value::Object(mut map) = args else {
+                return result;
+            };
+            if map
+                .get("run_note")
+                .is_some_and(|v| v.as_str().is_some_and(|s| !s.trim().is_empty()))
+            {
+                return result;
+            }
+            map.insert("run_note".into(), json!(note));
+            match &mut result {
+                Some(r) => r.args = Some(Value::Object(map)),
+                None => {
+                    result = Some(rpi_agent::BeforeToolCallResult {
+                        block: false,
+                        reason: None,
+                        terminate: false,
+                        args: Some(Value::Object(map)),
+                    })
+                }
+            }
+            result
+        })
+    })
+}
+
 fn human_duration(d: Duration) -> String {
     let secs = d.as_secs();
     if secs >= 60 && secs.is_multiple_of(60) {
@@ -3429,6 +3722,15 @@ fn parse_request(params: Value) -> Result<RunRequest, String> {
         Value::Object(map) => map,
         other => return Err(format!("arguments must be a JSON object, not {other}")),
     };
+    // AMP #4239: resuming is the manager's worker-control tools' job, not a fresh run's.
+    for key in ["resume", "control"] {
+        if params.contains_key(key) {
+            return Err(format!(
+                "unknown field `{key}`: amp_run_ticket starts a fresh worker (resume a stopped one \
+                 with amp_resume_worker)"
+            ));
+        }
+    }
     if let Some(v) = params.get("task_id").cloned() {
         let id = task_id_arg(&json!({ "task_id": v }))
             .ok_or_else(|| format!("task_id must be a number, not {v}"))?;
@@ -4644,6 +4946,507 @@ mod tests {
             ] {
                 assert!(!e.is_retryable(), "{e}");
             }
+        }
+    }
+
+    // -- #4239: resume (continue vs guarded replay) ---------------------------------------------
+
+    mod resume {
+        use super::*;
+        use crate::{agent::create_on_existing, session_store};
+        use rpi_ai::{
+            providers::faux::{
+                FauxBlock, FauxProvider, FauxScript, FauxStep, faux_assistant_message,
+            },
+            types::{Message, StopReason},
+        };
+        use rpi_harness::types::{AgentHarnessOptions, ToolReplay};
+        use tokio::sync::Notify;
+
+        const WAIT: Duration = Duration::from_secs(20);
+        const AGENT: &str = "amp-worker-backend";
+        /// The start of rpi's unknown-outcome stand-in (`frame_progress::INTERRUPTED_TOOL_RESULT`).
+        const STAND_IN: &str = "Tool execution was interrupted";
+
+        /// Counts its runs. With `hang`, a run never ends on its own (it waits for the run's
+        /// abort): the process "dies" while it runs.
+        struct Probe {
+            schema: Tool,
+            runs: Arc<AtomicUsize>,
+            entered: Arc<Notify>,
+            hang: Arc<AtomicBool>,
+            kill: CancellationToken,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentTool for Probe {
+            fn schema(&self) -> &Tool {
+                &self.schema
+            }
+            fn label(&self) -> &str {
+                "probe"
+            }
+            async fn execute(
+                &self,
+                _id: &str,
+                _params: Value,
+                signal: CancellationToken,
+                _on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+            ) -> Result<AgentToolResult, ToolError> {
+                self.runs.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_one();
+                if self.hang.load(Ordering::SeqCst) {
+                    tokio::select! {
+                        _ = signal.cancelled() => {}
+                        _ = self.kill.cancelled() => {}
+                    }
+                    return Err(ToolError::tool("aborted"));
+                }
+                Ok(AgentToolResult::text("probed"))
+            }
+        }
+
+        struct Fixture {
+            dir: PathBuf,
+            cwd: PathBuf,
+            runs: Arc<AtomicUsize>,
+            entered: Arc<Notify>,
+            hang: Arc<AtomicBool>,
+            kill: Mutex<CancellationToken>,
+            replay: ToolReplay,
+        }
+
+        impl Fixture {
+            fn new(name: &str, replay: ToolReplay) -> Self {
+                let root = repo_dir(&format!("resume-{name}"));
+                let cwd = root.join("wt");
+                std::fs::create_dir_all(&cwd).unwrap();
+                Self {
+                    dir: root.join("sessions").join("7"),
+                    cwd,
+                    runs: Arc::default(),
+                    entered: Arc::new(Notify::new()),
+                    hang: Arc::new(AtomicBool::new(true)),
+                    kill: Mutex::default(),
+                    replay,
+                }
+            }
+
+            fn tool(&self) -> HarnessTool {
+                HarnessTool::new(Arc::new(Probe {
+                    schema: Tool {
+                        name: "probe".into(),
+                        description: "test tool".into(),
+                        parameters: json!({"type": "object"}).into(),
+                        constrained_sampling: None,
+                    },
+                    runs: Arc::clone(&self.runs),
+                    entered: Arc::clone(&self.entered),
+                    hang: Arc::clone(&self.hang),
+                    kill: self.kill.lock().unwrap().clone(),
+                }))
+                .with_replay(self.replay)
+            }
+
+            fn options(
+                &self,
+                session: rpi_harness::session::Session,
+                steps: Vec<FauxStep>,
+            ) -> AgentHarnessOptions {
+                let script = FauxScript::new();
+                script.set_responses(steps);
+                let provider = FauxProvider::new(script);
+                AgentHarnessOptions {
+                    model: provider.default_model().clone(),
+                    models: vec![provider.clone()],
+                    tools: vec![self.tool()],
+                    session,
+                    ..Default::default()
+                }
+            }
+
+            fn calls_probe() -> FauxStep {
+                FauxStep::message(faux_assistant_message(
+                    vec![FauxBlock::tool_call("probe", json!({}))],
+                    StopReason::ToolUse,
+                ))
+            }
+
+            /// Drives `run` until the probe is running, then drops it with its harness, as a
+            /// crashed process or a run dropped after its abort grace leaves it: the operation
+            /// stays open in the file, and the session's lock is released.
+            async fn die_in_probe<F>(&self, harness: AgentHarness, run: F, path: &Path)
+            where
+                F: std::future::Future<Output = ()> + Send + 'static,
+            {
+                let task = tokio::spawn(run);
+                tokio::time::timeout(WAIT, self.entered.notified())
+                    .await
+                    .expect("the probe started");
+                task.abort();
+                let _ = task.await;
+                drop(harness);
+                // Whatever still runs the probe ends now, with nobody left to record it.
+                let kill = std::mem::take(&mut *self.kill.lock().unwrap());
+                kill.cancel();
+                let deadline = Instant::now() + WAIT;
+                while crate::session_lock::claim_session_lock(path).is_err() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the dead run still holds its session"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+
+            /// A worker session whose run died inside a `probe` call (attempt 0 of a chain).
+            async fn interrupted(&self) -> PathBuf {
+                let opened = session_store::create(&self.dir, &self.cwd, AGENT)
+                    .await
+                    .unwrap();
+                let harness =
+                    AgentHarness::create(self.options(opened.session, vec![Self::calls_probe()]))
+                        .await
+                        .unwrap();
+                let h = harness.clone();
+                self.die_in_probe(
+                    harness,
+                    async move {
+                        let _ = h.prompt_text("do the ticket", Vec::new()).await;
+                    },
+                    &opened.path,
+                )
+                .await;
+                opened.path
+            }
+
+            /// The saved session, rebuilt the way a resumed worker is ([`SessionKind::Existing`]).
+            async fn reopen(
+                &self,
+                path: &Path,
+                replay: bool,
+                steps: Vec<FauxStep>,
+            ) -> AgentHarness {
+                let opened = session_store::load(path, &self.cwd, AGENT).await.unwrap();
+                create_on_existing(self.options(opened.session, steps), replay)
+                    .await
+                    .unwrap()
+            }
+
+            fn runs(&self) -> usize {
+                self.runs.load(Ordering::SeqCst)
+            }
+        }
+
+        fn last_user(ctx: &rpi_ai::types::Context) -> String {
+            ctx.messages
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    Message::User(u) => u.content.as_text().map(str::to_owned),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        }
+
+        fn tool_results(ctx: &rpi_ai::types::Context) -> Vec<String> {
+            ctx.messages
+                .iter()
+                .filter_map(|m| match m {
+                    Message::ToolResult(r) => Some(
+                        r.content
+                            .iter()
+                            .filter_map(|c| match c {
+                                rpi_ai::types::Content::Text(t) => Some(t.text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Replay of a run that died in a `Never` tool: the tool is not run again, its call gets
+        /// the stand-in result, and the run continues from there.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn supervisor_replay_gives_a_never_tool_the_stand_in_without_running_it() {
+            let f = Fixture::new("never", ToolReplay::Never);
+            let path = f.interrupted().await;
+            assert_eq!(f.runs(), 1);
+            let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+            let s = Arc::clone(&seen);
+            let h = f
+                .reopen(
+                    &path,
+                    true,
+                    vec![FauxStep::factory(move |ctx| {
+                        *s.lock().unwrap() = tool_results(ctx);
+                        faux_assistant_message("done", StopReason::Stop)
+                    })],
+                )
+                .await;
+            assert_eq!(replay_refusal(&h), None, "an interrupted run is replayable");
+            assert_eq!(f.runs(), 1, "recovery did not re-run the Never tool");
+            let r = tokio::time::timeout(WAIT, h.resume_pending())
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("resumed");
+            assert!(
+                matches!(r.outcome, HarnessRunOutcome::Completed { .. }),
+                "{:?}",
+                r.outcome
+            );
+            assert_eq!(f.runs(), 1, "never re-executed");
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert!(seen[0].contains(STAND_IN), "{seen:?}");
+        }
+
+        /// Replay of a run that died in a `Safe` tool re-runs that call exactly once.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn supervisor_replay_reruns_a_safe_tool_once() {
+            let f = Fixture::new("safe", ToolReplay::Safe);
+            let path = f.interrupted().await;
+            f.hang.store(false, Ordering::SeqCst);
+            let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+            let s = Arc::clone(&seen);
+            let h = f
+                .reopen(
+                    &path,
+                    true,
+                    vec![FauxStep::factory(move |ctx| {
+                        *s.lock().unwrap() = tool_results(ctx);
+                        faux_assistant_message("done", StopReason::Stop)
+                    })],
+                )
+                .await;
+            assert_eq!(f.runs(), 2, "the Safe call re-ran once, in recovery");
+            assert_eq!(replay_refusal(&h), None);
+            tokio::time::timeout(WAIT, h.resume_pending())
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("resumed");
+            assert_eq!(f.runs(), 2, "and only once");
+            let seen = seen.lock().unwrap().clone();
+            assert!(seen.iter().any(|r| r.contains("probed")), "{seen:?}");
+            assert!(!seen.iter().any(|r| r.contains(STAND_IN)), "{seen:?}");
+        }
+
+        /// Continue never re-executes anything, not even a `Safe` call the old run left open:
+        /// it gets the stand-in, and the worker goes on from an explicit continue prompt.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn supervisor_continue_reruns_no_tool_and_prompts_to_continue() {
+            let f = Fixture::new("continue", ToolReplay::Safe);
+            let path = f.interrupted().await;
+            f.hang.store(false, Ordering::SeqCst);
+            type Seen = Vec<(String, Vec<String>)>;
+            let seen: Arc<Mutex<Seen>> = Arc::default();
+            let s = Arc::clone(&seen);
+            let h = f
+                .reopen(
+                    &path,
+                    false,
+                    vec![FauxStep::factory(move |ctx| {
+                        s.lock().unwrap().push((last_user(ctx), tool_results(ctx)));
+                        faux_assistant_message("done", StopReason::Stop)
+                    })],
+                )
+                .await;
+            assert_eq!(f.runs(), 1, "continue re-ran nothing in recovery");
+            let r =
+                tokio::time::timeout(WAIT, h.prompt_text("[resumed: continue] go on", Vec::new()))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                matches!(r.outcome, HarnessRunOutcome::Completed { .. }),
+                "{:?}",
+                r.outcome
+            );
+            assert_eq!(f.runs(), 1, "no tool re-executed");
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!(seen[0].0, "[resumed: continue] go on");
+            assert!(seen[0].1.iter().any(|r| r.contains(STAND_IN)), "{seen:?}");
+            // The tool's own flag is back for this run's frames.
+            assert!(
+                h.get_tools()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|t| t.replay == ToolReplay::Safe),
+                "the real replay flags were restored"
+            );
+        }
+
+        /// A stop ends the run as aborted: nothing is left open, so replay is refused (continue
+        /// still works on the same session).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn supervisor_replay_after_a_normal_stop_is_refused() {
+            let f = Fixture::new("stopped", ToolReplay::Never);
+            let opened = session_store::create(&f.dir, &f.cwd, AGENT).await.unwrap();
+            let path = opened.path.clone();
+            let h = Arc::new(
+                AgentHarness::create(f.options(opened.session, vec![Fixture::calls_probe()]))
+                    .await
+                    .unwrap(),
+            );
+            let run = tokio::spawn({
+                let h = Arc::clone(&h);
+                async move { h.prompt_text("do the ticket", Vec::new()).await }
+            });
+            tokio::time::timeout(WAIT, f.entered.notified())
+                .await
+                .unwrap();
+            h.abort().await.unwrap();
+            // However the run reports it, the stop ended it: its operation is finished.
+            let _ = tokio::time::timeout(WAIT, run).await.unwrap().unwrap();
+            drop(h);
+            let h = f.reopen(&path, true, Vec::new()).await;
+            assert_eq!(replay_refusal(&h), Some(ResumeRefusal::NothingToReplay));
+            assert_eq!(f.runs(), 1);
+        }
+
+        /// Three replays of a run that keeps dying are allowed; the fourth is refused
+        /// ([`MAX_RESUME_ATTEMPTS`]).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn supervisor_the_fourth_replay_is_refused() {
+            assert_eq!(MAX_RESUME_ATTEMPTS, 3);
+            let f = Fixture::new("budget", ToolReplay::Never);
+            let path = f.interrupted().await;
+            for attempt in 0..MAX_RESUME_ATTEMPTS {
+                let h = f.reopen(&path, true, vec![Fixture::calls_probe()]).await;
+                assert_eq!(replay_refusal(&h), None, "attempt {}", attempt + 1);
+                assert_eq!(h.pending_resume().unwrap().attempt, attempt);
+                let r = h.clone();
+                f.die_in_probe(
+                    h,
+                    async move {
+                        let _ = r.resume_pending().await;
+                    },
+                    &path,
+                )
+                .await;
+            }
+            assert_eq!(
+                f.runs(),
+                1 + MAX_RESUME_ATTEMPTS as usize,
+                "each resume ran the model's new call, never the old one again"
+            );
+            let h = f.reopen(&path, true, Vec::new()).await;
+            assert_eq!(replay_refusal(&h), Some(ResumeRefusal::NothingToReplay));
+        }
+
+        /// The session to resume is found before the worker is built, and refused when there is
+        /// none or a live writer holds it.
+        #[tokio::test]
+        async fn supervisor_resume_target_is_the_pre_build_latest_and_refuses_no_session_and_busy()
+        {
+            let state = repo_dir("resume-target");
+            let refused = |r: Result<PathBuf, RunTicketError>| match r {
+                Err(RunTicketError::ResumeRefused { refusal, .. }) => Some(refusal),
+                _ => None,
+            };
+            assert_eq!(
+                refused(resume_target(&state, 7)),
+                Some(ResumeRefusal::NoSession)
+            );
+            let dir = worker_session::sessions_dir(&state, 7);
+            let live = session_store::create(&dir, &state, AGENT).await.unwrap();
+            assert_eq!(refused(resume_target(&state, 7)), Some(ResumeRefusal::Busy));
+            let path = live.path.clone();
+            drop(live);
+            assert_eq!(resume_target(&state, 7).unwrap(), path);
+            // What a build would make next sorts last, which is why the target is taken first.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let built = session_store::create(&dir, &state, AGENT).await.unwrap();
+            assert_ne!(worker_session::latest_session(&state, 7).unwrap(), path);
+            drop(built);
+            let err = resume_target(&state, 8).unwrap_err().to_string();
+            assert!(
+                err.contains("no_session") && err.contains("nothing was dispatched"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn supervisor_resume_and_control_are_internal_to_the_run_request() {
+            for key in ["resume", "control"] {
+                let err = parse_request(json!({"task_id": 7, "agent_id": "w", key: "continue"}))
+                    .unwrap_err();
+                assert!(err.contains(&format!("unknown field `{key}`")), "{err}");
+            }
+            let req: RunRequest =
+                serde_json::from_value(json!({"task_id": 7, "agent_id": "w", "resume": "replay"}))
+                    .unwrap();
+            assert_eq!(req.resume, Some(ResumeMode::Replay));
+            assert_eq!(req.control_note().as_deref(), Some("resumed:replay"));
+            let req = RunRequest {
+                control: Some(ControlNote::Restarted),
+                ..RunRequest::default()
+            };
+            assert_eq!(req.control_note().as_deref(), Some("restarted"));
+            assert_eq!(RunRequest::default().control_note(), None);
+        }
+
+        async fn noted(hook: &BeforeToolCall, name: &str, args: Value) -> Option<Value> {
+            use rpi_ai::types::{Api, AssistantMessage, ToolCall};
+            let msg = AssistantMessage::empty(Api::Other("t".into()), "t", "m", 0);
+            let call = ToolCall {
+                kind: Default::default(),
+                id: "c1".into(),
+                name: name.into(),
+                arguments: args.clone(),
+                thought_signature: None,
+                namespace: None,
+            };
+            let context = rpi_agent::AgentContext {
+                system_prompt: String::new(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+            };
+            let ctx = rpi_agent::BeforeToolCallContext {
+                assistant_message: &msg,
+                tool_call: &call,
+                args: &args,
+                context: &context,
+            };
+            hook(ctx, CancellationToken::new()).await?.args
+        }
+
+        #[tokio::test]
+        async fn supervisor_a_resumed_run_notes_itself_on_its_own_closing_call() {
+            let hook = with_run_note(None, 7, "resumed:continue");
+            let out = noted(&hook, COMPLETE_TOOL, json!({"task_id": 7}))
+                .await
+                .unwrap();
+            assert_eq!(out["run_note"], "resumed:continue");
+            let out = noted(&hook, BLOCK_TOOL, json!({"task_id": "7", "reason": "q"}))
+                .await
+                .unwrap();
+            assert_eq!(out["run_note"], "resumed:continue");
+            // The worker's own note is kept; other tickets and tools are left alone.
+            assert_eq!(
+                noted(
+                    &hook,
+                    COMPLETE_TOOL,
+                    json!({"task_id": 7, "run_note": "mine"})
+                )
+                .await,
+                None
+            );
+            assert_eq!(
+                noted(&hook, COMPLETE_TOOL, json!({"task_id": 8})).await,
+                None
+            );
+            assert_eq!(
+                noted(&hook, "amp_get_task", json!({"task_id": 7})).await,
+                None
+            );
         }
     }
 }

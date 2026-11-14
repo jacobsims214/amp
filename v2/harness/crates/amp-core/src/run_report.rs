@@ -311,7 +311,8 @@ fn clip_note(note: &str) -> String {
 
 /// How the manager resumed a stopped worker (story 582): continue its session, or replay the
 /// ticket from the start.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResumeMode {
     Continue,
     Replay,

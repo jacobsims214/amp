@@ -68,7 +68,10 @@ use rpi_harness::{
     },
     skills::format_skill_invocation,
     system_prompt::compose_system_prompt,
-    types::{AgentHarnessOptions, AgentHarnessResources, CompactionSettings, HarnessTool, Skill},
+    types::{
+        AgentHarnessOptions, AgentHarnessResources, CompactionSettings, HarnessTool, Skill,
+        ToolReplay,
+    },
 };
 use rpi_tools::{
     BashExecution, BashPrepare, BashToolOptions, ExecutionEnv, ExecutionToolContext,
@@ -1018,6 +1021,19 @@ impl Runtime {
                 let (s, path) = jsonl_session(dir, &cwd, &role.id).await?;
                 (s, Some(path))
             }
+            SessionKind::Existing { path, .. } => {
+                // AMP #4239: the saved file itself, claimed and validated (same cwd, not Busy)
+                // before it is read. Its unconsumed queued prompts are dropped, as on any resume.
+                let opened = session_store::load(path, &cwd, &role.id).await?;
+                discard_persisted_queues(&opened.session)
+                    .await
+                    .map_err(AgentError::Harness)?;
+                (opened.session, Some(opened.path))
+            }
+        };
+        let existing = match &spec.session {
+            SessionKind::Existing { replay, .. } => Some(*replay),
+            _ => None,
         };
 
         let repeat = crate::repeat::RepeatGuard::default();
@@ -1064,9 +1080,11 @@ impl Runtime {
             ..Default::default()
         };
         let harness = Arc::new(
-            AgentHarness::create(options)
-                .await
-                .map_err(|e| AgentError::Harness(format!("{e}")))?,
+            match existing {
+                Some(replay) => create_on_existing(options, replay).await,
+                None => AgentHarness::create(options).await,
+            }
+            .map_err(|e| AgentError::Harness(format!("{e}")))?,
         );
         // Attached even with no server configured yet: a reload may add one (#2242).
         {
@@ -1660,6 +1678,17 @@ pub enum SessionKind {
     Jsonl {
         dir: PathBuf,
     },
+    /// The saved JSONL session at `path`, continued in place (AMP #4239: resuming a stopped or
+    /// crashed worker). Built with `allow_existing_session`, so rpi's crash recovery runs: an
+    /// operation the old process left open is closed, and every tool call it left without a
+    /// result gets one. With `replay`, a tool declared `ToolReplay::Safe` is re-run and the run is
+    /// left resumable ([`AgentHarness::pending_resume`]); without it no tool is re-run at all (every
+    /// open call gets the unknown-outcome stand-in) and the caller continues with a prompt of its
+    /// own. Refused like [`resume_session`]: another cwd, a live writer (`Busy`), a damaged header.
+    Existing {
+        path: PathBuf,
+        replay: bool,
+    },
 }
 
 /// One session to build.
@@ -1739,6 +1768,37 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// `AgentHarness::create` on a session that already has records (AMP #4239,
+/// [`SessionKind::Existing`]): `allow_existing_session`, so rpi's crash recovery runs on whatever
+/// operation the old process left open.
+///
+/// With `replay`, the tools keep their own replay flags: recovery re-runs a call only when it was
+/// recorded `ToolReplay::Safe` and the tool still declares it, gives every other open call the
+/// unknown-outcome stand-in, and leaves the run resumable ([`AgentHarness::pending_resume`]).
+///
+/// Without it (continue), nothing is re-run at all: recovery sees every tool as `Never`, so every
+/// open call gets the stand-in, and the real flags are put back right after `create` so the next
+/// run's own frames record them. The caller ignores any `pending_resume` and prompts instead.
+pub async fn create_on_existing(
+    mut options: AgentHarnessOptions,
+    replay: bool,
+) -> rpi_harness::result::HarnessResult<AgentHarness> {
+    options.allow_existing_session = true;
+    if replay {
+        return AgentHarness::create(options).await;
+    }
+    let tools = options.tools.clone();
+    let active = options.active_tool_names.clone();
+    options.tools = tools
+        .iter()
+        .cloned()
+        .map(|t| t.with_replay(ToolReplay::Never))
+        .collect();
+    let harness = AgentHarness::create(options).await?;
+    harness.set_tools(tools, Some(active)).await?;
+    Ok(harness)
 }
 
 /// A fresh in-memory session.
