@@ -11,9 +11,11 @@ import type {
   SubmitRequestInput, RequestSubmissionAnswer, UpdateRequestInput, RequestMutationAnswer, RequestDiscussionInput,
   RequestCommentAnswer, RequestPreconditionInput, RequestAssignInput, RequestLifecycleInput, RequestLifecycleAnswer,
   RequesterAnswerInput, RequestLinkInput, RequestLinkAnswer, RequestHandoffInput, RequestHandoffAnswer,
+  RequestReadPageOpts, RequestThreadAnswer, RequestEventsAnswer, RequestLinksAnswer, RequestLinkKind,
   RequestAttachmentPanel, RequestUploadInput, RequestUploadAnswer, RequestAttachmentKeepAnswer, RequestAttachmentDeleteAnswer,
   RequestDownloadLink, RequestGrantList, RequestGrantAnswer, RequestInviteList, RequestInviteAnswer,
 } from '../types'
+import type { ResolvedRequestLink } from '../lib/requestControls'
 import { auditQuery, auditVerifyUrl, type AuditScope } from '../lib/audit'
 import { apiErrorMessage, NOT_SIGNED_IN } from '../lib/apiError'
 import { isSessionEnded, markSessionEnded, sessionLost } from '../lib/session'
@@ -657,6 +659,37 @@ function ownRequestQuery(filter: OwnRequestFilter = {}): string {
 }
 
 /**
+ * The forward cursor a discussion or history read carries (`?after_id=N&limit=N`).
+ *
+ * Forward, not `before_id`, because both tables are append-only: a thread and a
+ * history are read from where they began. The server clamps `limit` itself, so
+ * this writes whatever the caller asked for and never re-derives the bound — a
+ * second copy of the ceiling is a second thing to get out of step with it.
+ * Zero means "unset" in both spellings, as on every other query here.
+ */
+function requestReadPageQuery(opts: RequestReadPageOpts = {}): string {
+  const q = new URLSearchParams()
+  if (opts.after_id) q.set('after_id', String(opts.after_id))
+  if (opts.limit) q.set('limit', String(opts.limit))
+  const s = q.toString()
+  return s ? `?${s}` : ''
+}
+
+/**
+ * The lineage read's `kind` filter, in the repeated form the server also
+ * accepts (`?kind=planned_as&kind=delivered_by`) — the queue's `state`
+ * convention, so one spelling is written here and the comma form is the
+ * server's business. No filter writes no query at all.
+ */
+function requestLinksQuery(kind?: RequestLinkKind | readonly RequestLinkKind[]): string {
+  const kinds: readonly RequestLinkKind[] = kind == null ? [] : typeof kind === 'string' ? [kind] : kind
+  if (kinds.length === 0) return ''
+  const q = new URLSearchParams()
+  for (const k of kinds) q.append('kind', k)
+  return `?${q.toString()}`
+}
+
+/**
  * A request write's precondition: the revision the caller read, in whichever of
  * the two spellings the caller chose.
  *
@@ -713,6 +746,66 @@ export const requestApi = {
   /** One of the caller's own requests. Another person's reference is the same 404 as an unknown one. */
   ownDetail: (ref: number | string) =>
     get<RequestReadAnswer>(`/requests/${encodeURIComponent(String(ref))}`),
+
+  // ---- The record's three sub-reads (F2's discussion, F3's history, F5's lineage) ----
+  /**
+   * One request's discussion: every stored row, in append order.
+   *
+   * `ref` is a serial or the requester's public reference, as on every request
+   * read (the server decodes it with the detail read's own decoder).
+   *
+   * The answer is returned whole, not unwrapped to one array, because the two
+   * arms are two different lists: a team answer carries `comments` (the stored
+   * `RequestComment` rows, attribution included) while a requester answer carries
+   * `shared_comments` (`RequesterComment`: no id, no author, no user id) and
+   * **omits `comments` entirely**. Returning `comments ?? []` would hand a
+   * requester an empty thread where they have a real one — the bug
+   * `servedReads` in `lib/requestDetail.ts` exists to prevent — so narrow on
+   * `view` and the right list follows.
+   *
+   * `opts` is the forward cursor. The thread is an append-only table read from
+   * where it began, so there is no `before_id`; the server clamps `limit` (50
+   * default, 200 ceiling) and answers `next_after_id` only when another page
+   * really exists, so a caller never asks for an empty page to learn it is done.
+   * A requester's answer carries no cursor at all.
+   */
+  listComments: (teamId: number, ref: number | string, opts?: RequestReadPageOpts) =>
+    get<RequestThreadAnswer>(`/teams/${teamId}/requests/${encodeURIComponent(String(ref))}/comments${requestReadPageQuery(opts)}`),
+  /**
+   * One request's history: the append-only `request_events` rows, in id order.
+   *
+   * One view, one list. The history is an internal fact — a row names the acting
+   * person, the internal state names and the ids of what it touched — so the
+   * server refuses a requester here (404, the surface's one answer) rather than
+   * filtering; a page that rendered this for a requester would be inventing a
+   * whitelist nothing consumes.
+   *
+   * Returned as its page, so `next_after_id` reaches the caller and a long
+   * history is a caller's decision rather than a silent truncation at the
+   * server's 50-row default. `events` is the existing `RequestEvent`.
+   */
+  listEvents: (teamId: number, ref: number | string, opts?: RequestReadPageOpts) =>
+    get<RequestEventsAnswer>(`/teams/${teamId}/requests/${encodeURIComponent(String(ref))}/events${requestReadPageQuery(opts)}`),
+  /**
+   * One request's linked work: the `request_links` rows in attach order, so the
+   * planning rail and the deliver panel's evidence list read the lineage itself
+   * rather than reconstructing it from the outcome aggregate.
+   *
+   * `kind` narrows the answer to one kind, or to a union of them (the server
+   * takes the repeated form this writes, and also a comma list). An unknown kind
+   * is a 400 `request.invalid`.
+   *
+   * Rows, not a page: a request's lineage is bounded by what planning and
+   * delivery attached, so there is no cursor and nothing to truncate. Each row is
+   * the rail's own `ResolvedRequestLink` — `RequestLink` plus an OPTIONAL
+   * `target`, which this answer never carries: the server does not resolve a
+   * target, and an absent one is the truthful state rather than a placeholder.
+   * The page fills a title (or `gone`/`approved`/`merged`) from the target's own
+   * read.
+   */
+  listLinks: (teamId: number, ref: number | string, kind?: RequestLinkKind | readonly RequestLinkKind[]): Promise<ResolvedRequestLink[]> =>
+    get<RequestLinksAnswer>(`/teams/${teamId}/requests/${encodeURIComponent(String(ref))}/links${requestLinksQuery(kind)}`)
+      .then(r => r.links ?? []),
 
   // ---- Triage writes (F2's write half) ----
   /** The submitter's versioned edit, while the request is still untriaged. `expected_rev` is required. */

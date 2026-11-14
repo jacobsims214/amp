@@ -2241,6 +2241,75 @@ export type RequestReadAnswer =
   | { view: 'team'; request: TeamRequest; outcome: RequestOutcome }
   | { view: 'requester'; projection: RequesterRequestView }
 
+// ---- The three sub-read answers: discussion, history and lineage ----
+
+/**
+ * The forward cursor a discussion or history read accepts
+ * (`GET …/comments` and `GET …/events`): read from where the last page ended.
+ *
+ * Both are forward-only because both tables are append-only — a thread is read
+ * from where it began — and `limit` is clamped by the server (50 default, 200
+ * ceiling), so a client never owns the bound.
+ */
+export interface RequestReadPageOpts {
+  /** The `next_after_id` of the page before; omitted reads from the beginning. */
+  after_id?: number
+  /** How many rows to ask for; the server clamps it. */
+  limit?: number
+}
+
+/**
+ * One request's discussion.
+ *
+ * `view` says which of the two lists is set, and exactly one ever is — the same
+ * rule as `RequestReadAnswer`: a team answer carries `comments` (every stored
+ * row, `RequestComment`), a requester answer carries `shared_comments` (the
+ * projection's shared kinds, `RequesterComment`, which has no id, author or user
+ * id at all). The other list is omitted, so a client reads `view` first rather
+ * than asking whether one of the keys is an array.
+ *
+ * A requester's answer also omits `request_id` and `next_after_id`: their rows
+ * carry no id, so there is no cursor they could use.
+ */
+export type RequestThreadAnswer =
+  | { view: 'team'; request_id: number; count: number; next_after_id?: number; comments: RequestComment[] }
+  | { view: 'requester'; count: number; shared_comments: RequesterComment[] }
+
+/**
+ * One request's history page: `RequestEvent` rows in append order, plus the
+ * forward cursor when another page exists.
+ *
+ * One view, one list. The history is an internal fact (it names the acting
+ * person, the internal state names and ids of what it touched), so the server
+ * refuses a requester rather than filtering — their milestones come from the
+ * detail read's projection instead.
+ */
+export interface RequestEventsAnswer {
+  view: 'team'
+  request_id: number
+  count: number
+  /** The cursor for the next page, absent on the last one. */
+  next_after_id?: number
+  events: RequestEvent[]
+}
+
+/**
+ * One request's linked work: `RequestLink` rows in attach order, tombstones
+ * included.
+ *
+ * There is no cursor: a request's lineage is bounded by what planning and
+ * delivery attached. The rows are the planning rail's type minus what only a
+ * client can know — `ResolvedRequestLink` is `RequestLink` plus an OPTIONAL
+ * `target` (its title, project, approval and tombstone facts), which the page
+ * fills from the target's own read. This answer never invents one.
+ */
+export interface RequestLinksAnswer {
+  view: 'team'
+  request_id: number
+  count: number
+  links: RequestLink[]
+}
+
 /** What a submission answers with — a whitelist, not the record. */
 export interface SubmittedRequest {
   /** The opaque reference the requester will quote. */

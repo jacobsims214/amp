@@ -25,6 +25,7 @@ import { setupServer } from 'msw/node'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import type {
   RequesterRequestView, TeamRequest, RequestReadAnswer, RequestQueue, OwnRequestPage,
+  RequestComment, RequestEvent, RequestLink, RequestThreadAnswer, RequestEventsAnswer, RequestLinksAnswer,
 } from '../types'
 import { requestApi, requestConflict, requestRetryAfterS, type HttpError } from './client'
 
@@ -314,6 +315,201 @@ describe('endpoint coverage: every function calls the route the server registers
   })
 })
 
+// ---- The record's three sub-reads: discussion, history, lineage (AMP #4273) ----
+//
+// These are the reads the detail page's panels were waiting on (#4270/#4271/#4272 on
+// the server). Each case asserts the exact verb and path the server registers, that
+// the rows arrive as the UI's ALREADY EXISTING types (no client-side reshaping), and
+// that a refusal surfaces as this client's `HttpError` rather than as an empty list —
+// "the read failed" and "there is nothing there" must never be one answer.
+//
+// The fixtures are the real answers' wire shapes, written out field for field:
+// comments carries the stored row (author, author_user_id, request_id), events the
+// append-only history row, links the `RequestLink` the rail resolves a target onto.
+
+/** One stored discussion row, as the team's arm answers it. */
+const commentRow: RequestComment = {
+  id: 9180,
+  request_id: 7,
+  kind: 'comment',
+  body: 'Looking at the November run now.',
+  author: 'dana@simstech.cloud',
+  author_user_id: 12,
+  created_at: '2026-11-13T11:00:00Z',
+}
+
+/** The same thread as a requester reads it: no id, no author, no user id. */
+const sharedCommentRow = {
+  kind: 'question' as const,
+  from: 'desk' as const,
+  body: 'Which export file do you mean?',
+  at: '2026-11-13T10:30:00Z',
+}
+
+const teamThread: RequestThreadAnswer = {
+  view: 'team', request_id: 7, count: 1, next_after_id: 9180, comments: [commentRow],
+}
+
+const requesterThread: RequestThreadAnswer = {
+  view: 'requester', count: 1, shared_comments: [sharedCommentRow],
+}
+
+/** One appended history row, from the act that moved the request into triage. */
+const eventRow: RequestEvent = {
+  id: 9181,
+  request_id: 7,
+  org_id: 2,
+  team_id: 4,
+  action: 'transition',
+  from_status: 'new',
+  to_status: 'triaging',
+  actor: 'dana@simstech.cloud',
+  actor_user_id: 12,
+  detail: '{"source_kind":"web"}',
+  created_at: '2026-11-13T10:00:00Z',
+}
+
+const history: RequestEventsAnswer = { view: 'team', request_id: 7, count: 1, events: [eventRow] }
+
+/** One lineage row: the route the request is on. */
+const linkRow: RequestLink = {
+  id: 3,
+  request_id: 7,
+  link_kind: 'routes_to',
+  target_kind: 'project',
+  target_id: 3,
+  created_by: 12,
+  created_at: '2026-11-13T11:00:00Z',
+}
+
+const lineage: RequestLinksAnswer = { view: 'team', request_id: 7, count: 1, links: [linkRow] }
+
+/** Call a route that fails, and return the thrown error as this client's type. */
+const failure = async (call: () => Promise<unknown>): Promise<HttpError> => {
+  const err = await call().then(() => null, (e: unknown) => e as HttpError)
+  expect(err).not.toBeNull()
+  return err!
+}
+
+describe('the record sub-reads: discussion, history and lineage', () => {
+  it('listComments asks the thread route and returns the team rows unchanged', async () => {
+    server.use(route('get', '*/api/teams/4/requests/7/comments', teamThread))
+    const answer = await requestApi.listComments(4, 7)
+    expect(calls.map(c => `${c.method} ${c.path}`)).toEqual(['GET /api/teams/4/requests/7/comments'])
+    // The answer narrows on `view`, and the rows are the existing RequestComment:
+    // the stored author snapshot travels, and nothing is reshaped client-side.
+    expect(answer.view).toBe('team')
+    if (answer.view !== 'team') throw new Error('expected the team arm')
+    expect(answer.comments).toEqual([commentRow])
+    expect(answer.next_after_id).toBe(9180)
+    // An unset cursor writes no query at all — the server reads "from the start".
+    expect(new URL(calls[0].url).search).toBe('')
+  })
+
+  it('listComments reads a requester arm as its own list, never as an empty team thread', async () => {
+    server.use(route('get', '*/api/teams/4/requests/a1b2c3d4e5f6g7h8i9j0/comments', requesterThread))
+    const answer = await requestApi.listComments(4, 'a1b2c3d4e5f6g7h8i9j0')
+    expect(calls.map(c => `${c.method} ${c.path}`)).toEqual([
+      'GET /api/teams/4/requests/a1b2c3d4e5f6g7h8i9j0/comments',
+    ])
+    // A requester answer has no `comments` key at all, so this arm is the only way
+    // to reach their thread: "is comments an array" would answer false for a real one.
+    if (answer.view !== 'requester') throw new Error('expected the requester arm')
+    expect(answer.shared_comments).toEqual([sharedCommentRow])
+    expect(answer).not.toHaveProperty('comments')
+    expect(answer).not.toHaveProperty('request_id')
+  })
+
+  it('listComments sends its forward cursor as after_id and limit', async () => {
+    server.use(route('get', '*/api/teams/4/requests/7/comments', teamThread))
+    await requestApi.listComments(4, 7, { after_id: 9180, limit: 25 })
+    const q = new URL(calls[0].url).searchParams
+    expect(q.get('after_id')).toBe('9180')
+    expect(q.get('limit')).toBe('25')
+  })
+
+  it('listComments surfaces a refusal as HttpError rather than an empty thread', async () => {
+    server.use(http.get('*/api/teams/4/requests/7/comments', () =>
+      HttpResponse.json({ error: 'no such request', code: 'request.not_found' }, { status: 404 })))
+    const err = await failure(() => requestApi.listComments(4, 7))
+    expect(err.status).toBe(404)
+    expect(err.code).toBe('request.not_found')
+    expect(err.message).toContain('no such request')
+  })
+
+  it('listEvents asks the history route and returns the append-only rows', async () => {
+    server.use(route('get', '*/api/teams/4/requests/7/events', history))
+    const answer = await requestApi.listEvents(4, 7)
+    expect(calls.map(c => `${c.method} ${c.path}`)).toEqual(['GET /api/teams/4/requests/7/events'])
+    expect(answer.view).toBe('team')
+    expect(answer.request_id).toBe(7)
+    // A transition row keeps both state names and its detail; the UI's optional
+    // fields are exactly the `omitempty` ones the server drops elsewhere.
+    expect(answer.events).toEqual([eventRow])
+    expect(answer.events[0].from_status).toBe('new')
+    expect(answer.events[0].to_status).toBe('triaging')
+    expect(answer.next_after_id).toBeUndefined()
+  })
+
+  it('listEvents sends its forward cursor as after_id and limit', async () => {
+    server.use(route('get', '*/api/teams/4/requests/7/events', history))
+    await requestApi.listEvents(4, 7, { after_id: 9181, limit: 50 })
+    const q = new URL(calls[0].url).searchParams
+    expect(q.get('after_id')).toBe('9181')
+    expect(q.get('limit')).toBe('50')
+  })
+
+  it('listEvents surfaces a refusal as HttpError rather than an empty history', async () => {
+    server.use(http.get('*/api/teams/4/requests/7/events', () =>
+      HttpResponse.json({ error: 'no such request', code: 'request.not_found' }, { status: 404 })))
+    const err = await failure(() => requestApi.listEvents(4, 7))
+    expect(err.status).toBe(404)
+    expect(err.code).toBe('request.not_found')
+  })
+
+  it('listLinks asks the lineage route and returns rows the rail can carry as-is', async () => {
+    server.use(route('get', '*/api/teams/4/requests/7/links', lineage))
+    const links = await requestApi.listLinks(4, 7)
+    expect(calls.map(c => `${c.method} ${c.path}`)).toEqual(['GET /api/teams/4/requests/7/links'])
+    // The row is the rail's `ResolvedRequestLink` — RequestLink plus an OPTIONAL
+    // target — and the server resolves no target: an absent one is truthful, and
+    // the page fills the title from the target's own read.
+    expect(links).toEqual([linkRow])
+    expect(links[0].target).toBeUndefined()
+    expect(new URL(calls[0].url).search).toBe('')
+  })
+
+  it('listLinks writes its kind filter in the repeated form the server accepts', async () => {
+    server.use(route('get', '*/api/teams/4/requests/7/links', lineage))
+    await requestApi.listLinks(4, 7, 'planned_as')
+    await requestApi.listLinks(4, 7, ['planned_as', 'delivered_by'])
+    const one = new URL(calls[0].url).searchParams
+    const two = new URL(calls[1].url).searchParams
+    expect(one.getAll('kind')).toEqual(['planned_as'])
+    expect(two.getAll('kind')).toEqual(['planned_as', 'delivered_by'])
+  })
+
+  it('listLinks surfaces a refusal as HttpError rather than an empty lineage', async () => {
+    server.use(http.get('*/api/teams/4/requests/7/links', () =>
+      HttpResponse.json({ error: 'no such request', code: 'request.not_found' }, { status: 404 })))
+    const err = await failure(() => requestApi.listLinks(4, 7))
+    expect(err.status).toBe(404)
+    expect(err.code).toBe('request.not_found')
+    expect(requestConflict(err)).toBeNull()
+  })
+
+  it('an empty list is [] and not a failure — the panels can tell the two apart', async () => {
+    // The server writes `[]` for "nothing attached yet"; the client passes it
+    // through, so a rail renders "not routed yet" rather than a failure notice.
+    server.use(
+      route('get', '*/api/teams/4/requests/7/links', { view: 'team', request_id: 7, count: 0, links: [] }),
+      route('get', '*/api/teams/4/requests/7/events', { view: 'team', request_id: 7, count: 0, events: [] }),
+    )
+    expect(await requestApi.listLinks(4, 7)).toEqual([])
+    expect((await requestApi.listEvents(4, 7)).events).toEqual([])
+  })
+})
+
 describe('DTO separation: the two views are two types', () => {
   it('the team record carries every internal field', () => {
     // The internal fields a requester must never see, all present on the record.
@@ -365,13 +561,6 @@ describe('DTO separation: the two views are two types', () => {
 })
 
 describe('client error/retry mapping', () => {
-  /** Call a route that fails, and return the thrown error as this client's type. */
-  const failure = async (call: () => Promise<unknown>): Promise<HttpError> => {
-    const err = await call().then(() => null, (e: unknown) => e as HttpError)
-    expect(err).not.toBeNull()
-    return err!
-  }
-
   it('a 409 carries the code and the revision the row is actually at', async () => {
     server.use(http.patch('*/api/teams/4/requests/7', () =>
       HttpResponse.json({ error: 'request 7 is at rev 9, not 3: it changed since it was read, so reload it and reapply', code: 'request.conflict', rev: 9 }, { status: 409 })))
