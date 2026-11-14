@@ -1721,3 +1721,236 @@ async fn compaction_disabled_and_absent_reach_the_harness() {
     );
     rt.mcp_hub.shutdown().await;
 }
+
+// ------------------------------------------------------------------------------------------------
+// Self-management guard (#4246): permission_widens, refuse_primary, dispatch_effect.
+// ------------------------------------------------------------------------------------------------
+
+fn perm(v: Value) -> Policy {
+    Policy::parse(Some(&v)).unwrap()
+}
+
+#[test]
+fn permission_widens_flags_every_widening_change() {
+    use amp_core::roles::{new_agent_baseline, permission_widens};
+    let base = new_agent_baseline();
+    let old = perm(json!({
+        "bash": { "*": "deny", "git status*": "allow" },
+        "edit": "deny",
+        "webfetch": "deny",
+        "mcp": { "*": "allow", "github/delete_*": "deny" },
+    }));
+    let cases: &[(&str, Value, &str)] = &[
+        (
+            "new allow",
+            json!({ "bash": { "*": "deny", "git status*": "allow", "cargo test*": "allow" },
+                    "edit": "deny", "webfetch": "deny",
+                    "mcp": { "*": "allow", "github/delete_*": "deny" } }),
+            "adds bash \"cargo test*\": allow",
+        ),
+        (
+            "removed deny",
+            json!({ "bash": { "*": "deny", "git status*": "allow" },
+                    "edit": "deny", "webfetch": "deny", "mcp": { "*": "allow" } }),
+            "removes mcp \"github/delete_*\": deny (now allow)",
+        ),
+        (
+            "removed key falls back to allow",
+            json!({ "bash": { "*": "deny", "git status*": "allow" },
+                    "webfetch": "deny", "mcp": { "*": "allow", "github/delete_*": "deny" } }),
+            "removes edit \"*\": deny (now allow)",
+        ),
+        (
+            "broader glob",
+            json!({ "bash": { "*": "deny", "git *": "allow" },
+                    "edit": "deny", "webfetch": "deny",
+                    "mcp": { "*": "allow", "github/delete_*": "deny" } }),
+            "adds bash \"git *\": allow",
+        ),
+        (
+            "deny flipped to allow",
+            json!({ "bash": { "*": "deny", "git status*": "allow" },
+                    "edit": "allow", "webfetch": "deny",
+                    "mcp": { "*": "allow", "github/delete_*": "deny" } }),
+            "edit \"*\": deny -> allow",
+        ),
+        (
+            "deny moved before the allow it overrode",
+            json!({ "bash": { "*": "deny", "git status*": "allow" },
+                    "edit": "deny", "webfetch": "deny",
+                    "mcp": { "github/delete_*": "deny", "*": "allow" } }),
+            // Either alignment is right: the deny is gone, or the catch-all allow now wins.
+            "mcp ",
+        ),
+        (
+            "whole block removed",
+            Value::Null,
+            "removes bash \"*\": deny (now allow)",
+        ),
+    ];
+    for (name, new, reason) in cases {
+        let new = Policy::parse(Some(new)).unwrap();
+        let w = permission_widens(Some(&old), &new, &base);
+        assert!(w.widens, "{name}: not flagged");
+        assert!(
+            w.reasons.iter().any(|r| r.contains(reason)),
+            "{name}: {:?} lacks {reason:?}",
+            w.reasons
+        );
+    }
+}
+
+#[test]
+fn permission_widens_allows_narrowing_and_no_ops() {
+    use amp_core::roles::{new_agent_baseline, permission_widens};
+    let base = new_agent_baseline();
+    let old = perm(json!({
+        "bash": { "*": "deny", "git status*": "allow", "git log*": "allow" },
+        "edit": { "*": "allow", "secrets/**": "deny" },
+        "webfetch": "deny",
+    }));
+    let cases: &[(&str, Value)] = &[
+        (
+            "identical",
+            json!({ "bash": { "*": "deny", "git status*": "allow", "git log*": "allow" },
+                    "edit": { "*": "allow", "secrets/**": "deny" }, "webfetch": "deny" }),
+        ),
+        (
+            "added deny",
+            json!({ "bash": { "*": "deny", "git status*": "allow", "git log*": "allow" },
+                    "edit": { "*": "allow", "secrets/**": "deny", ".env": "deny" },
+                    "webfetch": "deny", "mcp": { "db/*": "deny" } }),
+        ),
+        (
+            "removed allow",
+            json!({ "bash": { "*": "deny", "git status*": "allow" },
+                    "edit": { "*": "allow", "secrets/**": "deny" }, "webfetch": "deny" }),
+        ),
+        (
+            "allow flipped to deny",
+            json!({ "bash": { "*": "deny", "git status*": "allow", "git log*": "deny" },
+                    "edit": { "*": "allow", "secrets/**": "deny" }, "webfetch": "deny" }),
+        ),
+        (
+            "deny written as ask",
+            json!({ "bash": { "*": "ask", "git status*": "allow", "git log*": "allow" },
+                    "edit": { "*": "allow", "secrets/**": "deny" }, "webfetch": "ask" }),
+        ),
+        (
+            "allow for a permission that already allowed everything",
+            json!({ "bash": { "*": "deny", "git status*": "allow", "git log*": "allow" },
+                    "edit": { "*": "allow", "secrets/**": "deny" }, "webfetch": "deny",
+                    "websearch": "allow" }),
+        ),
+    ];
+    for (name, new) in cases {
+        let new = Policy::parse(Some(new)).unwrap();
+        let w = permission_widens(Some(&old), &new, &base);
+        assert!(!w.widens, "{name}: flagged {:?}", w.reasons);
+        assert!(w.reasons.is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn a_new_agent_is_judged_against_the_restrictive_baseline() {
+    use amp_core::roles::{new_agent_baseline, permission_widens};
+    let base = new_agent_baseline();
+    // No permission block: bash, edit and webfetch all fall back to allow.
+    let w = permission_widens(None, &Policy::default(), &base);
+    assert!(w.widens);
+    for p in ["bash", "edit", "webfetch"] {
+        assert!(
+            w.reasons
+                .iter()
+                .any(|r| r.starts_with(&format!("removes {p} "))),
+            "{p}: {:?}",
+            w.reasons
+        );
+    }
+    // The baseline itself, plus more denies, is fine.
+    let ok = perm(json!({ "bash": "deny", "edit": "deny", "webfetch": "deny", "task": "deny" }));
+    assert!(!permission_widens(None, &ok, &base).widens);
+    // Granting one command is a widening the person must confirm.
+    let grant = perm(json!({ "bash": { "*": "deny", "cargo test*": "allow" },
+                             "edit": "deny", "webfetch": "deny" }));
+    let w = permission_widens(None, &grant, &base);
+    assert!(w.widens);
+    assert_eq!(
+        w.reasons,
+        vec!["adds bash \"cargo test*\": allow".to_string()]
+    );
+    // external_directory defaults to ask, so an allow there widens even with no old rule.
+    let ext = perm(json!({ "bash": "deny", "edit": "deny", "webfetch": "deny",
+                           "external_directory": "allow" }));
+    assert!(permission_widens(None, &ext, &base).widens);
+}
+
+#[test]
+fn tool_edits_of_primary_agents_are_refused() {
+    use amp_core::roles::refuse_primary;
+    let reg = registry();
+    for name in ["amp-manager", "amp:amp-manager", "manager"] {
+        let e = refuse_primary(&reg, name, false).unwrap_err();
+        assert!(e.to_string().contains("is the manager"), "{name}: {e}");
+    }
+    assert!(refuse_primary(&reg, "amp-worker-backend", false).is_ok());
+    assert!(refuse_primary(&reg, "sql-expert", false).is_ok());
+    // Making a subagent primary, or creating a primary, is refused too.
+    let e = refuse_primary(&reg, "amp-worker-backend", true).unwrap_err();
+    assert!(e.to_string().contains("would become a primary"), "{e}");
+    assert!(refuse_primary(&reg, "new-lead", true).is_err());
+
+    // Judged on the role, not the name: a second primary under any id is refused.
+    let base = scratch("refuse-primary");
+    let agents = base.join("user/agents");
+    fs::create_dir_all(&agents).unwrap();
+    fs::write(
+        agents.join("lead.md"),
+        "---\ndescription: lead\nmode: primary\n---\nLead.\n",
+    )
+    .unwrap();
+    let assets = Assets::load(&OverrideDirs {
+        user: Some(base.join("user")),
+        repo: None,
+    })
+    .unwrap();
+    let reg = RoleRegistry::from_assets(&assets).unwrap();
+    assert!(reg.get("lead").unwrap().primary);
+    let e = refuse_primary(&reg, "lead", false).unwrap_err();
+    assert!(
+        e.to_string().contains("primary agent") || e.to_string().contains("is the manager"),
+        "{e}"
+    );
+    assert!(refuse_primary(&reg, "amp-manager", false).is_err());
+}
+
+#[test]
+fn dispatch_effect_reports_agents_the_manager_can_dispatch_at_once() {
+    use amp_core::roles::dispatch_effect;
+    let base = scratch("dispatch-effect");
+    let agents = base.join("user/agents");
+    fs::create_dir_all(&agents).unwrap();
+    let agent = |id: &str, extra: &str| {
+        fs::write(
+            agents.join(format!("{id}.md")),
+            format!("---\ndescription: {id}\nmode: subagent\n{extra}---\nDo {id}.\n"),
+        )
+        .unwrap();
+    };
+    agent("amp-sql", "");
+    agent("opted-in", "dispatch: true\n");
+    agent("helper", "");
+    let assets = Assets::load(&OverrideDirs {
+        user: Some(base.join("user")),
+        repo: None,
+    })
+    .unwrap();
+    let reg = RoleRegistry::from_assets(&assets).unwrap();
+    let manager = reg.manager();
+    let note = dispatch_effect(manager, reg.get("amp-sql").unwrap()).unwrap();
+    assert!(note.contains("amp-*"), "{note}");
+    let note = dispatch_effect(manager, reg.get("opted-in").unwrap()).unwrap();
+    assert!(note.contains("dispatch"), "{note}");
+    assert_eq!(dispatch_effect(manager, reg.get("helper").unwrap()), None);
+    assert_eq!(dispatch_effect(manager, manager), None);
+}
