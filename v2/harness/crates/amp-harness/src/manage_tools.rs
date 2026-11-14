@@ -1,5 +1,6 @@
-//! The manager's self-management tools (story 583, AMP #4252): `amp_manage_agent` and
-//! `amp_manage_skill` create or update an agent or a skill in the **user** layer.
+//! The manager's self-management tools (story 583): `amp_manage_agent` and `amp_manage_skill`
+//! (AMP #4252) create or update an agent or a skill in the **user** layer, and
+//! `amp_add_mcp_server` (AMP #4253, see [`AddMcpTool`]) adds an MCP server to the user config.
 //!
 //! Every call goes through the same gates, in this order, and writes nothing unless all pass:
 //! 1. a person can confirm here: with no [`Confirmer`] (headless `run -p`) the call is refused
@@ -29,6 +30,7 @@ use amp_core::{
         CONFIRM_TIMEOUT, ConfirmRequest, Confirmed, Confirmer, DenyReason, confirm_or_deny,
     },
     assets::{AGENTS_DIR, Origin, SKILLS_DIR, valid_name},
+    mcp_config::{self, McpConfig},
     roles::{self, RoleRegistry},
 };
 use amp_mcp::ConfigPaths;
@@ -41,11 +43,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agents_cmd::{Ctx, EDIT_DIR, Scope, write_agent_in},
+    mcp_crud::{self, AddOpts, Expect, NewServer},
     skills_cmd::write_skill_in,
 };
 
 pub(crate) const MANAGE_AGENT_TOOL: &str = "amp_manage_agent";
 pub(crate) const MANAGE_SKILL_TOOL: &str = "amp_manage_skill";
+pub(crate) const ADD_MCP_TOOL: &str = "amp_add_mcp_server";
 
 /// The skill file the tools write (the same name `skills_cmd` uses).
 const SKILL_FILE: &str = "SKILL.md";
@@ -62,13 +66,18 @@ pub(crate) fn tools(
         cwd,
         confirmer,
     });
-    [Kind::Agent, Kind::Skill]
+    let mut tools: Vec<HarnessTool> = [Kind::Agent, Kind::Skill]
         .into_iter()
         .map(|kind| {
             HarnessTool::new(Arc::new(ManageTool::new(kind, Arc::clone(&shared))))
                 .with_replay(ToolReplay::Never)
         })
-        .collect()
+        .collect();
+    tools.push(
+        HarnessTool::new(Arc::new(AddMcpTool::new(Arc::clone(&shared))))
+            .with_replay(ToolReplay::Never),
+    );
+    tools
 }
 
 struct Shared {
@@ -470,6 +479,407 @@ impl AgentTool for ManageTool {
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// amp_add_mcp_server (AMP #4253)
+// ------------------------------------------------------------------------------------------------
+
+/// The comment written under the table's header (also in the confirmed preview).
+const MCP_NOTE: &str = "Added by the manager (amp_add_mcp_server), confirmed by you.";
+
+/// Where secrets, headers and env go instead: a terminal, typed by the person.
+fn secrets_hint(name: &str) -> String {
+    format!(
+        "secrets, headers and environment variables are never taken by this tool: the person sets \
+         them in a terminal with `amp-harness mcp secret {name}` or `amp-harness mcp edit {name}`"
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum McpTransport {
+    Http,
+    Sse,
+    Stdio,
+}
+
+/// `amp_add_mcp_server`'s arguments. No `scope` (user only), no `force` (add-only), and no
+/// headers, env, secrets or OAuth fields: an unknown field is refused.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpArgs {
+    name: String,
+    transport: McpTransport,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    roles: Vec<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+fn parse_mcp_args(params: Value) -> Result<McpArgs, String> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("<name>")
+        .to_owned();
+    let args: McpArgs = serde_json::from_value(params).map_err(|e| {
+        let e = e.to_string();
+        if e.contains("unknown field") {
+            // Name the field, never its value (it may be a secret).
+            format!("bad arguments: {e}; {}", secrets_hint(&name))
+        } else {
+            format!("bad arguments: {e}")
+        }
+    })?;
+    if args.name.trim().is_empty() {
+        return Err("name is required".into());
+    }
+    if args.roles.is_empty() || args.roles.iter().any(|r| r.trim().is_empty()) {
+        return Err(
+            "roles is required: the agent ids that get this server's tools (`[\"*\"]` for every \
+             role, including every worker)"
+                .into(),
+        );
+    }
+    match args.transport {
+        McpTransport::Http | McpTransport::Sse => {
+            if args.url.as_deref().is_none_or(|u| u.trim().is_empty()) {
+                return Err("an http/sse server needs url".into());
+            }
+            if args.command.is_some() || !args.args.is_empty() {
+                return Err("command and args are for stdio servers".into());
+            }
+        }
+        McpTransport::Stdio => {
+            if args.command.as_deref().is_none_or(|c| c.trim().is_empty()) {
+                return Err("a stdio server needs command (and optionally args)".into());
+            }
+            if args.url.is_some() {
+                return Err("url is for http/sse servers".into());
+            }
+        }
+    }
+    Ok(args)
+}
+
+/// What passed the checks: shown to the person, and exactly what gets written.
+#[derive(Debug, Clone)]
+struct McpPlan {
+    name: String,
+    /// The user config.toml.
+    file: PathBuf,
+    /// `[mcp.<name>]` as it will be written.
+    table: toml::Table,
+    /// The same as TOML text, with [`MCP_NOTE`].
+    block: String,
+    /// The command line (stdio) or the URL.
+    target: String,
+    stdio: bool,
+}
+
+/// Everything short of writing: the name is free in every layer, the spec has no secrets, roles
+/// are explicit, a stdio server is disabled, and the user file would load with the new table.
+fn check_mcp(ctx: &Ctx, args: &McpArgs) -> Result<McpPlan, String> {
+    let name = args.name.trim();
+    mcp_config::check_server_name(name).map_err(|(message, fix)| match fix {
+        Some(fix) => format!("{message} ({fix})"),
+        None => message,
+    })?;
+    // Add-only, and never over a repo server: a user table would shadow it for this person.
+    let loaded = McpConfig::load(&ctx.paths);
+    let mut layers = Vec::new();
+    for scope in [Scope::User, Scope::Repo] {
+        if mcp_crud::layer_table(ctx, scope, name)
+            .map_err(|e| e.message)?
+            .is_some()
+        {
+            layers.push(scope.name());
+        }
+    }
+    if !layers.is_empty() || loaded.servers.contains_key(name) || loaded.broken.contains(name) {
+        let where_ = if layers.is_empty() {
+            "the config".to_owned()
+        } else {
+            format!("the {} config", layers.join(" and "))
+        };
+        return Err(format!(
+            "MCP server `{name}` already exists in {where_}; this tool only adds new servers. A \
+             person can change it with `amp-harness mcp edit {name}` in a terminal"
+        ));
+    }
+
+    let spec = match args.transport {
+        McpTransport::Http | McpTransport::Sse => mcp_crud::http_spec(
+            name,
+            args.url.as_deref().unwrap_or_default().trim(),
+            args.transport == McpTransport::Sse,
+        ),
+        McpTransport::Stdio => mcp_crud::stdio_spec(
+            name,
+            args.command.as_deref().unwrap_or_default().trim(),
+            &args.args,
+        ),
+    }
+    .map_err(|e| format!("{}; {}", e.message, secrets_hint(name)))?;
+    // The builders above take no secret flags; make sure nothing would prompt or hit the keychain.
+    if !spec.secrets.is_empty() {
+        return Err(secrets_hint(name));
+    }
+    let mut table = spec.table;
+    table.insert(
+        "roles".into(),
+        toml::Value::Array(
+            args.roles
+                .iter()
+                .map(|r| toml::Value::String(r.trim().to_owned()))
+                .collect(),
+        ),
+    );
+    let stdio = args.transport == McpTransport::Stdio;
+    if stdio {
+        // Registering never runs anything: the person starts it with `/mcp enable`.
+        table.insert("enabled".into(), toml::Value::Boolean(false));
+    }
+
+    let value = toml::Value::Table(table.clone());
+    let origin = mcp_crud::origin(ctx, Scope::User).map_err(|e| e.message)?;
+    let (server, _) = mcp_crud::parse_table(name, &value, origin)
+        .map_err(|e| format!("{}; {}", e.message, secrets_hint(name)))?;
+    let file = mcp_crud::config_file(ctx, Scope::User).map_err(|e| e.message)?;
+    let block = mcp_crud::mcp_block(name, &value, Some(MCP_NOTE)).map_err(|e| e.message)?;
+    let check = mcp_crud::layer_check(
+        Scope::User,
+        file.path.clone(),
+        name.to_owned(),
+        Expect::Present,
+    );
+    let preview = mcp_crud::preview_replace(&file, &format!("mcp.{name}"), Some(&block))?;
+    check(&preview)
+        .map_err(|e| format!("{}: the change would not load ({e})", file.path.display()))?;
+    Ok(McpPlan {
+        name: name.to_owned(),
+        file: file.path.clone(),
+        table,
+        block,
+        target: mcp_crud::target(&server),
+        stdio,
+    })
+}
+
+/// `amp_add_mcp_server`: adds an http, sse or stdio MCP server to the person's user config.toml
+/// after their "yes", with the same gates as [`ManageTool`]: refused with no confirmer, checked
+/// ([`check_mcp`]), confirmed with the exact TOML block on screen, checked again, then written by
+/// [`mcp_crud::add_server_in`] (add-only, under the config lock, `config.toml.bak` first). stdio
+/// servers are written disabled. Secrets are never accepted: the person sets them in a terminal.
+struct AddMcpTool {
+    shared: Arc<Shared>,
+    schema: Tool,
+}
+
+impl std::fmt::Debug for AddMcpTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AddMcpTool").finish_non_exhaustive()
+    }
+}
+
+impl AddMcpTool {
+    fn new(shared: Arc<Shared>) -> Self {
+        let schema = Tool {
+            name: ADD_MCP_TOOL.to_owned(),
+            description: "Add a NEW MCP server to the person's user config (config.toml). Call it \
+                only when the person explicitly asked for that server. The person is asked to \
+                confirm in the chat (y/N) with the exact TOML block on screen; nothing is \
+                written without their yes, and the call is refused where no person can answer. \
+                Add-only: a name that exists in any config is refused (changes are made by the \
+                person with `amp-harness mcp edit <name>`). Never ask for, and never pass, \
+                tokens, API keys, headers or environment values: this tool has no field for \
+                them; the person sets them in a terminal with `amp-harness mcp secret <name>`. \
+                stdio servers are added DISABLED (the person starts one with `/mcp enable \
+                <name>`). The server appears after your current reply ends, once live reload \
+                picks it up (or after /reload if auto-reload is off); http servers that need a \
+                login need `/mcp login <name>`. dry_run returns the block without asking or \
+                writing."
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "REQUIRED. Server name: lowercase letters, digits and hyphens (up to 32); amp_* is reserved."},
+                    "transport": {"type": "string", "enum": ["http", "sse", "stdio"], "description": "REQUIRED. http (streamable HTTP), sse (legacy HTTP+SSE) or stdio (a local command)."},
+                    "url": {"type": "string", "description": "http/sse only, REQUIRED there. The server URL, with no credentials in it."},
+                    "command": {"type": "string", "description": "stdio only, REQUIRED there. The program to run, e.g. npx."},
+                    "args": {"type": "array", "items": {"type": "string"}, "description": "stdio only. The command's arguments, with no secrets in them."},
+                    "roles": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "REQUIRED. The agent ids that get this server's tools; [\"*\"] means every role, workers included."},
+                    "dry_run": {"type": "boolean", "description": "Optional. Return the TOML block and file without asking or writing."}
+                },
+                "required": ["name", "transport", "roles"],
+                "additionalProperties": false
+            })
+            .into(),
+            constrained_sampling: None,
+        };
+        Self { shared, schema }
+    }
+
+    async fn run(&self, args: McpArgs, cancel: &CancellationToken) -> Result<String, String> {
+        let not_written = |why: String| format!("not written: {why}");
+        // 1. Nobody to ask: refuse before any work (dry runs too).
+        let Some(confirmer) = self.shared.confirmer.as_deref() else {
+            return Err(Confirmed::Denied(DenyReason::NoResponder)
+                .denial_message()
+                .unwrap_or_default());
+        };
+        let ctx = self.shared.ctx();
+        // 2. The checks.
+        let plan = check_mcp(&ctx, &args).map_err(not_written)?;
+        if args.dry_run {
+            return Ok(format!(
+                "Dry run, nothing written and nothing asked. This block would be added to {} \
+                 (user scope):\n{}",
+                plan.file.display(),
+                plan.block
+            ));
+        }
+
+        // 3. The person.
+        let kind = if plan.stdio {
+            "stdio"
+        } else if args.transport == McpTransport::Sse {
+            "sse"
+        } else {
+            "http"
+        };
+        let mut request = ConfirmRequest::self_management(
+            ADD_MCP_TOOL,
+            plan.file.clone(),
+            Scope::User.name(),
+            format!("add {kind} MCP server {}", plan.name),
+        );
+        if plan.stdio {
+            request = request.detail(format!("command: {}", plan.target)).detail(
+                "added DISABLED: it runs on your machine, with your environment, once you \
+                     `/mcp enable` it"
+                    .to_owned(),
+            );
+        } else {
+            request = request.detail(format!(
+                "url: {}; it connects on the next reload (a login: `/mcp login {}`)",
+                plan.target, plan.name
+            ));
+        }
+        let roles = args.roles.join(", ");
+        request = request.detail(if args.roles.iter().any(|r| r.trim() == "*") {
+            format!("roles: {roles} (every agent, workers included, gets its tools)")
+        } else {
+            format!("roles: {roles}")
+        });
+        request = request.detail("the block to add:".to_owned());
+        for line in plan.block.lines() {
+            request = request.detail(format!("  {line}"));
+        }
+        let answer = tokio::select! {
+            answer = confirm_or_deny(Some(confirmer), request, CONFIRM_TIMEOUT) => answer,
+            () = cancel.cancelled() => return Err(not_written("the call was cancelled".into())),
+        };
+        if let Some(message) = answer.denial_message() {
+            return Err(message);
+        }
+
+        // 4. Again (the config may have changed while the prompt was up), then write exactly
+        // what was shown. add_server_in re-checks under the config lock and never replaces.
+        let again = check_mcp(&ctx, &args).map_err(not_written)?;
+        if again.block != plan.block {
+            return Err(not_written(
+                "the config changed while the person was asked; ask again".into(),
+            ));
+        }
+        let added = mcp_crud::add_server_in(
+            &ctx,
+            &plan.name,
+            Scope::User,
+            NewServer {
+                table: plan.table.clone(),
+                secrets: Vec::new(),
+            },
+            &AddOpts {
+                force: false,
+                no_test: true,
+                secret_stdin: false,
+                json: false,
+                note: MCP_NOTE.into(),
+                quiet: true,
+            },
+        )
+        .map_err(|e| not_written(e.message))?;
+
+        let mut text = format!(
+            "Added {kind} MCP server `{}` to {} (user scope, confirmed by the person), roles: {roles}.",
+            plan.name,
+            added.file.display()
+        );
+        if let Some(b) = &added.backup {
+            text.push_str(&format!(
+                " The previous file is backed up at {}.",
+                b.display()
+            ));
+        }
+        for w in &added.warnings {
+            text.push_str(&format!(" Warning: {w}."));
+        }
+        if plan.stdio {
+            text.push_str(&format!(
+                " It is DISABLED: tell the person to run `/mcp enable {}` to start it.",
+                plan.name
+            ));
+        } else {
+            text.push_str(&format!(
+                " If it needs a login, the person runs `/mcp login {}`.",
+                plan.name
+            ));
+        }
+        text.push_str(&format!(
+            " Any token, key or header is set by the person in a terminal: `amp-harness mcp \
+             secret {name}` or `amp-harness mcp edit {name}`. The server appears after your \
+             current reply ends, once live reload picks it up; if auto-reload is off, ask the \
+             person to run /reload.",
+            name = plan.name
+        ));
+        Ok(text)
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTool for AddMcpTool {
+    fn schema(&self) -> &Tool {
+        &self.schema
+    }
+
+    fn label(&self) -> &str {
+        "Add MCP server"
+    }
+
+    fn execution_mode(&self) -> rpi_agent::ToolExecutionMode {
+        rpi_agent::ToolExecutionMode::Sequential
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        params: Value,
+        signal: CancellationToken,
+        _on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+    ) -> Result<AgentToolResult, ToolError> {
+        let args = parse_mcp_args(params).map_err(ToolError::Validation)?;
+        match self.run(args, &signal).await {
+            Ok(text) => Ok(AgentToolResult::text(text)),
+            Err(why) => Err(ToolError::Tool(why)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,7 +1268,254 @@ mod tests {
         let ctx = ctx("replay");
         let ts = tools(ctx.paths.clone(), ctx.cwd.clone(), None);
         let names: Vec<_> = ts.iter().map(|t| t.tool.schema().name.clone()).collect();
-        assert_eq!(names, [MANAGE_AGENT_TOOL, MANAGE_SKILL_TOOL]);
+        assert_eq!(names, [MANAGE_AGENT_TOOL, MANAGE_SKILL_TOOL, ADD_MCP_TOOL]);
         assert!(ts.iter().all(|t| t.replay == ToolReplay::Never));
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // amp_add_mcp_server (#4253)
+
+    /// [`ctx`] plus a repo layer (`<d>/repo/.amp/harness`), both disposable.
+    fn mcp_ctx(name: &str) -> Ctx {
+        let mut c = ctx(name);
+        let repo = c.cwd.join("repo/.amp/harness");
+        std::fs::create_dir_all(&repo).unwrap();
+        c.paths.repo_dir = Some(repo);
+        c
+    }
+
+    fn mcp_tool(ctx: &Ctx, confirmer: Option<Arc<dyn Confirmer>>) -> AddMcpTool {
+        AddMcpTool::new(Arc::new(Shared {
+            paths: ctx.paths.clone(),
+            cwd: ctx.cwd.clone(),
+            confirmer,
+        }))
+    }
+
+    async fn mcp_call(t: &AddMcpTool, args: Value) -> Result<String, String> {
+        match t
+            .execute(
+                "id",
+                args,
+                CancellationToken::new(),
+                Arc::new(|_: ToolResultPartial| {}),
+            )
+            .await
+        {
+            Ok(r) => Ok(serde_json::to_string(&r.into_content()).unwrap()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn user_text(ctx: &Ctx) -> String {
+        std::fs::read_to_string(ctx.paths.user_file.as_ref().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn confirmed_http_add_lands_in_the_user_config_and_the_next_load() {
+        let ctx = mcp_ctx("mcp-http");
+        let yes = Fake::new(true);
+        let t = mcp_tool(&ctx, Some(yes.clone()));
+        let watched = crate::reload::fingerprint(&ctx.paths);
+        let out = mcp_call(
+            &t,
+            json!({"name": "docs", "transport": "http", "url": "https://docs.example/mcp", "roles": ["amp-manager"]}),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("Added http MCP server `docs`"), "{out}");
+        assert!(out.contains("after your current reply ends"), "{out}");
+        assert!(out.contains("amp-harness mcp secret docs"), "{out}");
+
+        // What the person saw: the file, user scope, the url, the roles and the exact block.
+        assert_eq!(yes.asked.load(Ordering::SeqCst), 1);
+        let req = yes.last.lock().unwrap().clone().unwrap();
+        assert_eq!(req.tool, ADD_MCP_TOOL);
+        assert_eq!(&req.path, ctx.paths.user_file.as_ref().unwrap());
+        assert_eq!(req.scope, "user");
+        assert!(
+            req.details
+                .iter()
+                .any(|d| d.contains("https://docs.example/mcp")),
+            "{req:?}"
+        );
+        assert!(
+            req.details.iter().any(|d| d == "roles: amp-manager"),
+            "{req:?}"
+        );
+        assert!(
+            req.details.iter().any(|d| d.trim() == "[mcp.docs]"),
+            "{req:?}"
+        );
+
+        // Written to the user file (the rest of it kept): the reload watcher sees the change, and
+        // what a reload reads has the server.
+        assert_ne!(crate::reload::fingerprint(&ctx.paths), watched);
+        let text = user_text(&ctx);
+        assert!(
+            text.contains("[roles.manager]") && text.contains("[mcp.docs]"),
+            "{text}"
+        );
+        assert!(text.contains(MCP_NOTE), "{text}");
+        let loaded = McpConfig::load(&ctx.paths);
+        let s = &loaded.servers["docs"];
+        assert!(s.enabled);
+        assert_eq!(s.roles, ["amp-manager"]);
+        assert_eq!(mcp_crud::target(s), "https://docs.example/mcp");
+    }
+
+    #[tokio::test]
+    async fn confirmed_stdio_add_is_written_disabled_and_shows_the_command() {
+        let ctx = mcp_ctx("mcp-stdio");
+        let yes = Fake::new(true);
+        let t = mcp_tool(&ctx, Some(yes.clone()));
+        let out = mcp_call(
+            &t,
+            json!({"name": "files", "transport": "stdio", "command": "npx", "args": ["-y", "@acme/files-mcp", "${TMPDIR}"], "roles": ["*"]}),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("Added stdio MCP server `files`"), "{out}");
+        assert!(out.contains("/mcp enable files"), "{out}");
+        let req = yes.last.lock().unwrap().clone().unwrap();
+        assert!(
+            req.details
+                .iter()
+                .any(|d| d == "command: npx -y @acme/files-mcp ${env:TMPDIR}"),
+            "{req:?}"
+        );
+        assert!(
+            req.details.iter().any(|d| d.contains("DISABLED")),
+            "{req:?}"
+        );
+        assert!(
+            req.details.iter().any(|d| d.contains("workers included")),
+            "{req:?}"
+        );
+        assert!(
+            req.details.iter().any(|d| d.trim() == "enabled = false"),
+            "{req:?}"
+        );
+
+        let loaded = McpConfig::load(&ctx.paths);
+        let s = &loaded.servers["files"];
+        assert!(!s.enabled, "a stdio server is registered, never started");
+        assert_eq!(s.roles, ["*"]);
+        assert!(user_text(&ctx).contains("enabled = false"));
+    }
+
+    #[tokio::test]
+    async fn declined_headless_and_dry_runs_write_nothing() {
+        let ctx = mcp_ctx("mcp-unconfirmed");
+        let before = user_text(&ctx);
+        let a = json!({"name": "docs", "transport": "http", "url": "https://docs.example/mcp", "roles": ["amp-manager"]});
+
+        let no = Fake::new(false);
+        let e = mcp_call(&mcp_tool(&ctx, Some(no.clone())), a.clone())
+            .await
+            .unwrap_err();
+        assert!(e.contains("not written") && e.contains("declined"), "{e}");
+        assert_eq!(no.asked.load(Ordering::SeqCst), 1);
+
+        // Headless: refused before any check (an invalid name is not even looked at).
+        for a in [
+            a.clone(),
+            json!({"name": "Bad Name", "transport": "http", "url": "https://x", "roles": ["*"]}),
+        ] {
+            let e = mcp_call(&mcp_tool(&ctx, None), a).await.unwrap_err();
+            assert!(e.contains("no person can confirm it here"), "{e}");
+        }
+
+        // Dry run: the block, without asking or writing.
+        let yes = Fake::new(true);
+        let mut dry = a.clone();
+        dry["dry_run"] = json!(true);
+        let out = mcp_call(&mcp_tool(&ctx, Some(yes.clone())), dry)
+            .await
+            .unwrap();
+        assert!(
+            out.contains("Dry run") && out.contains("[mcp.docs]"),
+            "{out}"
+        );
+        assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
+
+        assert_eq!(user_text(&ctx), before);
+        assert!(!McpConfig::load(&ctx.paths).servers.contains_key("docs"));
+    }
+
+    #[tokio::test]
+    async fn existing_names_in_any_layer_are_refused_without_asking() {
+        let ctx = mcp_ctx("mcp-existing");
+        // Test setup, written directly: a repo server and a user server.
+        std::fs::write(
+            ctx.paths.repo_file().unwrap(),
+            "[mcp.shared]\ntype = \"http\"\nurl = \"https://repo.example/mcp\"\n",
+        )
+        .unwrap();
+        let user = format!(
+            "{}\n[mcp.mine]\ntype = \"http\"\nurl = \"https://mine.example/mcp\"\n",
+            user_text(&ctx)
+        );
+        std::fs::write(ctx.paths.user_file.as_ref().unwrap(), &user).unwrap();
+
+        let yes = Fake::new(true);
+        let t = mcp_tool(&ctx, Some(yes.clone()));
+        for (name, layer) in [("shared", "repo"), ("mine", "user")] {
+            let e = mcp_call(
+                &t,
+                json!({"name": name, "transport": "http", "url": "https://other.example/mcp", "roles": ["*"]}),
+            )
+            .await
+            .unwrap_err();
+            assert!(e.contains("already exists") && e.contains(layer), "{e}");
+            assert!(e.contains(&format!("amp-harness mcp edit {name}")), "{e}");
+        }
+        // Reserved names too.
+        let e = mcp_call(
+            &t,
+            json!({"name": "amp_tools", "transport": "http", "url": "https://x.example", "roles": ["*"]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("not written"), "{e}");
+        assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
+        assert_eq!(user_text(&ctx), user);
+    }
+
+    #[tokio::test]
+    async fn secrets_are_refused_and_never_echoed() {
+        let ctx = mcp_ctx("mcp-secrets");
+        let before = user_text(&ctx);
+        let yes = Fake::new(true);
+        let t = mcp_tool(&ctx, Some(yes.clone()));
+        let planted = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        for a in [
+            // Fields the tool does not have: headers, env, tokens, scope, force.
+            json!({"name": "gh", "transport": "http", "url": "https://gh.example/mcp", "roles": ["*"], "headers": {"Authorization": format!("Bearer {planted}")}}),
+            json!({"name": "gh", "transport": "stdio", "command": "gh-mcp", "roles": ["*"], "env": {"GITHUB_TOKEN": planted}}),
+            json!({"name": "gh", "transport": "http", "url": "https://gh.example/mcp", "roles": ["*"], "token": planted}),
+            json!({"name": "gh", "transport": "http", "url": "https://gh.example/mcp", "roles": ["*"], "secret_env": ["GITHUB_TOKEN"]}),
+            json!({"name": "gh", "transport": "http", "url": "https://gh.example/mcp", "roles": ["*"], "scope": "repo"}),
+            json!({"name": "gh", "transport": "http", "url": "https://gh.example/mcp", "roles": ["*"], "force": true}),
+            // Secrets in the values it does have.
+            json!({"name": "gh", "transport": "stdio", "command": "gh-mcp", "args": ["--token", planted], "roles": ["*"]}),
+            json!({"name": "gh", "transport": "stdio", "command": planted, "roles": ["*"]}),
+            json!({"name": "gh", "transport": "http", "url": format!("https://gh.example/mcp?api_key={planted}"), "roles": ["*"]}),
+        ] {
+            let e = mcp_call(&t, a.clone()).await.unwrap_err();
+            assert!(!e.contains(planted), "echoed a secret: {e}");
+            assert!(e.contains("amp-harness mcp secret gh"), "{a}: {e}");
+        }
+        // roles is required (no silent "*"), and transport fields must match.
+        for a in [
+            json!({"name": "gh", "transport": "http", "url": "https://gh.example/mcp"}),
+            json!({"name": "gh", "transport": "http", "url": "https://gh.example/mcp", "roles": []}),
+            json!({"name": "gh", "transport": "stdio", "url": "https://gh.example/mcp", "roles": ["*"]}),
+            json!({"name": "gh", "transport": "http", "command": "x", "roles": ["*"]}),
+        ] {
+            assert!(mcp_call(&t, a.clone()).await.is_err(), "{a}");
+        }
+        assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
+        assert_eq!(user_text(&ctx), before);
     }
 }
