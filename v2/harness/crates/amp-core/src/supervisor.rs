@@ -55,7 +55,7 @@ use rpi_agent::{
 };
 use rpi_ai::types::Tool;
 use rpi_harness::{
-    agent_harness::{AgentLane, HarnessRunOutcome},
+    agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome},
     types::HarnessTool,
 };
 use serde::Serialize;
@@ -922,6 +922,40 @@ pub enum StopError {
     AlreadyStopping(i64),
 }
 
+/// Why [`Supervisor::steer_worker`] did not hand a message to a worker (#4232). Never a silent
+/// no-op: the caller (the ticket-comment watcher, #4235) retries [`SteerError::NotReady`] on its
+/// next poll and stops steering that ticket on any other error ([`SteerError::is_retryable`]).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SteerError {
+    /// Retryable: the worker is waiting for a slot, or is still being prepared (its harness is
+    /// not built yet).
+    #[error("the worker on #{0} is not running yet; try again shortly")]
+    NotReady(i64),
+    #[error("#{0} has no worker in this chat")]
+    NotFound(i64),
+    #[error("the worker on #{0} has already finished")]
+    Finished(i64),
+    #[error("the worker on #{0} is stopping")]
+    Stopping(i64),
+    /// The worker's `amp_complete_task`/`amp_block_task` for its ticket is in flight.
+    #[error("the worker on #{0} is closing its ticket")]
+    Closing(i64),
+    /// The worker closed its ticket: another message must not give it another turn.
+    #[error("the worker on #{0} has already closed its ticket")]
+    Closed(i64),
+    /// The worker's harness refused the message.
+    #[error("could not steer the worker on #{0}: {1}")]
+    Failed(i64, String),
+}
+
+impl SteerError {
+    /// Whether the same steer may succeed later. Only [`SteerError::NotReady`]: every other
+    /// error means this worker will never take the message.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::NotReady(_))
+    }
+}
+
 /// A worker's session as the chat lists it (#2252): live (running or queued) or finished in this
 /// process.
 #[derive(Debug, Clone)]
@@ -1000,6 +1034,9 @@ struct LiveWorker {
     dispatch_id: String,
     /// Whether the worker has closed its ticket yet (set once it is running).
     watch: Option<Arc<WorkerWatch>>,
+    /// The worker's own harness, from the moment it is built until its run has ended and its
+    /// steering queue was cleared: what [`Supervisor::steer_worker`] steers (#4232).
+    harness: Option<Arc<AgentHarness>>,
     phase: WorkerPhase,
     model: Option<String>,
     cwd: Option<PathBuf>,
@@ -1441,6 +1478,47 @@ impl Supervisor {
         });
         w.stop.cancel();
         Ok(())
+    }
+
+    /// Hands `text` to the running worker on `task_id`, verbatim, as a steering message from
+    /// `from` (#4232): the worker's model reads it before its next model call, which is after the
+    /// tool calls of its current turn have finished, never in the middle of one. The message is
+    /// put in the worker's session view (#2252) when it is taken. Wrapping it (who wrote it, what
+    /// it may not do) is the caller's job (the ticket-comment watcher, #4235).
+    ///
+    /// Errors rather than dropping the message: [`SteerError::NotReady`] while the worker waits
+    /// for a slot or is still being built (retry it), and a terminal error once it is unknown,
+    /// finished, stopping, or closing or closed its ticket. A message taken just as the run ends
+    /// is not lost silently: the run's end clears the queue and the worker's report gets an
+    /// `undelivered steer from <from>: ...` note for it.
+    pub async fn steer_worker(
+        &self,
+        task_id: i64,
+        text: &str,
+        from: &str,
+    ) -> Result<(), SteerError> {
+        let (harness, watch, stop) = {
+            let live = self.live.lock().unwrap();
+            let w = live.get(&task_id);
+            let finished = w.is_none() && self.finished.lock().unwrap().contains_key(&task_id);
+            steer_target(task_id, w, finished)?
+        };
+        deliver_steer(task_id, &harness, &watch, &stop, text, from).await
+    }
+
+    /// The end of a worker's run, for steering (#4232): no steer is taken from now on, the
+    /// harness is forgotten, and every steer it took but never gave the model becomes a note.
+    async fn end_steering(
+        &self,
+        task_id: i64,
+        harness: &AgentHarness,
+        watch: &WorkerWatch,
+        notes: &mut Vec<String>,
+    ) {
+        if let Some(w) = self.live.lock().unwrap().get_mut(&task_id) {
+            w.harness = None;
+        }
+        notes.extend(reconcile_steers(harness, watch).await);
     }
 
     /// Keeps a finished worker's session viewable, and forgets it from the live map's point of
@@ -1965,6 +2043,7 @@ impl Supervisor {
                 dispatched: false,
                 dispatch_id: String::new(),
                 watch: None,
+                harness: None,
                 phase: WorkerPhase::Queued,
                 model: None,
                 cwd: None,
@@ -2104,6 +2183,8 @@ impl Supervisor {
             closed: Mutex::new(None),
             repeat_stop: Mutex::new(None),
             feed,
+            steered: Mutex::new(VecDeque::new()),
+            steer_open: tokio::sync::Mutex::new(true),
         });
         if let Some(w) = self.live.lock().unwrap().get_mut(&req.task_id) {
             w.watch = Some(Arc::clone(&watch));
@@ -2150,6 +2231,11 @@ impl Supervisor {
         info.model = built.resolved.model_ref();
         let session_file = built.session_file.clone();
         let harness = Arc::clone(&built.harness);
+        // #4232: steerable from here on. A steer before the claim is fine: rpi drains the queue
+        // when the run starts.
+        if let Some(w) = self.live.lock().unwrap().get_mut(&req.task_id) {
+            w.harness = Some(Arc::clone(&harness));
+        }
         // AMP #2802: the ticket is started by the harness, on its worker's behalf, at the moment
         // the worker actually exists and is about to run its first turn. Not by the model's first
         // tool call (a model that never makes one would leave the ticket unstarted and let AMP's
@@ -2173,6 +2259,8 @@ impl Supervisor {
                     // A stale token means this dispatch is over (AMP returned the ticket and
                     // dispatched it again): the run must not go on as if it held the ticket.
                     notes.push(format!("could not start #{0} in AMP: {e}", req.task_id));
+                    self.end_steering(req.task_id, &harness, &watch, &mut notes)
+                        .await;
                     return self
                         .finish(
                             &info,
@@ -2252,10 +2340,14 @@ impl Supervisor {
                     ));
                 }
                 let finish = finish.after_closing(closed, &mut notes);
+                self.end_steering(req.task_id, &harness, &watch, &mut notes)
+                    .await;
                 return self.finish(&info, started, notes, finish, dispatch).await;
             }
         };
 
+        self.end_steering(req.task_id, &harness, &watch, &mut notes)
+            .await;
         let closed = *watch.closed.lock().unwrap();
         let last = totals.lock().unwrap().last_text.clone();
         let mut finish = match result {
@@ -2679,11 +2771,21 @@ struct WorkerWatch {
     repeat_stop: Mutex<Option<crate::repeat::RepeatStop>>,
     /// The chat's session view reads the worker's events from here (#2252).
     feed: Arc<WorkerFeed>,
+    /// #4232: steers the harness took and the model has not been given yet, oldest first, as
+    /// (text, from).
+    steered: Mutex<VecDeque<(String, String)>>,
+    /// #4232: held while a steer is handed to the harness; `false` once the run has ended and
+    /// its queue was cleared, so no steer can land in a queue nobody drains.
+    steer_open: tokio::sync::Mutex<bool>,
 }
 
 impl WorkerWatch {
     fn observe(&self, event: &AgentEvent) {
-        self.feed.push(event);
+        // A steer is in the feed from when it was taken (#4232); rpi emits it again when it
+        // gives it to the model.
+        if !self.steer_echo(event) {
+            self.feed.push(event);
+        }
         let Some(e) = RunEvent::from_agent(event) else {
             return;
         };
@@ -2727,6 +2829,152 @@ impl WorkerWatch {
             _ => {}
         }
     }
+}
+
+impl WorkerWatch {
+    /// Whether `event` is rpi emitting a steer this worker took: its start, or its end (which
+    /// also marks the steer delivered).
+    fn steer_echo(&self, event: &AgentEvent) -> bool {
+        let (message, end) = match event {
+            AgentEvent::MessageStart { message } => (message, false),
+            AgentEvent::MessageEnd { message } => (message, true),
+            _ => return false,
+        };
+        let rpi_agent::AgentMessage::User(user) = message else {
+            return false;
+        };
+        let Some(text) = user.content.as_text() else {
+            return false;
+        };
+        let mut steered = self.steered.lock().unwrap();
+        let Some(i) = steered.iter().position(|(t, _)| t == text) else {
+            return false;
+        };
+        if end {
+            steered.remove(i);
+        }
+        true
+    }
+}
+
+/// The worker [`Supervisor::steer_worker`] would steer on `task_id`: its harness, watch and stop
+/// token, or why there is none. `finished`: no live worker, but one finished in this process.
+fn steer_target(
+    task_id: i64,
+    w: Option<&LiveWorker>,
+    finished: bool,
+) -> Result<(Arc<AgentHarness>, Arc<WorkerWatch>, CancellationToken), SteerError> {
+    let Some(w) = w else {
+        return Err(if finished {
+            SteerError::Finished(task_id)
+        } else {
+            SteerError::NotFound(task_id)
+        });
+    };
+    if w.stop.is_cancelled() {
+        return Err(SteerError::Stopping(task_id));
+    }
+    if let Some(watch) = &w.watch {
+        closing_state(task_id, watch)?;
+    }
+    // The phase is Running before the harness is built: wait for the harness too.
+    match (w.phase, &w.harness, &w.watch) {
+        (WorkerPhase::Running, Some(harness), Some(watch)) => {
+            Ok((Arc::clone(harness), Arc::clone(watch), w.stop.clone()))
+        }
+        _ => Err(SteerError::NotReady(task_id)),
+    }
+}
+
+/// [`SteerError::Closed`] once the worker closed its ticket, [`SteerError::Closing`] while its
+/// closing call runs.
+fn closing_state(task_id: i64, watch: &WorkerWatch) -> Result<(), SteerError> {
+    if watch.closed.lock().unwrap().is_some() {
+        return Err(SteerError::Closed(task_id));
+    }
+    if !watch.closing.lock().unwrap().is_empty() {
+        return Err(SteerError::Closing(task_id));
+    }
+    Ok(())
+}
+
+/// Queues `text` from `from` on the worker's harness and records it (#4232). Checks again under
+/// the steer lock, which [`reconcile_steers`] takes before clearing the queue: a steer is either
+/// refused here or seen there, never left in a queue nobody drains.
+async fn deliver_steer(
+    task_id: i64,
+    harness: &AgentHarness,
+    watch: &WorkerWatch,
+    stop: &CancellationToken,
+    text: &str,
+    from: &str,
+) -> Result<(), SteerError> {
+    let open = watch.steer_open.lock().await;
+    if !*open {
+        return Err(SteerError::Finished(task_id));
+    }
+    if stop.is_cancelled() {
+        return Err(SteerError::Stopping(task_id));
+    }
+    closing_state(task_id, watch)?;
+    let message = rpi_agent::AgentMessage::User(rpi_ai::types::UserMessage {
+        role: Default::default(),
+        content: rpi_ai::types::UserContent::Text(text.to_owned()),
+        timestamp: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64),
+    });
+    // Recorded before it is queued, so the drain's echo is recognised even when it comes at once.
+    watch
+        .steered
+        .lock()
+        .unwrap()
+        .push_back((text.to_owned(), from.to_owned()));
+    if let Err(e) = harness.steer(message.clone()).await {
+        let mut steered = watch.steered.lock().unwrap();
+        if let Some(i) = steered.iter().rposition(|(t, _)| t == text) {
+            steered.remove(i);
+        }
+        return Err(SteerError::Failed(task_id, e.to_string()));
+    }
+    watch.feed.push(&AgentEvent::MessageStart { message });
+    Ok(())
+}
+
+/// Ends steering for a run that has returned (#4232): refuses every later steer, clears the
+/// harness's queue, and returns a note per steer the model never got:
+/// `undelivered steer from <from>: <its first line, at most 120 characters>`.
+async fn reconcile_steers(harness: &AgentHarness, watch: &WorkerWatch) -> Vec<String> {
+    let mut open = watch.steer_open.lock().await;
+    *open = false;
+    let mut pending: VecDeque<(String, String)> =
+        std::mem::take(&mut *watch.steered.lock().unwrap());
+    if pending.is_empty() {
+        // Nothing this supervisor queued is left: leave the harness's queue alone.
+        return Vec::new();
+    }
+    let undelivered: Vec<String> = match harness.clear_queue().await {
+        Ok(queued) => queued.steering,
+        // The harness is gone: what was never echoed was never delivered.
+        Err(_) => pending.iter().map(|(t, _)| t.clone()).collect(),
+    };
+    undelivered
+        .into_iter()
+        .map(|text| {
+            let from = match pending.iter().position(|(t, _)| *t == text) {
+                Some(i) => pending.remove(i).map(|(_, f)| f).unwrap_or_default(),
+                None => "unknown".to_owned(),
+            };
+            let first: String = text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect();
+            format!("undelivered steer from {from}: {first}")
+        })
+        .collect()
 }
 
 fn live_info(task_id: i64, w: &LiveWorker) -> WorkerSessionInfo {
@@ -3471,6 +3719,8 @@ mod tests {
             closed: Mutex::default(),
             repeat_stop: Mutex::default(),
             feed: WorkerFeed::new(),
+            steered: Mutex::default(),
+            steer_open: tokio::sync::Mutex::new(true),
         };
         let start = |id: &str, name: &str, task: i64| AgentEvent::ToolExecutionStart {
             tool_call_id: id.into(),
@@ -3816,5 +4066,391 @@ mod tests {
         );
         assert!(context.contains("branch: amp-31"), "{context}");
         assert!(context.contains("dispatch_id: d_x"), "{context}");
+    }
+
+    // -- #4232: steer_worker ---------------------------------------------------------------
+
+    mod steer {
+        use super::*;
+        use rpi_ai::{
+            providers::faux::{FauxProvider, FauxScript, FauxStep, faux_assistant_message},
+            types::{Message, StopReason},
+        };
+        use rpi_harness::{
+            session::{
+                memory::{InMemorySessionStorage, SystemClock},
+                session::{DefaultIdGenerator, Session},
+                types::SessionMetadata,
+            },
+            types::AgentHarnessOptions,
+        };
+        use tokio::sync::Notify;
+
+        const WAIT: Duration = Duration::from_secs(20);
+
+        /// A tool for the faux worker: answers "ok", after `hold` is released when it has one.
+        struct TestTool {
+            schema: Tool,
+            hold: Option<(Arc<Notify>, Arc<Notify>)>,
+        }
+
+        impl TestTool {
+            fn harness_tool(name: &str, hold: Option<(Arc<Notify>, Arc<Notify>)>) -> HarnessTool {
+                let schema = Tool {
+                    name: name.to_owned(),
+                    description: "test tool".to_owned(),
+                    parameters: json!({"type": "object"}).into(),
+                    constrained_sampling: None,
+                };
+                HarnessTool::new(Arc::new(Self { schema, hold }))
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl AgentTool for TestTool {
+            fn schema(&self) -> &Tool {
+                &self.schema
+            }
+            fn label(&self) -> &str {
+                "test"
+            }
+            async fn execute(
+                &self,
+                _id: &str,
+                _params: Value,
+                _signal: CancellationToken,
+                _on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+            ) -> Result<AgentToolResult, ToolError> {
+                if let Some((entered, release)) = &self.hold {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                Ok(AgentToolResult::text("ok"))
+            }
+        }
+
+        fn watch(task_id: i64) -> Arc<WorkerWatch> {
+            Arc::new(WorkerWatch {
+                task_id,
+                totals: Arc::default(),
+                max_turns: 0,
+                budget: CancellationToken::new(),
+                closing: Mutex::default(),
+                closed: Mutex::default(),
+                repeat_stop: Mutex::default(),
+                feed: WorkerFeed::new(),
+                steered: Mutex::default(),
+                steer_open: tokio::sync::Mutex::new(true),
+            })
+        }
+
+        /// A worker harness on the faux provider, emitting into `watch` as a real worker does.
+        async fn harness(
+            steps: Vec<FauxStep>,
+            tools: Vec<HarnessTool>,
+            watch: &Arc<WorkerWatch>,
+        ) -> Arc<AgentHarness> {
+            let script = FauxScript::new();
+            script.set_responses(steps);
+            let provider = FauxProvider::new(script);
+            let session = Session::new(
+                Arc::new(InMemorySessionStorage::new(
+                    SessionMetadata {
+                        id: "worker".into(),
+                        created_at: 0,
+                        parent_session_id: None,
+                    },
+                    Arc::new(SystemClock),
+                    Arc::new(DefaultIdGenerator::new()),
+                )),
+                None,
+            );
+            let harness = AgentHarness::create(AgentHarnessOptions {
+                model: provider.default_model().clone(),
+                models: vec![provider.clone()],
+                tools,
+                session,
+                agent_emitter: Some(Arc::new(WorkerEmitter {
+                    watch: Arc::clone(watch),
+                })),
+                ..Default::default()
+            })
+            .await
+            .expect("harness");
+            Arc::new(harness)
+        }
+
+        fn live(
+            phase: WorkerPhase,
+            watch: Option<Arc<WorkerWatch>>,
+            harness: Option<Arc<AgentHarness>>,
+        ) -> LiveWorker {
+            LiveWorker {
+                agent_id: "amp:amp-worker-backend".into(),
+                dispatched: true,
+                dispatch_id: String::new(),
+                watch,
+                harness,
+                phase,
+                model: None,
+                cwd: None,
+                since: SystemTime::now(),
+                totals: None,
+                feed: WorkerFeed::new(),
+                stop: CancellationToken::new(),
+                stopped_by: Arc::default(),
+                branch: None,
+                context_window: None,
+            }
+        }
+
+        async fn steer(w: &LiveWorker, task_id: i64, text: &str) -> Result<(), SteerError> {
+            let (harness, watch, stop) = steer_target(task_id, Some(w), false)?;
+            deliver_steer(task_id, &harness, &watch, &stop, text, "alice@example.com").await
+        }
+
+        fn last_user(ctx: &rpi_ai::types::Context) -> String {
+            ctx.messages
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    Message::User(u) => u.content.as_text().map(str::to_owned),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        }
+
+        /// The feed's user messages, as the chat's session view shows them.
+        fn feed_users(watch: &WorkerWatch) -> Vec<String> {
+            watch
+                .feed
+                .since(0)
+                .0
+                .into_iter()
+                .filter_map(|(_, e)| match e {
+                    AgentEvent::MessageStart {
+                        message: rpi_agent::AgentMessage::User(u),
+                    } => u.content.as_text().map(str::to_owned),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// A steer taken while the worker's tool runs reaches the model at its next turn, not
+        /// before; the session view shows it once; nothing is left undelivered.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_steer_reaches_a_running_worker_at_its_next_turn() {
+            let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+            let record = |seen: &Arc<Mutex<Vec<String>>>| {
+                let seen = Arc::clone(seen);
+                move |ctx: &rpi_ai::types::Context| seen.lock().unwrap().push(last_user(ctx))
+            };
+            let (first, second) = (record(&seen), record(&seen));
+            let steps = vec![
+                FauxStep::factory(move |ctx| {
+                    first(ctx);
+                    faux_assistant_message(
+                        vec![rpi_ai::providers::faux::FauxBlock::tool_call(
+                            "hold",
+                            json!({}),
+                        )],
+                        StopReason::ToolUse,
+                    )
+                }),
+                FauxStep::factory(move |ctx| {
+                    second(ctx);
+                    faux_assistant_message("done", StopReason::Stop)
+                }),
+            ];
+            let (entered, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+            let watch = watch(7);
+            let tool =
+                TestTool::harness_tool("hold", Some((Arc::clone(&entered), Arc::clone(&release))));
+            let h = harness(steps, vec![tool], &watch).await;
+            let w = live(
+                WorkerPhase::Running,
+                Some(Arc::clone(&watch)),
+                Some(Arc::clone(&h)),
+            );
+
+            let run = tokio::spawn({
+                let h = Arc::clone(&h);
+                async move { h.prompt_text("do the ticket", Vec::new()).await }
+            });
+            tokio::time::timeout(WAIT, entered.notified())
+                .await
+                .expect("the tool started");
+            steer(&w, 7, "also check the stop path\nsecond line")
+                .await
+                .expect("steered");
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                1,
+                "no model call while the tool runs"
+            );
+            release.notify_one();
+            let r = tokio::time::timeout(WAIT, run)
+                .await
+                .expect("the run ended")
+                .expect("join")
+                .expect("run");
+            assert!(
+                matches!(r.outcome, HarnessRunOutcome::Completed { .. }),
+                "{:?}",
+                r.outcome
+            );
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert_eq!(seen[0], "do the ticket");
+            assert_eq!(
+                seen[1], "also check the stop path\nsecond line",
+                "the next turn has it"
+            );
+            assert_eq!(
+                feed_users(&watch),
+                vec!["also check the stop path\nsecond line".to_owned()],
+                "in the session view once"
+            );
+            assert!(reconcile_steers(&h, &watch).await.is_empty());
+            assert_eq!(
+                steer(&w, 7, "late").await,
+                Err(SteerError::Finished(7)),
+                "the run's end refuses later steers"
+            );
+        }
+
+        /// The review's case (#3138): a steer after the worker's amp_complete_task succeeded is
+        /// refused with Closed, and gives the model no other turn.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_steer_after_amp_complete_task_is_refused_closed() {
+            let steps = vec![
+                FauxStep::tool_call(COMPLETE_TOOL, json!({"task_id": 7})),
+                FauxStep::text("done"),
+            ];
+            let watch = watch(7);
+            let h = harness(
+                steps,
+                vec![TestTool::harness_tool(COMPLETE_TOOL, None)],
+                &watch,
+            )
+            .await;
+            let w = live(
+                WorkerPhase::Running,
+                Some(Arc::clone(&watch)),
+                Some(Arc::clone(&h)),
+            );
+            tokio::time::timeout(WAIT, h.prompt_text("do the ticket", Vec::new()))
+                .await
+                .expect("the run ended")
+                .expect("run");
+            assert_eq!(
+                *watch.closed.lock().unwrap(),
+                Some(WorkerOutcome::Completed)
+            );
+            assert_eq!(
+                steer(&w, 7, "one more thing").await,
+                Err(SteerError::Closed(7))
+            );
+            assert!(watch.steered.lock().unwrap().is_empty());
+            assert!(
+                h.queued_messages().await.expect("queue").is_empty(),
+                "nothing queued"
+            );
+        }
+
+        /// The race: a steer taken just as the run returned is cleared from the queue and
+        /// becomes a note naming who sent it and its first line.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_steer_the_run_never_took_becomes_a_note() {
+            let watch = watch(7);
+            let h = harness(vec![FauxStep::text("done")], Vec::new(), &watch).await;
+            let w = live(
+                WorkerPhase::Running,
+                Some(Arc::clone(&watch)),
+                Some(Arc::clone(&h)),
+            );
+            tokio::time::timeout(WAIT, h.prompt_text("do the ticket", Vec::new()))
+                .await
+                .expect("the run ended")
+                .expect("run");
+            let long = format!("[comment #42] {}\nbody", "x".repeat(200));
+            steer(&w, 7, &long)
+                .await
+                .expect("taken: the run has not been reconciled");
+            let notes = reconcile_steers(&h, &watch).await;
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            let first: String = long.lines().next().unwrap().chars().take(120).collect();
+            assert_eq!(
+                notes[0],
+                format!("undelivered steer from alice@example.com: {first}")
+            );
+            assert!(notes[0].contains("comment #42"));
+            assert!(
+                h.queued_messages().await.expect("queue").is_empty(),
+                "cleared"
+            );
+        }
+
+        /// Never a silent no-op: queued and not-yet-built workers are retryable, unknown,
+        /// finished, stopping, closing and closed ones are not.
+        #[tokio::test]
+        async fn steers_to_workers_that_cannot_take_one_are_refused() {
+            assert_eq!(
+                steer_target(9, None, false).err(),
+                Some(SteerError::NotFound(9))
+            );
+            assert_eq!(
+                steer_target(9, None, true).err(),
+                Some(SteerError::Finished(9))
+            );
+
+            let queued = live(WorkerPhase::Queued, None, None);
+            let err = steer_target(9, Some(&queued), false).err();
+            assert_eq!(err, Some(SteerError::NotReady(9)));
+            assert!(err.unwrap().is_retryable());
+
+            // Running is set before the build; no harness yet.
+            let preparing = live(WorkerPhase::Running, Some(watch(9)), None);
+            assert_eq!(
+                steer_target(9, Some(&preparing), false).err(),
+                Some(SteerError::NotReady(9))
+            );
+
+            let stopping = live(WorkerPhase::Queued, None, None);
+            stopping.stop.cancel();
+            let err = steer_target(9, Some(&stopping), false).err();
+            assert_eq!(err, Some(SteerError::Stopping(9)));
+            assert!(!err.unwrap().is_retryable());
+
+            let closing = live(WorkerPhase::Running, Some(watch(9)), None);
+            closing
+                .watch
+                .as_ref()
+                .unwrap()
+                .closing
+                .lock()
+                .unwrap()
+                .insert("c".into(), WorkerOutcome::Completed);
+            assert_eq!(
+                steer_target(9, Some(&closing), false).err(),
+                Some(SteerError::Closing(9))
+            );
+
+            let closed = live(WorkerPhase::Running, Some(watch(9)), None);
+            *closed.watch.as_ref().unwrap().closed.lock().unwrap() = Some(WorkerOutcome::Blocked);
+            assert_eq!(
+                steer_target(9, Some(&closed), false).err(),
+                Some(SteerError::Closed(9))
+            );
+            for e in [
+                SteerError::NotFound(9),
+                SteerError::Finished(9),
+                SteerError::Closing(9),
+                SteerError::Closed(9),
+                SteerError::Failed(9, "x".into()),
+            ] {
+                assert!(!e.is_retryable(), "{e}");
+            }
+        }
     }
 }
