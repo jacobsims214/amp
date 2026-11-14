@@ -35,6 +35,10 @@ struct Rig {
     done: UnboundedReceiver<amp_tui::RunDone>,
     meta: MetaHandle,
     opened: Arc<Mutex<Vec<String>>>,
+    /// The shell's harness, to read its session (`/compact`, AMP #4222).
+    harness: Arc<AgentHarness>,
+    /// The faux provider's queue, to see which steps were used.
+    script: FauxScript,
 }
 
 fn plan_json() -> Value {
@@ -58,9 +62,12 @@ fn blocked_json() -> Value {
 }
 
 async fn rig(steps: Vec<FauxStep>, with_meta: bool) -> Rig {
-    let script = FauxScript::new();
+    rig_with(FauxScript::new(), steps, with_meta).await
+}
+
+async fn rig_with(script: FauxScript, steps: Vec<FauxStep>, with_meta: bool) -> Rig {
     script.set_responses(steps);
-    let provider = FauxProvider::new(script);
+    let provider = FauxProvider::new(script.clone());
     let model = provider.default_model().clone();
     let (emitter, events) = ChannelEmitter::new();
     let harness = AgentHarness::create(AgentHarnessOptions {
@@ -84,7 +91,8 @@ async fn rig(steps: Vec<FauxStep>, with_meta: bool) -> Rig {
         session_file: None,
         banner: vec!["AMP harness · manager".into()],
     };
-    let (mut shell, done) = Shell::new(Arc::new(harness), info, Vec::new());
+    let harness = Arc::new(harness);
+    let (mut shell, done) = Shell::new(Arc::clone(&harness), info, Vec::new());
     let opened: Arc<Mutex<Vec<String>>> = Arc::default();
     let log = Arc::clone(&opened);
     shell.set_opener(Arc::new(move |url: &str| {
@@ -120,6 +128,8 @@ async fn rig(steps: Vec<FauxStep>, with_meta: bool) -> Rig {
         done,
         meta,
         opened,
+        harness,
+        script,
     }
 }
 
@@ -1048,4 +1058,265 @@ async fn typing_with_a_panel_open_goes_to_the_editor() {
     rig.typ(KeyCode::Esc).await;
     assert!(!rig.shell.view().panel().is_open());
     assert_fits(&rig);
+}
+
+// ---------------------------------------------------------------------------------------------
+// `/compact [instructions]` (AMP #4222, KB specs/harness-compact-command.md §7).
+// ---------------------------------------------------------------------------------------------
+
+mod compact {
+    use super::*;
+    use rpi_ai::{
+        providers::faux::faux_assistant_message,
+        types::{Context, StopReason},
+    };
+    use rpi_harness::session::types::{CompactionEntry, Entry, EntryQuery};
+
+    /// Every transcript line, the box edges dropped and wrapped lines joined back with a space.
+    fn flat(rig: &Rig) -> String {
+        rig.shell
+            .view()
+            .render_plain(W, 400)
+            .iter()
+            .map(|l| l.replace('│', " ").trim().to_owned())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    async fn entries(rig: &Rig) -> Vec<Entry> {
+        rig.harness
+            .session()
+            .find_entries(&EntryQuery::default())
+            .await
+            .expect("entries")
+    }
+
+    async fn compactions(rig: &Rig) -> Vec<CompactionEntry> {
+        entries(rig)
+            .await
+            .into_iter()
+            .filter_map(|e| match e {
+                Entry::Compaction(c) => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A step that answers `text` and records the request it was given (its `Debug` form).
+    fn recording(text: &'static str, seen: &Arc<Mutex<Vec<String>>>) -> FauxStep {
+        let seen = Arc::clone(seen);
+        FauxStep::factory(move |ctx: &Context| {
+            seen.lock().unwrap().push(format!("{ctx:?}"));
+            faux_assistant_message(text, StopReason::Stop)
+        })
+    }
+
+    fn long(word: &str, n: usize) -> String {
+        (0..n)
+            .map(|i| format!("{word}{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Waits (bounded) until `/compact`'s model call has taken its step from the script.
+    async fn until_summarizing(rig: &mut Rig) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while rig.script.pending_count() > 0 {
+            assert!(tokio::time::Instant::now() < deadline, "never summarized");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            rig.shell.poll();
+        }
+        // The stream has started: give it a moment to be under way.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// Case 1 (C1, O1, D1-D3): between runs, `/compact focus on X` summarizes with the
+    /// instructions, says so with estimated before/after figures, keeps the earlier entries,
+    /// and the next prompt's request carries the summary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compact_summarizes_between_runs() {
+        let summarized = Arc::new(Mutex::new(Vec::new()));
+        let next = Arc::new(Mutex::new(Vec::new()));
+        let mut rig = rig(
+            vec![
+                FauxStep::text("first answer"),
+                recording("SUMMARY-OF-EARLIER-TURNS", &summarized),
+                recording("second answer", &next),
+            ],
+            false,
+        )
+        .await;
+        rig.say("hello there").await;
+        rig.say("/compact focus on the API").await;
+        assert!(!rig.shell.is_compacting());
+        let screen = flat(&rig);
+        assert!(screen.contains("compacted: ~"), "{screen}");
+        assert!(screen.contains("tokens (estimate)"), "{screen}");
+        assert!(screen.contains("details may be lost"), "{screen}");
+        // D1: this rig keeps its session in memory, so no claim about a session file.
+        assert!(!screen.contains("session file"), "{screen}");
+        assert!(screen.contains("not saved"), "{screen}");
+        // C1: the instructions reached the summary request.
+        let asked = summarized.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0].contains("focus on the API"), "{}", asked[0]);
+        // D1/D2: one compaction entry, the earlier messages still in the session.
+        let found = compactions(&rig).await;
+        assert_eq!(found.len(), 1);
+        assert!(found[0].summary.contains("SUMMARY-OF-EARLIER-TURNS"));
+        let all = format!("{:?}", entries(&rig).await);
+        assert!(all.contains("hello there") && all.contains("first answer"));
+        // D3: the next prompt continues from the summary.
+        rig.say("and now?").await;
+        let sent = next.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("SUMMARY-OF-EARLIER-TURNS"), "{}", sent[0]);
+        assert!(flat(&rig).contains("second answer"));
+    }
+
+    /// Case 2 (B1, N1): `/compact` during a reply is refused; the reply runs on unaffected and
+    /// no step is spent on a summary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compact_is_refused_while_a_reply_runs() {
+        let mut rig = rig_with(
+            FauxScript::new().with_tokens_per_second(200.0),
+            vec![FauxStep::text(format!("alpha {}", long("word", 120)))],
+            false,
+        )
+        .await;
+        assert_eq!(rig.shell.submit("go").await, Submit::Continue);
+        assert!(rig.shell.is_running());
+        assert_eq!(rig.shell.submit("/compact").await, Submit::Continue);
+        assert!(!rig.shell.is_compacting());
+        assert!(rig.shell.queued_prompts().is_empty(), "never queued");
+        rig.shell
+            .drive_until_idle(&mut rig.events, &mut rig.done, WAIT)
+            .await
+            .expect("idle");
+        rig.settle().await;
+        let screen = flat(&rig);
+        assert!(
+            screen.contains("/compact: wait for the reply to finish"),
+            "{screen}"
+        );
+        assert!(screen.contains("word119"), "the reply ran on\n{screen}");
+        assert!(compactions(&rig).await.is_empty());
+        assert_eq!(rig.script.pending_count(), 0);
+    }
+
+    /// Case 3 (O2): nothing to compact on an empty chat; no model call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compact_on_an_empty_chat_is_declined() {
+        let mut rig = rig(vec![FauxStep::text("unused")], false).await;
+        rig.say("/compact").await;
+        assert!(!rig.shell.is_compacting());
+        let screen = flat(&rig);
+        assert!(screen.contains("nothing to compact"), "{screen}");
+        assert!(!screen.contains("compaction failed"), "{screen}");
+        assert_eq!(rig.script.pending_count(), 1, "no model call");
+        assert!(compactions(&rig).await.is_empty());
+    }
+
+    /// Case 4 (O4, D4): a failed summary says so, writes nothing, and the next prompt sees the
+    /// old context.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compact_failure_keeps_context() {
+        let next = Arc::new(Mutex::new(Vec::new()));
+        let mut failed = faux_assistant_message("", StopReason::Error);
+        failed.error_message = Some("summary model exploded".into());
+        let failing: Vec<FauxStep> = (0..6).map(|_| FauxStep::message(failed.clone())).collect();
+        let mut rig = rig(vec![FauxStep::text("first answer")], false).await;
+        rig.say("hello there").await;
+        rig.script.set_responses(failing);
+        rig.say("/compact").await;
+        assert!(!rig.shell.is_compacting());
+        let screen = flat(&rig);
+        assert!(screen.contains("compaction failed ("), "{screen}");
+        assert!(screen.contains("context unchanged"), "{screen}");
+        assert!(!screen.contains("compacted: ~"), "{screen}");
+        assert!(compactions(&rig).await.is_empty());
+        rig.script
+            .set_responses(vec![recording("second answer", &next)]);
+        rig.say("and now?").await;
+        let sent = next.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].contains("hello there") && sent[0].contains("first answer"),
+            "{}",
+            sent[0]
+        );
+    }
+
+    /// Case 5 (C5): a prompt typed during `/compact` queues, then runs once, after it — on the
+    /// compacted context.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_typed_during_compaction_queues_then_runs() {
+        let next = Arc::new(Mutex::new(Vec::new()));
+        let mut rig = rig_with(
+            FauxScript::new().with_tokens_per_second(150.0),
+            vec![
+                FauxStep::text("first answer"),
+                FauxStep::text(format!("SUMMARY-MARK {}", long("sum", 150))),
+                recording("after the summary", &next),
+            ],
+            false,
+        )
+        .await;
+        rig.say("hello there").await;
+        assert_eq!(rig.shell.submit("/compact").await, Submit::Continue);
+        assert!(rig.shell.is_compacting());
+        assert_eq!(rig.shell.submit("queued question").await, Submit::Continue);
+        assert!(!rig.shell.is_running(), "no run starts under a compaction");
+        assert_eq!(
+            rig.shell.queued_prompts(),
+            vec!["queued question".to_owned()]
+        );
+        // The compaction ends; the queued prompt then starts as its own turn.
+        rig.shell.settle(WAIT).await.expect("compacted");
+        assert!(!rig.shell.is_compacting());
+        assert!(rig.shell.is_running(), "the queued prompt runs");
+        rig.shell
+            .drive_until_idle(&mut rig.events, &mut rig.done, WAIT)
+            .await
+            .expect("idle");
+        rig.settle().await;
+        assert!(rig.shell.queued_prompts().is_empty());
+        assert_eq!(compactions(&rig).await.len(), 1);
+        let sent = next.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "ran once");
+        assert!(sent[0].contains("SUMMARY-MARK"), "{}", sent[0]);
+        assert!(sent[0].contains("queued question"), "{}", sent[0]);
+        assert!(flat(&rig).contains("after the summary"));
+    }
+
+    /// Case 6 (X1, X2, O3): Esc during `/compact` stops it: "stopped", not an error, and
+    /// nothing written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn esc_during_compaction_stops_it() {
+        let mut rig = rig_with(
+            FauxScript::new().with_tokens_per_second(40.0),
+            vec![
+                FauxStep::text("first answer"),
+                FauxStep::text(format!("SUMMARY-MARK {}", long("sum", 400))),
+            ],
+            false,
+        )
+        .await;
+        rig.say("hello there").await;
+        assert_eq!(rig.shell.submit("/compact").await, Submit::Continue);
+        assert!(rig.shell.is_compacting());
+        until_summarizing(&mut rig).await;
+        assert!(rig.shell.key(&key(KeyCode::Esc), true).await, "Esc is used");
+        rig.shell.settle(WAIT).await.expect("stopped");
+        assert!(!rig.shell.is_compacting());
+        let screen = flat(&rig);
+        assert!(
+            screen.contains("compaction stopped — context unchanged"),
+            "{screen}"
+        );
+        assert!(!screen.contains("compaction failed"), "{screen}");
+        assert!(!screen.contains("compacted: ~"), "{screen}");
+        assert!(compactions(&rig).await.is_empty());
+    }
 }

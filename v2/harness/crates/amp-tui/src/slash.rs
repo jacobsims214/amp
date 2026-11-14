@@ -217,6 +217,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         "reload agents, skills, models, MCP servers",
     ),
     CommandSpec::new(Group::Chat, "usage", "", "tokens and cost this session"),
+    CommandSpec::new(
+        Group::Chat,
+        "compact",
+        "[instructions]",
+        "summarize older turns to free context (lossy)",
+    ),
     CommandSpec::new(Group::Chat, "abort", "", "stop the reply"),
     CommandSpec::new(
         Group::Chat,

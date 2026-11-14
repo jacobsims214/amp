@@ -21,6 +21,7 @@
    /reload                  reload agents, skills, models, MCP servers
  Chat
    /usage                   tokens and cost this session
+   /compact [instructions]  summarize older turns to free context (lossy)
    /abort                   stop the reply
    /stop                    stop the reply, or the wait for plan approval
    /close                   close the open panel

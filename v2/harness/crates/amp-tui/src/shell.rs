@@ -76,7 +76,9 @@ use amp_core::tickets::Status;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rpi_agent::AgentEvent;
 use rpi_ai::{Model, ThinkingLevel};
-use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome, RunResult};
+use rpi_harness::agent_harness::{
+    AgentHarness, AgentLane, CompactionOutcome, CompactionResult, HarnessRunOutcome, RunResult,
+};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -165,6 +167,9 @@ enum ShellMsg {
         active: bool,
         manual: bool,
     },
+    /// `/compact` finished (AMP #4222): its own message, never `done_tx`, so it writes no
+    /// `RunEnd` to the remote feed and drains nothing as a model reply would.
+    Compacted(Box<CompactDone>),
     /// `/sessions` scanned this directory's saved chats (AMP #3010).
     Sessions(Result<SessionList, String>),
     /// A confirmed resume finished: the harness switched to that session, or why it refused.
@@ -953,6 +958,57 @@ pub enum Submit {
     Quit,
 }
 
+/// `/compact`'s outcome, applied by [`Shell::poll`] (AMP #4222).
+struct CompactDone {
+    result: Result<CompactionResult, CompactError>,
+    /// A decline whose branch already ends in a compaction (O2).
+    already_compacted: bool,
+}
+
+/// `/compact`'s call failed before rpi gave an outcome.
+struct CompactError {
+    /// rpi refused it because the lane was busy (O5): a refusal, not a failure.
+    busy: bool,
+    message: String,
+}
+
+/// `/compact` while a reply runs (B1, O5).
+const COMPACT_WAIT_REPLY: &str = "wait for the reply to finish (Esc stops it), then try again";
+
+/// A compaction the person stopped (X2, O3).
+const COMPACT_STOPPED: &str = "compaction stopped — context unchanged";
+
+/// The model context right after a compaction, estimated (spec E2): chars/4 over the summary
+/// message plus the retained tail. Not `estimate_context_tokens`: that takes the last assistant
+/// message's reported usage, and the retained tail still carries the pre-compaction figure.
+pub(crate) fn compacted_context_tokens(
+    entry: &rpi_harness::session::types::CompactionEntry,
+) -> i64 {
+    use rpi_harness::compaction::estimate_tokens;
+    let summary = rpi_harness::messages::create_compaction_summary_message(
+        entry.summary.as_str(),
+        entry.tokens_before,
+        entry.base.timestamp,
+    );
+    estimate_tokens(&summary) + entry.retained_tail.iter().map(estimate_tokens).sum::<i64>()
+}
+
+/// O1's notice. Compaction is lossy, so it never promises every detail is kept; without a
+/// session file (D1) it doesn't claim the full history is saved.
+fn compacted_notice(before: i64, after: i64, saved: bool) -> String {
+    let history = if saved {
+        "Full history stays in the session file."
+    } else {
+        "This chat is not saved (in memory): only the transcript above keeps the earlier turns."
+    };
+    format!(
+        "compacted: ~{} → ~{} tokens (estimate). Older turns are now a summary; details may be \
+         lost. {history}",
+        crate::footer::format_tokens(before),
+        crate::footer::format_tokens(after),
+    )
+}
+
 pub struct Shell {
     view: ChatView,
     harness: Arc<AgentHarness>,
@@ -1098,6 +1154,12 @@ pub struct Shell {
     end_seen_at: Option<Instant>,
     /// [`Shell::quit`] has begun: nothing new starts.
     quitting: bool,
+    /// `/compact` is running on the manager's lane (AMP #4222, spec C5). A busy state of its own,
+    /// not [`Shell::running`]: every place that starts a turn or switches the session checks it
+    /// too, because rpi holds the lane for the compaction and a prompt would fail `lane_busy`.
+    compacting: bool,
+    /// A `/sessions` resume is in flight (spec B3): `/compact` waits for it.
+    resuming: bool,
 }
 
 /// A tool call whose arguments are still streaming (#2384).
@@ -1198,6 +1260,8 @@ impl Shell {
                 wake_guard: WakeGuard::default(),
                 end_seen_at: None,
                 quitting: false,
+                compacting: false,
+                resuming: false,
             },
             done_rx,
         )
@@ -1228,7 +1292,7 @@ impl Shell {
         prompt_id: Option<String>,
     ) -> bool {
         let text = text.trim();
-        if text.is_empty() || self.running || self.switching {
+        if text.is_empty() || self.running || self.compacting || self.switching {
             return false;
         }
         // #2376: a prompt from a paired device says so above its bubble. #2391 (L2): its text
@@ -1273,7 +1337,7 @@ impl Shell {
         let ctx = self.totals.context_tokens;
         let status = amp_core::remote::HostStatus {
             model: self.info.model_ref(),
-            busy: self.running,
+            busy: self.running || self.compacting,
             context_pct: (ctx > 0).then(|| (ctx * 100 / window).clamp(0, 100)),
             cost_usd_micros: amp_core::chat_event::usd_micros(self.totals.usage.cost_usd),
             project: meta.as_ref().and_then(|m| {
@@ -1927,6 +1991,11 @@ impl Shell {
         self.running
     }
 
+    /// `/compact` is running (AMP #4222): a busy state of its own, not a reply.
+    pub fn is_compacting(&self) -> bool {
+        self.compacting
+    }
+
     /// Gives the shell the session's worker supervisor (the manager's; `None` for a worker role).
     pub fn set_supervisor(&mut self, supervisor: Option<Arc<Supervisor>>) {
         self.launch_watch = supervisor.as_ref().map(|s| s.watch_launch_ends());
@@ -2250,6 +2319,13 @@ impl Shell {
     /// Nothing here cancels anything: a switch is refused, never made to fit, and no device is
     /// disconnected on the person's behalf.
     fn switch_blocker(&self) -> Option<String> {
+        if self.compacting {
+            return Some(
+                "the context is being compacted — wait for it to finish (or press Esc to stop \
+                 it), then try again."
+                    .to_owned(),
+            );
+        }
         if self.running {
             return Some(
                 "the manager is replying — wait for it to finish (or press Esc to stop it), then \
@@ -2354,6 +2430,7 @@ impl Shell {
         self.view.add_notice(&format!("resuming {}…", request.id));
         let tx = self.msgs_tx.clone();
         self.in_flight += 1;
+        self.resuming = true;
         tokio::spawn(async move {
             let result = control.resume(request.clone()).await;
             let _ = tx.send(ShellMsg::Resumed(Box::new(request), result));
@@ -2571,7 +2648,8 @@ impl Shell {
             }
             return;
         };
-        if self.reloading {
+        // AMP #4222 (C5): no reload under a running compaction; it follows the compaction.
+        if self.reloading || self.compacting {
             // A panel's or a person's request outranks the watcher's (it says what changed).
             if self.reload_again != Some(ReloadCause::Command) {
                 self.reload_again = match (self.reload_again, cause) {
@@ -2580,8 +2658,11 @@ impl Shell {
                 };
             }
             if cause == ReloadCause::Command {
-                self.view
-                    .add_notice("/reload: already reloading; once more when it is done");
+                self.view.add_notice(if self.reloading {
+                    "/reload: already reloading; once more when it is done"
+                } else {
+                    "/reload: compacting the context; reloading once that is done"
+                });
             }
             return;
         }
@@ -2695,6 +2776,10 @@ impl Shell {
         // Quitting: nothing queued may start once the reply ends, nor any automatic turn.
         self.quitting = true;
         self.prompt_queue.clear();
+        if self.compacting {
+            // Nothing is written unless the compaction completes (spec D4): stop it.
+            let _ = self.harness.abort().await;
+        }
         if self.settled() {
             return QuitOutcome::Idle;
         }
@@ -2865,6 +2950,7 @@ impl Shell {
     fn wake_on_worker_end(&mut self, now: Instant) -> bool {
         if !self.wake_on_end
             || self.running
+            || self.compacting
             || self.switching
             || self.quitting
             || self.quit_confirm_until.is_some_and(|until| now < until)
@@ -2975,7 +3061,7 @@ impl Shell {
     /// Never while a reply runs or a server switch is going on.
     fn watch_approval(&mut self) -> bool {
         use amp_core::approval_wait::{self as aw, WaitCheck};
-        if self.running || self.switching {
+        if self.running || self.compacting || self.switching {
             return false;
         }
         let (Some(meta), Some(wait)) = (&self.meta, self.approval_wait.as_mut()) else {
@@ -3255,7 +3341,9 @@ impl Shell {
         // A prompt hands the keys back to the editor; a docked panel stays, unfocused.
         // #2161: a sent prompt hands the keys back to the editor; a docked panel stays.
         self.editor_clicked = self.view.panel().is_open();
-        if self.running {
+        // AMP #4222 (C5): a prompt typed during `/compact` waits for it like one typed during a
+        // reply, and runs once the compaction has ended ([`Shell::finish_compaction`]).
+        if self.running || self.compacting {
             self.queue_prompt(trimmed);
             return Submit::Continue;
         }
@@ -3417,6 +3505,10 @@ impl Shell {
     /// dispatched workers keep running and only this reply's still-queued launches end
     /// ([`reply_stop_notice`] says which). `/workers` stops one worker; quitting stops them all.
     pub async fn abort(&mut self) {
+        if self.compacting {
+            self.stop_compaction().await;
+            return;
+        }
         if self.running {
             self.warn_reply_stop();
         }
@@ -3523,6 +3615,160 @@ impl Shell {
         self.after_run(stopped);
     }
 
+    /// Why `/compact` can't start now (spec §2, B1-B5), or `None`. Refuse, never queue, never
+    /// cancel: nothing is stopped to make room. Live workers (B6) don't block it: they are
+    /// separate harnesses, and their ends stay queued for the next turn.
+    fn compact_blocker(&self) -> Option<&'static str> {
+        if self.quitting {
+            return Some("the chat is quitting");
+        }
+        if self.compacting {
+            return Some("already compacting");
+        }
+        if self.running {
+            return Some(COMPACT_WAIT_REPLY);
+        }
+        if self.switching || self.resuming {
+            return Some("a server switch or session resume is running — try again when it's done");
+        }
+        if !self.prompt_queue.is_empty() {
+            return Some(
+                "prompts are queued and would run against whichever context exists — send or drop \
+                 the queued prompts first",
+            );
+        }
+        None
+    }
+
+    /// `/compact [instructions]` (AMP #4222, KB specs/harness-compact-command.md): asks the
+    /// manager chat's own harness (C3) to summarize its older turns, off the event loop (C6).
+    /// Everything after the name is focus instructions for the summary (C1), never a target.
+    ///
+    /// Short sessions (spec §4 correction b): there is deliberately no "too little to compact"
+    /// pre-check against `keep_recent_tokens`. rpi decides what to summarize, and the outcome
+    /// notice shows honest before/after estimates, so a compaction that saved nothing says so.
+    fn compact_command(&mut self, arg: &str) {
+        if let Some(why) = self.compact_blocker() {
+            self.view.add_notice(&format!("/compact: {why}"));
+            return;
+        }
+        self.compacting = true;
+        self.view.set_stopping(false);
+        self.in_flight += 1;
+        let instructions = (!arg.is_empty()).then(|| arg.to_owned());
+        let harness = Arc::clone(&self.harness);
+        let tx = self.msgs_tx.clone();
+        tokio::spawn(async move {
+            // Its own task, so a panic in the compaction still reports back here.
+            let job = {
+                let harness = Arc::clone(&harness);
+                tokio::spawn(async move { harness.compact(instructions.as_deref()).await })
+            };
+            let result = match job.await {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => Err(CompactError {
+                    busy: matches!(e, rpi_harness::result::HarnessError::LaneBusy { .. }),
+                    message: e.to_string(),
+                }),
+                Err(e) => Err(CompactError {
+                    busy: false,
+                    message: format!("the compaction crashed: {e}"),
+                }),
+            };
+            // O2: a decline on a branch whose last entry is already a compaction says so.
+            let already_compacted = match &result {
+                Ok(CompactionResult {
+                    outcome: CompactionOutcome::Declined { leaf_id },
+                    ..
+                }) if !leaf_id.is_empty() => matches!(
+                    harness.session().get_entry(leaf_id).await,
+                    Ok(Some(rpi_harness::session::types::Entry::Compaction(_)))
+                ),
+                _ => false,
+            };
+            let _ = tx.send(ShellMsg::Compacted(Box::new(CompactDone {
+                result,
+                already_compacted,
+            })));
+        });
+        self.refresh_remote_status();
+    }
+
+    /// Esc, `/stop` or `/abort` while compacting (X1): cancels the compaction only. Workers,
+    /// queued prompts and the reply history are left alone (X3, N2).
+    async fn stop_compaction(&mut self) {
+        self.view.set_stopping(true);
+        self.clear_esc_hint();
+        if let Err(e) = self.harness.abort().await {
+            self.view.add_error(&format!("/compact: stop: {e}"));
+        }
+    }
+
+    /// Applies `/compact`'s outcome (spec §4): exactly one notice, then the chat is idle again
+    /// and a prompt queued meanwhile runs, as after a completed reply (C5, X3).
+    fn finish_compaction(&mut self, done: CompactDone) {
+        self.compacting = false;
+        let stopping = self.view.stopping();
+        self.view.set_stopping(false);
+        match done.result {
+            Ok(CompactionResult { outcome, .. }) => match outcome {
+                CompactionOutcome::Completed { entry, .. } => {
+                    let rpi_harness::session::types::Entry::Compaction(c) = &entry else {
+                        self.view.add_notice("compacted the context");
+                        return self.after_compaction();
+                    };
+                    let after = compacted_context_tokens(c);
+                    self.view.add_notice(&compacted_notice(
+                        c.tokens_before,
+                        after,
+                        self.info.session_file.is_some(),
+                    ));
+                }
+                CompactionOutcome::Declined { .. } if done.already_compacted => {
+                    self.view.add_notice(
+                        "/compact: nothing to compact — already compacted; send a prompt first",
+                    )
+                }
+                CompactionOutcome::Declined { .. } => {
+                    self.view.add_notice("/compact: nothing to compact")
+                }
+                // X2: rpi 0.8.0 reports a stopped compaction as `Failed`; `Aborted` is mapped
+                // the same for when it starts producing it.
+                CompactionOutcome::Aborted { .. } => self.view.add_notice(COMPACT_STOPPED),
+                CompactionOutcome::Failed { .. } if stopping => {
+                    self.view.add_notice(COMPACT_STOPPED)
+                }
+                CompactionOutcome::Failed { error, .. } => self.view.add_error(&format!(
+                    "✗ compaction failed ({}): {} — context unchanged",
+                    error.code,
+                    crate::chrome::clean(&error.message)
+                )),
+            },
+            // O5: a race with a reply rpi caught: a refusal, nothing changed.
+            Err(e) if e.busy => self
+                .view
+                .add_notice(&format!("/compact: {COMPACT_WAIT_REPLY}")),
+            Err(_) if stopping => self.view.add_notice(COMPACT_STOPPED),
+            Err(e) => self.view.add_error(&format!(
+                "✗ /compact failed: {} (rpi writes the summary only on success)",
+                crate::chrome::clean(&e.message)
+            )),
+        }
+        self.after_compaction();
+    }
+
+    /// After `/compact` ended, however it ended: a reload asked for meanwhile runs, then the
+    /// oldest queued prompt (its own turn, as after a completed reply).
+    fn after_compaction(&mut self) {
+        if !self.reloading
+            && let Some(again) = self.reload_again.take()
+        {
+            self.reload_command(again);
+        }
+        self.after_run(false);
+        self.refresh_remote_status();
+    }
+
     /// A key the editor doesn't get first: the `/` menu's keys ([`crate::slash::CommandMenu`]),
     /// then an open AMP panel's keys ([`Shell::panel_key`]), then the transcript's scroll keys
     /// ([`Shell::scroll_key`]), then Esc during a run, which stops the reply. Returns true when it was used; otherwise the caller gives it to the editor
@@ -3600,7 +3846,7 @@ impl Shell {
         if self.scroll_key(key, editor_empty) {
             return true;
         }
-        if is_esc && self.running {
+        if is_esc && (self.running || self.compacting) {
             self.abort().await;
             return true;
         }
@@ -3799,6 +4045,7 @@ impl Shell {
                     .newline(self.newline),
             )),
             "usage" => self.view.add_notice(&self.usage_text()),
+            "compact" => self.compact_command(arg),
             "model" if arg.is_empty() => self.model_picker(),
             // `/model provider/model` switches this chat; `/model roles`, `/model <role> …` are a
             // role's model (#2245).
@@ -3813,7 +4060,7 @@ impl Shell {
             "abort" => self.abort().await,
             // #2425: stops the reply, or the wait for plan approval.
             "stop" => {
-                if self.running {
+                if self.running || self.compacting {
                     self.abort().await;
                 } else if !self.stop_approval_wait(Some(STOPPED_WAITING)) {
                     self.view.add_notice("/stop: nothing to stop");
@@ -3919,6 +4166,11 @@ impl Shell {
         if self.switching {
             self.view
                 .add_notice("/server: already switching; wait for it to finish");
+            return;
+        }
+        if self.compacting {
+            self.view
+                .add_notice("/server: compacting the context; switch once that is done");
             return;
         }
         if self.running {
@@ -4471,7 +4723,11 @@ impl Shell {
                 ShellMsg::Config { result, command } => self.apply_config(result, &command),
                 ShellMsg::RemoteDone(reply) => self.remote_done(reply),
                 ShellMsg::Sessions(listed) => self.apply_sessions(listed),
-                ShellMsg::Resumed(request, result) => self.apply_resumed(*request, result),
+                ShellMsg::Resumed(request, result) => {
+                    self.resuming = false;
+                    self.apply_resumed(*request, result)
+                }
+                ShellMsg::Compacted(done) => self.finish_compaction(*done),
                 ShellMsg::Notice { .. }
                 | ShellMsg::ReloadRequest
                 | ShellMsg::Remote(_)
@@ -4792,6 +5048,11 @@ impl Shell {
         if self.running {
             self.view
                 .add_notice("can't switch models during a run (Esc aborts it)");
+            return;
+        }
+        if self.compacting {
+            self.view
+                .add_notice("can't switch models while compacting the context (Esc stops it)");
             return;
         }
         let Some(choice) = self
