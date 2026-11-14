@@ -8,12 +8,19 @@
 //!   the areas doctor does not already cover with its own checks (roles, keys, models, MCP,
 //!   agents and skills).
 //!
+//! - `compaction` (#4227): the `[compaction]` settings in force (enabled, reserve_tokens,
+//!   keep_recent_tokens), each with the layer that set it (`default`, `shipped` or
+//!   `config <path>`), the chat role's effective (capped) window, and every warning the models
+//!   config raised (#4221), the doctor-only ones (W2) included. The chat's `/config` shows the same
+//!   rows ([`compaction_rows`], [`chat_window`]) and the warnings it shows on load. W2 is a note:
+//!   it holds for most shipped models, so it alone does not make the check warn.
+//!
 //! Problems come from [`amp_core::config_check`], so doctor and `config check` never disagree.
 
 use amp_core::{
     assets::{Assets, Origin},
     config_check::{self, CheckReport, Problem, Severity},
-    models::{ModelHints, ModelsConfig},
+    models::{CompactionConfig, ModelHints, ModelsConfig, ModelsWarning, WarningKind},
     providers::SystemKeys,
     repo_trust::{ItemKind, UntrustedItem},
     roles::RoleRegistry,
@@ -354,6 +361,202 @@ pub fn check(
         ),
     ));
     (agents, skills, out)
+}
+
+/// `doctor --json` `.compaction` (#4227). Add fields, never rename or remove them.
+#[derive(Debug, Serialize)]
+pub struct CompactionReport {
+    pub enabled: bool,
+    /// `default` (rpi's), `shipped` or `config <path>`.
+    pub enabled_source: String,
+    pub reserve_tokens: i64,
+    pub reserve_tokens_source: String,
+    pub keep_recent_tokens: i64,
+    pub keep_recent_tokens_source: String,
+    /// The chat role's model with its role caps applied (`null` when it does not resolve).
+    pub chat: Option<ChatWindow>,
+    /// Every warning the models config raised, the doctor-only ones included.
+    pub warnings: Vec<WarningRow>,
+}
+
+/// The chat role's effective budget: the window rpi compacts against and the output per turn.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatWindow {
+    pub role: String,
+    /// `provider/model`.
+    pub model: String,
+    /// With the role's `context_window` cap applied.
+    pub context_window: u64,
+    /// With the role's `max_tokens` cap applied.
+    pub max_tokens: u64,
+    /// The role's caps as configured (`null` when not set).
+    pub cap_context_window: Option<u64>,
+    pub cap_max_tokens: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WarningRow {
+    /// `max_tokens_over_window` (W1), `reserve_below_output` (W2), `assumed_window` (W3),
+    /// `compaction_does_not_fit`, `role_cap_above_model` (W4).
+    pub kind: &'static str,
+    pub subject: String,
+    pub message: String,
+    /// Shown by doctor only, not when the chat loads the config.
+    pub doctor_only: bool,
+}
+
+/// A stable name for a warning kind (doctor `--json`).
+pub fn warning_kind(kind: WarningKind) -> &'static str {
+    match kind {
+        WarningKind::MaxTokensOverWindow => "max_tokens_over_window",
+        WarningKind::ReserveBelowOutput => "reserve_below_output",
+        WarningKind::AssumedWindow => "assumed_window",
+        WarningKind::CompactionDoesNotFit => "compaction_does_not_fit",
+        WarningKind::RoleCapAboveModel => "role_cap_above_model",
+    }
+}
+
+/// `(key, value, source)` for each `[compaction]` field, read from #4221's provenance (never
+/// recomputed here). Used by doctor and the chat's `/config`.
+pub fn compaction_rows(c: &CompactionConfig) -> [(&'static str, String, String); 3] {
+    [
+        (
+            "enabled",
+            c.settings.enabled.to_string(),
+            c.enabled_source.clone(),
+        ),
+        (
+            "reserve_tokens",
+            c.settings.reserve_tokens.to_string(),
+            c.reserve_tokens_source.clone(),
+        ),
+        (
+            "keep_recent_tokens",
+            c.settings.keep_recent_tokens.to_string(),
+            c.keep_recent_tokens_source.clone(),
+        ),
+    ]
+}
+
+/// `role`'s model as the chat runs it: the resolved model already carries the role's caps
+/// (#4224), so its window is the effective one.
+pub fn chat_window(role: &amp_core::roles::Role, models: &ModelsConfig) -> Option<ChatWindow> {
+    let resolved = role.resolve_model(models).ok()?;
+    Some(ChatWindow {
+        role: role.id.clone(),
+        model: resolved.model_ref(),
+        context_window: resolved.model.context_window,
+        max_tokens: resolved.model.max_tokens,
+        cap_context_window: resolved.caps.context_window,
+        cap_max_tokens: resolved.caps.max_tokens,
+    })
+}
+
+impl ChatWindow {
+    /// `openrouter/x · window 200000 · output 32000 (capped by [roles.<id>] context_window)`.
+    pub fn text(&self) -> String {
+        let mut caps = Vec::new();
+        if self.cap_context_window.is_some() {
+            caps.push("context_window");
+        }
+        if self.cap_max_tokens.is_some() {
+            caps.push("max_tokens");
+        }
+        let mut text = format!(
+            "{} · window {} · output {}",
+            self.model, self.context_window, self.max_tokens
+        );
+        if !caps.is_empty() {
+            text.push_str(&format!(
+                " (role caps: [roles.{}] {})",
+                amp_core::models::normalize_role(&self.role),
+                caps.join(", ")
+            ));
+        }
+        text
+    }
+}
+
+fn warning_row(w: &ModelsWarning) -> WarningRow {
+    WarningRow {
+        kind: warning_kind(w.kind),
+        subject: w.subject.clone(),
+        message: w.message.clone(),
+        doctor_only: w.kind.doctor_only(),
+    }
+}
+
+/// The `compaction` check: the settings in force with their sources, the chat role's effective
+/// window, and every models-config warning: any but W2 (doctor-only, a note) makes it warn; none
+/// fails it.
+pub fn compaction(
+    loaded: &Loaded,
+    models: Option<&ModelsConfig>,
+) -> (Option<CompactionReport>, Named) {
+    let Some(models) = models else {
+        return (
+            None,
+            (
+                "compaction".to_owned(),
+                Finding::new(
+                    CheckStatus::Skip,
+                    "the models config does not load (see `roles`)",
+                ),
+            ),
+        );
+    };
+    let c = &models.compaction;
+    let chat = loaded
+        .roles
+        .as_ref()
+        .and_then(|r| chat_window(r.manager(), models));
+    let report = CompactionReport {
+        enabled: c.settings.enabled,
+        enabled_source: c.enabled_source.clone(),
+        reserve_tokens: c.settings.reserve_tokens,
+        reserve_tokens_source: c.reserve_tokens_source.clone(),
+        keep_recent_tokens: c.settings.keep_recent_tokens,
+        keep_recent_tokens_source: c.keep_recent_tokens_source.clone(),
+        chat: chat.clone(),
+        warnings: models.warnings.iter().map(warning_row).collect(),
+    };
+    let mut detail = compaction_rows(c)
+        .iter()
+        .map(|(k, v, src)| format!("{k} {v} ({src})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(chat) = &chat {
+        detail.push_str(&format!("; chat ({}) {}", chat.role, chat.text()));
+    }
+    // W2 is true for most shipped models: listed (one line for all roles), never a warning on
+    // its own, so a default install still passes; the others make the check warn.
+    let (notes, warnings): (Vec<&WarningRow>, Vec<&WarningRow>) =
+        report.warnings.iter().partition(|w| w.doctor_only);
+    if !notes.is_empty() {
+        let roles: Vec<&str> = notes
+            .iter()
+            .map(|w| w.subject.strip_prefix("role ").unwrap_or(&w.subject))
+            .collect();
+        detail.push_str(&format!(
+            "; note: max_tokens above reserve_tokens ({}) for {} (one long turn can pass the window before compaction runs)",
+            c.settings.reserve_tokens,
+            roles.join(", ")
+        ));
+    }
+    let finding = if warnings.is_empty() {
+        Finding::new(CheckStatus::Ok, detail)
+    } else {
+        let messages: Vec<&str> = warnings.iter().map(|w| w.message.as_str()).collect();
+        Finding::new(
+            CheckStatus::Warn,
+            format!("{detail}; {}", messages.join("; ")),
+        )
+        .fix(
+            "set `context_window` / `max_tokens` on the model (`[providers.<p>.models.<m>]`), \
+             or `[compaction] reserve_tokens` in config.toml",
+        )
+    };
+    (Some(report), ("compaction".to_owned(), finding))
 }
 
 #[cfg(test)]

@@ -13,6 +13,8 @@
 //!   it falls back to (#2246).
 //! - `mcp`, `mcp:<server>`: see [`mcp`] (#2246): each MCP server's health, trust, auth and which
 //!   roles may use it.
+//! - `compaction` (#4227): the `[compaction]` settings in force with where each came from, the
+//!   chat role's effective window and the models config's warnings: see [`config`].
 //! - `skills`, `agents`, `config-check`: see [`config`] (#2246).
 //! - `workspace` (#2364): where workers work in this folder: git worktrees, or (not a git
 //!   repository) a folder each under `amp-work/`. Not an error; a warning only when
@@ -23,7 +25,7 @@
 //! OPENROUTER_API_KEY`), never by value. Exit code 1 when any check fails; warnings don't count.
 
 mod ca;
-mod config;
+pub(crate) mod config;
 mod mcp;
 mod providers;
 
@@ -78,6 +80,9 @@ pub struct Report {
     /// Agents and skills (`agents`, `skills` checks, #2246).
     pub agents: config::AgentsReport,
     pub skills: config::SkillsReport,
+    /// `[compaction]` in force and the chat's window (`compaction` check, #4227; `null` when the
+    /// models config does not load).
+    pub compaction: Option<config::CompactionReport>,
     pub checks: Vec<Check>,
 }
 
@@ -226,7 +231,7 @@ pub enum CheckStatus {
 pub struct Check {
     /// One of: config, credentials, ca, connect, versions, tools, contract, whoami, project, roles,
     /// fallback, `key:<provider>`, `models:<provider>`, mcp, `mcp:<server>`, skills, agents,
-    /// config-check, workspace.
+    /// compaction, config-check, workspace.
     pub name: String,
     pub status: CheckStatus,
     pub detail: String,
@@ -352,6 +357,8 @@ async fn diagnose(conn: &ConnArgs, offline: bool) -> Report {
     for (name, finding) in findings {
         checks.push(&name, finding);
     }
+    let (compaction, (name, finding)) = config::compaction(&loaded, models_ok.as_ref());
+    checks.push(&name, finding);
     let (mcp, findings) = mcp::check(&ctx, loaded.roles.as_ref(), offline).await;
     for (name, finding) in findings {
         checks.push(&name, finding);
@@ -381,6 +388,7 @@ async fn diagnose(conn: &ConnArgs, offline: bool) -> Report {
         mcp,
         agents,
         skills,
+        compaction,
         checks: checks.0,
     }
 }
@@ -881,6 +889,21 @@ fn print_human(r: &Report) {
         println!("  auth:     {method}");
     }
     print_models(&r.models);
+    if let Some(c) = &r.compaction {
+        // #4227: what is in force and where each value came from.
+        println!(
+            "  compaction: enabled {} ({}), reserve_tokens {} ({}), keep_recent_tokens {} ({})",
+            c.enabled,
+            c.enabled_source,
+            c.reserve_tokens,
+            c.reserve_tokens_source,
+            c.keep_recent_tokens,
+            c.keep_recent_tokens_source
+        );
+        if let Some(chat) = &c.chat {
+            println!("  chat window: {} ({})", chat.text(), chat.role);
+        }
+    }
     println!();
     let width = r
         .checks

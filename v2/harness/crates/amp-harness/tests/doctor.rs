@@ -517,10 +517,19 @@ async fn unreachable_catalog_warns_and_other_providers_key_warns() {
         fix(&v, "key:anthropic").starts_with("set ANTHROPIC_API_KEY in the environment"),
         "{v}"
     );
+    assert_eq!(status(&v, "compaction"), "warn");
+    assert!(
+        check(&v, "compaction")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("context_window not set for mock/m-1; assuming 128000"),
+        "{v}"
+    );
 
     let human = run(&dir, &amp.url, &["doctor"], &[("MOCK_KEY", MOCK_KEY)]).await;
     assert!(
-        human.stdout.contains("No failures (3 warnings)."),
+        // #4227: mock's models have no context_window: `compaction` warns (W3, assumed 128000).
+        human.stdout.contains("No failures (4 warnings)."),
         "{}",
         human.stdout
     );
@@ -550,6 +559,122 @@ async fn a_broken_models_config_fails_roles() {
     assert!(fix(&v, "roles").contains("config.toml"), "{v}");
     // AMP's checks still ran.
     assert_eq!(status(&v, "whoami"), "ok");
+}
+
+// --- compaction (#4227, T14) ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn compaction_settings_sources_window_and_warnings() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = workdir("doctor-compaction", None);
+    let cfg = dir.join("home/.config/amp-harness");
+    std::fs::create_dir_all(&cfg).unwrap();
+    let config = cfg.join("config.toml");
+    // mock/m-1 has no context_window and no catalog entry: W3 (assumed 128000). The manager caps
+    // its window at 100000; its max_tokens (16384) is above reserve_tokens: W2 (doctor only).
+    std::fs::write(
+        &config,
+        "[compaction]\nreserve_tokens = 9000\n\n\
+         [providers.mock]\napi = \"openai-completions\"\nbase_url = \"http://127.0.0.1:9/v1\"\n\
+         key_env = \"MOCK_KEY\"\n[providers.mock.models.\"m-1\"]\n\n\
+         [roles.manager]\nmodel = \"mock/m-1\"\ncontext_window = 100000\n",
+    )
+    .unwrap();
+    let state = dir.join("home/.local/state");
+    let cache = dir.join("home/.cache");
+    let env = [
+        ("MOCK_KEY", MOCK_KEY),
+        ("XDG_STATE_HOME", state.to_str().unwrap()),
+        ("XDG_CACHE_HOME", cache.to_str().unwrap()),
+        ("AMP_HARNESS_CONFIG", config.to_str().unwrap()),
+    ];
+    let out = run(&dir, &amp.url, &["doctor", "--json", "--offline"], &env).await;
+    assert_no_secret(&out, &[MOCK_KEY]);
+    let v = out.json();
+    let c = &v["compaction"];
+    assert_eq!(c["enabled"], true, "{c}");
+    assert_eq!(c["enabled_source"], "default", "{c}");
+    assert_eq!(c["reserve_tokens"], 9000, "{c}");
+    let src = c["reserve_tokens_source"].as_str().unwrap();
+    assert!(
+        src.starts_with("config ") && src.ends_with("config.toml"),
+        "{c}"
+    );
+    assert_eq!(c["keep_recent_tokens"], 20000, "{c}");
+    assert_eq!(c["keep_recent_tokens_source"], "default", "{c}");
+    assert_eq!(c["chat"]["model"], "mock/m-1", "{c}");
+    assert_eq!(c["chat"]["context_window"], 100000, "{c}");
+    assert_eq!(c["chat"]["cap_context_window"], 100000, "{c}");
+    let warnings = c["warnings"].as_array().unwrap();
+    let has = |kind: &str, text: &str| {
+        warnings
+            .iter()
+            .any(|w| w["kind"] == kind && w["message"].as_str().unwrap().contains(text))
+    };
+    assert!(
+        has(
+            "assumed_window",
+            "context_window not set for mock/m-1; assuming 128000"
+        ),
+        "{c}"
+    );
+    assert!(has("reserve_below_output", "mock/m-1's max_tokens"), "{c}");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w["kind"] == "reserve_below_output" && w["doctor_only"] == true),
+        "{c}"
+    );
+    assert_eq!(status(&v, "compaction"), "warn");
+    let detail = check(&v, "compaction")["detail"].as_str().unwrap();
+    assert!(detail.contains("reserve_tokens 9000 (config "), "{detail}");
+    assert!(detail.contains("enabled true (default)"), "{detail}");
+    assert!(detail.contains("window 100000"), "{detail}");
+    assert!(detail.contains("assuming 128000"), "{detail}");
+
+    let human = run(&dir, &amp.url, &["doctor", "--offline"], &env).await;
+    assert!(
+        human
+            .stdout
+            .contains("compaction: enabled true (default), reserve_tokens 9000 (config "),
+        "{}",
+        human.stdout
+    );
+    assert!(
+        human.stdout.contains("keep_recent_tokens 20000 (default)"),
+        "{}",
+        human.stdout
+    );
+    assert!(
+        human
+            .stdout
+            .contains("chat window: mock/m-1 · window 100000"),
+        "{}",
+        human.stdout
+    );
+}
+
+#[tokio::test]
+async fn compaction_is_skipped_when_the_models_config_does_not_load() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = workdir("doctor-compaction-broken", None);
+    let cfg = dir.join("home/.config/amp-harness");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("config.toml"),
+        "[compaction]\nreserve_tokens = 0\n",
+    )
+    .unwrap();
+    let out = run(
+        &dir,
+        &amp.url,
+        &["doctor", "--json", "--offline"],
+        &[OR_KEY],
+    )
+    .await;
+    let v = out.json();
+    assert_eq!(status(&v, "compaction"), "skip");
+    assert!(v["compaction"].is_null(), "{v}");
 }
 
 // --- versions -------------------------------------------------------------------------------------

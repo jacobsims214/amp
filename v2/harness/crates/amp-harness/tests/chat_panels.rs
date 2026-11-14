@@ -803,6 +803,51 @@ async fn config_overview_with_sources() {
     }
 }
 
+/// #4227 (T14): `/config` lists `[compaction]` enabled / reserve_tokens / keep_recent_tokens, each
+/// with the layer that set it, the chat role's effective window, and the load warnings (W3 for a
+/// model with no window; W2 stays doctor's).
+async fn config_shows_compaction_with_sources() {
+    let extra = "\n[compaction]\nreserve_tokens = 9000\n\n[providers.oc]\napi = \"openai-completions\"\n\
+                 base_url = \"http://127.0.0.1:9/v1\"\nkey_env = \"OC_KEY\"\n[providers.oc.models.\"oc-1\"]\n";
+    let dir = setup("config-compaction", extra, "");
+    let state = dir.join("home/.local/state");
+    let cache = dir.join("home/.cache");
+    let config = dir.join("home/.config/amp-harness/config.toml");
+    let mut seen = String::new();
+    for downs in [0, 14, 28, 42, 56, 70] {
+        let mut inputs = vec!["/config"];
+        inputs.extend(std::iter::repeat_n("key:down", downs));
+        let out = chat(
+            &dir,
+            None,
+            &inputs,
+            &[
+                ("XDG_STATE_HOME", state.to_str().unwrap()),
+                ("XDG_CACHE_HOME", cache.to_str().unwrap()),
+                ("AMP_HARNESS_CONFIG", config.to_str().unwrap()),
+            ],
+        )
+        .await;
+        seen.push_str(&panel(&out).join("\n"));
+        seen.push('\n');
+    }
+    let seen = flat(&seen);
+    for want in [
+        "compaction [compaction]",
+        "enabled true (default)",
+        "reserve_tokens 9000 (config ~/.config/amp-harness/config.toml)",
+        "keep_recent_tokens 20000 (default)",
+        "chat window boss/boss-1 · window 128000",
+        "warning: context_window not set for oc/oc-1; assuming 128000",
+    ] {
+        assert!(seen.contains(want), "{want:?} missing from:\n{seen}");
+    }
+    assert!(
+        !seen.contains("is above [compaction] reserve_tokens"),
+        "W2 is doctor-only:\n{seen}"
+    );
+}
+
 /// `/help` lists the new commands in its Config group.
 async fn help_lists_the_panels() {
     let dir = setup("help", "", "");
@@ -847,6 +892,7 @@ fn main() {
         model_roles_show_the_fallback,
         agents_and_skills,
         config_overview_with_sources,
+        config_shows_compaction_with_sources,
         help_lists_the_panels,
     ];
     let rt = tokio::runtime::Builder::new_multi_thread()

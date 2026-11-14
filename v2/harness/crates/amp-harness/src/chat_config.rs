@@ -1198,6 +1198,31 @@ impl Inner {
             }
         }
 
+        // #4227: the compaction settings in force, each with the layer that set it, the chat
+        // role's effective (capped) window, and the warnings the chat shows on load (W2 is
+        // doctor's only).
+        head(&mut rows, "compaction [compaction]");
+        for (key, value, source) in crate::doctor::config::compaction_rows(&models.compaction) {
+            line(&mut rows, key, value, source);
+        }
+        let catalog = self.rt.catalog();
+        if let Some(chat) = catalog
+            .roles
+            .roles()
+            .find(|r| r.id == self.role)
+            .and_then(|r| crate::doctor::config::chat_window(r, &models))
+        {
+            line(
+                &mut rows,
+                "chat window",
+                chat.text(),
+                short_role(&chat.role).to_owned(),
+            );
+        }
+        for w in models.load_warnings() {
+            rows.push(InfoRow::text(format!("warning: {w}"), Tone::Warning, 2));
+        }
+
         head(&mut rows, "MCP servers (/mcp)");
         let mcp = self.hub().config();
         if mcp.servers.is_empty() && mcp.broken.is_empty() {
