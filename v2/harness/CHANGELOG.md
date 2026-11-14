@@ -5,6 +5,21 @@ from AMP's server images, and follows [Semantic Versioning](https://semver.org/)
 tagged `harness-vX.Y.Z`. The versioning and compatibility policy is D14 in the AMP project 2 KB,
 `decisions/amp-harness-architecture.md`. How to cut a release: [RELEASING.md](RELEASING.md).
 
+## Unreleased
+
+### Added
+
+- Context management: a `[compaction]` table in your `config.toml` (`enabled`, `reserve_tokens`,
+  `keep_recent_tokens`; defaults true / 16384 / 20000), checked against every model's context
+  window, and `[roles.X] context_window` / `max_tokens` caps that can only lower a role's window and
+  output per turn. Both reach the manager chat and every worker. `/compact [instructions]`
+  summarizes the manager chat's older turns now. Compaction is lossy, and the full history stays
+  in the session file. `/usage` and the footer show the compaction threshold, the count and
+  estimated sizes, `/config` and `doctor` show the settings in force with their sources, and
+  `/reload` says that budget changes apply to new sessions and workers. The chat also says when
+  automatic compaction fails or frees nothing. See "Context window and compaction" in the README
+  (#4221, #4222, #4224, #4225, #4226, #4227, #4263).
+
 ## [0.3.0] - 2026-11-05
 
 Resume a saved conversation from the chat, and worker runs that change nothing no longer ask for a

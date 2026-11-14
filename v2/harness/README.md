@@ -1258,6 +1258,139 @@ Workers already running keep what they were built with (prompt, tools, model) un
 unparsable config.toml changes nothing, and the error says what to fix. A secret variable a new
 provider or MCP server reads is hidden from bash from then on.
 
+### Context window and compaction: `[compaction]`, role caps, `/compact` (#4221-#4227, #4263)
+
+When a conversation gets close to its model's context window, the harness compacts it: the model
+writes a summary of the older turns, and from then on the context is that summary plus the most
+recent turns, kept word for word. **Compaction is lossy.** The summary is the model's own, so
+details from older turns may be lost. The session file keeps the full history: nothing in it is
+deleted or rewritten, the transcript on screen is not cleared, and `/sessions` still replays
+everything. A resumed session continues from the latest summary.
+
+**`[compaction]`** (user `config.toml` only; one setting for the whole harness, not per model or
+role):
+
+```toml
+[compaction]
+enabled = true              # automatic compaction on/off (/compact works either way)
+reserve_tokens = 16384      # compact once the context passes window - reserve_tokens
+keep_recent_tokens = 20000  # how much of the latest conversation is kept word for word
+```
+
+- The values above are the defaults (rpi's), used for any key you leave out. Each key is merged
+  on its own: the shipped defaults, then your `config.toml`.
+- A repo's `.amp/harness/config.toml` may not set `[compaction]`: it is an error naming the file,
+  like any other table a repo can't hold.
+- Unknown keys, and `reserve_tokens` or `keep_recent_tokens` of 0 or less, are errors.
+- `reserve_tokens + keep_recent_tokens` must be smaller than the context window of every model
+  the config defines (after role caps, below). If you set either value yourself, a model it doesn't
+  fit is an error naming `provider/model`, the window and where each value came from. If both
+  are defaults, it is only a warning, so an existing config with a small local model still loads.
+- `context_window = 0` on a model (`[providers.P.models.M]`, any layer) is an error, because 0
+  would silently turn automatic compaction off. To turn it off, use `enabled = false`.
+- A model with no `context_window` that the built-in Anthropic catalog doesn't know is assumed to
+  have **128000** tokens (16384 output), with the warning `context_window not set for P/M;
+  assuming 128000`. Set `context_window` for such a model if its window is different.
+- Other warnings, shown on load and by `doctor`: `max_tokens` above `context_window`, and a
+  role's `max_tokens` above `reserve_tokens`. The second one means a single long turn can pass the
+  window before compaction runs. It is true for most shipped models, so only `doctor` shows it,
+  as a note.
+
+**Role caps**: `[roles.X] context_window` and `[roles.X] max_tokens` limit what that role uses
+from its model, for example to keep a worker's context small or its turns short:
+
+```toml
+[roles.manager]
+model = "anthropic/claude-sonnet-5-5"
+context_window = 100000   # compact against 100000 even if the model allows more
+max_tokens = 8000         # output tokens per turn
+```
+
+- A cap can only lower a value. A cap above the model's own value is clamped to the model's value
+  with a warning (`[roles.manager] context_window = 2000000 is above P/M's context_window
+  (1050000); using 1050000`). A cap of 0 is an error.
+- Caps are set in the same layers as `[roles]`: shipped, the selected profile, your `config.toml`,
+  and a repo's `config.toml` only once you trust the repo's roles (see Where configuration lives).
+  A higher layer that changes only a role's `model` keeps the caps from below.
+- With `profile = "inherit"`, caps are ignored (and not shown).
+- `/model` keeps the chat role's caps: the model you switch to is capped the same way, and so is
+  the footer's window.
+
+**When automatic compaction runs**: before each run (a prompt you send, a worker run), and between the
+turns of a run's tool loop when the context passed `window - reserve_tokens`. It never runs in the
+middle of a tool call. `enabled = false` turns off both. The manager chat and every worker
+compact with the same `[compaction]` settings, each against its own role's (capped) window.
+These notices can appear in the chat:
+
+- `automatic compaction failed (…); context unchanged, your prompt is saved but was not
+  answered`: the compaction before a run failed. The prompt is in the session but nothing re-sends
+  it. Send it again.
+- `automatic compaction failed; continuing without it`: a compaction between turns did not
+  land. The run goes on with the uncompacted context.
+- `compaction freed nothing — a single tool result exceeds keep_recent_tokens`: compaction ran but
+  the context did not get smaller (see Known limits). Shown once per run.
+
+**`/compact [instructions]`** compacts the manager chat now. Anything after the command is passed
+to the summary as focus instructions (`/compact keep the API decisions and open questions`).
+
+- It compacts the chat's own conversation only, never a worker's. Workers keep running while it
+  runs.
+- It is refused, not queued, while a reply is running (Esc stops the reply), while a compaction
+  is already running, while prompts are queued (send or drop them first), and during a server
+  switch or session resume. A prompt typed while it runs is queued and runs after it.
+- Esc, `/stop` or `/abort` stops it: `compaction stopped — context unchanged`.
+- On success: `compacted: ~before → ~after tokens (estimate). Older turns are now a summary;
+  details may be lost. Full history stays in the session file.` In a `--no-session` chat the last
+  sentence says that only the transcript on screen keeps the earlier turns. If there is nothing to
+  compact (an empty chat, or the last thing in it is already a compaction) it says
+  `nothing to compact`, and a failure says `compaction failed (code): message — context unchanged`.
+  In every case except success the context is exactly what it was.
+- There is no "too little to compact" check: compacting a short chat still asks the model for a
+  summary, and the before/after numbers show if it saved nothing.
+- `/compact` sent from a paired remote device is not a command. It reaches the model as a normal
+  prompt.
+
+**What you see**: after a compaction the footer's context figure drops to the new estimate, until
+the next reply reports its real usage. `/usage` adds two lines:
+
+```text
+auto-compaction: on · triggers at ~184k of 200k · keeps ~20k recent · summary ≤ 13k · 2 this session (1 manual, 1 automatic)
+trigger estimate: ~41k tokens (excludes system prompt and tools)
+```
+
+(`auto-compaction: off · /compact still works · …` when `enabled = false`). All of these numbers
+are estimates. The trigger estimate is the real token count of the last reply plus about 4
+characters per token for anything after it. Before the first reply there is no real count, so it
+is characters/4 over the messages only, without the system prompt and tool definitions, and is
+marked `(excludes system prompt and tools)`. On that first turn, `reserve_tokens` is the only
+margin. The count of compactions comes from the session, so it survives a resume.
+
+`/config` has a `compaction [compaction]` section (`enabled`, `reserve_tokens`,
+`keep_recent_tokens`, each with the layer that set it: `default`, `shipped` or `config <path>`),
+a `chat window` row with the chat role's window and output after caps, and the load warnings.
+`amp-harness doctor` has a `compaction` check with the same rows; `doctor --json` puts them under
+`.compaction` (settings and sources, the manager's window with its caps, and every warning with
+its kind). The check warns on any warning except the reserve-below-output note, so a default
+install still passes. `config show` does not list `[compaction]`.
+
+**Changing these values**: `[compaction]`, a model's `context_window`/`max_tokens` and role caps
+are fixed when a chat session or worker is built. After you edit them, `/reload` (or the
+automatic reload) lists the change (`budget manager: context_window … → …, max_tokens … → …`,
+`compaction: … → …`) and says `context budget / compaction changes apply to new sessions and
+workers; this chat keeps its current budget until a new session`. Workers dispatched from then on
+use the new values. The current chat keeps the old ones until you start a new session or resume
+one with `/sessions`.
+
+**Known limits** (rpi-harness 0.8.0):
+
+- Compaction is triggered by the estimate only. When a provider rejects a request as too long,
+  that is a failed run, not a compaction (no compaction on overflow, and no automatic retry).
+- Compaction always keeps at least `keep_recent_tokens` of the latest conversation, cut at a user
+  message. If one tool result alone is larger than that, compaction frees nothing (you get the
+  `compaction freed nothing` notice). Lower the tool output, or start a new session.
+- `[compaction]` is global: there is no per-model or per-role setting, only role caps on the
+  window and output.
+
 ### Theme (M3-1)
 
 The chat uses the AMP theme: `amp-dark` or `amp-light` (provisional simstech tokens v1, #1815),
