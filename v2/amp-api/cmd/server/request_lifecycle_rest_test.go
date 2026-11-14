@@ -225,6 +225,17 @@ func (w *readsWorld) transitions(requestID int) int {
 	return n
 }
 
+// reopenedCountOf reads how many times a request has been reopened (D6): the
+// column a reopen is recorded in, since reopen is a transition and not a state.
+func (w *readsWorld) reopenedCountOf(requestID int) int {
+	w.t.Helper()
+	var n int
+	if err := w.db.QueryRow(w.ctx, `SELECT reopened_count FROM team_requests WHERE id = $1`, requestID).Scan(&n); err != nil {
+		w.t.Fatalf("reopened_count of %d: %v", requestID, err)
+	}
+	return n
+}
+
 // serviceRequestRef is a legal opaque reference for the hand-written rows this
 // suite needs (a service submission with no requester user): 16–64 characters, at
 // least one letter, no padding.
@@ -296,6 +307,12 @@ func (w *readsWorld) uiServer() *httptest.Server {
 // sendWithIdentity issues one request as a signed-in person.
 func (w *readsWorld) sendWithIdentity(ident *auth.Identity, method, path string, body any) writeResult {
 	w.t.Helper()
+	return w.sendWithHeaders(ident, method, path, body, nil)
+}
+
+// sendWithHeaders is sendWithIdentity with extra request headers (If-Match).
+func (w *readsWorld) sendWithHeaders(ident *auth.Identity, method, path string, body any, headers map[string]string) writeResult {
+	w.t.Helper()
 	var reader io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -310,6 +327,9 @@ func (w *readsWorld) sendWithIdentity(ident *auth.Identity, method, path string,
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 	if ident != nil && ident.User != nil {
 		req.Header.Set("X-Test-User", strconv.Itoa(ident.User.ID))
@@ -335,9 +355,16 @@ func (w *readsWorld) sendWithIdentity(ident *auth.Identity, method, path string,
 // UI (I1, D5), so the accept/reopen cases must arrive as a signed-in person.
 func (w *readsWorld) uiSend(ident *auth.Identity, method, path string, body any) writeResult {
 	w.t.Helper()
+	return w.uiSendHeaders(ident, method, path, body, nil)
+}
+
+// uiSendHeaders is uiSend with request headers, for the cases whose subject is a
+// header rather than a body field (If-Match and its refused spellings).
+func (w *readsWorld) uiSendHeaders(ident *auth.Identity, method, path string, body any, headers map[string]string) writeResult {
+	w.t.Helper()
 	c := *ident
 	c.Listener, c.Channel, c.AuthMethod = "rest", auth.ChannelUI, auth.AuthDexSession
-	return w.sendWithIdentity(&c, method, path, body)
+	return w.sendWithHeaders(&c, method, path, body, headers)
 }
 
 // uiIdentity is the *auth.Identity a signed-in person's request carries.
@@ -719,6 +746,176 @@ func TestRESTRequestLifecycle_ConflictsCarryRev(t *testing.T) {
 	if got := w.stateOf(starTarget.ID); got != domain.RequestStatusTriaging {
 		t.Fatalf("an If-Match: * write landed (%q)", got)
 	}
+}
+
+// TestRESTRequestLifecycle_ReopenHonoursBodyRev is the regression for the one
+// route that decoded its body twice: POST .../reopen read the body to validate
+// it and then read it again to find the precondition, and because the first read
+// consumes r.Body the second always saw EOF and found a nil expected_rev. A
+// body-borne `expected_rev` was therefore dropped in silence and the act degraded
+// to a plain write — the lost update the revision exists to prevent.
+//
+// So this walks the reopen alone, through every spelling it documents as
+// equivalent, and pins that the body spelling is a compare-and-set too:
+//
+//	stale body rev       409 request.conflict, carrying the row's actual rev, nothing written
+//	current body rev     200, the move lands
+//	absent rev           200 against whatever the row is now (replay-tolerant)
+//	If-Match spelling    200 with the current rev, 409 with a stale one
+//	If-Match and body disagreeing  400, nothing written
+//	If-Match: *          400, nothing written
+//	`to` in the body     400 (the destination is the route's), nothing written
+//
+// A reopen is the team's own reconsideration of its close (D6), so every case
+// starts from `rejected` and every "nothing written" is asserted against the row
+// (rev, state, reopened_count) and its history and audit rows, not against an
+// answer.
+func TestRESTRequestLifecycle_ReopenHonoursBodyRev(t *testing.T) {
+	w := newReadsWorld(t)
+	w.relaxSubmissionLimit()
+	admin := w.uiIdentity(w.admin.User.ID)
+
+	// reopenable submits one request, moves it to rejected (the team's close), and
+	// returns it plus the path of the team's reopen route. Each case needs its own
+	// row: a landed reopen is not repeatable, and a case must not inherit the
+	// rev bumps of the one before it.
+	reopenable := func(label string) (*domain.TeamRequest, string) {
+		t.Helper()
+		req := w.freshRequest(w.requester, "reopen "+label)
+		w.moveRequest(req.ID, domain.RequestStatusRejected)
+		return req, w.lifecyclePath(w.team, req.ID, "reopen")
+	}
+
+	// unwritten asserts that a refused reopen wrote nothing: the revision, the
+	// state, the reopen counter, the transition history and the audit trail are
+	// all exactly what they were.
+	unwritten := func(target *domain.TeamRequest, rev int, state domain.RequestStatus, reopenedCount, history, audits int, what string) {
+		t.Helper()
+		if got := w.revOf(target.ID); got != rev {
+			t.Fatalf("%s moved the revision to %d, want %d", what, got, rev)
+		}
+		if got := w.stateOf(target.ID); got != state {
+			t.Fatalf("%s moved the request to %q, want %q", what, got, state)
+		}
+		if got := w.reopenedCountOf(target.ID); got != reopenedCount {
+			t.Fatalf("%s changed reopened_count to %d, want %d", what, got, reopenedCount)
+		}
+		if got := w.transitions(target.ID); got != history {
+			t.Fatalf("%s appended %d history rows", what, got-history)
+		}
+		if got := w.auditRows(w.admin.User.ID, "request.transition"); got != audits {
+			t.Fatalf("%s produced %d request.transition audit rows", what, got-audits)
+		}
+	}
+
+	// A STALE body-borne rev is refused as a conflict and writes nothing. This is
+	// the case that fails without the fix (it answered 200 changed:true and moved
+	// the row).
+	staleTarget, stalePath := reopenable("stale")
+	stale := w.revOf(staleTarget.ID)
+	// One reopen lands first, so the rev the caller then sends is genuinely behind:
+	// the body it sends is a revision the row has moved past.
+	landed := w.uiSend(admin, http.MethodPost, stalePath, map[string]any{"expected_rev": stale})
+	if landed.status != 200 {
+		t.Fatalf("reopen with the CURRENT body rev = %d %v, want 200", landed.status, landed.body)
+	}
+	if got := w.stateOf(staleTarget.ID); got != domain.RequestStatusTriaging {
+		t.Fatalf("the reopen landed in %q, want triaging", got)
+	}
+	current := w.revOf(staleTarget.ID)
+	if current <= stale {
+		t.Fatalf("the reopen did not advance the revision (%d -> %d)", stale, current)
+	}
+
+	// Now put it back to rejected the way the fixture does, and send the stale rev.
+	w.moveRequest(staleTarget.ID, domain.RequestStatusRejected)
+	staleRev, staleState := w.revOf(staleTarget.ID), w.stateOf(staleTarget.ID)
+	staleCount, staleHistory := w.reopenedCountOf(staleTarget.ID), w.transitions(staleTarget.ID)
+	staleAudits := w.auditRows(w.admin.User.ID, "request.transition")
+
+	lost := w.uiSend(admin, http.MethodPost, stalePath, map[string]any{"expected_rev": stale})
+	w.wantWriteCode(lost, 409, authz.CodeRequestConflict)
+	if got, _ := lost.body["rev"].(float64); int(got) != staleRev {
+		t.Fatalf("the conflict reports rev %v, want the row's actual %d", lost.body["rev"], staleRev)
+	}
+	unwritten(staleTarget, staleRev, staleState, staleCount, staleHistory, staleAudits, "a stale body rev")
+
+	// The CURRENT body rev succeeds, and the retry with the rev the conflict just
+	// reported needs no extra read.
+	retry := w.uiSend(admin, http.MethodPost, stalePath, map[string]any{"expected_rev": staleRev})
+	if retry.status != 200 {
+		t.Fatalf("reopen with the reported rev = %d %v, want 200", retry.status, retry.body)
+	}
+	if _, _, retryRev, _ := w.answerFacts(retry); retryRev != staleRev+1 {
+		t.Fatalf("the reopen answered rev %d, want %d", retryRev, staleRev+1)
+	}
+
+	// An ABSENT rev stays replay-tolerant: no precondition is sent, and the act
+	// lands against whatever the row is now (the form that never saw a revision).
+	absentTarget, absentPath := reopenable("absent")
+	absent := w.uiSend(admin, http.MethodPost, absentPath, nil)
+	if absent.status != 200 {
+		t.Fatalf("reopen with no body = %d %v, want 200", absent.status, absent.body)
+	}
+	if got := w.stateOf(absentTarget.ID); got != domain.RequestStatusTriaging {
+		t.Fatalf("a body-less reopen landed in %q, want triaging", got)
+	}
+
+	// The If-Match spelling is unchanged: the same compare-and-set from the
+	// header, on a route that also accepts the body field.
+	matchTarget, matchPath := reopenable("ifmatch")
+	matchRev := w.revOf(matchTarget.ID)
+	matched := w.uiSendHeaders(admin, http.MethodPost, matchPath, nil, map[string]string{"If-Match": `"` + strconv.Itoa(matchRev) + `"`})
+	if matched.status != 200 {
+		t.Fatalf("reopen with the current If-Match = %d %v, want 200", matched.status, matched.body)
+	}
+	w.moveRequest(matchTarget.ID, domain.RequestStatusRejected)
+	matchRev, matchState := w.revOf(matchTarget.ID), w.stateOf(matchTarget.ID)
+	matchCount, matchHistory := w.reopenedCountOf(matchTarget.ID), w.transitions(matchTarget.ID)
+	matchAudits := w.auditRows(w.admin.User.ID, "request.transition")
+	staleMatch := w.uiSendHeaders(admin, http.MethodPost, matchPath, nil, map[string]string{"If-Match": strconv.Itoa(matchRev - 1)})
+	w.wantWriteCode(staleMatch, 409, authz.CodeRequestConflict)
+	if got, _ := staleMatch.body["rev"].(float64); int(got) != matchRev {
+		t.Fatalf("a stale If-Match reports rev %v, want the row's actual %d", staleMatch.body["rev"], matchRev)
+	}
+	unwritten(matchTarget, matchRev, matchState, matchCount, matchHistory, matchAudits, "a stale If-Match")
+
+	// The two spellings disagreeing is the caller's mistake, answered rather than
+	// resolved by picking one.
+	disagreeTarget, disagreePath := reopenable("disagree")
+	disagreeRev := w.revOf(disagreeTarget.ID)
+	disagreeState, disagreeCount := w.stateOf(disagreeTarget.ID), w.reopenedCountOf(disagreeTarget.ID)
+	disagreeHistory, disagreeAudits := w.transitions(disagreeTarget.ID), w.auditRows(w.admin.User.ID, "request.transition")
+	disagreed := w.uiSendHeaders(admin, http.MethodPost, disagreePath,
+		map[string]any{"expected_rev": disagreeRev - 1}, map[string]string{"If-Match": strconv.Itoa(disagreeRev)})
+	w.wantWriteCode(disagreed, 400, authz.CodeRequestInvalid)
+	unwritten(disagreeTarget, disagreeRev, disagreeState, disagreeCount, disagreeHistory, disagreeAudits, "a disagreeing precondition")
+
+	// `If-Match: *` is still refused here: "any representation" is the lost update
+	// the revision exists to prevent.
+	starTarget, starPath := reopenable("star")
+	starRev, starState := w.revOf(starTarget.ID), w.stateOf(starTarget.ID)
+	starCount, starHistory := w.reopenedCountOf(starTarget.ID), w.transitions(starTarget.ID)
+	starAudits := w.auditRows(w.admin.User.ID, "request.transition")
+	star := w.uiSendHeaders(admin, http.MethodPost, starPath, nil, map[string]string{"If-Match": "*"})
+	w.wantWriteCode(star, 400, authz.CodeRequestInvalid)
+	if msg, _ := star.body["error"].(string); !strings.Contains(msg, "If-Match") {
+		t.Fatalf("an If-Match: * refusal does not name the header: %q", msg)
+	}
+	unwritten(starTarget, starRev, starState, starCount, starHistory, starAudits, "an If-Match: * reopen")
+
+	// A `to` in the body is answered, not ignored: the destination is the route's
+	// (triaging), and this route is not a second way to reach every edge.
+	toTarget, toPath := reopenable("to")
+	toRev, toState := w.revOf(toTarget.ID), w.stateOf(toTarget.ID)
+	toCount, toHistory := w.reopenedCountOf(toTarget.ID), w.transitions(toTarget.ID)
+	toAudits := w.auditRows(w.admin.User.ID, "request.transition")
+	withTo := w.uiSend(admin, http.MethodPost, toPath, map[string]any{"to": string(domain.RequestStatusDuplicate), "expected_rev": toRev})
+	w.wantWriteCode(withTo, 400, authz.CodeRequestInvalid)
+	if msg, _ := withTo.body["error"].(string); !strings.Contains(msg, string(domain.RequestStatusTriaging)) {
+		t.Fatalf("a `to` refusal does not name this route's destination: %q", msg)
+	}
+	unwritten(toTarget, toRev, toState, toCount, toHistory, toAudits, "a body naming a destination")
 }
 
 // ---- criterion 2: the requester's acts ----

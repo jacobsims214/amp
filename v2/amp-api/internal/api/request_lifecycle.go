@@ -249,6 +249,16 @@ func (h *RestHandler) teamRequestDuplicate(w http.ResponseWriter, r *http.Reques
 // The requester's reopen is a different route on their own surface: which of the
 // two applies is not a transport fact but the caller's standing, and the policy
 // decides it from the capability the service resolved.
+//
+// The body is decoded EXACTLY ONCE. It used to be read twice — once to validate
+// it and once, through requestMutationPreconditionRev, to find the precondition —
+// and because decodeRequestMutation wraps r.Body in a fresh MaxBytesReader and
+// consumes it, the second decode always saw EOF and read a nil expected_rev. A
+// body-borne `expected_rev` was therefore silently dropped here: the act
+// degraded to a plain write, so a client racing another writer lost its
+// compare-and-set without being told, which is the lost update the revision
+// exists to prevent (found reviewing #3976). One decode, then requestWriteRev
+// — the same shape as ownRequestReopen and teamRequestDeliver.
 func (h *RestHandler) teamRequestReopen(w http.ResponseWriter, r *http.Request) {
 	teamID, requestID, ok := requestLifecycleTarget(w, r)
 	if !ok {
@@ -258,10 +268,19 @@ func (h *RestHandler) teamRequestReopen(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	if _, ok := decodeRequestLifecycle(w, r, "request reopen"); !ok {
+	body, ok := decodeRequestLifecycle(w, r, "request reopen")
+	if !ok {
 		return
 	}
-	rev, err := requestMutationPreconditionRev(w, r)
+	if strings.TrimSpace(string(body.To)) != "" {
+		// The destination is this route's (triaging), so a body naming another one
+		// is answered rather than ignored: a caller that sent `to` believes it
+		// chose, and `duplicate` or `reject` from this URL would be a second way to
+		// reach edges that have their own routes and their own evidence.
+		fail(w, authz.RequestInvalid("this route's destination is fixed (%s): send the revision only, without `to`", domain.RequestStatusTriaging), http.StatusBadRequest)
+		return
+	}
+	rev, err := requestWriteRev(r, body.ExpectedRev)
 	if err != nil {
 		fail(w, err, http.StatusBadRequest)
 		return
@@ -498,7 +517,12 @@ func requestLifecycleTarget(w http.ResponseWriter, r *http.Request) (teamID, req
 
 // decodeRequestLifecycle reads one team lifecycle body: bounded, strict about
 // unknown fields, one JSON value, and an empty body is "no fields" (the plain
-// steps and the reopen take none).
+// steps and a reopen that sends no precondition take none).
+//
+// It is the ONLY read of r.Body a handler does: the returned body carries every
+// field the route may act on, the precondition included, because a second decode
+// of the same request is always empty by then (decodeRequestMutation consumed the
+// stream) and silently drops what it was looking for.
 func decodeRequestLifecycle(w http.ResponseWriter, r *http.Request, what string) (requestLifecycleBody, bool) {
 	var body requestLifecycleBody
 	if err := decodeRequestMutation(w, r, &body, what); err != nil {
@@ -518,20 +542,6 @@ func decodeRequesterAct(w http.ResponseWriter, r *http.Request, what string) (re
 		return body, false
 	}
 	return body, true
-}
-
-// requestMutationPreconditionRev reads the optional precondition of an act whose
-// body carries no other field (the reopen), by decoding the (possibly empty)
-// body and merging If-Match with it.
-func requestMutationPreconditionRev(w http.ResponseWriter, r *http.Request) (int, error) {
-	var body requestLifecycleBody
-	if err := decodeRequestMutation(w, r, &body, "request reopen"); err != nil {
-		return 0, err
-	}
-	if strings.TrimSpace(string(body.To)) != "" {
-		return 0, authz.RequestInvalid("this route's destination is fixed: send the precondition only, without `to`")
-	}
-	return requestWriteRev(r, body.ExpectedRev)
 }
 
 // writeLifecycleResult encodes one lifecycle act's outcome, or writes its coded
