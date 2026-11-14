@@ -258,15 +258,132 @@ fn materialized_skills_are_readable_rpi_skills() {
     let skills = assets.materialize_skills(&dest).unwrap();
     assert_eq!(skills.len(), assets.skills().count());
     let exec = skills.iter().find(|s| s.name == "amp-execution").unwrap();
+    let root = materialized_root(&dest, &skills);
     assert_eq!(
         Path::new(&exec.file_path),
-        dest.join("amp-execution/SKILL.md")
+        root.join("amp-execution/SKILL.md")
     );
     let on_disk = fs::read_to_string(&exec.file_path).unwrap();
     assert!(on_disk.starts_with("---\nname: amp-execution"));
     assert!(on_disk.contains(&exec.content));
     assert!(
-        dest.join("amp-design-tools/scripts/publish_file.py")
+        root.join("amp-design-tools/scripts/publish_file.py")
             .is_file()
     );
+}
+
+/// The content-addressed directory a materialize returned: `dest/<12 hex>/`.
+fn materialized_root(dest: &Path, skills: &[rpi_harness::types::Skill]) -> PathBuf {
+    let first = Path::new(&skills[0].file_path);
+    let root = first.parent().unwrap().parent().unwrap().to_path_buf();
+    assert_eq!(root.parent().unwrap(), dest);
+    let hash = root.file_name().unwrap().to_str().unwrap();
+    assert!(
+        hash.len() == 12 && hash.chars().all(|c| c.is_ascii_hexdigit()),
+        "{hash}"
+    );
+    for s in skills {
+        assert!(
+            Path::new(&s.file_path).starts_with(&root),
+            "{}",
+            s.file_path
+        );
+    }
+    root
+}
+
+/// Every file under `dir`, keyed by its path relative to `dir`, with its bytes and mtime.
+fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        out: &mut std::collections::BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)>,
+    ) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+                out.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    (fs::read(&path).unwrap(), mtime),
+                );
+            }
+        }
+    }
+    let mut out = Default::default();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// The entries directly under `dest`.
+fn entries(dest: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dest)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn materializing_identical_skills_reuses_the_directory_and_writes_nothing() {
+    let dest = scratch("materialize-same");
+    let assets = Assets::embedded().unwrap();
+    let first = assets.materialize_skills(&dest).unwrap();
+    let root = materialized_root(&dest, &first);
+    let before = snapshot(&root);
+    assert!(!before.is_empty());
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let again = Assets::embedded()
+        .unwrap()
+        .materialize_skills(&dest)
+        .unwrap();
+    assert_eq!(again, first, "same skills must give the same paths");
+    assert_eq!(
+        snapshot(&root),
+        before,
+        "no file rewritten (bytes and mtime)"
+    );
+    assert_eq!(
+        entries(&dest),
+        [root.file_name().unwrap().to_string_lossy().into_owned()],
+        "no new directory and no leftover temp dir"
+    );
+}
+
+#[test]
+fn changing_a_skill_materializes_a_new_directory_and_leaves_the_old_one_alone() {
+    let dest = scratch("materialize-change");
+    let mut assets = Assets::embedded().unwrap();
+    let first = assets.materialize_skills(&dest).unwrap();
+    let old_root = materialized_root(&dest, &first);
+    let before = snapshot(&old_root);
+
+    let exec = assets.skill("amp-execution").unwrap();
+    let mut md = exec.files["SKILL.md"].bytes.clone();
+    md.extend_from_slice(b"\nChanged body for #4266.\n");
+    let origin = Origin::User(dest.join("override/SKILL.md"));
+    assets
+        .put_skill_file("amp-execution", "SKILL.md", md.clone(), origin)
+        .unwrap();
+    let second = assets.materialize_skills(&dest).unwrap();
+    let new_root = materialized_root(&dest, &second);
+
+    assert_ne!(new_root, old_root, "changed skills need a new directory");
+    let new_exec = second.iter().find(|s| s.name == "amp-execution").unwrap();
+    assert_eq!(fs::read(&new_exec.file_path).unwrap(), md);
+    assert_eq!(
+        snapshot(&old_root),
+        before,
+        "every file under the first directory is untouched"
+    );
+    let mut want = vec![
+        old_root.file_name().unwrap().to_string_lossy().into_owned(),
+        new_root.file_name().unwrap().to_string_lossy().into_owned(),
+    ];
+    want.sort();
+    assert_eq!(entries(&dest), want, "no leftover temp dir");
 }

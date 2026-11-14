@@ -450,10 +450,18 @@ impl Assets {
             .or_else(|| self.agents().find(|a| a.is_primary()))
     }
 
-    /// Write every skill's files under `dest/<name>/` and return them as rpi skills whose
+    /// Write every skill's files under `dest/<hash>/<name>/` and return them as rpi skills whose
     /// `file_path` points at the written `SKILL.md`, so the model can read the skill and the files
     /// it references (scripts, examples) by path. `dest` should be a harness-owned directory
-    /// (e.g. under `~/.local/state/amp-harness/`); existing files there are overwritten.
+    /// (e.g. under `~/.local/state/amp-harness/`).
+    ///
+    /// `<hash>` is 12 hex digits of a SHA-256 over the effective skills (each skill's name, and
+    /// each file's relative path and bytes, in sorted order), so the directory is
+    /// content-addressed: identical skills reuse the existing directory without writing, and
+    /// changed skills land in a new one. The new directory is built in a sibling temp dir
+    /// (`dest/.tmp-<random>`) and renamed into place, so a directory this returned is never
+    /// rewritten or deleted: running workers that were handed its paths keep reading exactly
+    /// what they were built with (AMP #4266). Old directories are left in place.
     pub fn materialize_skills(
         &self,
         dest: &Path,
@@ -462,29 +470,95 @@ impl Assets {
             let path = path.to_path_buf();
             move |source| AssetError::Io { path, source }
         };
-        let mut out = Vec::with_capacity(self.skills.len());
-        for skill in self.skills.values() {
-            let dir = dest.join(&skill.name);
-            for (rel, file) in &skill.files {
-                let path = dir.join(rel);
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent).map_err(io_err(parent))?;
-                }
-                fs::write(&path, &file.bytes).map_err(io_err(&path))?;
+        let root = dest.join(self.skills_hash());
+        if !root.is_dir() {
+            fs::create_dir_all(dest).map_err(io_err(dest))?;
+            let tmp = dest.join(format!(".tmp-{}", random_hex()));
+            let written = self.write_skills(&tmp);
+            let result = written.and_then(|()| match fs::rename(&tmp, &root) {
+                Ok(()) => Ok(()),
+                // Lost a race to another materialize of the same skills: use theirs.
+                Err(_) if root.is_dir() => Ok(()),
+                Err(source) => Err(AssetError::Io {
+                    path: root.clone(),
+                    source,
+                }),
+            });
+            if tmp.exists() {
+                let _ = fs::remove_dir_all(&tmp);
             }
-            out.push(rpi_harness::types::Skill {
+            result?;
+        }
+        Ok(self
+            .skills
+            .values()
+            .map(|skill| rpi_harness::types::Skill {
                 name: skill.name.clone(),
                 description: skill.description.clone(),
                 content: skill.content.clone(),
-                file_path: dir.join(SKILL_FILE).to_string_lossy().into_owned(),
+                file_path: root
+                    .join(&skill.name)
+                    .join(SKILL_FILE)
+                    .to_string_lossy()
+                    .into_owned(),
                 disable_model_invocation: skill
                     .frontmatter
                     .get("disable-model-invocation")
                     .and_then(Value::as_bool),
-            });
-        }
-        Ok(out)
+            })
+            .collect())
     }
+
+    /// 12 hex digits of a SHA-256 over every skill's name and each file's relative path and
+    /// bytes, in sorted order. Each field is length-prefixed so no two skill sets share an input.
+    fn skills_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        let mut field = |bytes: &[u8]| {
+            h.update((bytes.len() as u64).to_le_bytes());
+            h.update(bytes);
+        };
+        for skill in self.skills.values() {
+            field(skill.name.as_bytes());
+            field(&(skill.files.len() as u64).to_le_bytes());
+            for (rel, file) in &skill.files {
+                field(rel.as_bytes());
+                field(&file.bytes);
+            }
+        }
+        h.finalize()
+            .iter()
+            .take(6)
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Write every skill's files under `dir/<name>/`.
+    fn write_skills(&self, dir: &Path) -> Result<(), AssetError> {
+        for skill in self.skills.values() {
+            let skill_dir = dir.join(&skill.name);
+            for (rel, file) in &skill.files {
+                let path = skill_dir.join(rel);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|source| AssetError::Io {
+                        path: parent.to_path_buf(),
+                        source,
+                    })?;
+                }
+                fs::write(&path, &file.bytes).map_err(|source| AssetError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 16 random hex digits for a temp directory name.
+fn random_hex() -> String {
+    use rand_core::{OsRng, RngCore};
+    format!("{:016x}", OsRng.next_u64())
 }
 
 fn collect_embedded(dir: &Dir<'static>, root: &Path, out: &mut BTreeMap<String, SkillFile>) {
