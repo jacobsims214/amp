@@ -116,7 +116,6 @@ pub struct Session {
     /// MCP servers still on their first attempt when the session was built.
     pub mcp_starting: Vec<String>,
     /// [`SessionRequest::confirmer`], for the self-management tools (#4252) and `/reload`.
-    #[allow(dead_code, reason = "the self-management tools (AMP #4252) take it")]
     pub confirmer: Option<Arc<dyn amp_core::approval::Confirmer>>,
 }
 
@@ -293,6 +292,15 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         Arc::clone(&totals),
         false,
     ));
+    // #4252: amp_manage_agent / amp_manage_skill, for the manager only. Headless `run -p` has no
+    // confirmer, so every call there is refused.
+    if role.primary {
+        spec.extra_tools.extend(crate::manage_tools::tools(
+            rt.paths.clone(),
+            cwd.clone(),
+            req.confirmer.clone(),
+        ));
+    }
     spec.emitter = Some(
         TotalsEmitter::new(Arc::clone(&totals), Some(fanout.clone().into_emitter())).into_emitter(),
     );

@@ -1,0 +1,864 @@
+//! The manager's self-management tools (story 583, AMP #4252): `amp_manage_agent` and
+//! `amp_manage_skill` create or update an agent or a skill in the **user** layer.
+//!
+//! Every call goes through the same gates, in this order, and writes nothing unless all pass:
+//! 1. a person can confirm here: with no [`Confirmer`] (headless `run -p`) the call is refused
+//!    before any other work;
+//! 2. the guard (#4246): no tool may touch a primary agent or the manager, make an agent primary,
+//!    or widen an agent's permissions (a new agent is compared with
+//!    [`roles::new_agent_baseline`]); a skill a primary agent preloads is the manager's prompt, so
+//!    it is refused too. The new text must also load;
+//! 3. the person's "yes" through [`confirm_or_deny`] (#4247, #4259), with the target path, the
+//!    backup location and the dispatch note (#4246) on screen;
+//! 4. the guard again (the files may have changed while the prompt was up), then
+//!    [`write_agent_in`] / [`write_skill_in`] (#4244, #4245), which validate once more, back the
+//!    previous layer file up under `<layer>/.edit/backup/` and write atomically.
+//!
+//! The reload watcher picks the file up; reloads wait while the manager is replying (#4267), so a
+//! write takes effect from the manager's next turn.
+//!
+//! User scope only (manager decision for v0.4.0): repo trust only covers the CLI's own writes, so
+//! a tool's repo write would not load anyway. Paths come from the session's [`ConfigPaths`],
+//! never from the process's current directory. The session registers [`tools`] for primary
+//! roles only, and `/reload` registers them again with the same confirmer.
+
+use std::{path::PathBuf, sync::Arc};
+
+use amp_core::{
+    approval::{
+        CONFIRM_TIMEOUT, ConfirmRequest, Confirmed, Confirmer, DenyReason, confirm_or_deny,
+    },
+    assets::{AGENTS_DIR, Origin, SKILLS_DIR, valid_name},
+    roles::{self, RoleRegistry},
+};
+use amp_mcp::ConfigPaths;
+use rpi_agent::{AgentError as ToolError, AgentTool, AgentToolResult, ToolResultPartial};
+use rpi_ai::types::Tool;
+use rpi_harness::types::{HarnessTool, ToolReplay};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+use crate::{
+    agents_cmd::{Ctx, EDIT_DIR, Scope, write_agent_in},
+    skills_cmd::write_skill_in,
+};
+
+pub(crate) const MANAGE_AGENT_TOOL: &str = "amp_manage_agent";
+pub(crate) const MANAGE_SKILL_TOOL: &str = "amp_manage_skill";
+
+/// The skill file the tools write (the same name `skills_cmd` uses).
+const SKILL_FILE: &str = "SKILL.md";
+
+/// The manager's self-management tools over the session's config `paths`. `confirmer` is the
+/// chat's y/N prompt; `None` (headless) refuses every call.
+pub(crate) fn tools(
+    paths: ConfigPaths,
+    cwd: PathBuf,
+    confirmer: Option<Arc<dyn Confirmer>>,
+) -> Vec<HarnessTool> {
+    let shared = Arc::new(Shared {
+        paths,
+        cwd,
+        confirmer,
+    });
+    [Kind::Agent, Kind::Skill]
+        .into_iter()
+        .map(|kind| {
+            HarnessTool::new(Arc::new(ManageTool::new(kind, Arc::clone(&shared))))
+                .with_replay(ToolReplay::Never)
+        })
+        .collect()
+}
+
+struct Shared {
+    paths: ConfigPaths,
+    cwd: PathBuf,
+    confirmer: Option<Arc<dyn Confirmer>>,
+}
+
+impl Shared {
+    fn ctx(&self) -> Ctx {
+        Ctx {
+            paths: self.paths.clone(),
+            cwd: self.cwd.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Agent,
+    Skill,
+}
+
+impl Kind {
+    fn noun(self) -> &'static str {
+        match self {
+            Kind::Agent => "agent",
+            Kind::Skill => "skill",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Action {
+    Create,
+    Update,
+}
+
+impl Action {
+    fn verb(self) -> &'static str {
+        match self {
+            Action::Create => "create",
+            Action::Update => "update",
+        }
+    }
+}
+
+/// The tools' arguments. No `scope`: user scope is implied.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Args {
+    action: Action,
+    name: String,
+    content: String,
+}
+
+fn parse_args(params: Value) -> Result<Args, String> {
+    let args: Args = serde_json::from_value(params).map_err(|e| format!("bad arguments: {e}"))?;
+    if args.name.trim().is_empty() {
+        return Err("name is required".into());
+    }
+    if args.content.trim().is_empty() {
+        return Err("content is required: the whole file".into());
+    }
+    Ok(args)
+}
+
+/// What passed the guard: the person is asked about this, and it is what gets written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Plan {
+    /// The canonical agent id or the skill name.
+    name: String,
+    /// The file to write.
+    path: PathBuf,
+    /// Where the current layer file will be copied first, when there is one.
+    backup: Option<String>,
+    /// Lines for the confirmation (the dispatch note, a shadowing repo file).
+    notes: Vec<String>,
+}
+
+/// The guard for an agent write (#4246): the role is not primary and does not become primary,
+/// the text loads, and the permissions do not widen.
+fn check_agent(ctx: &Ctx, action: Action, name: &str, content: &str) -> Result<Plan, String> {
+    let loaded = ctx.load().map_err(|e| e.message)?;
+    let name = name.trim();
+    let id = match action {
+        Action::Create => {
+            if !valid_name(name) {
+                return Err(format!(
+                    "agent id {name:?} must be lowercase letters, digits and single hyphens"
+                ));
+            }
+            if loaded.roles.get(name).is_some() {
+                return Err(format!("agent {name} already exists; use action update"));
+            }
+            name.to_owned()
+        }
+        Action::Update => loaded
+            .roles
+            .get(name)
+            .map(|r| r.id.clone())
+            .ok_or_else(|| format!("no agent {name}; use action create"))?,
+    };
+    roles::refuse_primary(&loaded.roles, &id, false).map_err(|e| e.to_string())?;
+
+    let dir = ctx.scope_dir(Scope::User).map_err(|e| e.message)?;
+    let path = dir.join(AGENTS_DIR).join(format!("{id}.md"));
+    let mut assets = loaded.assets.clone();
+    assets
+        .put_agent(&id, content, Origin::User(path.clone()))
+        .map_err(|e| format!("the new text does not load: {e}"))?;
+    let registry = RoleRegistry::from_assets(&assets)
+        .map_err(|e| format!("the roster does not load with the new text: {e}"))?;
+    let new_role = registry
+        .get(&id)
+        .ok_or_else(|| format!("agent {id} does not load from this text"))?;
+    roles::refuse_primary(&loaded.roles, &id, new_role.primary).map_err(|e| e.to_string())?;
+
+    let old = match action {
+        Action::Create => None,
+        Action::Update => loaded.roles.get(&id).map(|r| &r.policy),
+    };
+    let widening = roles::permission_widens(old, &new_role.policy, &roles::new_agent_baseline());
+    if widening.widens {
+        let against = if old.is_some() {
+            "its current permissions"
+        } else {
+            "a new agent's baseline (bash, edit and webfetch denied)"
+        };
+        return Err(format!(
+            "it widens agent {id}'s permissions compared with {against}: {}. Tools may only \
+             narrow permissions; a person can widen them with `amp-harness agents edit {id}`",
+            widening.reasons.join("; ")
+        ));
+    }
+
+    let mut notes = Vec::new();
+    if let Some(note) = roles::dispatch_effect(registry.manager(), new_role) {
+        notes.push(note);
+    }
+    if let Some(Origin::Repo(p)) = loaded.assets.agent(&id).map(|a| &a.origin) {
+        notes.push(format!(
+            "a repo file overrides it in this repo ({}); the user-layer change applies elsewhere",
+            p.display()
+        ));
+    }
+    let backup = (action == Action::Update && path.is_file()).then(|| {
+        dir.join(EDIT_DIR)
+            .join(format!("backup/agents/{id}.<unix ms>/{id}.md"))
+            .display()
+            .to_string()
+    });
+    Ok(Plan {
+        name: id,
+        path,
+        backup,
+        notes,
+    })
+}
+
+/// The guard for a skill write: the name is valid, the skill exists (update) or not (create), and
+/// no primary agent preloads it (that would change the manager's own prompt).
+fn check_skill(ctx: &Ctx, action: Action, name: &str) -> Result<Plan, String> {
+    let name = name.trim();
+    if !valid_name(name) {
+        return Err(format!(
+            "skill name {name:?} must be lowercase letters, digits and single hyphens"
+        ));
+    }
+    let loaded = ctx.load().map_err(|e| e.message)?;
+    let exists = loaded.assets.skill(name).is_some();
+    match action {
+        Action::Create if exists => {
+            return Err(format!("skill {name} already exists; use action update"));
+        }
+        Action::Update if !exists => return Err(format!("no skill {name}; use action create")),
+        _ => {}
+    }
+    if let Some(role) = loaded
+        .roles
+        .roles()
+        .find(|r| r.primary && r.skills.iter().any(|s| s == name))
+    {
+        return Err(format!(
+            "skill {name} is preloaded by the primary agent {}; tools can't change it (a person \
+             can, with `amp-harness skills edit {name}`)",
+            role.id
+        ));
+    }
+    let dir = ctx.scope_dir(Scope::User).map_err(|e| e.message)?;
+    let path = dir.join(SKILLS_DIR).join(name).join(SKILL_FILE);
+    let backup = (action == Action::Update && path.is_file()).then(|| {
+        dir.join(EDIT_DIR)
+            .join(format!("backup/skills/{name}.<unix ms>/{SKILL_FILE}"))
+            .display()
+            .to_string()
+    });
+    let mut notes = Vec::new();
+    if let Some(Origin::Repo(p)) = loaded.assets.skill(name).map(|s| s.origin()) {
+        notes.push(format!(
+            "a repo skill overrides it in this repo ({}); the user-layer change applies elsewhere",
+            p.display()
+        ));
+    }
+    Ok(Plan {
+        name: name.to_owned(),
+        path,
+        backup,
+        notes,
+    })
+}
+
+struct ManageTool {
+    kind: Kind,
+    shared: Arc<Shared>,
+    schema: Tool,
+}
+
+impl ManageTool {
+    fn new(kind: Kind, shared: Arc<Shared>) -> Self {
+        let (name, description, content) = match kind {
+            Kind::Agent => (
+                MANAGE_AGENT_TOOL,
+                "Create or update a subagent definition (agents/<id>.md) in the person's user \
+                 config. The person is asked to confirm every write in the chat (y/N); \
+                 nothing is written without their yes, and the call is refused where no person \
+                 can answer. Refused outright: the manager or any primary agent, `mode: \
+                 primary`, and any change that widens permissions (a new agent may not allow \
+                 bash, edit or webfetch; an update may only add deny rules or remove allow \
+                 rules). The previous file is backed up under .edit/backup/agents/. A write \
+                 takes effect from your NEXT turn, once live reload picks it up; workers \
+                 dispatched after that reload see it too. If auto-reload is off, ask the person \
+                 to run /reload.",
+                "REQUIRED. The whole agent file: YAML frontmatter (description, mode: subagent, \
+                 permission, skills, ...) and the prompt.",
+            ),
+            Kind::Skill => (
+                MANAGE_SKILL_TOOL,
+                "Create or update a skill (skills/<name>/SKILL.md) in the person's user config. \
+                 The person is asked to confirm every write in the chat (y/N); nothing is \
+                 written without their yes, and the call is refused where no person can answer. \
+                 A skill a primary agent preloads can't be changed. Only SKILL.md is written; \
+                 the previous one is backed up under .edit/backup/skills/. A write takes effect \
+                 from your NEXT turn, once live reload picks it up; workers dispatched after \
+                 that reload see it too. If auto-reload is off, ask the person to run /reload.",
+                "REQUIRED. The whole SKILL.md: YAML frontmatter (name, description) and the body.",
+            ),
+        };
+        let schema = Tool {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["create", "update"], "description": "REQUIRED. create a new one or update an existing one."},
+                    "name": {"type": "string", "description": format!("REQUIRED. The {} name: lowercase letters, digits and hyphens.", kind.noun())},
+                    "content": {"type": "string", "description": content}
+                },
+                "required": ["action", "name", "content"],
+                "additionalProperties": false
+            })
+            .into(),
+            constrained_sampling: None,
+        };
+        Self {
+            kind,
+            shared,
+            schema,
+        }
+    }
+
+    fn check(&self, ctx: &Ctx, args: &Args) -> Result<Plan, String> {
+        match self.kind {
+            Kind::Agent => check_agent(ctx, args.action, &args.name, &args.content),
+            Kind::Skill => check_skill(ctx, args.action, &args.name),
+        }
+    }
+
+    /// The whole call, as text for the model: the written file and what happens next, or why
+    /// nothing was written.
+    async fn run(&self, args: Args, cancel: &CancellationToken) -> Result<String, String> {
+        let not_written = |why: String| format!("not written: {why}");
+        // 1. Nobody to ask: refuse before any work.
+        let Some(confirmer) = self.shared.confirmer.as_deref() else {
+            return Err(Confirmed::Denied(DenyReason::NoResponder)
+                .denial_message()
+                .unwrap_or_default());
+        };
+        let ctx = self.shared.ctx();
+        // 2. The guard.
+        let plan = self.check(&ctx, &args).map_err(not_written)?;
+
+        // 3. The person.
+        let mut request = ConfirmRequest::self_management(
+            self.schema.name.clone(),
+            plan.path.clone(),
+            Scope::User.name(),
+            format!("{} {} {}", args.action.verb(), self.kind.noun(), plan.name),
+        );
+        request = request.detail(match &plan.backup {
+            Some(b) => format!("the current file is backed up first to {b}"),
+            None => "new file (nothing to back up)".to_owned(),
+        });
+        for note in &plan.notes {
+            request = request.detail(note.clone());
+        }
+        request = request.detail(format!(
+            "{} lines; the {} applies from the manager's next turn",
+            args.content.lines().count(),
+            self.kind.noun()
+        ));
+        let answer = tokio::select! {
+            answer = confirm_or_deny(Some(confirmer), request, CONFIRM_TIMEOUT) => answer,
+            () = cancel.cancelled() => return Err(not_written("the call was cancelled".into())),
+        };
+        if let Some(message) = answer.denial_message() {
+            return Err(message);
+        }
+
+        // 4. Again, then write.
+        self.check(&ctx, &args).map_err(not_written)?;
+        let create = args.action == Action::Create;
+        let (path, backup) = match self.kind {
+            Kind::Agent => {
+                let w = write_agent_in(&ctx, Scope::User, &plan.name, &args.content, create)
+                    .map_err(|e| not_written(e.message))?;
+                (w.path, w.backup)
+            }
+            Kind::Skill => {
+                let w = write_skill_in(&ctx, Scope::User, &plan.name, &args.content, create)
+                    .map_err(|e| not_written(e.message))?;
+                (w.path, w.backup)
+            }
+        };
+        let mut text = format!(
+            "{} {} {}: wrote {} (user scope, confirmed by the person).",
+            if create { "Created" } else { "Updated" },
+            self.kind.noun(),
+            plan.name,
+            path.display()
+        );
+        if let Some(b) = backup {
+            text.push_str(&format!(
+                " The previous file is backed up at {}.",
+                b.display()
+            ));
+        }
+        for note in &plan.notes {
+            text.push_str(&format!(" Note: {note}."));
+        }
+        text.push_str(
+            " It takes effect from your next turn, once live reload picks it up (reloads wait \
+             while you are replying); workers dispatched after that reload see it too. If \
+             auto-reload is off, ask the person to run /reload.",
+        );
+        Ok(text)
+    }
+}
+
+impl std::fmt::Debug for ManageTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManageTool")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTool for ManageTool {
+    fn schema(&self) -> &Tool {
+        &self.schema
+    }
+
+    fn label(&self) -> &str {
+        match self.kind {
+            Kind::Agent => "Manage agent",
+            Kind::Skill => "Manage skill",
+        }
+    }
+
+    fn execution_mode(&self) -> rpi_agent::ToolExecutionMode {
+        // One prompt at a time, and no two writes racing on the same layer.
+        rpi_agent::ToolExecutionMode::Sequential
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        params: Value,
+        signal: CancellationToken,
+        _on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+    ) -> Result<AgentToolResult, ToolError> {
+        let args = parse_args(params).map_err(ToolError::Validation)?;
+        match self.run(args, &signal).await {
+            Ok(text) => Ok(AgentToolResult::text(text)),
+            Err(why) => Err(ToolError::Tool(why)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        path::Path,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    /// A user layer only, under the crate's target dir (never the person's config), whose config
+    /// gives every role a faux model.
+    fn ctx(name: &str) -> Ctx {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/unit-manage-tools")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("config.toml"),
+            "[providers.f]\napi = \"faux\"\n[providers.f.models.\"f-1\"]\n\n[roles.manager]\nmodel = \"f/f-1\"\n[roles.worker-backend]\nmodel = \"f/f-1\"\n[roles.sql-expert]\nmodel = \"f/f-1\"\n",
+        )
+        .unwrap();
+        Ctx {
+            paths: ConfigPaths {
+                user_file: Some(d.join("config.toml")),
+                user_dir: Some(d.clone()),
+                ..ConfigPaths::default()
+            },
+            cwd: d,
+        }
+    }
+
+    /// Answers every request with `yes` and counts them.
+    struct Fake {
+        yes: bool,
+        asked: AtomicUsize,
+        last: std::sync::Mutex<Option<ConfirmRequest>>,
+    }
+
+    impl Fake {
+        fn new(yes: bool) -> Arc<Self> {
+            Arc::new(Self {
+                yes,
+                asked: AtomicUsize::new(0),
+                last: std::sync::Mutex::new(None),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Confirmer for Fake {
+        async fn confirm(&self, request: ConfirmRequest) -> Confirmed {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            *self.last.lock().unwrap() = Some(request);
+            if self.yes {
+                Confirmed::Approved
+            } else {
+                Confirmed::Denied(DenyReason::Declined)
+            }
+        }
+    }
+
+    fn tool(ctx: &Ctx, kind: Kind, confirmer: Option<Arc<dyn Confirmer>>) -> ManageTool {
+        ManageTool::new(
+            kind,
+            Arc::new(Shared {
+                paths: ctx.paths.clone(),
+                cwd: ctx.cwd.clone(),
+                confirmer,
+            }),
+        )
+    }
+
+    async fn call(t: &ManageTool, args: Value) -> Result<String, String> {
+        let result = t
+            .execute(
+                "id",
+                args,
+                CancellationToken::new(),
+                Arc::new(|_: ToolResultPartial| {}),
+            )
+            .await;
+        match result {
+            Ok(r) => Ok(serde_json::to_string(&r.into_content()).unwrap()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// A subagent that denies bash, edit and webfetch (the new-agent baseline), plus `extra`.
+    fn narrow_agent(description: &str, extra: &str) -> String {
+        format!(
+            "---\ndescription: {description}\nmode: subagent\npermission:\n  bash:\n    \"*\": deny\n  edit:\n    \"*\": deny\n  webfetch:\n    \"*\": deny\n{extra}---\n\nYou answer SQL questions.\n"
+        )
+    }
+
+    fn args(action: &str, name: &str, content: &str) -> Value {
+        json!({"action": action, "name": name, "content": content})
+    }
+
+    #[tokio::test]
+    async fn confirmed_create_and_update_write_and_the_next_load_sees_them() {
+        let ctx = ctx("agent-confirmed");
+        let yes = Fake::new(true);
+        let t = tool(&ctx, Kind::Agent, Some(yes.clone()));
+        let file = ctx
+            .paths
+            .user_dir
+            .clone()
+            .unwrap()
+            .join("agents/sql-expert.md");
+
+        let out = call(&t, args("create", "sql-expert", &narrow_agent("SQL", "")))
+            .await
+            .unwrap();
+        assert!(out.contains("Created agent sql-expert"), "{out}");
+        assert!(
+            out.contains("next turn") && out.contains("/reload"),
+            "{out}"
+        );
+        assert_eq!(yes.asked.load(Ordering::SeqCst), 1);
+        let req = yes.last.lock().unwrap().clone().unwrap();
+        assert_eq!(req.tool, MANAGE_AGENT_TOOL);
+        assert_eq!(req.path, file);
+        assert_eq!(req.scope, "user");
+        assert!(
+            req.details.iter().any(|d| d.contains("new file")),
+            "{req:?}"
+        );
+        // The next run (a fresh load of the layers) sees it.
+        assert_eq!(
+            ctx.load()
+                .unwrap()
+                .roles
+                .get("sql-expert")
+                .unwrap()
+                .description,
+            "SQL"
+        );
+
+        // update: narrowing more (an added deny) is allowed, and backs the old file up.
+        let narrower = narrow_agent("SQL v2", "  task:\n    \"*\": deny\n");
+        let out = call(&t, args("update", "sql-expert", &narrower))
+            .await
+            .unwrap();
+        assert!(out.contains("Updated agent sql-expert"), "{out}");
+        assert!(out.contains(".edit/backup/agents/sql-expert."), "{out}");
+        let req = yes.last.lock().unwrap().clone().unwrap();
+        assert!(
+            req.details.iter().any(|d| d.contains("backed up first")),
+            "{req:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), narrower);
+        assert_eq!(
+            ctx.load()
+                .unwrap()
+                .roles
+                .get("sql-expert")
+                .unwrap()
+                .description,
+            "SQL v2"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_or_no_confirmer_writes_nothing() {
+        let ctx = ctx("agent-unconfirmed");
+        let file = ctx
+            .paths
+            .user_dir
+            .clone()
+            .unwrap()
+            .join("agents/sql-expert.md");
+        let text = narrow_agent("SQL", "");
+
+        // The person says no.
+        let no = Fake::new(false);
+        let e = call(
+            &tool(&ctx, Kind::Agent, Some(no.clone())),
+            args("create", "sql-expert", &text),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("not written") && e.contains("declined"), "{e}");
+        assert_eq!(no.asked.load(Ordering::SeqCst), 1);
+        assert!(!file.exists());
+
+        // Headless: refused before anything else (even a bad name is not looked at).
+        for a in [
+            args("create", "sql-expert", &text),
+            args("create", "Bad Name", &text),
+        ] {
+            let e = call(&tool(&ctx, Kind::Agent, None), a).await.unwrap_err();
+            assert!(e.contains("no person can confirm it here"), "{e}");
+        }
+        assert!(!file.exists());
+
+        // Skills too.
+        let skill = ctx.paths.user_dir.clone().unwrap().join("skills/my-skill");
+        let md = "---\nname: my-skill\ndescription: Does things\n---\n\nDo it.\n";
+        let e = call(
+            &tool(&ctx, Kind::Skill, None),
+            args("create", "my-skill", md),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("no person can confirm"), "{e}");
+        let e = call(
+            &tool(&ctx, Kind::Skill, Some(no.clone())),
+            args("create", "my-skill", md),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("declined"), "{e}");
+        assert!(!skill.exists());
+    }
+
+    #[tokio::test]
+    async fn primary_and_manager_edits_are_refused_without_asking() {
+        let ctx = ctx("agent-primary");
+        let yes = Fake::new(true);
+        let t = tool(&ctx, Kind::Agent, Some(yes.clone()));
+        let manager = ctx.load().unwrap().roles.manager().id.clone();
+        for name in [manager.as_str(), "manager"] {
+            let e = call(&t, args("update", name, &narrow_agent("x", "")))
+                .await
+                .unwrap_err();
+            assert!(e.contains("is the manager"), "{e}");
+        }
+        // Becoming primary.
+        let primary = narrow_agent("x", "").replace("mode: subagent", "mode: primary");
+        let e = call(&t, args("create", "sql-expert", &primary))
+            .await
+            .unwrap_err();
+        assert!(e.contains("primary"), "{e}");
+        assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
+        assert!(!ctx.paths.user_dir.clone().unwrap().join("agents").exists());
+    }
+
+    #[tokio::test]
+    async fn widening_writes_are_refused_without_asking() {
+        let ctx = ctx("agent-widening");
+        let yes = Fake::new(true);
+        let t = tool(&ctx, Kind::Agent, Some(yes.clone()));
+        let file = ctx
+            .paths
+            .user_dir
+            .clone()
+            .unwrap()
+            .join("agents/sql-expert.md");
+
+        // A new agent with no permission block gets bash/edit/webfetch: wider than the baseline.
+        let open = "---\ndescription: SQL\nmode: subagent\n---\n\nHi.\n";
+        let e = call(&t, args("create", "sql-expert", open))
+            .await
+            .unwrap_err();
+        assert!(e.contains("widens") && e.contains("bash"), "{e}");
+        assert!(!file.exists());
+
+        // An existing agent: allowing bash it used to deny.
+        call(&t, args("create", "sql-expert", &narrow_agent("SQL", "")))
+            .await
+            .unwrap();
+        let before = std::fs::read_to_string(&file).unwrap();
+        let asked = yes.asked.load(Ordering::SeqCst);
+        let wider = narrow_agent("SQL", "").replacen("\"*\": deny", "\"*\": allow", 1);
+        let e = call(&t, args("update", "sql-expert", &wider))
+            .await
+            .unwrap_err();
+        assert!(e.contains("widens"), "{e}");
+        assert_eq!(yes.asked.load(Ordering::SeqCst), asked);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+
+        // A built-in worker: dropping its permission block widens too.
+        let e = call(&t, args("update", "amp-worker-backend", open))
+            .await
+            .unwrap_err();
+        assert!(e.contains("widens"), "{e}");
+        assert!(
+            !ctx.paths
+                .user_dir
+                .clone()
+                .unwrap()
+                .join("agents/amp-worker-backend.md")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn skills_create_and_update_with_confirmation() {
+        let ctx = ctx("skill-confirmed");
+        let yes = Fake::new(true);
+        let t = tool(&ctx, Kind::Skill, Some(yes.clone()));
+        let md = "---\nname: my-skill\ndescription: Does things\n---\n\nDo it.\n";
+        let out = call(&t, args("create", "my-skill", md)).await.unwrap();
+        assert!(out.contains("Created skill my-skill"), "{out}");
+        assert_eq!(
+            ctx.load_assets()
+                .unwrap()
+                .skill("my-skill")
+                .unwrap()
+                .description,
+            "Does things"
+        );
+        let md2 = md.replace("Does things", "Does more");
+        let out = call(&t, args("update", "my-skill", &md2)).await.unwrap();
+        assert!(out.contains(".edit/backup/skills/my-skill."), "{out}");
+        assert_eq!(
+            ctx.load_assets()
+                .unwrap()
+                .skill("my-skill")
+                .unwrap()
+                .description,
+            "Does more"
+        );
+        // create on an existing one, update on a missing one: refused before asking.
+        let asked = yes.asked.load(Ordering::SeqCst);
+        assert!(
+            call(&t, args("create", "my-skill", md))
+                .await
+                .unwrap_err()
+                .contains("already exists")
+        );
+        assert!(
+            call(&t, args("update", "nope", md))
+                .await
+                .unwrap_err()
+                .contains("no skill nope")
+        );
+        assert_eq!(yes.asked.load(Ordering::SeqCst), asked);
+    }
+
+    #[tokio::test]
+    async fn skills_a_primary_preloads_are_refused() {
+        let ctx = ctx("skill-primary");
+        let user = ctx.paths.user_dir.clone().unwrap();
+        // Test setup, written directly: a skill and a primary agent that preloads it.
+        let md = "---\nname: boss-notes\ndescription: x\n---\n\nx\n";
+        std::fs::create_dir_all(user.join("skills/boss-notes")).unwrap();
+        std::fs::write(user.join("skills/boss-notes/SKILL.md"), md).unwrap();
+        std::fs::create_dir_all(user.join("agents")).unwrap();
+        std::fs::write(
+            user.join("agents/boss.md"),
+            "---\ndescription: Boss\nmode: primary\nskills:\n  - boss-notes\n---\n\nBoss.\n",
+        )
+        .unwrap();
+        assert!(ctx.load().unwrap().roles.get("boss").unwrap().primary);
+
+        let yes = Fake::new(true);
+        let t = tool(&ctx, Kind::Skill, Some(yes.clone()));
+        let e = call(
+            &t,
+            args("update", "boss-notes", &md.replace("x\n\nx", "y\n\ny")),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("preloaded by the primary agent boss"), "{e}");
+        assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            std::fs::read_to_string(user.join("skills/boss-notes/SKILL.md")).unwrap(),
+            md
+        );
+        // And the primary itself can't be edited by the agent tool.
+        let a = tool(&ctx, Kind::Agent, Some(yes.clone()));
+        let e = call(&a, args("update", "boss", &narrow_agent("x", "")))
+            .await
+            .unwrap_err();
+        assert!(e.contains("primary agent"), "{e}");
+    }
+
+    #[test]
+    fn arguments_deny_unknown_fields_and_have_no_scope() {
+        assert!(parse_args(args("create", "a", "x")).is_ok());
+        let mut with_scope = args("create", "a", "x");
+        with_scope["scope"] = json!("repo");
+        assert!(
+            parse_args(with_scope)
+                .unwrap_err()
+                .contains("unknown field")
+        );
+        assert!(parse_args(args("delete", "a", "x")).is_err());
+        assert!(parse_args(args("create", " ", "x")).is_err());
+        assert!(parse_args(json!({"action": "create", "name": "a"})).is_err());
+    }
+
+    #[test]
+    fn tools_are_never_replayed() {
+        let ctx = ctx("replay");
+        let ts = tools(ctx.paths.clone(), ctx.cwd.clone(), None);
+        let names: Vec<_> = ts.iter().map(|t| t.tool.schema().name.clone()).collect();
+        assert_eq!(names, [MANAGE_AGENT_TOOL, MANAGE_SKILL_TOOL]);
+        assert!(ts.iter().all(|t| t.replay == ToolReplay::Never));
+    }
+}
