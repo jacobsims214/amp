@@ -157,6 +157,8 @@ struct Rows {
     active: Vec<String>,
     /// Whether the current row is the first of its logical line.
     first: bool,
+    /// How each finished row continues into the next (parallel to `rows`).
+    joins: Vec<Join>,
 }
 
 impl Rows {
@@ -168,6 +170,7 @@ impl Rows {
             cur_w: 0,
             active: Vec::new(),
             first: true,
+            joins: Vec::new(),
         }
     }
 
@@ -199,12 +202,14 @@ impl Rows {
         }
     }
 
-    /// Ends the current row: closes its open styling and re-opens it on the next row.
-    fn break_row(&mut self) {
+    /// Ends the current row: closes its open styling and re-opens it on the next row. `join` says
+    /// how the finished row continues into the next one.
+    fn break_row(&mut self, join: Join) {
         if !self.active.is_empty() {
             self.cur.push_str(RESET);
         }
         self.rows.push(std::mem::take(&mut self.cur));
+        self.joins.push(join);
         self.cur = self.active.concat();
         self.cur_w = 0;
         self.first = false;
@@ -212,7 +217,7 @@ impl Rows {
 
     /// Ends a logical line (a `\n` in the input, or the end).
     fn end_line(&mut self) {
-        self.break_row();
+        self.break_row(Join::Newline);
         self.first = true;
     }
 
@@ -223,8 +228,9 @@ impl Rows {
                 // Leading spaces of a logical line are its indentation.
                 self.emit(spaces);
                 if self.cur_w > 0 && self.cur_w + word_w > self.width {
-                    // The indent leaves no room for the word: start it on a clean row.
-                    self.break_row();
+                    // The indent leaves no room for the word: start it on a clean row. The indent
+                    // row keeps its spaces, so it rejoins with nothing.
+                    self.break_row(Join::None);
                 }
             } else {
                 self.emit_escapes(spaces);
@@ -233,7 +239,7 @@ impl Rows {
             self.emit(spaces);
         } else {
             self.emit_escapes(spaces);
-            self.break_row();
+            self.break_row(Join::Space);
         }
         if self.cur_w + word_w <= self.width {
             self.emit(word);
@@ -245,7 +251,7 @@ impl Rows {
                 Item::Esc(e) => self.esc(e),
                 Item::Char(c, w) => {
                     if self.cur_w > 0 && self.cur_w + w > self.width {
-                        self.break_row();
+                        self.break_row(Join::None);
                     }
                     self.char(c, w);
                 }
@@ -257,7 +263,32 @@ impl Rows {
 /// Word-wraps `s` (which may carry ANSI styling) to `width` columns. Each `\n` starts a new row.
 /// Always returns at least one row.
 pub fn wrap(s: &str, width: usize) -> Vec<String> {
-    wrap_in(s, width, Vec::new())
+    wrap_marked(s, width).0
+}
+
+/// [`wrap`], plus each row's [`RowMeta`]: [`Join::Space`] where a break dropped spaces,
+/// [`Join::None`] inside a token wider than the row, [`Join::Newline`] at a line end. The prefix is
+/// always 0 (no decoration is added). The rows are exactly those of [`wrap`].
+pub fn wrap_marked(s: &str, width: usize) -> (Vec<String>, Vec<RowMeta>) {
+    let rows = wrap_in(s, width, Vec::new());
+    (rows.rows, metas(&rows.joins, 0))
+}
+
+/// `joins` as [`RowMeta`]s: the first row of each logical line gets prefix 0, continuation rows
+/// get `prefix`.
+fn metas(joins: &[Join], prefix: usize) -> Vec<RowMeta> {
+    let mut first = true;
+    joins
+        .iter()
+        .map(|&join| {
+            let meta = RowMeta {
+                prefix: if first { 0 } else { prefix },
+                join,
+            };
+            first = join == Join::Newline;
+            meta
+        })
+        .collect()
 }
 
 /// Hard-wraps one styled line at exactly `width` columns, keeping every character (spaces
@@ -266,25 +297,31 @@ pub fn wrap(s: &str, width: usize) -> Vec<String> {
 /// split into separate codes (rpi-tui 0.8.0's `wrap_text_with_ansi` replays `r`, `g` and `b` on
 /// to a continuation row as codes of their own, #2188). Always returns at least one row.
 pub fn hard_wrap(s: &str, width: usize) -> Vec<String> {
+    hard_wrap_marked(s, width).0
+}
+
+/// [`hard_wrap`], plus each row's [`RowMeta`]: every break is [`Join::None`] (no character is
+/// dropped, so the rows rejoin byte-exact) and the last row is [`Join::Newline`].
+pub fn hard_wrap_marked(s: &str, width: usize) -> (Vec<String>, Vec<RowMeta>) {
     let mut rows = Rows::new(width);
     for item in items(s) {
         match item {
             Item::Esc(e) => rows.esc(e),
             Item::Char(c, w) => {
                 if rows.cur_w > 0 && rows.cur_w + w > rows.width {
-                    rows.break_row();
+                    rows.break_row(Join::None);
                 }
                 rows.char(c, w);
             }
         }
     }
     rows.end_line();
-    rows.rows
+    (rows.rows, metas(&rows.joins, 0))
 }
 
 /// [`wrap`], for text that continues a row whose styling `active` is open: continuation rows
 /// re-open it too.
-fn wrap_in(s: &str, width: usize, active: Vec<String>) -> Vec<String> {
+fn wrap_in(s: &str, width: usize, active: Vec<String>) -> Rows {
     let mut rows = Rows::new(width);
     rows.active = active;
     for line in s.split('\n') {
@@ -326,7 +363,7 @@ fn wrap_in(s: &str, width: usize, active: Vec<String>) -> Vec<String> {
         }
         rows.end_line();
     }
-    rows.rows
+    rows
 }
 
 /// The SGR sequences still open at the end of `s`.
@@ -453,6 +490,12 @@ fn hang(plain: &str) -> Hang {
 /// Word-wraps one rendered row to `width`, with continuations hanging under the row's text: under
 /// a list item's text, behind a quote's borders, or at the row's indentation.
 pub fn reflow_row(row: &str, width: usize) -> Vec<String> {
+    reflow_row_marked(row, width).0
+}
+
+/// [`reflow_row`], plus each row's [`RowMeta`]: continuation rows carry the hanging indent or the
+/// repeated quote borders as their `prefix`, and joins are as in [`wrap_marked`].
+pub fn reflow_row_marked(row: &str, width: usize) -> (Vec<String>, Vec<RowMeta>) {
     let width = width.max(1);
     let plain_row = plain(row);
     let mut h = hang(&plain_row);
@@ -475,7 +518,10 @@ pub fn reflow_row(row: &str, width: usize) -> Vec<String> {
         " ".repeat(h.cols)
     };
     // The body continues whatever styling the head left open.
-    wrap_in(body, width - h.cols, head_style)
+    let wrapped = wrap_in(body, width - h.cols, head_style);
+    let meta = metas(&wrapped.joins, h.cols);
+    let rows = wrapped
+        .rows
         .into_iter()
         .enumerate()
         .map(|(i, part)| {
@@ -485,7 +531,54 @@ pub fn reflow_row(row: &str, width: usize) -> Vec<String> {
                 format!("{continuation}{part}")
             }
         })
-        .collect()
+        .collect();
+    (rows, meta)
+}
+
+/// The start of an amp-private APC that carries a row's [`RowMeta`] in band (rpi's
+/// `Component::render` returns only strings). Terminals ignore APCs, and [`plain`] and
+/// `rpi_tui::strip_ansi` drop it, so it has no width.
+const ROW_META_START: &str = "\x1b_amp:r;";
+
+/// Encodes `meta` as a zero-width APC, `\x1b_amp:r;{prefix};{s|n|-}\x07`. Append it to the **end**
+/// of a row, so prefix checks such as `Inset`'s `FLUSH_LEFT` still see the row's real start.
+pub fn encode_row_meta(meta: &RowMeta) -> String {
+    let join = match meta.join {
+        Join::Space => 's',
+        Join::Newline => 'n',
+        Join::None => '-',
+    };
+    format!("{ROW_META_START}{};{join}\x07", meta.prefix)
+}
+
+/// Removes the last row-meta marker from `row` and decodes it. A row with no marker (or a
+/// malformed one) comes back unchanged with `None`.
+pub fn take_row_meta(row: &str) -> (String, Option<RowMeta>) {
+    let Some(start) = row.rfind(ROW_META_START) else {
+        return (row.to_owned(), None);
+    };
+    let body_start = start + ROW_META_START.len();
+    let Some(len) = row[body_start..].find('\x07') else {
+        return (row.to_owned(), None);
+    };
+    let body = &row[body_start..body_start + len];
+    let parsed = body.split_once(';').and_then(|(prefix, join)| {
+        let prefix = prefix.parse::<usize>().ok()?;
+        let join = match join {
+            "s" => Join::Space,
+            "n" => Join::Newline,
+            "-" => Join::None,
+            _ => return None,
+        };
+        Some(RowMeta { prefix, join })
+    });
+    match parsed {
+        Some(meta) => {
+            let end = body_start + len + 1;
+            (format!("{}{}", &row[..start], &row[end..]), Some(meta))
+        }
+        None => (row.to_owned(), None),
+    }
 }
 
 #[cfg(test)]
@@ -587,5 +680,223 @@ mod tests {
             ("\x1b[1mab\x1b[0m", "cd")
         );
         assert_eq!(split_at_col("ab", 0), ("", "ab"));
+    }
+
+    fn joins(meta: &[RowMeta]) -> Vec<Join> {
+        meta.iter().map(|m| m.join).collect()
+    }
+
+    /// Rejoins marked rows into their source: skips each row's `prefix`, then joins by `join`.
+    fn rejoin(rows: &[String], meta: &[RowMeta]) -> String {
+        assert_eq!(rows.len(), meta.len());
+        let mut out = String::new();
+        for (row, m) in rows.iter().zip(meta) {
+            let text = plain(split_at_col(row, m.prefix).1);
+            out.push_str(&text);
+            match m.join {
+                Join::Newline => out.push('\n'),
+                Join::Space => out.push(' '),
+                Join::None => {}
+            }
+        }
+        out.pop(); // the last row's line end
+        out
+    }
+
+    #[test]
+    fn marked_variants_return_the_same_rows() {
+        for (s, w) in [
+            ("one two three four five", 9),
+            ("see https://example.com/a/very/long/path ok", 12),
+            ("\x1b[1mbold words here\x1b[0m done", 10),
+            ("a\n\nb", 5),
+            ("  alpha beta gamma", 12),
+        ] {
+            let (rows, meta) = wrap_marked(s, w);
+            assert_eq!(rows, wrap(s, w));
+            assert_eq!(rows.len(), meta.len());
+            let (rows, meta) = hard_wrap_marked(s, w);
+            assert_eq!(rows, hard_wrap(s, w));
+            assert_eq!(rows.len(), meta.len());
+        }
+        for (r, w) in [
+            ("   • alpha beta gamma delta", 16),
+            ("  │ alpha beta gamma", 14),
+        ] {
+            let (rows, meta) = reflow_row_marked(r, w);
+            assert_eq!(rows, reflow_row(r, w));
+            assert_eq!(rows.len(), meta.len());
+        }
+    }
+
+    #[test]
+    fn word_breaks_join_with_a_space() {
+        let (rows, meta) = wrap_marked("alpha beta gamma", 11);
+        assert_eq!(plain_rows(&rows), ["alpha beta", "gamma"]);
+        assert_eq!(joins(&meta), [Join::Space, Join::Newline]);
+        assert!(meta.iter().all(|m| m.prefix == 0));
+        assert_eq!(rejoin(&rows, &meta), "alpha beta gamma");
+    }
+
+    #[test]
+    fn hard_wrap_joins_with_nothing_and_rejoins_byte_exact() {
+        let (rows, meta) = hard_wrap_marked("abcdefghij", 4);
+        assert_eq!(joins(&meta), [Join::None, Join::None, Join::Newline]);
+        assert_eq!(rejoin(&rows, &meta), "abcdefghij");
+        let code = "    let  x =  1;   // two  spaces ";
+        let (rows, meta) = hard_wrap_marked(code, 7);
+        assert_eq!(rejoin(&rows, &meta), code);
+    }
+
+    #[test]
+    fn a_long_token_breaks_with_no_join() {
+        let s = "see https://example.com/a/very/long/path ok";
+        let (rows, meta) = wrap_marked(s, 12);
+        assert_eq!(
+            joins(&meta),
+            [
+                Join::Space,
+                Join::None,
+                Join::None,
+                Join::Space,
+                Join::Newline
+            ]
+        );
+        assert_eq!(rejoin(&rows, &meta), s);
+    }
+
+    #[test]
+    fn line_ends_and_blank_lines_join_with_newlines() {
+        let s = "first line wraps here\n\nsecond";
+        let (rows, meta) = wrap_marked(s, 10);
+        assert_eq!(rejoin(&rows, &meta), s);
+        assert_eq!(meta.last().map(|m| m.join), Some(Join::Newline));
+    }
+
+    #[test]
+    fn styled_text_rejoins_to_its_plain_source() {
+        let (rows, meta) = wrap_marked("\x1b[1mbold words here\x1b[0m done", 10);
+        assert_eq!(joins(&meta), [Join::Space, Join::Newline]);
+        assert_eq!(rejoin(&rows, &meta), "bold words here done");
+    }
+
+    #[test]
+    fn an_indent_only_row_rejoins_with_nothing() {
+        let (rows, meta) = wrap_marked("      abcdefgh", 8);
+        assert_eq!(plain_rows(&rows), ["      ", "abcdefgh"]);
+        assert_eq!(joins(&meta), [Join::None, Join::Newline]);
+        assert_eq!(rejoin(&rows, &meta), "      abcdefgh");
+    }
+
+    #[test]
+    fn several_spaces_at_a_break_come_back_as_one() {
+        // Known, accepted loss (#3652 review): the dropped run is not stored.
+        let (rows, meta) = wrap_marked("alpha    beta", 7);
+        assert_eq!(rejoin(&rows, &meta), "alpha beta");
+    }
+
+    #[test]
+    fn wide_glyphs_rejoin_exactly() {
+        let s = "日本語 です 🎉🎉 ok";
+        let (rows, meta) = wrap_marked(s, 6);
+        assert_eq!(plain_rows(&rows), ["日本語", "です", "🎉🎉", "ok"]);
+        assert_eq!(rejoin(&rows, &meta), s);
+        // A CJK run wider than the row breaks inside, between glyphs.
+        let s = "日本語日本語日本語";
+        let (rows, meta) = wrap_marked(s, 5);
+        assert_eq!(plain_rows(&rows), ["日本", "語日", "本語", "日本", "語"]);
+        assert!(meta[..4].iter().all(|m| m.join == Join::None));
+        assert_eq!(rejoin(&rows, &meta), s);
+        let s = "e\u{301}e\u{301}e\u{301}";
+        let (rows, meta) = hard_wrap_marked(s, 2);
+        assert_eq!(rejoin(&rows, &meta), s);
+    }
+
+    #[test]
+    fn reflowed_list_continuations_carry_the_hang_as_prefix() {
+        let (rows, meta) = reflow_row_marked("• one two three four", 10);
+        assert_eq!(plain_rows(&rows), ["• one two", "  three", "  four"]);
+        assert_eq!(
+            meta[0],
+            RowMeta {
+                prefix: 0,
+                join: Join::Space
+            }
+        );
+        assert_eq!(
+            meta[1],
+            RowMeta {
+                prefix: 2,
+                join: Join::Space
+            }
+        );
+        assert_eq!(
+            meta[2],
+            RowMeta {
+                prefix: 2,
+                join: Join::Newline
+            }
+        );
+        assert_eq!(rejoin(&rows, &meta), "• one two three four");
+        let (rows, meta) = reflow_row_marked(" 12. alpha beta gamma", 14);
+        assert!(meta[1..].iter().all(|m| m.prefix == 5));
+        assert_eq!(rejoin(&rows, &meta), " 12. alpha beta gamma");
+    }
+
+    #[test]
+    fn reflowed_quote_continuations_skip_the_repeated_borders() {
+        let (rows, meta) = reflow_row_marked("│ alpha beta gamma", 12);
+        assert_eq!(plain_rows(&rows), ["│ alpha beta", "│ gamma"]);
+        assert_eq!(meta[1].prefix, 2);
+        assert_eq!(rejoin(&rows, &meta), "│ alpha beta gamma");
+        let (rows, meta) = reflow_row_marked("  │ │ \x1b[3mone two three\x1b[0m", 14);
+        assert!(meta[1..].iter().all(|m| m.prefix == 6));
+        assert_eq!(rejoin(&rows, &meta), "  │ │ one two three");
+    }
+
+    #[test]
+    fn row_meta_marker_round_trips_and_has_no_width() {
+        for meta in [
+            RowMeta {
+                prefix: 0,
+                join: Join::Newline,
+            },
+            RowMeta {
+                prefix: 2,
+                join: Join::Space,
+            },
+            RowMeta {
+                prefix: 17,
+                join: Join::None,
+            },
+        ] {
+            let row = "\x1b[1m日本 text\x1b[0m";
+            let marked = format!("{row}{}", encode_row_meta(&meta));
+            assert_eq!(take_row_meta(&marked), (row.to_owned(), Some(meta)));
+            assert_eq!(plain(&marked), plain(row));
+            assert_eq!(rpi_tui::strip_ansi(&marked), rpi_tui::strip_ansi(row));
+            assert_eq!(rpi_tui::visible_width(&marked), rpi_tui::visible_width(row));
+            assert_eq!(split_at_col(&marked, 2).0, "\x1b[1m日");
+        }
+        // The marker sits at the end, so a FLUSH_LEFT row still starts with it.
+        let flush = format!(
+            "{}https://a{}",
+            crate::inset::FLUSH_LEFT,
+            encode_row_meta(&RowMeta::default())
+        );
+        assert!(flush.starts_with(crate::inset::FLUSH_LEFT));
+        assert_eq!(take_row_meta(&flush).1, Some(RowMeta::default()));
+    }
+
+    #[test]
+    fn rows_without_a_valid_marker_are_unchanged() {
+        assert_eq!(take_row_meta("plain row"), ("plain row".to_owned(), None));
+        for bad in [
+            "a\x1b_amp:r;x;s\x07",
+            "a\x1b_amp:r;2;q\x07",
+            "a\x1b_amp:r;2;s",
+        ] {
+            assert_eq!(take_row_meta(bad), (bad.to_owned(), None));
+        }
     }
 }
