@@ -376,6 +376,29 @@ pub fn plain(s: &str) -> String {
         .collect()
 }
 
+/// How a rendered row continues into the next row, so selected text can be rejoined
+/// (select-to-copy, story #580).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Join {
+    /// A real line end: rejoin with `"\n"`.
+    #[default]
+    Newline,
+    /// A word-wrap break whose spaces were dropped: rejoin with one `" "`.
+    Space,
+    /// A break inside a token or a hard-wrapped (code) row: rejoin with nothing.
+    None,
+}
+
+/// Per-row copy metadata: the decoration columns a continuation row starts with (hanging list
+/// indent, repeated quote borders) and how the row continues into the next one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RowMeta {
+    /// Columns of decoration to skip when a selection starts inside them on a row after the first.
+    pub prefix: usize,
+    /// How this row continues into the next row.
+    pub join: Join,
+}
+
 /// How a row's continuation lines are indented.
 #[derive(Debug, PartialEq)]
 struct Hang {

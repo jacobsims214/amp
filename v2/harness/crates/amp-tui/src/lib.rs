@@ -70,6 +70,7 @@ pub mod remote;
 pub mod remote_ui;
 pub mod roster;
 pub mod scroll;
+pub mod selection;
 pub mod shell;
 pub mod slash;
 pub mod table;
