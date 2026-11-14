@@ -29,6 +29,9 @@ import { isNoUserError, noMyWorkReason } from '../lib/myWorkAccess'
 import { MyWorkLoadError, MyWorkUnavailable } from '../components/human/MyWorkUnavailable'
 import { Markdown } from '../components/ui/Markdown'
 import { GetStarted } from '../components/GetStarted'
+import { TeamInboxSummary } from '../components/requests/TeamInboxSummary'
+import { ClaimedRequests } from '../components/requests/ClaimedRequests'
+import { useTeamInboxes } from '../hooks/useTeamInboxes'
 
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone
 const ymd = (d: Date) => d.toLocaleDateString('en-CA', { timeZone: TZ })
@@ -258,6 +261,11 @@ export function MyWork() {
 
   const counts = work?.counts ?? ZERO
   const cards = work?.projects ?? []
+  // The two team-inbox panels (AMP #3983): one read per team the viewer is on,
+  // answering both the shared queue's counts and the viewer's own slice. A
+  // person on no team gets neither panel — there is no queue to describe.
+  const teamInboxes = useTeamInboxes(me, authLoading)
+  const hasTeams = (me?.teams ?? []).length > 0
   // The find box narrows the lists below, not the counts above: those stay the server's.
   // A project that matches by name or code keeps all its rows; otherwise only matching rows.
   const narrow = (p: ProjectWait): ProjectWait | null => {
@@ -305,7 +313,7 @@ export function MyWork() {
   return (
     <div className="flex flex-col min-h-full">
       <PageHeader crumb="Overview" title="My work"
-        meta="A summary across your projects. Each row opens the item in that project's My work." />
+        meta="A summary across your projects — and the team queues you belong to. Team requests are shared: they never become your personal tickets unless you claim one." />
       <div className="p-4 sm:p-7 sm:pt-5 grid gap-4">
         {/* No AMP user (sign-in off): the checklist still guides a first run (#128). */}
         {noWork === 'local-dev' && <GetStarted who="local-dev" />}
@@ -386,6 +394,11 @@ export function MyWork() {
                 </>
               )}
 
+              {/* The personal half (AMP #3983): only what I claimed or was
+                  assigned, from the server's deduped `mine` union. It sits under
+                  the project cards, as approved mockup 37 v1 view 3 draws it. */}
+              {hasTeams && <ClaimedRequests inboxes={teamInboxes.inboxes} loading={teamInboxes.loading} />}
+
               {(comingOnly.length > 0 || clear.length > 0) && <>
                 <SectionRule>{waitingCards.length ? 'Nothing waiting on you' : 'Your projects'}</SectionRule>
                 <div className="amp-panel">
@@ -412,6 +425,8 @@ export function MyWork() {
             </section>
 
             <aside className="grid gap-4 min-w-0">
+              {hasTeams && <TeamInboxSummary inboxes={teamInboxes.inboxes} loading={teamInboxes.loading} />}
+
               <Panel label="Your agents" right={<span>{agentsTotal} running</span>}>
                 {agentsByProject.size === 0
                   ? <p className="m-0 px-4 py-3.5 text-[13px] text-ink-2">Nothing running. When your harness dispatches one of your tickets, it shows up here.</p>
