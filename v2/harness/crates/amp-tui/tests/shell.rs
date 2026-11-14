@@ -89,6 +89,8 @@ impl Rig {
             .drive_until_idle(&mut self.events, &mut self.done, WAIT)
             .await
             .expect("idle");
+        // `/compact` (AMP #4222) reports back through the shell's command queue.
+        self.shell.settle(WAIT).await.expect("settled");
     }
 
     fn screen(&self) -> String {
@@ -285,4 +287,115 @@ async fn narrow_terminals_still_render_a_full_frame() {
             "{w}x{h}: {lines:#?}"
         );
     }
+}
+
+/// The rendered frame as one line of words: box edges and wrapping gone.
+fn flat(rig: &Rig) -> String {
+    rig.shell
+        .view()
+        .render_plain(W, 80)
+        .iter()
+        .map(|l| l.trim().trim_matches('│').trim())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// AMP #4226 (spec E1, review #3881): `/usage` says when rpi compacts on its own (window −
+/// reserve), what it keeps, how long the summary may be, and how many compactions this session
+/// had, by reason; the trigger estimate is its own line, apart from the measured context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_shows_compaction_threshold_and_count() {
+    let mut rig = rig(vec![
+        FauxStep::text("first answer"),
+        FauxStep::text("SUMMARY-OF-EARLIER-TURNS"),
+    ])
+    .await;
+    // Before any reply: no compaction yet, and the estimate leaves out the system prompt.
+    rig.say("/usage").await;
+    let screen = flat(&rig);
+    // Defaults: reserve 16 384 of a 200 000 window; keep 20 000; summary 0.8 × reserve.
+    let window = amp_tui::footer::format_tokens(200_000);
+    let trigger = amp_tui::footer::format_tokens(200_000 - 16_384);
+    assert!(
+        screen.contains(&format!(
+            "auto-compaction: on · triggers at ~{trigger} of {window}"
+        )),
+        "{screen}"
+    );
+    assert!(
+        screen.contains(&format!(
+            "keeps ~{} recent",
+            amp_tui::footer::format_tokens(20_000)
+        )),
+        "{screen}"
+    );
+    assert!(
+        screen.contains(&format!(
+            "summary ≤ {}",
+            amp_tui::footer::format_tokens(13_107)
+        )),
+        "{screen}"
+    );
+    assert!(screen.contains("0 this session"), "{screen}");
+    assert!(
+        screen.contains("excludes system prompt and tools"),
+        "{screen}"
+    );
+
+    rig.say("hello").await;
+    rig.say("/compact").await;
+    assert!(rig.screen().contains("compacted: ~"), "{}", rig.screen());
+    rig.say("/usage").await;
+    let screen = flat(&rig);
+    assert!(
+        screen.contains("1 this session (1 manual, 0 automatic)"),
+        "{screen}"
+    );
+    assert!(screen.contains("trigger estimate: ~"), "{screen}");
+}
+
+/// AMP #4226 (spec E2/E3): right after a completed `/compact` the footer's context is the
+/// summary + kept tail estimate, below the figure before it and not the stale usage the kept
+/// tail still carries; the remote status's figure follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn footer_context_drops_after_compaction() {
+    // The faux provider reports chars/4 of the request as its usage, so long prompts make a
+    // large context. rpi keeps at least `keep_recent_tokens` (20k): the ~25k second turn and
+    // the short third are the kept tail, and the third reply still carries the large (stale)
+    // usage; the ~75k first turn becomes the summary.
+    let mut rig = rig(vec![
+        FauxStep::text("first answer"),
+        FauxStep::text("second answer"),
+        FauxStep::text("third answer"),
+        FauxStep::text("SUMMARY-OF-EARLIER-TURNS"),
+    ])
+    .await;
+    rig.say(&"lots of earlier context ".repeat(12_500)).await;
+    rig.say(&"some recent context ".repeat(5_000)).await;
+    rig.say("short follow-up").await;
+    let stale = rig.shell.view().footer().context().expect("ctx").tokens;
+    assert!(stale > 90_000, "{stale}");
+    let before_label = amp_tui::footer::context_label(stale as f64 / 2_000.0);
+    assert!(flat(&rig).contains(&before_label), "{}", flat(&rig));
+
+    rig.say("/compact").await;
+    assert!(flat(&rig).contains("compacted: ~"), "{}", flat(&rig));
+    let after = rig.shell.view().footer().context().expect("ctx").tokens;
+    assert!(
+        after < stale,
+        "after {after} before {stale}: {}",
+        flat(&rig)
+    );
+    assert_ne!(after, stale);
+    assert!(after < stale / 2, "the summary and the kept tail: {after}");
+    assert_eq!(rig.shell.totals().context_tokens, after);
+    assert!(!flat(&rig).contains(&before_label), "{}", flat(&rig));
+
+    // A declined compaction (the leaf is already one) leaves the footer as it was.
+    rig.say("/compact").await;
+    assert!(flat(&rig).contains("nothing to compact"), "{}", flat(&rig));
+    assert_eq!(rig.shell.view().footer().context().unwrap().tokens, after);
 }

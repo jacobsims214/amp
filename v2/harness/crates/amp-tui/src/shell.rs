@@ -170,6 +170,10 @@ enum ShellMsg {
     /// `/compact` finished (AMP #4222): its own message, never `done_tx`, so it writes no
     /// `RunEnd` to the remote feed and drains nothing as a model reply would.
     Compacted(Box<CompactDone>),
+    /// An automatic compaction's entry, looked up once its progress ended (AMP #4226, spec E3):
+    /// `None` when none landed (it failed or freed nothing to persist). Not counted in
+    /// `in_flight`.
+    CompactionLanded(Option<LandedCompaction>),
     /// `/sessions` scanned this directory's saved chats (AMP #3010).
     Sessions(Result<SessionList, String>),
     /// A confirmed resume finished: the harness switched to that session, or why it refused.
@@ -993,6 +997,207 @@ pub(crate) fn compacted_context_tokens(
     estimate_tokens(&summary) + entry.retained_tail.iter().map(estimate_tokens).sum::<i64>()
 }
 
+/// What the shell knows about this chat's compactions (AMP #4226). The footer and `/usage`
+/// read it; #4263's notices (compaction failed / skipped / freed nothing) build on it.
+#[derive(Debug, Default)]
+struct CompactionTrack {
+    /// When the running compaction's progress started (ms since the epoch): an entry older
+    /// than this is an earlier compaction, not the one that just ended.
+    started_ms: Option<i64>,
+    /// The latest compaction entry whose estimate the footer was set to.
+    applied: Option<String>,
+    /// The latest completed compaction (any reason): before and after, estimated.
+    last: Option<LandedCompaction>,
+}
+
+/// A compaction entry that landed on the branch, with E2's estimate of the context after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LandedCompaction {
+    pub(crate) entry_id: String,
+    pub(crate) tokens_before: i64,
+    pub(crate) after: i64,
+    /// The footer's context tokens when the progress ended: the estimate replaces them only
+    /// if no reply reported a newer figure meanwhile.
+    pub(crate) footer_at_end: Option<i64>,
+}
+
+impl LandedCompaction {
+    fn of(
+        entry: &rpi_harness::session::types::CompactionEntry,
+        footer_at_end: Option<i64>,
+    ) -> Self {
+        Self {
+            entry_id: entry.base.id.clone(),
+            tokens_before: entry.tokens_before,
+            after: compacted_context_tokens(entry),
+            footer_at_end,
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// How long the lookup for an automatic compaction's entry keeps trying: rpi drops the progress
+/// guard before it persists the entry, so the entry lands shortly after `active:false`.
+const LANDED_TRIES: u32 = 20;
+const LANDED_EVERY: Duration = Duration::from_millis(25);
+
+/// The newest compaction entry on the branch that is at least as new as `since_ms`, waiting a
+/// bounded time ([`LANDED_TRIES`] x [`LANDED_EVERY`]) for it to be persisted.
+async fn landed_compaction(
+    harness: &AgentHarness,
+    since_ms: i64,
+    footer_at_end: Option<i64>,
+) -> Option<LandedCompaction> {
+    use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery};
+    let query = EntryQuery {
+        entry_type: Some("compaction"),
+        order: Some(EntryOrder::NewestFirst),
+        limit: Some(1),
+        ..Default::default()
+    };
+    for _ in 0..LANDED_TRIES {
+        if let Ok(found) = harness
+            .find_entries_on_branch(&query, &BranchBounds::default())
+            .await
+            && let Some(rpi_harness::session::types::Entry::Compaction(c)) =
+                found.into_iter().next()
+            && c.base.timestamp >= since_ms
+        {
+            return Some(LandedCompaction::of(&c, footer_at_end));
+        }
+        tokio::time::sleep(LANDED_EVERY).await;
+    }
+    None
+}
+
+/// The compactions on this chat's branch, by reason, and E1's trigger estimate.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BranchCompactions {
+    manual: usize,
+    automatic: usize,
+    /// rpi's own trigger figure for the branch (`estimate_context_tokens`), and whether it
+    /// includes a reported usage (without one it is chars/4 over the messages only, which
+    /// leaves out the system prompt and the tools).
+    estimate: i64,
+    measured: bool,
+}
+
+/// Counts the compaction entries on the branch (spec E1). Source: `Entry::Compaction` on the
+/// branch, not the live progress events, so the count survives `/sessions` resume and a
+/// restart, and counts only compactions that completed. The reason (manual vs automatic) is on
+/// the `step_attempt` record rpi writes after each entry; an entry without one counts as
+/// automatic.
+async fn branch_compactions(harness: &AgentHarness) -> BranchCompactions {
+    use rpi_harness::session::types::{
+        BranchBounds, CompactionReason, EntryOrder, EntryQuery, LaneRecord, RecordQuery,
+    };
+    let query = EntryQuery {
+        order: Some(EntryOrder::OldestFirst),
+        ..Default::default()
+    };
+    let path = harness
+        .find_entries_on_branch(&query, &BranchBounds::default())
+        .await
+        .unwrap_or_default();
+    let manual: std::collections::HashSet<String> = harness
+        .session()
+        .find_records(&RecordQuery {
+            record_type: Some("step_attempt"),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| match r {
+            LaneRecord::StepAttempt(a) if a.compaction_reason == Some(CompactionReason::Manual) => {
+                Some(a.result_entry_id)
+            }
+            _ => None,
+        })
+        .collect();
+    let mut out = BranchCompactions::default();
+    for e in &path {
+        if let rpi_harness::session::types::Entry::Compaction(c) = e {
+            if manual.contains(&c.base.id) {
+                out.manual += 1;
+            } else {
+                out.automatic += 1;
+            }
+        }
+    }
+    let ctx = rpi_harness::session::context::build_session_context(
+        &path,
+        &rpi_harness::session::context::SessionContextBuildOptions::default(),
+    );
+    let est = rpi_harness::compaction::estimate_context_tokens(&ctx.messages);
+    out.estimate = est.tokens;
+    out.measured = est.last_usage_index.is_some();
+    out
+}
+
+/// `/usage`'s compaction lines (spec E1, review #3881): when rpi compacts on its own, what it
+/// keeps and how long the summary may be, how many compactions this session has, and rpi's
+/// trigger estimate, apart from the measured context on the line above.
+fn compaction_lines(
+    settings: rpi_harness::types::CompactionSettings,
+    window: i64,
+    max_output: u64,
+    branch: BranchCompactions,
+) -> String {
+    use crate::footer::format_tokens as tok;
+    let n = branch.manual + branch.automatic;
+    let count = if n == 0 {
+        "0 this session".to_owned()
+    } else {
+        format!(
+            "{n} this session ({} manual, {} automatic)",
+            branch.manual, branch.automatic
+        )
+    };
+    let mut line = if !settings.enabled {
+        format!("auto-compaction: off · /compact still works · {count}")
+    } else {
+        let summary = {
+            let budget = (settings.reserve_tokens.max(0) as f64 * 0.8).floor() as u64;
+            if max_output > 0 {
+                budget.min(max_output)
+            } else {
+                budget
+            }
+        };
+        let trigger = if window > 0 {
+            format!(
+                "triggers at ~{} of {}",
+                tok(window - settings.reserve_tokens),
+                tok(window)
+            )
+        } else {
+            "triggers at window − ".to_owned() + &tok(settings.reserve_tokens) + " (window unknown)"
+        };
+        format!(
+            "auto-compaction: on · {trigger} · keeps ~{} recent · summary ≤ {} · {count}",
+            tok(settings.keep_recent_tokens),
+            tok(summary as i64),
+        )
+    };
+    line.push_str(&format!(
+        "\ntrigger estimate: ~{} tokens{}",
+        tok(branch.estimate),
+        if branch.measured {
+            ""
+        } else {
+            " (excludes system prompt and tools)"
+        }
+    ));
+    line
+}
+
 /// O1's notice. Compaction is lossy, so it never promises every detail is kept; without a
 /// session file (D1) it doesn't claim the full history is saved.
 fn compacted_notice(before: i64, after: i64, saved: bool) -> String {
@@ -1160,6 +1365,8 @@ pub struct Shell {
     compacting: bool,
     /// A `/sessions` resume is in flight (spec B3): `/compact` waits for it.
     resuming: bool,
+    /// Compaction bookkeeping for the footer and `/usage` (AMP #4226).
+    compaction: CompactionTrack,
 }
 
 /// A tool call whose arguments are still streaming (#2384).
@@ -1261,6 +1468,7 @@ impl Shell {
                 end_seen_at: None,
                 quitting: false,
                 compacting: false,
+                compaction: CompactionTrack::default(),
                 resuming: false,
             },
             done_rx,
@@ -2753,8 +2961,10 @@ impl Shell {
             .map_or(ABORT_GRACE, |s| s.config().abort_grace + REPORT_ALLOWANCE)
     }
 
+    /// Nothing still running: no reply, no compaction (it was asked to stop and reports back,
+    /// AMP #4226 / wave check #4223), no live worker.
     fn settled(&self) -> bool {
-        !self.running && self.live_tickets().is_empty()
+        !self.running && !self.compacting && self.live_tickets().is_empty()
     }
 
     /// Winds the session down before the process exits. With workers live: cancel them all,
@@ -2837,7 +3047,12 @@ impl Shell {
                     self.release_unfinished("the chat quit before its worker stopped", &mut repaint).await;
                     return QuitOutcome::TimedOut;
                 }
-                _ = ticker.tick() => {}
+                _ = ticker.tick() => {
+                    // A stopped compaction reports back through the message queue.
+                    if self.compacting {
+                        self.poll();
+                    }
+                }
             }
         }
     }
@@ -3717,7 +3932,9 @@ impl Shell {
                         self.view.add_notice("compacted the context");
                         return self.after_compaction();
                     };
-                    let after = compacted_context_tokens(c);
+                    let landed = LandedCompaction::of(c, None);
+                    let after = landed.after;
+                    self.apply_landed(landed);
                     self.view.add_notice(&compacted_notice(
                         c.tokens_before,
                         after,
@@ -3755,6 +3972,42 @@ impl Shell {
             )),
         }
         self.after_compaction();
+    }
+
+    /// A completed compaction (spec E3): the footer's context drops to E2's estimate at once,
+    /// and the remote `context_pct` with it; the next reply's reported usage replaces it.
+    /// Only after a *completed* one: Declined/Failed leave the footer as it was.
+    fn apply_landed(&mut self, landed: LandedCompaction) {
+        if self.compaction.applied.as_deref() == Some(landed.entry_id.as_str()) {
+            return;
+        }
+        self.compaction.applied = Some(landed.entry_id.clone());
+        self.view.footer().set_context_tokens(Some(landed.after));
+        self.totals.context_tokens = landed.after;
+        self.compaction.last = Some(landed);
+        self.refresh_remote_status();
+    }
+
+    /// An automatic compaction's progress ended: look up whether its entry landed (bounded),
+    /// off the event loop. A manual one is applied by [`Shell::finish_compaction`].
+    fn compaction_progress(&mut self, active: bool, manual: bool) {
+        if active {
+            self.compaction.started_ms = Some(now_ms());
+            return;
+        }
+        let Some(since) = self.compaction.started_ms.take() else {
+            return;
+        };
+        if manual {
+            return;
+        }
+        let footer_at_end = self.view.footer().context().map(|c| c.tokens);
+        let harness = Arc::clone(&self.harness);
+        let tx = self.msgs_tx.clone();
+        tokio::spawn(async move {
+            let landed = landed_compaction(&harness, since, footer_at_end).await;
+            let _ = tx.send(ShellMsg::CompactionLanded(landed));
+        });
     }
 
     /// After `/compact` ended, however it ended: a reload asked for meanwhile runs, then the
@@ -4044,7 +4297,11 @@ impl Shell {
                     .mouse_capture(self.mouse_capture)
                     .newline(self.newline),
             )),
-            "usage" => self.view.add_notice(&self.usage_text()),
+            "usage" => {
+                let branch = branch_compactions(&self.harness).await;
+                let text = format!("{}\n{}", self.usage_text(), self.compaction_text(branch));
+                self.view.add_notice(&text)
+            }
             "compact" => self.compact_command(arg),
             "model" if arg.is_empty() => self.model_picker(),
             // `/model provider/model` switches this chat; `/model roles`, `/model <role> …` are a
@@ -4650,6 +4907,16 @@ impl Shell {
             }
             if let ShellMsg::Compaction { active, manual } = &msg {
                 self.view.set_compaction(*active, *manual);
+                self.compaction_progress(*active, *manual);
+                continue;
+            }
+            if let ShellMsg::CompactionLanded(landed) = msg {
+                // Only if no reply reported a newer context since the compaction ended.
+                if let Some(l) = landed
+                    && self.view.footer().context().map(|c| c.tokens) == l.footer_at_end
+                {
+                    self.apply_landed(l);
+                }
                 continue;
             }
             if let ShellMsg::ReloadRequest = &msg {
@@ -4732,6 +4999,7 @@ impl Shell {
                 | ShellMsg::ReloadRequest
                 | ShellMsg::Remote(_)
                 | ShellMsg::ProjectLinked(_)
+                | ShellMsg::CompactionLanded(_)
                 | ShellMsg::Compaction { .. } => {}
                 ShellMsg::Answered { ticket, result } => match result {
                     Ok(_) => {
@@ -4873,6 +5141,21 @@ impl Shell {
                 .session_file
                 .as_deref()
                 .unwrap_or("in memory (not saved)"),
+        )
+    }
+
+    /// `/usage`'s compaction lines for this chat's harness and model ([`compaction_lines`]).
+    fn compaction_text(&self, branch: BranchCompactions) -> String {
+        let max_output = self
+            .models
+            .iter()
+            .find(|m| m.reference == self.info.model_ref())
+            .map_or(0, |m| m.model.max_tokens);
+        compaction_lines(
+            self.harness.compaction_settings(),
+            self.info.context_window as i64,
+            max_output,
+            branch,
         )
     }
 
