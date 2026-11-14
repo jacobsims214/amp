@@ -46,6 +46,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -183,6 +184,26 @@ func newReadsWorld(t *testing.T) *readsWorld {
 	mux := http.NewServeMux()
 	h := api.NewRestHandler(nil, repo, nil, nil)
 	w.svc = h.Service()
+	// Raise this world's submission quota at the source, so every suite built
+	// on this constructor inherits it.
+	//
+	// The limiter is package-shared by default (service.defaultRequestLimits, so
+	// the REST and MCP listeners count one budget), and its key is
+	// (org, team, submitter, source) — three ids and a constant. Ids restart at 1
+	// in every scratch database, so every world's first org, first team and first
+	// customer share one bucket: this constructor's submissions (plus each case's
+	// freshRequest calls) compete for a single 30-a-minute budget with every other
+	// suite in the binary. An integrated `go test ./cmd/server` run then fails
+	// intermittently with `too many submissions` on the fixture's own submissions —
+	// a property of the fixture, not of the routes under test (#3976's review saw
+	// three suites fail 1 run in 3 this way; #3974 gotcha 4, #3973).
+	//
+	// A budget no test here can reach fixes it once, in the constructor, instead of
+	// in each case. This weakens no rate-limit coverage: the limiter's own
+	// behaviour is proven in internal/service/request_limits_test.go, and the
+	// submission routes' 429 test injects its own small limiter
+	// (request_submit_surface_test.go), so it never reads this world's Service.
+	w.svc.RequestLimits = service.NewRequestLimiter(service.RequestLimitConfig{Window: time.Minute, Max: 10000})
 	h.Register(mux)
 	w.srv = httptest.NewServer(auth.NewAPITokenVerifier(repo).Middleware(mux))
 	t.Cleanup(w.srv.Close)
