@@ -4460,7 +4460,16 @@ impl Shell {
             )),
             "usage" => {
                 let branch = branch_compactions(&self.harness).await;
-                let text = format!("{}\n{}", self.usage_text(), self.compaction_text(branch));
+                // The live model, role caps applied (#4276, spec S1/I9): rpi budgets the summary
+                // with this model's `max_tokens`, not the uncapped `/model` choice.
+                let max_output = AgentLane::get_model(&*self.harness)
+                    .await
+                    .map_or(0, |m| m.max_tokens);
+                let text = format!(
+                    "{}\n{}",
+                    self.usage_text(),
+                    self.compaction_text(max_output, branch)
+                );
                 self.view.add_notice(&text)
             }
             "compact" => self.compact_command(arg),
@@ -5306,12 +5315,8 @@ impl Shell {
     }
 
     /// `/usage`'s compaction lines for this chat's harness and model ([`compaction_lines`]).
-    fn compaction_text(&self, branch: BranchCompactions) -> String {
-        let max_output = self
-            .models
-            .iter()
-            .find(|m| m.reference == self.info.model_ref())
-            .map_or(0, |m| m.model.max_tokens);
+    /// `max_output`: the live harness model's `max_tokens` (role caps applied); 0 if unknown.
+    fn compaction_text(&self, max_output: u64, branch: BranchCompactions) -> String {
         compaction_lines(
             self.harness.compaction_settings(),
             self.info.context_window as i64,

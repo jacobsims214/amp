@@ -1477,3 +1477,51 @@ async fn model_switches_keep_the_role_caps() {
     assert_eq!((now.context_window, now.max_tokens), (400_000, 64_000));
     assert_eq!(rig.shell.info().context_window, 400_000);
 }
+
+/// AMP #4276 (spec S1, I9): `/usage`'s summary budget is min(0.8 × reserve, O) with O the
+/// role-capped `max_tokens` the harness runs on, not the uncapped `/model` choice's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_summary_budget_uses_the_role_capped_max_tokens() {
+    use amp_core::models::RoleCaps;
+    use rpi_harness::agent_harness::AgentLane;
+
+    let mut rig = rig(Vec::new(), false).await;
+    let mut model = AgentLane::get_model(&*rig.harness).await.unwrap();
+    model.id = "faux-roomy".into();
+    model.max_tokens = 32_000;
+    let reference = format!("{}/{}", model.provider, model.id);
+    let info = rig.shell.info().clone();
+    let (shell, done) = Shell::new(
+        Arc::clone(&rig.harness),
+        info,
+        vec![amp_tui::ModelChoice {
+            reference: reference.clone(),
+            model,
+        }],
+    );
+    rig.shell = shell;
+    rig.done = done;
+    rig.shell.set_role_caps(RoleCaps {
+        context_window: None,
+        max_tokens: Some(8_000),
+    });
+    rig.say(&format!("/model {reference}")).await;
+    assert_eq!(
+        AgentLane::get_model(&*rig.harness)
+            .await
+            .unwrap()
+            .max_tokens,
+        8_000
+    );
+
+    rig.say("/usage").await;
+    let screen = rig
+        .screen()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let capped = format!("summary ≤ {}", amp_tui::footer::format_tokens(8_000));
+    let uncapped = format!("summary ≤ {}", amp_tui::footer::format_tokens(13_107));
+    assert!(screen.contains(&capped), "{screen}");
+    assert!(!screen.contains(&uncapped), "{screen}");
+}
