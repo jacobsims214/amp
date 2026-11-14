@@ -539,6 +539,22 @@ func NormalizeRequestEventAction(s string) (RequestEventAction, error) {
 	return a, nil
 }
 
+// NormalizeRequestLinkKind validates a link kind on its own, against the closed
+// set 055's CHECK enforces. It exists for the READS: a caller filtering a
+// request's lineage by kind names one kind and no target, so there is no pair to
+// check — and refusing an unknown word here is what keeps a typo'd filter from
+// answering an empty list that reads as "this request has nothing" (AMP #4272).
+//
+// It shares requestLinkTargets with NormalizeRequestLink rather than a second
+// list, so a kind added to the matrix is accepted here without another edit.
+func NormalizeRequestLinkKind(s string) (RequestLinkKind, error) {
+	k := RequestLinkKind(strings.ToLower(strings.TrimSpace(s)))
+	if _, ok := requestLinkTargets[k]; !ok {
+		return "", fmt.Errorf("link kind must be one of %s", requestNames(RequestLinkKinds))
+	}
+	return k, nil
+}
+
 // NormalizeRequestLink validates a link kind and the kind of target it points
 // at, refusing a pair the contract never allows (a planned_as link to an
 // artifact, a routes_to link to a ticket).

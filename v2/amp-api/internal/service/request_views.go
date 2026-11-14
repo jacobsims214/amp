@@ -15,6 +15,8 @@ package service
 //	ListOwnRequests     a requester's own requests, projected, never the record.
 //	ListRequestComments one request's discussion: the team's whole thread, or
 //	                    only the shared kinds of the requester's own (AMP #4270).
+//	ListRequestLinks    one request's lineage: the route, the plan items and the
+//	                    delivery evidence, filterable by kind (AMP #4272).
 //
 // They are one file because they share one question — *what may this caller
 // see of this request?* — and that question is answered in one place:
@@ -92,6 +94,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -1089,4 +1092,121 @@ func (s *Service) ListRequestEvents(ctx context.Context, p authz.Principal, in R
 		NextAfterID: page.NextAfterID,
 		Count:       page.Count,
 	}, nil
+}
+
+// ---- The request's linked work ----
+
+// RequestLinksInput names the request whose lineage is being read, and which
+// kinds of relation the caller wants.
+//
+// It embeds RequestReadInput for the same reason RequestThreadInput and
+// RequestHistoryInput do: a request's links are read through the detail read's
+// name — a serial, or the opaque reference — so whatever that type accepts is
+// accepted here without a second parsing decision, and a name added to it reaches
+// this read too.
+type RequestLinksInput struct {
+	RequestReadInput
+	// Kinds narrows the answer to the relations named. Empty means every kind,
+	// which is the planning rail's question ("what is attached to this request?")
+	// and the repository's own default. The values are typed and already
+	// normalized by the adapter (domain.NormalizeRequestLinkKind), so an unknown
+	// word is a cursor-free 400 at the surface rather than an empty list that a
+	// reader would take for "nothing is attached".
+	Kinds []domain.RequestLinkKind
+}
+
+// RequestLinks is one request's lineage, with the view that produced it.
+//
+// There is only ever one arm. A link row carries the target's kind and **serial
+// id**, the AMP user id of whoever attached it and the exact moment they did —
+// that is the internal identity of work the requester's projection exists to
+// withhold, and the projection already carries the public summary of the same
+// facts (its `milestones`: received, being reviewed, in progress, delivered, you
+// confirm). So the requester's view is refused rather than filtered, exactly as
+// the history read refuses it, and View is always the team's today. It is carried
+// anyway, because a client branches on it for the detail read and the thread, and
+// because a future requester arm would then be a change to this type rather than
+// to every caller.
+type RequestLinks struct {
+	// View is the decision that produced this answer: always "team" today.
+	View authz.RequestView
+	// RequestID is the request the lineage belongs to, so a caller can pin the
+	// answer to the request it asked about.
+	RequestID int
+	// Links is the request's whole lineage, in attach order (by id), tombstones
+	// included. Always the stored rows.
+	Links []domain.RequestLink
+	// Count is how many rows this answer holds.
+	Count int
+}
+
+// ListRequestLinks returns one request's lineage — the project it is routed to,
+// the epics/stories/tickets it is planned as, the tasks/artifacts/receipts that
+// delivered it, and its request-to-request relations — as the caller may see it.
+//
+// It authorizes through authorizeRequestRead — the same load-and-decide the
+// detail read runs, a call rather than a resemblance — so "who may read a
+// request's links" is exactly "who may read the request", and a stranger, a
+// sibling team's request, another requester's request and an id that never
+// existed are one 404 (authz.RequestNotFound), byte for byte.
+//
+// # A requester is refused, not filtered — and why that is the decision
+//
+// The ticket that added this read asks this question explicitly, so it is
+// answered here rather than left to a reader's inference:
+//
+// **a requester does not receive the raw rows; they receive the projection's own
+// summary of them, which the detail read already serves.** The projection's
+// `milestones` is that summary — five public steps derived from the outcome
+// aggregate, with no project, epic, ticket, artifact or receipt named, no serial
+// ids, and no `created_by`. A link row is the opposite of that shape by
+// construction: `target_kind` and `target_id` are the internal identity of the
+// work (a ticket serial the requester has no route to, in a project they may not
+// see), and `created_by`/`created_at` name the triager and the minute they acted.
+// There is no requester-shaped link type to project into — the requester's page
+// renders milestones, not rows (v2/ui/src/components/requests/RequestHistory.tsx
+// `mode: 'requester'`) — so a filtered arm would be a whitelist invented for a
+// list nothing consumes.
+//
+// The refusal is after authorizeRequestRead, so it cannot disagree with the
+// detail read about who the caller is: a requester who is also an inbox member
+// gets the team's view and the rows with it, exactly as GetRequest gives them the
+// record. A 403 would confirm the request exists and that something is being kept
+// from them; the surface's one 404 is the same answer the detail route gives.
+//
+// # No paging, and that is deliberate
+//
+// A request's lineage is bounded by what planning and delivery attached to it —
+// one active route (D9; re-routes are lineage but rare), the plan's items, the
+// evidence — not by anything a caller can append to without limit. The
+// repository's read is `ORDER BY id` with no cursor, and inventing a cursor here
+// would be a second policy over a list the product draws whole (the planning rail
+// groups it by kind and the deliver panel joins it to the aggregate). A bound
+// nobody needs is a page a client can silently miss.
+func (s *Service) ListRequestLinks(ctx context.Context, p authz.Principal, in RequestLinksInput) (*RequestLinks, error) {
+	view, req, err := s.authorizeRequestRead(ctx, p, in.RequestReadInput, "read a request's links")
+	if err != nil {
+		return nil, err
+	}
+	if !view.Full() {
+		// The requester's projection has no field for a link row, and there is no
+		// filtered arm to build: fail closed with the surface's one 404. See this
+		// method's header for the decision and its reasons.
+		return nil, authz.RequestNotFound()
+	}
+	// The kinds are handed to the repository's own variadic, so "which relations"
+	// has one implementation and a kind the matrix allows tomorrow is honored here
+	// without this call changing. The repository re-validates each one; the adapter
+	// normalized them first only so a typo is a coded 400 rather than a 500.
+	links, err := s.Repo.RequestLinks(ctx, req.ID, req.OrgID, req.TeamID, in.Kinds...)
+	if err != nil {
+		return nil, fmt.Errorf("read request %d's links: %w", req.ID, err)
+	}
+	if links == nil {
+		// The repository answers an empty slice, never nil; this keeps a
+		// hand-built Repository implementation from encoding `null` (which the UI
+		// seam reads as "not served").
+		links = []domain.RequestLink{}
+	}
+	return &RequestLinks{View: view, RequestID: req.ID, Links: links, Count: len(links)}, nil
 }

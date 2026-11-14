@@ -1222,3 +1222,174 @@ func isRevConflict(err error, current int) bool {
 	}
 	return conflict.Current == current
 }
+
+// ---- The READ half (AMP #4272) ----
+
+// TestRequestLinksReadsEveryKindAndFiltersByKind is the read's contract, which no
+// test owned before this ticket: RequestLinks was exercised only as the write
+// path's own lineage check, never as the read a route serves.
+//
+// What it pins:
+//
+//  1. no kinds answers EVERY kind, in attach order (id order), tombstones and
+//     superseded routes included — the planning rail groups this list by kind and
+//     the deliver panel joins it to the aggregate, so a read that dropped a kind
+//     would silently empty a rail;
+//  2. one kind answers only that kind, through the same variadic the service
+//     passes the caller's filter to;
+//  3. several kinds answer their union, still in attach order;
+//  4. an unknown kind is refused rather than answered as "no rows" — a typo'd
+//     filter must not read as "this request has nothing planned";
+//  5. a request with nothing attached answers an EMPTY SLICE, never nil (nil
+//     encodes as `null`, which the UI seam reads as "not served").
+func TestRequestLinksReadsEveryKindAndFiltersByKind(t *testing.T) {
+	f := newRequestLinksFixture(t)
+	req := f.newRequest("linkread0000", domain.RequestStatusInProgress)
+
+	// Attach one relation of each kind the planning rail and the deliver panel
+	// draw, interleaved so attach order is not kind order.
+	attach := func(kind domain.RequestLinkKind, target domain.RequestTargetKind, id int) *domain.RequestLink {
+		t.Helper()
+		link, changed, err := f.r.LinkRequest(f.ctx, f.linkWrite(req, kind, target, id, f.org))
+		if err != nil || !changed {
+			t.Fatalf("attach %s→%s %d: changed=%v err=%v", kind, target, id, changed, err)
+		}
+		return link
+	}
+	route := attach(domain.RequestLinkRoutesTo, domain.RequestTargetProject, f.project)
+	plannedEpic := attach(domain.RequestLinkPlannedAs, domain.RequestTargetEpic, f.epic)
+	delivered := attach(domain.RequestLinkDeliveredBy, domain.RequestTargetTask, f.task)
+	plannedTask := attach(domain.RequestLinkPlannedAs, domain.RequestTargetTask, f.task2)
+
+	// 1. Every kind, in attach order. The expectation is the order the writes
+	// happened in, not a sort: `ORDER BY id` is the read's documented order and a
+	// route that re-sorted (by kind, say) would still "pass" a hand-built list.
+	wantAll := []int64{route.ID, plannedEpic.ID, delivered.ID, plannedTask.ID}
+	all, err := f.r.RequestLinks(f.ctx, req.ID, f.org, req.TeamID)
+	if err != nil {
+		t.Fatalf("RequestLinks: %v", err)
+	}
+	if len(all) != len(wantAll) {
+		t.Fatalf("every kind = %d rows, want %d: %+v", len(all), len(wantAll), all)
+	}
+	for i, id := range wantAll {
+		if all[i].ID != id {
+			t.Fatalf("row %d is link %d, want %d (attach order, not kind order): %+v", i, all[i].ID, id, all)
+		}
+	}
+	// The stored row's own fields survive the read: a rail needs the target to
+	// name what it is, and the attribution to say who attached it.
+	if all[1].LinkKind != domain.RequestLinkPlannedAs || all[1].TargetKind != domain.RequestTargetEpic ||
+		all[1].TargetID != f.epic || all[1].RequestID != req.ID {
+		t.Fatalf("the planned_as row lost its identity: %+v", all[1])
+	}
+	if all[1].CreatedBy == nil || *all[1].CreatedBy != f.user || all[1].CreatedAt.IsZero() {
+		t.Fatalf("the planned_as row lost its attribution: %+v", all[1])
+	}
+
+	// 2. One kind: only that kind, in the same order.
+	planned, err := f.r.RequestLinks(f.ctx, req.ID, f.org, req.TeamID, domain.RequestLinkPlannedAs)
+	if err != nil {
+		t.Fatalf("RequestLinks(planned_as): %v", err)
+	}
+	if len(planned) != 2 || planned[0].ID != plannedEpic.ID || planned[1].ID != plannedTask.ID {
+		t.Fatalf("planned_as = %+v, want the two planned rows in attach order", planned)
+	}
+	for _, l := range planned {
+		if l.LinkKind != domain.RequestLinkPlannedAs {
+			t.Fatalf("the kind filter returned a %s row: %+v", l.LinkKind, l)
+		}
+	}
+	routeOnly, err := f.r.RequestLinks(f.ctx, req.ID, f.org, req.TeamID, domain.RequestLinkRoutesTo)
+	if err != nil || len(routeOnly) != 1 || routeOnly[0].ID != route.ID {
+		t.Fatalf("routes_to = %+v err=%v, want just the route", routeOnly, err)
+	}
+
+	// 3. Several kinds: their union, still in attach order.
+	union, err := f.r.RequestLinks(f.ctx, req.ID, f.org, req.TeamID,
+		domain.RequestLinkRoutesTo, domain.RequestLinkDeliveredBy)
+	if err != nil {
+		t.Fatalf("RequestLinks(routes_to, delivered_by): %v", err)
+	}
+	if len(union) != 2 || union[0].ID != route.ID || union[1].ID != delivered.ID {
+		t.Fatalf("the two-kind union = %+v, want the route then the delivery in attach order", union)
+	}
+
+	// A kind with no rows is an empty answer, not an error: "nothing relates these
+	// two requests" is a fact the rail renders.
+	none, err := f.r.RequestLinks(f.ctx, req.ID, f.org, req.TeamID, domain.RequestLinkRelatesTo)
+	if err != nil {
+		t.Fatalf("RequestLinks(relates_to): %v", err)
+	}
+	if none == nil || len(none) != 0 {
+		t.Fatalf("a kind with no rows = %+v, want an empty non-nil slice", none)
+	}
+
+	// 4. An unknown kind is refused, not answered as "no rows".
+	if _, err := f.r.RequestLinks(f.ctx, req.ID, f.org, req.TeamID, domain.RequestLinkKind("shipped")); err == nil {
+		t.Fatal("an unknown kind was accepted: a typo'd filter must not read as \"nothing is attached\"")
+	}
+
+	// 5. A request with nothing attached is an empty slice, never nil.
+	quiet := f.newRequest("linkreadquiet", domain.RequestStatusNew)
+	empty, err := f.r.RequestLinks(f.ctx, quiet.ID, f.org, f.team)
+	if err != nil {
+		t.Fatalf("RequestLinks on an unattached request: %v", err)
+	}
+	if empty == nil {
+		t.Fatal("an unattached request answered nil: it encodes as null, which a client reads as \"not served\"")
+	}
+	if len(empty) != 0 {
+		t.Fatalf("an unattached request answered %d rows", len(empty))
+	}
+}
+
+// TestRequestLinksIsTenantScoped is the read's tenant question, which the write
+// path's tests never asked of it: another team's request, another org's request
+// and an id that never existed are all ErrNotFound — never an empty lineage, which
+// would let a probe tell "not yours" from "nothing attached" and would answer a
+// caller a request's existence by the shape of the empty list.
+func TestRequestLinksIsTenantScoped(t *testing.T) {
+	f := newRequestLinksFixture(t)
+	mine := f.newRequest("linktenant000", domain.RequestStatusTriaging)
+	if _, _, err := f.r.LinkRequest(f.ctx, f.linkWrite(mine, domain.RequestLinkRoutesTo,
+		domain.RequestTargetProject, f.project, f.org)); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	sibling := f.otherTeamRequest("linktenantsib")
+	foreign := f.otherOrgRequest("linktenantfor")
+
+	for _, tc := range []struct {
+		name          string
+		requestID     int
+		orgID, teamID int
+	}{
+		{"a sibling team's request, named under this team", sibling.ID, f.org, f.team},
+		{"another org's request", foreign.ID, f.org, f.team},
+		{"this request, named under the other org", mine.ID, f.other, f.team},
+		{"this request, named under the sibling team", mine.ID, f.org, f.team2},
+		{"an id that never existed", 999_999_999, f.org, f.team},
+		{"request 0", 0, f.org, f.team},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			links, err := f.r.RequestLinks(f.ctx, tc.requestID, tc.orgID, tc.teamID)
+			if !errors.Is(err, ErrNotFound) {
+				t.Fatalf("RequestLinks = %+v, %v; want ErrNotFound", links, err)
+			}
+			if links != nil {
+				t.Fatalf("a refused read answered %d rows", len(links))
+			}
+		})
+	}
+
+	// The right tenant still reads the same request, so the refusals above are the
+	// tenant's and not the request's absence.
+	if links, err := f.r.RequestLinks(f.ctx, mine.ID, f.org, f.team); err != nil || len(links) != 1 {
+		t.Fatalf("the owning tenant = %+v err=%v, want the one route", links, err)
+	}
+	// And the foreign org's own member reads its own request — through its own
+	// tenant, which proves the scope is the pair and not a hard-coded org.
+	if _, err := f.r.RequestLinks(f.ctx, foreign.ID, f.other, f.teamOther); err != nil {
+		t.Fatalf("the foreign org reading its own request: %v", err)
+	}
+}

@@ -175,6 +175,12 @@ func (h *RestHandler) register(mux *deniedMux) {
 	// the same reason, and through deniedMux, so the submit-scope gate refuses a
 	// submit-only credential before the handler runs.
 	mux.HandleFunc("GET /api/teams/{id}/requests/{request}/events", h.teamRequestEvents)
+	// The request's linked work (request_reads.go, AMP #4272): the read `POST
+	// …/links` never had. The planning rail and the deliver panel's evidence list
+	// are drawn from these rows. Registered in the reads block for the same reason
+	// as its two siblings, and through deniedMux, so the submit-scope gate refuses
+	// a submit-only credential before the handler runs.
+	mux.HandleFunc("GET /api/teams/{id}/requests/{request}/links", h.teamRequestLinks)
 	// Team request writes (request_mutations.go, AMP #3971): the submitter's
 	// versioned edit and the four triage acts, each on its own sub-path so a
 	// method+path pair names exactly one act. All through deniedMux, so the

@@ -16,13 +16,16 @@ package api
 //	                                        request allows it (AMP #4270)
 //	GET /api/teams/:id/requests/:request/events
 //	                                        one request's history rows, team view only (AMP #4271)
+//	GET /api/teams/:id/requests/:request/links
+//	                                        one request's linked work, filterable by kind,
+//	                                        team view only (AMP #4272)
 //	GET /api/requests                       the caller's OWN requests, projected, never the record
 //	GET /api/requests/:request              one of the caller's own, by serial or public reference
 //
 // Every one of them is a thin adapter over the one authorized read path
 // (internal/service/request_views.go, slice S2: ListRequests, GetRequest,
-// ListOwnRequests, and the two one-request reads ListRequestComments and
-// ListRequestEvents). It decodes a query
+// ListOwnRequests, and the three one-request reads ListRequestComments,
+// ListRequestEvents and ListRequestLinks). It decodes a query
 // string or a path, maps the transport's own facts onto the service's input and
 // encodes the service's answer. It
 // decides nothing: who may read what, the tenant, the keyset cursor, the
@@ -413,6 +416,111 @@ type requestHistoryAnswer struct {
 	Events *[]domain.RequestEvent `json:"events,omitempty"`
 }
 
+// teamRequestLinks serves GET /api/teams/:id/requests/:request/links: one
+// request's linked work — the project it is routed to, the epics/stories/tickets
+// it is planned as, and the tasks/artifacts/receipts that delivered it.
+//
+// It is the read the POST beside it has always lacked (AMP #4272): the detail
+// design draws the planning rail and the deliver panel's evidence list from these
+// rows, and until this route the page reconstructed only the route row from
+// `outcome.routed_project_id` and stated the rest as a gap (the temporary seam in
+// v2/ui/src/pages/RequestDetail.tsx).
+//
+// It decides nothing. The path value is decoded with requestReadTarget — the same
+// decoder the detail read and its two sibling reads use, so the serial and the
+// requester's opaque reference are accepted exactly where they are accepted there
+// — and the service runs the same load-and-decide, which is why an unknown team,
+// another team's request, another requester's request and a request in another
+// org are one 404 with one code, byte for byte.
+//
+// One view, one list. The lineage is an internal fact (a link row names a ticket
+// serial, a project id and the triager who attached it), so the requester's view
+// is refused by the service and this handler fails closed if a hand-assembled
+// answer ever carried rows on a non-team view — the writeRequestRead discipline,
+// applied here for the same reason. The requester's own summary of the same facts
+// is the projection's `milestones`, which the detail read already serves.
+//
+// # The optional kind filter reuses the repository's variadic
+//
+// `?kind=planned_as` (and a repeated or comma-joined list) narrows the answer.
+// The values are normalized and refused by domain.NormalizeRequestLinkKind before
+// the service is called, because the repository's own refusal is an uncoded error
+// and a client branching on `request.invalid` should not have to tell a typo from
+// a server fault (parseRequestLinksQuery's note). No kind means every kind, which
+// is the rail's question. There is no cursor: the list is bounded by what planning
+// and delivery attached, and a page nobody needs is a page a client can miss.
+func (h *RestHandler) teamRequestLinks(w http.ResponseWriter, r *http.Request) {
+	teamID, ok := requestPathTeam(w, r)
+	if !ok {
+		return
+	}
+	ref, err := requestReadTarget(r.PathValue("request"))
+	if err != nil {
+		fail(w, err, http.StatusBadRequest)
+		return
+	}
+	p, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	in, err := parseRequestLinksQuery(r.URL.Query())
+	if err != nil {
+		fail(w, err, http.StatusBadRequest)
+		return
+	}
+	ref.TeamID = teamID
+	in.RequestReadInput = ref
+	links, err := h.svc.ListRequestLinks(r.Context(), p, in)
+	if err != nil {
+		fail(w, err, http.StatusInternalServerError)
+		return
+	}
+	if links == nil || !links.View.Full() {
+		// Unreachable through ListRequestLinks, which refuses a requester and
+		// answers no other view. It is here so a future caller that skips the
+		// decision fails closed instead of encoding the lineage as a real answer
+		// for someone the whitelist excludes.
+		fail(w, authz.RequestNotFound(), http.StatusNotFound)
+		return
+	}
+	rows := links.Links
+	if rows == nil {
+		rows = []domain.RequestLink{}
+	}
+	jsonOK(w, requestLinksAnswer{
+		View:      links.View.String(),
+		RequestID: links.RequestID,
+		Count:     links.Count,
+		Links:     &rows,
+	})
+}
+
+// requestLinksAnswer is one request's linked work.
+//
+// Links is field-for-field the UI's existing `RequestLink`
+// (v2/ui/src/types/index.ts) — domain.RequestLink's JSON tags are that type's
+// fields: id, request_id, link_kind, target_kind, target_id, created_by,
+// created_at. So this route adds nothing to the client's shapes, and the UI's
+// `ResolvedRequestLink` is that type plus an OPTIONAL resolved `target` (its
+// title, project, approval and tombstone facts), which a client fills from the
+// target's own read — it is not this answer's to invent.
+//
+// It is a pointer so that a request with nothing attached encodes as [] rather
+// than null: "nothing is attached yet" is an answer the planning rail must be able
+// to render ("Not routed yet"), and null reads as "not served".
+type requestLinksAnswer struct {
+	// View is the decision that produced this answer: "team" today.
+	View string `json:"view"`
+	// RequestID is the request the lineage belongs to, so a caller can pin the
+	// answer to the request it asked about.
+	RequestID int `json:"request_id"`
+	// Count is how many rows this answer holds, so a rail can say "3 planned
+	// items" without counting.
+	Count int `json:"count"`
+	// Links is the whole lineage, in attach order (by id), tombstones included.
+	Links *[]domain.RequestLink `json:"links,omitempty"`
+}
+
 // ownRequests serves GET /api/requests: the caller's own requests, projected.
 func (h *RestHandler) ownRequests(w http.ResponseWriter, r *http.Request) {
 	p, ok := h.principal(w, r)
@@ -690,6 +798,53 @@ func parseRequestHistoryQuery(q url.Values) (service.RequestHistoryInput, error)
 		return in, err
 	}
 	in.Limit = limit
+	return in, nil
+}
+
+// parseRequestLinksQuery maps the links read's query string onto the service's
+// input: the optional `kind` filter and nothing else.
+//
+// `kind` may be repeated (`?kind=planned_as&kind=delivered_by`) or comma-joined
+// (`?kind=planned_as,delivered_by`), the shape `state` has on the queue and the
+// one every filter on this surface uses, so a client does not learn a second
+// spelling for the same idea. Every value is normalized through
+// domain.NormalizeRequestLinkKind, so `PLANNED_AS` and ` planned_as ` mean the
+// kind, and an unknown word is a coded 400 naming the closed set — never a filter
+// silently dropped, which would answer "this request has nothing planned" for a
+// request that does. That is the "filter given, filter ignored" bug
+// architecture/request-queue-summaries.md records, and the reason this decoder
+// refuses rather than tolerates.
+//
+// A duplicate kind is a caller repeating itself, not an error: the repository's
+// `link_kind = ANY($3)` answers the same rows either way, and refusing would
+// punish a client that merged two filters. The list is passed through as the
+// caller wrote it, deduplicated in order, so the answer cannot change with the
+// request's spelling of it.
+//
+// There is deliberately no cursor and no page size: see teamRequestLinks.
+func parseRequestLinksQuery(q url.Values) (service.RequestLinksInput, error) {
+	var in service.RequestLinksInput
+	seen := map[domain.RequestLinkKind]bool{}
+	for _, raw := range q["kind"] {
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				return in, authz.RequestInvalid("kind must name a link relation; omit it to list every relation")
+			}
+			kind, err := domain.NormalizeRequestLinkKind(part)
+			if err != nil {
+				// The domain's message names the closed set and never echoes the
+				// rejected value back (contract §5: a refusal must not repeat
+				// content).
+				return in, authz.RequestInvalid("%s", err)
+			}
+			if seen[kind] {
+				continue
+			}
+			seen[kind] = true
+			in.Kinds = append(in.Kinds, kind)
+		}
+	}
 	return in, nil
 }
 
