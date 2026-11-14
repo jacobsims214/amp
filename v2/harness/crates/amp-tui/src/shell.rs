@@ -166,14 +166,21 @@ enum ShellMsg {
     Compaction {
         active: bool,
         manual: bool,
+        /// When the bus reported it (ms since the epoch). AMP #4263: the shell may apply the
+        /// message after the entry already landed, so the entry lookup must not start from
+        /// the time it was applied.
+        at_ms: i64,
     },
     /// `/compact` finished (AMP #4222): its own message, never `done_tx`, so it writes no
     /// `RunEnd` to the remote feed and drains nothing as a model reply would.
     Compacted(Box<CompactDone>),
     /// An automatic compaction's entry, looked up once its progress ended (AMP #4226, spec E3):
-    /// `None` when none landed (it failed or freed nothing to persist). Not counted in
-    /// `in_flight`.
-    CompactionLanded(Option<LandedCompaction>),
+    /// `None` when none landed (it failed or freed nothing to persist). `run`: the run it
+    /// happened in (`Shell::prompts` then), for AMP #4263's notices. Not counted in `in_flight`.
+    CompactionLanded {
+        run: u32,
+        landed: Option<LandedCompaction>,
+    },
     /// `/sessions` scanned this directory's saved chats (AMP #3010).
     Sessions(Result<SessionList, String>),
     /// A confirmed resume finished: the harness switched to that session, or why it refused.
@@ -198,6 +205,7 @@ fn watch_compaction(harness: &AgentHarness, tx: UnboundedSender<ShellMsg>) -> Bu
             let _ = tx.send(ShellMsg::Compaction {
                 active: p.active,
                 manual: p.manual,
+                at_ms: now_ms(),
             });
         }
     }));
@@ -540,6 +548,35 @@ pub enum QuitOutcome {
 
 /// The transcript line a run the person stopped ends with: dim, no error colour (#2181).
 pub const STOPPED: &str = "Stopped.";
+
+/// AMP #4263 (G2, spec F2): a between-turn compaction ended without persisting its entry; rpi
+/// skips it and the run carries on with the uncompacted context.
+pub const COMPACTION_SKIPPED: &str = "automatic compaction failed; continuing without it";
+
+/// AMP #4263 (G3, spec I3/S4): an automatic compaction left the context no smaller. Pinned rpi
+/// behaviour, nothing is truncated or retried.
+pub const COMPACTION_NO_PROGRESS: &str =
+    "compaction freed nothing — a single tool result exceeds keep_recent_tokens";
+
+/// AMP #4263 (G1, spec F1): a run whose pre-run compaction failed. rpi keeps the prompt in the
+/// session without a reply; nothing re-sends it (I4).
+pub fn compaction_failed_notice(message: &str) -> String {
+    format!(
+        "automatic compaction failed ({}); context unchanged, your prompt is saved but was not \
+         answered",
+        // rpi prefixes the summarizer's error with "Summarization failed: "; the notice already
+        // says it failed.
+        crate::chrome::clean(
+            message
+                .trim()
+                .trim_start_matches("Summarization failed:")
+                .trim()
+        )
+    )
+}
+
+/// The `Failed` code rpi gives a run whose pre-run compaction failed (spec F1).
+const COMPACTION_FAILED: &str = "compaction_failed";
 
 /// What the spinner line says, for [`ESC_HINT_FOR`], after Esc closed a panel, the `/` menu or a
 /// worker's session during a run (#2181, #2354). With this chat's workers live it names them
@@ -1001,13 +1038,26 @@ pub(crate) fn compacted_context_tokens(
 /// read it; #4263's notices (compaction failed / skipped / freed nothing) build on it.
 #[derive(Debug, Default)]
 struct CompactionTrack {
-    /// When the running compaction's progress started (ms since the epoch): an entry older
-    /// than this is an earlier compaction, not the one that just ended.
+    /// When the running compaction's progress started (ms since the epoch); `None` when none
+    /// is running. The entry lookup is bounded by the progress *end* (AMP #4263).
     started_ms: Option<i64>,
     /// The latest compaction entry whose estimate the footer was set to.
     applied: Option<String>,
     /// The latest completed compaction (any reason): before and after, estimated.
     last: Option<LandedCompaction>,
+    /// The run the running compaction's progress started in (`Shell::prompts`).
+    started_run: u32,
+    /// AMP #4263 (F2/F5): the latest run that ended stopped or with `compaction_failed`. A
+    /// missing entry for an automatic compaction in that run is already explained by how the
+    /// run ended (G1 notice or "Stopped."), so G2's notice stays quiet for it.
+    quiet_run: Option<u32>,
+    /// AMP #4263 (S4): automatic compactions that landed in one run, as `(run, count)`.
+    run_auto: (u32, usize),
+    /// AMP #4263 (S4): the run whose no-progress warning was shown (once per run).
+    warned_run: Option<u32>,
+    /// AMP #4263 (S4): a landed automatic compaction waiting for the next measured usage, as
+    /// `(run, tokens_before)`.
+    measure: Option<(u32, i64)>,
 }
 
 /// A compaction entry that landed on the branch, with E2's estimate of the context after it.
@@ -1047,8 +1097,9 @@ fn now_ms() -> i64 {
 const LANDED_TRIES: u32 = 20;
 const LANDED_EVERY: Duration = Duration::from_millis(25);
 
-/// The newest compaction entry on the branch that is at least as new as `since_ms`, waiting a
-/// bounded time ([`LANDED_TRIES`] x [`LANDED_EVERY`]) for it to be persisted.
+/// The oldest compaction entry on the branch that is at least as new as `since_ms` (the first
+/// to land after it), waiting a bounded time ([`LANDED_TRIES`] x [`LANDED_EVERY`]) for it to be
+/// persisted.
 async fn landed_compaction(
     harness: &AgentHarness,
     since_ms: i64,
@@ -1058,18 +1109,26 @@ async fn landed_compaction(
     let query = EntryQuery {
         entry_type: Some("compaction"),
         order: Some(EntryOrder::NewestFirst),
-        limit: Some(1),
+        limit: Some(8),
         ..Default::default()
     };
     for _ in 0..LANDED_TRIES {
         if let Ok(found) = harness
             .find_entries_on_branch(&query, &BranchBounds::default())
             .await
-            && let Some(rpi_harness::session::types::Entry::Compaction(c)) =
-                found.into_iter().next()
-            && c.base.timestamp >= since_ms
+            && let Some(c) = found
+                .iter()
+                .map_while(|e| match e {
+                    rpi_harness::session::types::Entry::Compaction(c)
+                        if c.base.timestamp >= since_ms =>
+                    {
+                        Some(c)
+                    }
+                    _ => None,
+                })
+                .last()
         {
-            return Some(LandedCompaction::of(&c, footer_at_end));
+            return Some(LandedCompaction::of(c, footer_at_end));
         }
         tokio::time::sleep(LANDED_EVERY).await;
     }
@@ -3348,6 +3407,13 @@ impl Shell {
             meta.observe(event);
         }
         self.view.apply(event);
+        if let AgentEvent::MessageEnd {
+            message: rpi_agent::AgentMessage::Assistant(m),
+        } = event
+        {
+            let u = &m.usage;
+            self.measured_after_compaction(u.input + u.output + u.cache_read + u.cache_write);
+        }
         self.follow_streaming(event);
         // AMP #2862: the roster follows the supervisor's live status, not the dispatch tool call.
         // In Launch mode `amp_run_ticket` returns at once, while its worker is still queued or
@@ -3764,6 +3830,14 @@ impl Shell {
             },
             Err(_) => stopping,
         };
+        let compaction_failed = matches!(
+            &result,
+            Ok(RunResult { outcome: HarnessRunOutcome::Failed { error, .. }, .. })
+                if error.code == COMPACTION_FAILED
+        );
+        if stopped || compaction_failed {
+            self.compaction.quiet_run = Some(self.prompts);
+        }
         if let Some(run_id) = self.run_id.take() {
             use amp_core::chat_event::{ChatEvent, RunOutcome};
             let (outcome, error) = match &result {
@@ -3771,6 +3845,10 @@ impl Shell {
                     HarnessRunOutcome::Completed { .. } => (RunOutcome::Completed, None),
                     HarnessRunOutcome::Aborted { .. } => (RunOutcome::Aborted, None),
                     HarnessRunOutcome::Failed { .. } if stopping => (RunOutcome::Aborted, None),
+                    HarnessRunOutcome::Failed { error, .. } if error.code == COMPACTION_FAILED => (
+                        RunOutcome::Failed,
+                        Some(compaction_failed_notice(&error.message)),
+                    ),
                     HarnessRunOutcome::Failed {
                         error,
                         final_message,
@@ -3804,6 +3882,11 @@ impl Shell {
                 // The provider may report a stopped request as an error ("Request was
                 // aborted"): the person asked for it, so it is not one.
                 HarnessRunOutcome::Failed { .. } if stopping => self.view.add_notice(STOPPED),
+                // G1 (spec F1): its own line, even if a reply error was drawn; the prompt stays
+                // saved and is never re-sent (I4).
+                HarnessRunOutcome::Failed { error, .. } if error.code == COMPACTION_FAILED => self
+                    .view
+                    .add_error(&format!("✗ {}", compaction_failed_notice(&error.message))),
                 HarnessRunOutcome::Failed { .. } if error_shown => {}
                 HarnessRunOutcome::Failed {
                     error,
@@ -3990,24 +4073,84 @@ impl Shell {
 
     /// An automatic compaction's progress ended: look up whether its entry landed (bounded),
     /// off the event loop. A manual one is applied by [`Shell::finish_compaction`].
-    fn compaction_progress(&mut self, active: bool, manual: bool) {
+    fn compaction_progress(&mut self, active: bool, manual: bool, at_ms: i64) {
         if active {
-            self.compaction.started_ms = Some(now_ms());
+            self.compaction.started_ms = Some(at_ms);
+            self.compaction.started_run = self.prompts;
             return;
         }
-        let Some(since) = self.compaction.started_ms.take() else {
-            return;
-        };
-        if manual {
+        if self.compaction.started_ms.take().is_none() || manual {
             return;
         }
+        // AMP #4263: rpi persists the entry after the progress ends, so the entry is at least as
+        // new as the end. Bounding from the end (not the start) keeps two compactions in one
+        // run apart when the shell applies both progress pairs in one poll.
+        let since = at_ms;
         let footer_at_end = self.view.footer().context().map(|c| c.tokens);
+        let run = self.compaction.started_run;
         let harness = Arc::clone(&self.harness);
         let tx = self.msgs_tx.clone();
         tokio::spawn(async move {
             let landed = landed_compaction(&harness, since, footer_at_end).await;
-            let _ = tx.send(ShellMsg::CompactionLanded(landed));
+            let _ = tx.send(ShellMsg::CompactionLanded { run, landed });
         });
+    }
+
+    /// An automatic compaction's lookup came back (AMP #4263).
+    /// - None landed (G2, spec F2): rpi skipped it and the run carries on uncompacted, so say
+    ///   so — unless the run already ended stopped (F5) or with `compaction_failed` (G1 said it).
+    /// - One landed: the footer takes its estimate (#4226, E3), and G3 (S4) checks it freed
+    ///   something: a second automatic compaction in the same run, an estimate after it no
+    ///   smaller than before, or (later) a measured usage no smaller than before ⇒ warn once.
+    fn automatic_compaction_ended(&mut self, run: u32, landed: Option<LandedCompaction>) {
+        let Some(l) = landed else {
+            if self.compaction.quiet_run != Some(run) && !self.view.stopping() {
+                self.view.add_warning(COMPACTION_SKIPPED);
+            }
+            return;
+        };
+        if self.compaction.last.as_ref().map(|x| x.entry_id.as_str()) == Some(l.entry_id.as_str()) {
+            return;
+        }
+        let (before, after) = (l.tokens_before, l.after);
+        // Only if no reply reported a newer context since the compaction ended.
+        if self.view.footer().context().map(|c| c.tokens) == l.footer_at_end {
+            self.apply_landed(l);
+        } else {
+            self.compaction.last = Some(l);
+        }
+        let count = match self.compaction.run_auto {
+            (r, n) if r == run => n + 1,
+            _ => 1,
+        };
+        self.compaction.run_auto = (run, count);
+        if count >= 2 || after >= before {
+            self.warn_no_progress(run);
+        } else {
+            self.compaction.measure = Some((run, before));
+        }
+    }
+
+    /// G3 (S4): the next measured usage after an automatic compaction is no smaller than the
+    /// context before it ⇒ it freed nothing.
+    fn measured_after_compaction(&mut self, context: i64) {
+        if context <= 0 {
+            return;
+        }
+        if let Some((run, before)) = self.compaction.measure.take()
+            && before <= context
+        {
+            self.warn_no_progress(run);
+        }
+    }
+
+    /// G3's warning, at most once per run. Nothing is truncated or retried.
+    fn warn_no_progress(&mut self, run: u32) {
+        if self.compaction.warned_run == Some(run) {
+            return;
+        }
+        self.compaction.warned_run = Some(run);
+        self.view.add_warning(COMPACTION_NO_PROGRESS);
     }
 
     /// After `/compact` ended, however it ended: a reload asked for meanwhile runs, then the
@@ -4905,18 +5048,18 @@ impl Shell {
                 }
                 continue;
             }
-            if let ShellMsg::Compaction { active, manual } = &msg {
+            if let ShellMsg::Compaction {
+                active,
+                manual,
+                at_ms,
+            } = &msg
+            {
                 self.view.set_compaction(*active, *manual);
-                self.compaction_progress(*active, *manual);
+                self.compaction_progress(*active, *manual, *at_ms);
                 continue;
             }
-            if let ShellMsg::CompactionLanded(landed) = msg {
-                // Only if no reply reported a newer context since the compaction ended.
-                if let Some(l) = landed
-                    && self.view.footer().context().map(|c| c.tokens) == l.footer_at_end
-                {
-                    self.apply_landed(l);
-                }
+            if let ShellMsg::CompactionLanded { run, landed } = msg {
+                self.automatic_compaction_ended(run, landed);
                 continue;
             }
             if let ShellMsg::ReloadRequest = &msg {
@@ -4999,7 +5142,7 @@ impl Shell {
                 | ShellMsg::ReloadRequest
                 | ShellMsg::Remote(_)
                 | ShellMsg::ProjectLinked(_)
-                | ShellMsg::CompactionLanded(_)
+                | ShellMsg::CompactionLanded { .. }
                 | ShellMsg::Compaction { .. } => {}
                 ShellMsg::Answered { ticket, result } => match result {
                     Ok(_) => {

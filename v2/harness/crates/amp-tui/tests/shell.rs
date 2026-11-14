@@ -14,7 +14,10 @@ use rpi_ai::{
     providers::faux::{FauxProvider, FauxScript, FauxStep},
     types::Context,
 };
-use rpi_harness::{agent_harness::AgentHarness, types::AgentHarnessOptions};
+use rpi_harness::{
+    agent_harness::AgentHarness,
+    types::{AgentHarnessOptions, CompactionSettings},
+};
 use serde_json::json;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -32,16 +35,30 @@ struct Rig {
 }
 
 async fn rig(steps: Vec<FauxStep>) -> Rig {
+    rig_with(steps, None, CompactionSettings::default()).await
+}
+
+/// `window`: the model's context window (`None`: the faux default, shown as 200 000), so a
+/// small one makes rpi compact on its own (AMP #4263).
+async fn rig_with(
+    steps: Vec<FauxStep>,
+    window: Option<u64>,
+    compaction: CompactionSettings,
+) -> Rig {
     let script = FauxScript::new();
     script.set_responses(steps);
     let provider = FauxProvider::new(script);
-    let model = provider.default_model().clone();
+    let mut model = provider.default_model().clone();
+    if let Some(w) = window {
+        model.context_window = w;
+    }
     let (emitter, events) = ChannelEmitter::new();
     let harness = AgentHarness::create(AgentHarnessOptions {
         model: model.clone(),
         session: memory_session(),
         models: vec![provider],
         agent_emitter: Some(emitter.into_emitter()),
+        compaction,
         ..Default::default()
     })
     .await
@@ -52,7 +69,7 @@ async fn rig(steps: Vec<FauxStep>) -> Rig {
         model_id: model.id.clone(),
         thinking: ThinkingLevel::Off,
         requested_thinking: None,
-        context_window: 200_000,
+        context_window: window.unwrap_or(200_000),
         cwd: "/work/amp".into(),
         git_branch: Some("harness-m2".into()),
         session_file: None,
@@ -91,6 +108,15 @@ impl Rig {
             .expect("idle");
         // `/compact` (AMP #4222) reports back through the shell's command queue.
         self.shell.settle(WAIT).await.expect("settled");
+    }
+
+    /// Waits (bounded) for the shell's look-up of an automatic compaction's entry, which is not
+    /// counted in `settle` (AMP #4226): it takes up to ~0.5 s when no entry lands.
+    async fn settle_landed(&mut self) {
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.shell.poll();
+        }
     }
 
     fn screen(&self) -> String {
@@ -398,4 +424,169 @@ async fn footer_context_drops_after_compaction() {
     rig.say("/compact").await;
     assert!(flat(&rig).contains("nothing to compact"), "{}", flat(&rig));
     assert_eq!(rig.shell.view().footer().context().unwrap().tokens, after);
+}
+
+/// AMP #4263: a faux model that answers rpi's summarization requests from one queue and the
+/// chat's own turns from another, so a test controls each whatever order rpi calls them in
+/// (a split turn makes two summary calls).
+#[derive(Default)]
+struct Router {
+    /// `Err(message)`: the summary call fails. Empty: a short summary.
+    summaries: std::collections::VecDeque<Result<String, String>>,
+    turns: std::collections::VecDeque<FauxStep>,
+    summary_calls: usize,
+    turn_calls: usize,
+}
+
+fn routed(router: &Arc<std::sync::Mutex<Router>>) -> Vec<FauxStep> {
+    use rpi_ai::{providers::faux::faux_assistant_message, types::StopReason};
+    (0..40)
+        .map(|_| {
+            let router = Arc::clone(router);
+            FauxStep::factory(move |ctx: &Context| {
+                let mut r = router.lock().unwrap();
+                let summary = ctx
+                    .system_prompt
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("You are a context summarization"));
+                let failed = |msg: &str| {
+                    let mut m = faux_assistant_message("", StopReason::Error);
+                    m.error_message = Some(msg.into());
+                    m
+                };
+                if summary {
+                    r.summary_calls += 1;
+                    return match r.summaries.pop_front() {
+                        Some(Err(e)) => failed(&e),
+                        Some(Ok(text)) => faux_assistant_message(text, StopReason::Stop),
+                        None => faux_assistant_message("SUMMARY", StopReason::Stop),
+                    };
+                }
+                r.turn_calls += 1;
+                match r.turns.pop_front() {
+                    Some(FauxStep::Message(m)) => m,
+                    Some(FauxStep::Factory(f)) => f(ctx),
+                    None => failed("no more scripted turns"),
+                }
+            })
+        })
+        .collect()
+}
+
+/// A tool call whose arguments make ~15 000 tokens of output (faux usage is chars/4).
+fn big_tool_call() -> FauxStep {
+    FauxStep::tool_call("amp_whoami", json!({ "pad": "x".repeat(60_000) }))
+}
+
+/// A 30 000 window: rpi compacts above 30 000 − 16 384 = 13 616 (default reserve).
+const SMALL_WINDOW: u64 = 30_000;
+
+/// AMP #4263 G1 (spec F1, I4): a run whose pre-run compaction fails says so in its own words,
+/// the prompt is kept but never re-sent, and G2's skipped notice stays quiet for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_pre_run_compaction_has_its_own_notice_and_no_resend() {
+    let router = Arc::new(std::sync::Mutex::new(Router::default()));
+    router
+        .lock()
+        .unwrap()
+        .turns
+        .push_back(FauxStep::text("first answer"));
+    let mut rig = rig_with(
+        routed(&router),
+        Some(SMALL_WINDOW),
+        CompactionSettings::default(),
+    )
+    .await;
+    // ~12 000 tokens: below the trigger before the first call.
+    rig.say(&"earlier context ".repeat(3_000)).await;
+    assert_eq!(router.lock().unwrap().summary_calls, 0, "{}", rig.screen());
+    router
+        .lock()
+        .unwrap()
+        .summaries
+        .push_back(Err("summary model exploded".into()));
+    // ~4 000 more: the pre-run estimate crosses the trigger, and the summary call fails.
+    rig.say(&format!("SECOND-PROMPT {}", "more ".repeat(3_200)))
+        .await;
+    rig.settle_landed().await;
+    let screen = flat(&rig);
+    assert!(
+        screen.contains("automatic compaction failed (summary model exploded); context unchanged, your prompt is saved but was not answered"),
+        "{screen}"
+    );
+    assert!(
+        !screen.contains(amp_tui::shell::COMPACTION_SKIPPED),
+        "{screen}"
+    );
+    assert!(!rig.shell.is_running());
+    let r = router.lock().unwrap();
+    assert!(r.summary_calls >= 1);
+    assert_eq!(
+        r.turn_calls, 1,
+        "the prompt was never sent to the model, nor re-sent"
+    );
+}
+
+/// AMP #4263 G2 (spec F2): a between-turn compaction whose summary fails is skipped by rpi; the
+/// chat says so and the run carries on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_skipped_between_turn_compaction_is_shown() {
+    let router = Arc::new(std::sync::Mutex::new(Router::default()));
+    {
+        let mut r = router.lock().unwrap();
+        r.turns.push_back(big_tool_call());
+        r.turns.push_back(FauxStep::text("carried on"));
+        for _ in 0..4 {
+            r.summaries.push_back(Err("summary model exploded".into()));
+        }
+    }
+    let keep = CompactionSettings {
+        keep_recent_tokens: 2_000,
+        ..CompactionSettings::default()
+    };
+    let mut rig = rig_with(routed(&router), Some(SMALL_WINDOW), keep).await;
+    rig.say("go").await;
+    rig.settle_landed().await;
+    let screen = flat(&rig);
+    assert!(router.lock().unwrap().summary_calls >= 1, "{screen}");
+    assert!(screen.contains("carried on"), "{screen}");
+    assert!(
+        screen.contains(amp_tui::shell::COMPACTION_SKIPPED),
+        "{screen}"
+    );
+    assert!(!screen.contains("compaction freed nothing"), "{screen}");
+}
+
+/// AMP #4263 G3 (spec I3/S4): when one tool result alone is larger than keep_recent_tokens,
+/// automatic compaction frees nothing and fires again next turn: the chat warns, once per run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compaction_that_frees_nothing_warns_once_per_run() {
+    let router = Arc::new(std::sync::Mutex::new(Router::default()));
+    {
+        let mut r = router.lock().unwrap();
+        r.turns.push_back(big_tool_call());
+        r.turns.push_back(big_tool_call());
+        r.turns.push_back(FauxStep::text("finally done"));
+    }
+    let keep = CompactionSettings {
+        keep_recent_tokens: 2_000,
+        ..CompactionSettings::default()
+    };
+    let mut rig = rig_with(routed(&router), Some(SMALL_WINDOW), keep).await;
+    rig.say("go").await;
+    rig.settle_landed().await;
+    let screen = flat(&rig);
+    assert!(screen.contains("finally done"), "{screen}");
+    assert!(router.lock().unwrap().summary_calls >= 2, "{screen}");
+    assert_eq!(
+        screen
+            .matches(amp_tui::shell::COMPACTION_NO_PROGRESS)
+            .count(),
+        1,
+        "{screen}"
+    );
+    assert!(
+        !screen.contains(amp_tui::shell::COMPACTION_SKIPPED),
+        "{screen}"
+    );
 }
