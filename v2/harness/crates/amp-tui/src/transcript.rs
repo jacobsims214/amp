@@ -41,7 +41,10 @@ use rpi_tui::{
 };
 
 use crate::table;
-use crate::wrap::{hard_wrap, open_sgr as open_style, plain, reflow_row};
+use crate::wrap::{
+    RowMeta, encode_row_meta, hard_wrap_marked, open_sgr as open_style, plain, reflow_row_marked,
+    take_row_meta,
+};
 
 /// The width prose is rendered at before it is word-wrapped: wide enough that rpi never wraps.
 const UNBOUNDED: usize = 1 << 20;
@@ -74,21 +77,62 @@ impl Cache {
     }
 }
 
+/// Appends `meta` to `row` as the in-band row marker ([`encode_row_meta`]), at the row's END so
+/// prefix checks such as `Inset`'s `FLUSH_LEFT` still see its real start (select-to-copy,
+/// story #580). A plain line end with nothing to skip ([`RowMeta::default`]) is what a row
+/// without a marker already means, so it gets none and the row stays byte-identical.
+fn mark(mut row: String, meta: RowMeta) -> String {
+    if meta != RowMeta::default() {
+        row.push_str(&encode_row_meta(&meta));
+    }
+    row
+}
+
+/// `meta` for a row drawn `cols` columns further right than it was wrapped: a continuation's
+/// decoration (hanging indent, quote borders) starts behind the added columns, so they are
+/// skipped with it. Nothing to skip stays nothing (leading spaces are dedented anyway).
+fn shifted(meta: RowMeta, cols: usize) -> RowMeta {
+    if meta.prefix == 0 {
+        return meta;
+    }
+    RowMeta {
+        prefix: meta.prefix + cols,
+        ..meta
+    }
+}
+
+/// Re-marks rows a wrapper drew `cols` columns further right (a box's left padding), with the
+/// marker moved back to the row's end after the wrapper's fill.
+fn shift_marks(rows: Vec<String>, cols: usize) -> Vec<String> {
+    rows.into_iter()
+        .map(|row| match take_row_meta(&row) {
+            (row, Some(meta)) => mark(row, shifted(meta, cols)),
+            (row, None) => row,
+        })
+        .collect()
+}
+
 /// Word-wraps `text` (styled, several lines) to `width`, each row prefixed with `pad`. A style
 /// left open at the end of one line carries on to the next, as it does on a terminal.
 fn wrap_lines(text: &str, pad: &str, width: usize) -> Vec<String> {
+    wrap_lines_marked(text, pad, width).0
+}
+
+/// [`wrap_lines`], plus each row's [`RowMeta`] (word-wrap joins, and continuations' hanging
+/// indent behind `pad`).
+fn wrap_lines_marked(text: &str, pad: &str, width: usize) -> (Vec<String>, Vec<RowMeta>) {
+    let pad_cols = rpi_tui::visible_width(pad);
     let mut rows = Vec::new();
+    let mut metas = Vec::new();
     let mut carry = String::new();
     for line in text.split('\n') {
         let styled = format!("{carry}{line}");
         carry = open_style(&styled);
-        rows.extend(
-            reflow_row(&styled, width)
-                .into_iter()
-                .map(|r| format!("{pad}{r}")),
-        );
+        let (wrapped, meta) = reflow_row_marked(&styled, width);
+        rows.extend(wrapped.into_iter().map(|r| format!("{pad}{r}")));
+        metas.extend(meta.into_iter().map(|m| shifted(m, pad_cols)));
     }
-    rows
+    (rows, metas)
 }
 
 /// Lines of text, word-wrapped: rpi's `Text` (left padding, blank rows above and below), with
@@ -148,11 +192,9 @@ impl Component for WrapText {
             let above = if self.padding_top { self.padding_y } else { 0 };
             let mut lines = vec![String::new(); above];
             let content_width = width.saturating_sub(self.padding_x).max(1);
-            lines.extend(wrap_lines(
-                &self.text(),
-                &" ".repeat(self.padding_x),
-                content_width,
-            ));
+            let (rows, metas) =
+                wrap_lines_marked(&self.text(), &" ".repeat(self.padding_x), content_width);
+            lines.extend(rows.into_iter().zip(metas).map(|(r, m)| mark(r, m)));
             if self.padding_bottom {
                 lines.extend(std::iter::repeat_n(String::new(), self.padding_y));
             }
@@ -314,11 +356,17 @@ fn code_rows(lang: &str, code: &[&str], width: usize, padding_x: usize) -> Vec<S
         }
         let expanded = line.replace('\t', "    ");
         let styled = highlighter.highlight(&expanded, &colors);
-        for chunk in hard_wrap(&styled, body_width) {
+        let (chunks, metas) = hard_wrap_marked(&styled, body_width);
+        for (chunk, meta) in chunks.into_iter().zip(metas) {
             let body = apply_background_to_line(&format!(" {chunk}"), panel_width, |text| {
                 colors.md_code_block_bg.bg(text)
             });
-            out.push(format!("{pad}{indent}{body}"));
+            // The pad, the indent and the surface's inset cell are decoration on every row.
+            let meta = RowMeta {
+                prefix: padding_x + CODE_INDENT + 1,
+                ..meta
+            };
+            out.push(mark(format!("{pad}{indent}{body}"), meta));
         }
     }
     out
@@ -378,7 +426,9 @@ impl Component for WrapMarkdown {
                             s
                         };
                         for row in self.markdown(s).render(UNBOUNDED) {
-                            lines.extend(reflow_row(&unpad_code_chips(&row), text_width));
+                            let (rows, metas) =
+                                reflow_row_marked(&unpad_code_chips(&row), text_width);
+                            lines.extend(rows.into_iter().zip(metas).map(|(r, m)| mark(r, m)));
                         }
                     }
                     Segment::Block(s) => lines.extend(self.block(&s, width)),
@@ -761,6 +811,19 @@ impl ThinkingBlock {
         truncate_to_width(&row, width, "")
     }
 
+    /// An expanded body row's [`RowMeta`]: the padding and `│ ` gutter are decoration on every
+    /// row, so a selection running down the body copies the thinking text alone.
+    ///
+    /// The header row is left unmarked (a plain line end): it is one row, and copying it copies
+    /// what shows, `▸ Thought for 18s · Ctrl+T or click to open` included. A prefix only skips
+    /// columns at a row's start, so it can't drop a hint at the end.
+    fn body_meta(meta: RowMeta) -> RowMeta {
+        RowMeta {
+            prefix: Self::PAD + 2 + meta.prefix,
+            ..meta
+        }
+    }
+
     fn body(&self, text: &str, width: usize) -> Vec<String> {
         self.cache.get_or(width, || {
             let colors = theme().colors;
@@ -773,11 +836,18 @@ impl ThinkingBlock {
                 .flat_map(|line| {
                     let line = plain(line);
                     if line.trim().is_empty() {
-                        return vec![format!("{pad}{gutter}")];
+                        return vec![mark(
+                            format!("{pad}{gutter}"),
+                            Self::body_meta(RowMeta::default()),
+                        )];
                     }
-                    wrap_lines(&line, "", body_width)
-                        .into_iter()
-                        .map(|r| format!("{pad}{gutter} {}", colors.thinking_text.fg(&r)))
+                    let (rows, metas) = wrap_lines_marked(&line, "", body_width);
+                    rows.into_iter()
+                        .zip(metas)
+                        .map(|(r, m)| {
+                            let row = format!("{pad}{gutter} {}", colors.thinking_text.fg(&r));
+                            mark(row, Self::body_meta(m))
+                        })
                         .collect()
                 })
                 .collect()
@@ -1154,10 +1224,13 @@ pub struct UserBlock {
     tag: Option<String>,
 }
 
+/// The user bubble's left (and right) padding.
+const USER_BOX_PAD: usize = 1;
+
 fn user_box(text: &str) -> BgBox {
     let bg = theme().colors.surface;
     // Compact (#2346): no padding rows above and below the text.
-    let content = BgBox::new(1, if crate::density::compact() { 0 } else { 1 });
+    let content = BgBox::new(USER_BOX_PAD, if crate::density::compact() { 0 } else { 1 });
     content.set_bg_fn(Some(Arc::new(move |s: &str| bg.bg(s))));
     content.add_child(Arc::new(WrapText::new(verbatim(text), 0, 0)));
     content
@@ -1213,7 +1286,8 @@ impl Component for UserBlock {
         if inner.0 != revision {
             *inner = (revision, user_box(&self.text));
         }
-        let mut lines = inner.1.render(width);
+        // The box draws the text one column in: its continuations' decoration moves with it.
+        let mut lines = shift_marks(inner.1.render(width), USER_BOX_PAD);
         if let Some(tag) = &self.tag
             && !lines.is_empty()
         {
@@ -2440,5 +2514,169 @@ mod tests {
         assert!(!is_rule("* ** x"));
         assert!(is_rule("---"));
         assert!(is_rule("  ***"));
+    }
+
+    // Select-to-copy row markers (#4214, story #580).
+
+    use crate::wrap::{Join, hard_wrap, reflow_row};
+
+    /// Splits each row into its marker-free text and its meta, checking the marker is the row's
+    /// last bytes and adds no width or text.
+    fn unmark(rows: &[String]) -> (Vec<String>, Vec<Option<RowMeta>>) {
+        rows.iter()
+            .map(|row| {
+                let (bare, meta) = take_row_meta(row);
+                if let Some(m) = meta {
+                    assert_eq!(
+                        row,
+                        &format!("{bare}{}", encode_row_meta(&m)),
+                        "marker at end"
+                    );
+                }
+                assert_eq!(plain(row), plain(&bare), "{row:?}");
+                assert_eq!(
+                    rpi_tui::visible_width(row),
+                    rpi_tui::visible_width(&bare),
+                    "{row:?}"
+                );
+                (bare, meta)
+            })
+            .unzip()
+    }
+
+    fn meta(prefix: usize, join: Join) -> Option<RowMeta> {
+        Some(RowMeta { prefix, join })
+    }
+
+    #[test]
+    fn wrap_text_marks_word_breaks_and_hanging_indents_behind_its_padding() {
+        let text = "alpha beta gamma delta\n• one two three four five\nshort";
+        let rows = WrapText::new(text, 2, 0).render(14);
+        let (bare, metas) = unmark(&rows);
+        // Unchanged once the markers are gone: the rows the unmarked wrap draws.
+        let want: Vec<String> = text
+            .split('\n')
+            .flat_map(|l| reflow_row(l, 12))
+            .map(|r| format!("  {r}"))
+            .collect();
+        assert_eq!(bare, want);
+        assert_eq!(
+            plain_rows(&bare),
+            vec![
+                "  alpha beta",
+                "  gamma delta",
+                "  • one two",
+                "    three four",
+                "    five",
+                "  short"
+            ]
+        );
+        assert_eq!(
+            metas,
+            vec![
+                meta(0, Join::Space),
+                None,
+                meta(0, Join::Space),
+                // The list hang (2) behind the padding (2).
+                meta(4, Join::Space),
+                meta(4, Join::Newline),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn one_row_text_carries_no_marker() {
+        let rows = WrapText::new("hello there", 1, 1).render(40);
+        assert!(
+            rows.iter().all(|r| take_row_meta(r).1.is_none()),
+            "{rows:?}"
+        );
+        assert_eq!(rows, vec!["", " hello there", ""]);
+    }
+
+    #[test]
+    fn markdown_prose_and_code_rows_are_marked() {
+        let code = "let total = items.iter().map(|item| item.price).sum::<u64>();";
+        let md = format!("A paragraph that is long enough to wrap.\n\n```rust\n{code}\n```");
+        let rows = WrapMarkdown::new(md, 1, MarkdownStyle::Plain).render(30);
+        let (bare, metas) = unmark(&rows);
+        let prose: Vec<usize> = (0..bare.len())
+            .filter(|&i| plain(&bare[i]).contains("paragraph") || plain(&bare[i]).contains("wrap."))
+            .collect();
+        assert!(prose.len() >= 2, "{bare:?}");
+        assert_eq!(metas[prose[0]], meta(0, Join::Space));
+        // rpi's 1-column padding is the continuation's hang.
+        assert_eq!(metas[*prose.last().unwrap()], meta(1, Join::Newline));
+
+        // Code: pad 1 + indent 2 + the surface's inset cell on every row; hard breaks join with
+        // nothing, the line's end with a newline.
+        let code_idx: Vec<usize> = (0..metas.len())
+            .filter(|&i| metas[i].is_some_and(|m| m.prefix == 4))
+            .collect();
+        let chunks = hard_wrap(code, 30 - 2 - 2 - 2);
+        assert_eq!(code_idx.len(), chunks.len(), "{bare:?}");
+        for (n, &i) in code_idx.iter().enumerate() {
+            let join = if n + 1 == chunks.len() {
+                Join::Newline
+            } else {
+                Join::None
+            };
+            assert_eq!(metas[i], meta(4, join));
+            assert_eq!(rpi_tui::visible_width(&bare[i]), 30 - 1, "{:?}", bare[i]);
+        }
+        let joined: String = code_idx
+            .iter()
+            .map(|&i| plain(&bare[i])[4..].trim_end().to_owned())
+            .collect();
+        assert_eq!(joined.replace(' ', ""), code.replace(' ', ""));
+    }
+
+    #[test]
+    fn user_bubble_marks_shift_by_its_padding_and_sit_after_the_fill() {
+        let block = UserBlock::new("one two three four five six\n  indented words that wrap here");
+        let rows = block.render(16);
+        let (bare, metas) = unmark(&rows);
+        for row in &bare {
+            assert!(
+                row.is_empty() || rpi_tui::visible_width(row) == 16,
+                "filled: {row:?}"
+            );
+        }
+        let text: Vec<(String, Option<RowMeta>)> = plain_rows(&bare)
+            .into_iter()
+            .zip(metas)
+            .filter(|(r, _)| !r.trim().is_empty())
+            .collect();
+        assert_eq!(text[0], (" one two three".to_owned(), meta(0, Join::Space)));
+        let indented = text
+            .iter()
+            .position(|(r, _)| r.starts_with("   indented"))
+            .unwrap();
+        assert_eq!(text[indented].1, meta(0, Join::Space));
+        // The continuation hangs under the 2-space indent, behind the bubble's 1 column.
+        assert_eq!(text[indented + 1].1.map(|m| m.prefix), Some(3));
+        assert_eq!(text.last().unwrap().1.map(|m| m.join), Some(Join::Newline));
+    }
+
+    #[test]
+    fn thinking_body_skips_its_gutter_and_the_header_stays_unmarked() {
+        let block = ThinkingBlock::new_at(
+            ThinkingDisplay::Full,
+            "first thought that wraps around\n\nsecond",
+            None,
+        );
+        let rows = block.render(20);
+        let (bare, metas) = unmark(&rows);
+        assert!(plain(&bare[0]).contains("Thinking"), "{bare:?}");
+        assert_eq!(metas[0], None, "header: a plain line end");
+        let body = &metas[1..];
+        assert!(
+            body.iter().all(|m| m.is_some_and(|m| m.prefix == 3)),
+            "{metas:?}"
+        );
+        assert_eq!(body[0].unwrap().join, Join::Space);
+        assert_eq!(body.last().unwrap().unwrap().join, Join::Newline);
+        assert!(plain(&bare[1]).starts_with(" │ first"), "{bare:?}");
     }
 }
