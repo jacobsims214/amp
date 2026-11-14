@@ -260,6 +260,11 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
     } else {
         None
     };
+    // #4235: a comment added to a running worker's ticket reaches that worker. The watcher holds
+    // the supervisor weakly and ends with it.
+    if let Some(sup) = &supervisor {
+        amp_core::comment_watch::spawn(sup, Arc::clone(&rt.mcp));
+    }
     let (emitter, events) = ChannelEmitter::new();
     let fanout = FanOutEmitter::new();
     fanout.add_sink(emitter.into_emitter());

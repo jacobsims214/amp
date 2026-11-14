@@ -38,6 +38,8 @@
 //!   [`supervisor::WorkerReport`] with a [`supervisor::WorkerOutcome`].
 //! - [`worker_control`]: the manager's worker-control tools (#4233: `amp_stop_worker`), registered
 //!   next to `amp_run_ticket` through [`worker_control::tools`].
+//! - [`comment_watch`] (#4235): polls live workers' tickets and steers each new comment into its
+//!   worker in a fixed envelope, through [`supervisor::Supervisor::steer_worker`].
 //!
 //! M2-6 (#2098):
 //! - [`run_report`]: automatic run reporting (D8). [`run_report::RunReporter`] fills the model,
@@ -112,6 +114,7 @@ pub mod approval;
 pub mod approval_wait;
 pub mod assets;
 pub mod chat_event;
+pub mod comment_watch;
 pub mod config_check;
 pub mod dispatch_ledger;
 pub mod events;
