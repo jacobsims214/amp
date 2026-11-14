@@ -279,3 +279,46 @@ fn content_pos_is_none_outside_the_transcript_and_clamps_for_drags() {
     assert_eq!(clamped.row, view.scroll().top());
     assert!(clamped.row <= at.row);
 }
+
+/// With #4214's real transcript components: a wrapped user message and a wrapped notice copy
+/// as their source text, and no marker reaches the frame.
+#[test]
+fn real_transcript_blocks_strip_markers_and_rejoin() {
+    let words: Vec<String> = (0..36).map(|i| format!("u{i:02}")).collect();
+    let said = words.join(" ");
+    let note: String = (0..36)
+        .map(|i| format!("n{i:02}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let view = ChatView::new();
+    view.add_user(&said);
+    view.add_notice(&note);
+    for width in [W, 60] {
+        let frame = view.render_frame(width, H);
+        assert!(frame.iter().all(|l| !l.contains("\x1b_amp:")), "{frame:?}");
+    }
+    for (text, first, last) in [(&said, "u00", "u35"), (&note, "n00", "n35")] {
+        let start = locate(&view, W, first);
+        let end = locate(&view, W, last);
+        assert!(end.row > start.row, "{text} wraps");
+        select(&view, start, right(end, 2));
+        assert_eq!(view.select_text().as_deref(), Some(text.as_str()));
+    }
+}
+
+/// #4214's user bubble breaks a long token mid-word over its background fill: the fill is not
+/// copied, so the token rejoins exactly.
+#[test]
+fn long_word_in_the_user_bubble_rejoins_without_fill() {
+    let token = format!("https://example.com/{}", "abcdefghij".repeat(15));
+    let view = ChatView::new();
+    view.add_user(&format!("zsee {token} okz"));
+    let start = locate(&view, W, "zsee");
+    let end = locate(&view, W, "okz");
+    assert!(end.row > start.row + 1, "the token wraps");
+    select(&view, start, right(end, 2));
+    assert_eq!(
+        view.select_text().as_deref(),
+        Some(format!("zsee {token} okz").as_str())
+    );
+}

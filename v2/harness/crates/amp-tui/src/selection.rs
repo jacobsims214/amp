@@ -148,6 +148,29 @@ fn leading_spaces(s: &str) -> usize {
     s.len() - s.trim_start_matches(' ').len()
 }
 
+/// The column a `Join::None` row's content ends at: the furthest non-space column over its run
+/// of `None` rows (a hard-wrapped code line, a token broken across rows). Those rows all break at
+/// the same wrap column, so cells past it on any of them are background fill or padding, while
+/// spaces before it are content. Only a run whose every row ends in spaces loses them.
+fn run_content_end(rows: &[String], meta: &[RowMeta], r: usize) -> usize {
+    let none = |i: usize| meta.get(i).is_some_and(|m| m.join == Join::None);
+    let mut a = r;
+    while a > 0 && none(a - 1) {
+        a -= 1;
+    }
+    let mut b = r;
+    while b + 1 < rows.len() && none(b + 1) {
+        b += 1;
+    }
+    (a..=b)
+        .map(|i| {
+            let plain = wrap::plain(&rows[i]);
+            rpi_tui::visible_width(plain.trim_end())
+        })
+        .max()
+        .unwrap_or(usize::MAX)
+}
+
 /// The text a selection covers in `rows` (rendered content rows, ANSI included), with `meta`
 /// giving each row's [`RowMeta`] (missing entries default to a plain `Newline` row). Returns
 /// `None` when nothing but whitespace is selected, which means nothing gets copied.
@@ -172,13 +195,24 @@ pub fn extract(rows: &[String], meta: &[RowMeta], sel: Selection) -> Option<Stri
             from = m.prefix;
             whole_left = true;
         }
-        let to = if r == last { end_col } else { usize::MAX };
+        let mut to = if r == last { end_col } else { usize::MAX };
+        // Trailing spaces inside a hard-wrapped run are content (code), but the background fill
+        // after the run's wrap column is not (#4215): cut at the run's content end.
+        if m.join == Join::None && r != last {
+            to = to.min(run_content_end(rows, meta, r));
+        }
         let mut text = cells(&wrap::plain(row), from, to);
-        // Trailing spaces inside a hard-wrapped run are content (code), not padding.
         if m.join != Join::None || r == last {
             text.truncate(text.trim_end().len());
         }
-        let line_start = r == start.row || meta_at(r - 1).join == Join::Newline;
+        let prev = (r > start.row).then(|| meta_at(r - 1).join);
+        let line_start = prev.is_none_or(|j| j == Join::Newline);
+        // A continuation's leading spaces are decoration when the break dropped the spaces
+        // (`Space`: wrapped text never resumes with one) or when nothing marks its decoration
+        // (prefix 0: the pad, padding_x or the user bubble's inset cell, #4214).
+        if !line_start && (prev == Some(Join::Space) || m.prefix == 0) {
+            text.drain(..leading_spaces(&text));
+        }
         pieces.push(Piece {
             text,
             from,
@@ -284,6 +318,49 @@ mod tests {
         let mut rows = s(rows);
         paint(&mut rows, sel(a, h));
         rows
+    }
+
+    #[test]
+    fn background_fill_after_a_broken_run_is_not_copied() {
+        // A code line hard-wrapped at 6 inside a panel 8 wide: one fill cell after each chunk.
+        let rows = s(&["   abcdef  ", "   ghijkl  ", "   mn      "]);
+        let m = [
+            meta(3, Join::None),
+            meta(3, Join::None),
+            meta(3, Join::Newline),
+        ];
+        assert_eq!(
+            extract(&rows, &m, sel((0, 0), (2, 10))).as_deref(),
+            Some("abcdefghijklmn")
+        );
+        // Spaces inside the run before its wrap column stay: they are code.
+        let rows = s(&["   ab  ef  ", "   ghijkl  ", "   mn      "]);
+        assert_eq!(
+            extract(&rows, &m, sel((0, 0), (2, 10))).as_deref(),
+            Some("ab  efghijklmn")
+        );
+        let rows = s(&["   abcd    ", "   ghijkl  ", "   mn      "]);
+        assert_eq!(
+            extract(&rows, &m, sel((0, 0), (2, 10))).as_deref(),
+            Some("abcd  ghijklmn")
+        );
+        // A long word broken in the user bubble (fill to the row's end, prefix 0).
+        let rows = s(&[" aaaaaaaa ", " bbbb     "]);
+        let m = [meta(0, Join::None), NL];
+        assert_eq!(
+            extract(&rows, &m, sel((0, 0), (1, 9))).as_deref(),
+            Some("aaaaaaaabbbb")
+        );
+    }
+
+    #[test]
+    fn unmarked_decoration_on_continuations_is_not_copied() {
+        // The user bubble's inset cell on word-wrapped rows (prefix 0).
+        let rows = s(&[" one two ", " three   "]);
+        assert_eq!(
+            extract(&rows, &[SP, NL], sel((0, 0), (1, 8))).as_deref(),
+            Some("one two three")
+        );
     }
 
     #[test]

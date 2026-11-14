@@ -225,8 +225,8 @@ pub fn paint_pill(frame: &LayoutFrame, lines: &mut [String], pill: &str) {
 ///
 /// On every render it takes the in-band row markers ([`crate::wrap::encode_row_meta`]) off the
 /// rows, so none reaches the scroll view's cache or the terminal, and keeps the rows and their
-/// [`RowMeta`] for [`Self::text`]. A marked row's `prefix` gets the inset's padding added, since
-/// it is measured inside the inset. The selection is held in content coordinates and painted in
+/// [`RowMeta`] for [`Self::text`]. A marked row's nonzero `prefix` gets the inset's padding
+/// added, since it is measured inside the inset. The selection is held in content coordinates and painted in
 /// reverse video ([`selection::paint`]), so it scrolls with the text.
 ///
 /// A selection change needs a full render of the scroll view's child (amp's `repaint()`), not
@@ -326,7 +326,9 @@ impl Component for SelectionLayer {
         for line in lines {
             let (row, m) = strip_markers(line);
             let m = m.map(|mut m| {
-                if !row.is_empty() && !row.starts_with(FLUSH_LEFT) {
+                // A count of 0 means nothing marked to skip (leading spaces are handled by
+                // extract), so only real decoration counts move with the inset.
+                if m.prefix > 0 && !row.is_empty() && !row.starts_with(FLUSH_LEFT) {
                     m.prefix += pad;
                 }
                 m
