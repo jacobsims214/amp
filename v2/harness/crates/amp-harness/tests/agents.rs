@@ -1141,16 +1141,19 @@ async fn untrusted_repo_agents_and_skills_are_not_listed_as_in_use() {
 
 // ------------------------------------------------------------------------------------------------
 // #4244: the non-interactive agent writer (`agents_cmd::write_agent_in`) behind `new` / `edit`.
-// Validates before writing and keeps the previous file in `<layer>/agents/.edit/backup/`.
+// Validates before writing and keeps the previous file in `<layer>/.edit/backup/agents/`.
 // (Skill-writer tests from #4245 go in their own section.)
 // ------------------------------------------------------------------------------------------------
 
-/// The files in `<layer>/agents/.edit/backup/`, sorted.
+/// The agent backups in `<layer>/.edit/backup/agents/` (`<id>.<unix ms>/<id>.md`), sorted.
 fn agent_backups(layer: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(layer.join("agents/.edit/backup")) else {
+    let Ok(entries) = std::fs::read_dir(layer.join(".edit/backup/agents")) else {
         return Vec::new();
     };
-    let mut files: Vec<PathBuf> = entries.map(|e| e.unwrap().path()).collect();
+    let mut files: Vec<PathBuf> = entries
+        .flat_map(|e| std::fs::read_dir(e.unwrap().path()).unwrap())
+        .map(|e| e.unwrap().path())
+        .collect();
     files.sort();
     files
 }
@@ -1193,11 +1196,14 @@ async fn write_agent_in_backs_up_before_overwriting_and_refuses_invalid_text() {
     let backups = agent_backups(&user);
     assert_eq!(backups.len(), 1, "{backups:?}");
     let backup = &backups[0];
-    let name = backup.file_name().unwrap().to_string_lossy().into_owned();
-    assert!(
-        name.starts_with("sql-expert.") && name.ends_with("Z.md"),
-        "{name}"
-    );
+    assert_eq!(backup.file_name().unwrap(), "sql-expert.md");
+    let stamp_dir = backup
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy();
+    assert!(stamp_dir.starts_with("sql-expert."), "{stamp_dir}");
     assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
     assert!(
         out.stdout

@@ -749,10 +749,11 @@ fn edit_file(ctx: &Ctx, path: &Path, id: &str, scope: Scope) -> Result<(), CliEr
 // their own prompts and templates; manager tools call it directly.
 // ------------------------------------------------------------------------------------------------
 
-/// Where [`write_agent_in`] keeps the previous version of an agent file it overwrites:
-/// `<layer>/agents/.edit/backup/`. A dot dir, so neither `Assets::load` nor the reload watcher
-/// reads it (a backup next to the agent file would load as a second agent). Backups are kept.
-pub const BACKUP_DIR: &str = "backup";
+/// Under `<layer>/.edit/`: earlier versions of a layer's agent file, one directory per write
+/// (`<layer>/.edit/backup/agents/<id>.<unix ms>/<id>.md`), the same layout as skills (#4245).
+/// Outside `agents/`, so neither `Assets::load` nor the reload watcher ever reads a backup as an
+/// agent. Backups are kept.
+const BACKUP_DIR: &str = "backup";
 
 /// What [`write_agent_in`] wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -764,8 +765,9 @@ pub(crate) struct WrittenAgent {
     pub path: PathBuf,
     /// `true` when the file is new (`create`).
     pub created: bool,
-    /// The previous layer file, copied aside before it was overwritten (none when the layer had
-    /// no file yet, e.g. the first override of a built-in agent).
+    /// The previous layer file, copied to `<layer>/.edit/backup/agents/` before it was
+    /// overwritten (none for a new agent, and when the layer had no file yet, e.g. the first
+    /// override of a built-in agent).
     pub backup: Option<PathBuf>,
 }
 
@@ -786,8 +788,8 @@ enum ModelCheck<'a> {
 ///
 /// The text is validated with the checks the harness runs at start (`Assets::put_agent`, the
 /// role registry, and the model the role resolves to) **before** anything is touched. Only then
-/// is the previous layer file copied to `<layer>/agents/.edit/backup/<id>.<UTC stamp>.md` and the
-/// new text written (atomically).
+/// is the previous layer file copied to `<layer>/.edit/backup/agents/<id>.<unix ms>/<id>.md` and
+/// the new text written (atomically).
 pub(crate) fn write_agent_in(
     ctx: &Ctx,
     scope: Scope,
@@ -858,7 +860,7 @@ fn write_agent(
     }
 
     let backup = if !create && path.is_file() {
-        Some(backup_agent_file(&path, &id)?)
+        Some(backup_agent_file(ctx, scope, &id, &path)?)
     } else {
         None
     };
@@ -890,53 +892,35 @@ fn refuse_taken_id(loaded: &Loaded, id: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Copies `path` (`<layer>/agents/<id>.md`) to `<layer>/agents/.edit/backup/<id>.<stamp>.md`
+/// Copies the layer's `current` agent file to `<layer>/.edit/backup/agents/<id>.<unix ms>/<id>.md`
 /// and returns the copy's path. Never overwrites an earlier backup.
-fn backup_agent_file(path: &Path, id: &str) -> Result<PathBuf, CliError> {
-    let agents_dir = path
-        .parent()
-        .ok_or_else(|| CliError::new(format!("{}: no parent directory", path.display())))?;
-    let dir = agents_dir.join(EDIT_DIR).join(BACKUP_DIR);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| CliError::new(format!("create {}: {e}", dir.display())))?;
-    let stamp = utc_stamp(std::time::SystemTime::now());
-    let mut backup = dir.join(format!("{id}.{stamp}.md"));
+fn backup_agent_file(
+    ctx: &Ctx,
+    scope: Scope,
+    id: &str,
+    current: &Path,
+) -> Result<PathBuf, CliError> {
+    let root = ctx
+        .scope_dir(scope)?
+        .join(EDIT_DIR)
+        .join(BACKUP_DIR)
+        .join(AGENTS_DIR);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let mut dir = root.join(format!("{id}.{stamp}"));
     let mut n = 1;
-    while backup.exists() {
+    while dir.exists() {
+        dir = root.join(format!("{id}.{stamp}-{n}"));
         n += 1;
-        backup = dir.join(format!("{id}.{stamp}-{n}.md"));
     }
-    std::fs::copy(path, &backup).map_err(|e| {
-        CliError::new(format!(
-            "back up {} to {}: {e}; nothing was written",
-            path.display(),
-            backup.display()
-        ))
-    })?;
-    Ok(backup)
-}
-
-/// `YYYYMMDDTHHMMSS.mmmZ` (UTC) for `t`: sorts in time order, down to the millisecond.
-fn utc_stamp(t: std::time::SystemTime) -> String {
-    let since = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    let (secs, millis) = (since.as_secs(), since.subsec_millis());
-    let (days, rem) = (secs / 86_400, secs % 86_400);
-    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}.{millis:03}Z",
-        rem / 3_600,
-        rem % 3_600 / 60,
-        rem % 60
-    )
+    let bytes = std::fs::read(current)
+        .map_err(|e| CliError::new(format!("read {}: {e}", current.display())))?;
+    let file = dir.join(format!("{id}.md"));
+    write_file(&file, &bytes)
+        .map_err(|e| CliError::new(format!("{}; nothing was written", e.message)))?;
+    Ok(file)
 }
 
 fn remove(ctx: &Ctx, id: &str, scope: Scope) -> Result<(), CliError> {
@@ -1566,14 +1550,19 @@ mod tests {
         let e = write_agent_in(&ctx, Scope::User, "sql-expert", &bad, false).unwrap_err();
         assert!(e.message.contains("description"), "{}", e.message);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), first);
-        assert!(!d.join("agents/.edit").exists());
+        assert!(!d.join(".edit").exists());
 
         // create: false backs the old file up into the hidden dir, then writes.
         let edited = worker_text("sql-expert", "SQL, edited");
         let w = write_agent_in(&ctx, Scope::User, "sql-expert", &edited, false).unwrap();
         assert!(!w.created);
         let backup = w.backup.expect("a backup of the previous file");
-        assert_eq!(backup.parent().unwrap(), d.join("agents/.edit/backup"));
+        assert!(
+            backup.starts_with(d.join(".edit/backup/agents")),
+            "{}",
+            backup.display()
+        );
+        assert_eq!(backup.file_name().unwrap(), "sql-expert.md");
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), first);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), edited);
 
@@ -1583,20 +1572,11 @@ mod tests {
             loaded.role("sql-expert").unwrap().description,
             "SQL, edited"
         );
-        assert!(loaded.assets.agents().all(
-            |a| !matches!(&a.origin, Origin::User(p) if p.starts_with(d.join("agents/.edit")))
-        ));
-    }
-
-    #[test]
-    fn utc_stamp_is_a_civil_utc_time() {
-        let at = |s: u64| utc_stamp(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s));
-        assert_eq!(at(0), "19700101T000000.000Z");
-        assert_eq!(at(951_782_400), "20000229T000000.000Z");
-        assert_eq!(at(1_794_674_385), "20261114T163945.000Z");
-        assert_eq!(
-            utc_stamp(std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_794_674_385_042)),
-            "20261114T163945.042Z"
+        assert!(
+            loaded
+                .assets
+                .agents()
+                .all(|a| !matches!(&a.origin, Origin::User(p) if p.starts_with(d.join(".edit"))))
         );
     }
 }
