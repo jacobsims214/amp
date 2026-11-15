@@ -625,6 +625,19 @@ pub const CONFIRM_VIEW_FIRST: &str =
 pub const CONFIRM_ARM: Duration = Duration::from_millis(750);
 /// What a key pressed before the confirmation is armed says (AMP #4319), once per question.
 pub const CONFIRM_WAIT_NOTICE: &str = "A confirmation is waiting: read it, then press y or N.";
+/// What a key pressed before the remote pairing question is armed says (AMP #4599), once per
+/// question. The pairing question takes the same [`CONFIRM_ARM`] window as a confirmation.
+pub const PAIRING_WAIT_NOTICE: &str = "A pairing request is waiting: read it, then press y or N.";
+
+/// The arm window of a y/N question (AMP #4319, #4599): false when `armed_at` has passed (the
+/// key answers); otherwise the window starts again from `now` and the key is held (true).
+fn hold_unarmed(armed_at: &mut Option<Instant>, now: Instant) -> bool {
+    if armed_at.is_some_and(|at| now >= at) {
+        return false;
+    }
+    *armed_at = Some(now + CONFIRM_ARM);
+    true
+}
 
 /// Where the shell reads the time for the confirmation's arm window ([`CONFIRM_ARM`]): the real
 /// clock, or a test's ([`Shell::set_clock`]).
@@ -1506,6 +1519,11 @@ pub struct Shell {
     confirm_armed_at: Option<Instant>,
     /// The confirmation on screen already said [`CONFIRM_WAIT_NOTICE`].
     confirm_wait_noted: bool,
+    /// When the remote pairing question on screen takes its first answer (AMP #4599):
+    /// [`CONFIRM_ARM`] after it was shown, pushed back by every key pressed before then.
+    pairing_armed_at: Option<Instant>,
+    /// The pairing question on screen already said [`PAIRING_WAIT_NOTICE`].
+    pairing_wait_noted: bool,
     /// The time for the confirmation's arm window: [`Instant::now`] unless a test set its own.
     clock: Clock,
     /// The person clicked into the editor while a panel was open (#2344): the editor has the
@@ -1658,6 +1676,8 @@ impl Shell {
                 confirm_unseen: Vec::new(),
                 confirm_armed_at: None,
                 confirm_wait_noted: false,
+                pairing_armed_at: None,
+                pairing_wait_noted: false,
                 clock: Arc::new(Instant::now),
                 editor_clicked: false,
                 mouse_press: None,
@@ -1891,13 +1911,35 @@ impl Shell {
     /// [`CONFIRM_WAIT_NOTICE`]. Returns false when the confirmation is armed (the key answers).
     fn hold_unarmed_confirm(&mut self) -> bool {
         let now = (self.clock)();
-        if self.confirm_armed_at.is_some_and(|at| now >= at) {
+        if !hold_unarmed(&mut self.confirm_armed_at, now) {
             return false;
         }
-        self.confirm_armed_at = Some(now + CONFIRM_ARM);
         if !self.confirm_wait_noted {
             self.confirm_wait_noted = true;
             self.view.add_local_line(CONFIRM_WAIT_NOTICE, true);
+            self.view.scroll().to_end();
+        }
+        true
+    }
+
+    /// The remote pairing question on screen takes answers now (AMP #4599): it has been shown
+    /// for [`CONFIRM_ARM`] with no key pressed in that time. False with none on screen.
+    pub fn pairing_armed(&self) -> bool {
+        self.pairing_pending() && self.pairing_armed_at.is_some_and(|at| (self.clock)() >= at)
+    }
+
+    /// A key on a pairing question that is not armed yet (AMP #4599), as
+    /// [`Self::hold_unarmed_confirm`] for a confirmation: it answers nothing and does not reach
+    /// the editor, the arm window starts again, and the first such key says
+    /// [`PAIRING_WAIT_NOTICE`]. Returns false when the question is armed (the key answers).
+    fn hold_unarmed_pairing(&mut self) -> bool {
+        let now = (self.clock)();
+        if !hold_unarmed(&mut self.pairing_armed_at, now) {
+            return false;
+        }
+        if !self.pairing_wait_noted {
+            self.pairing_wait_noted = true;
+            self.view.add_local_line(PAIRING_WAIT_NOTICE, true);
             self.view.scroll().to_end();
         }
         true
@@ -2452,6 +2494,9 @@ impl Shell {
         self.view.add_local_line(&question, true);
         self.view.add_local_line(&hint, false);
         self.view.scroll().to_end();
+        // AMP #4599: each question (a newer one replaces the old) gets its own arm window.
+        self.pairing_armed_at = Some((self.clock)() + CONFIRM_ARM);
+        self.pairing_wait_noted = false;
     }
 
     pub fn view(&self) -> &ChatView {
@@ -4784,7 +4829,13 @@ impl Shell {
     /// chat's live workers ([`esc_hint`]), and the next Esc stops the reply (#2181, #2354).
     pub async fn key(&mut self, key: &KeyEvent, editor_empty: bool) -> bool {
         // #2376: a pairing question takes the next key: `y` allows, anything else refuses.
+        // AMP #4599: as for a confirmation (#4319), until it has been on screen for CONFIRM_ARM
+        // with no key, a key (a `y` typed ahead as the question popped up) answers nothing,
+        // doesn't reach the editor, and restarts that.
         if self.pairing_pending() {
+            if self.hold_unarmed_pairing() {
+                return true;
+            }
             let plain = !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
