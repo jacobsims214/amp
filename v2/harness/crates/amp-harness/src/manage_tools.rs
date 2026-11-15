@@ -271,9 +271,19 @@ fn check_skill(ctx: &Ctx, action: Action, name: &str) -> Result<Plan, String> {
         Action::Update if !exists => return Err(format!("no skill {name}; use action create")),
         _ => {}
     }
-    if let Some(role) = loaded
-        .roles
+    // The write lands in the user layer, which applies in every repo, so the primary-preload
+    // refusal also checks built-ins plus the user layer (#4600): a repo file overriding a
+    // primary must not hide a user-layer primary that preloads this skill. Either roster
+    // refusing is enough; this can only refuse more.
+    let user_assets = Assets::load(&OverrideDirs {
+        user: ctx.paths.user_dir.clone(),
+        repo: None,
+    })
+    .map_err(|e| e.to_string())?;
+    let user_roles = RoleRegistry::from_assets(&user_assets).map_err(|e| e.to_string())?;
+    if let Some(role) = user_roles
         .roles()
+        .chain(loaded.roles.roles())
         .find(|r| r.primary && r.skills.iter().any(|s| s == name))
     {
         return Err(format!(
@@ -1591,6 +1601,63 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.contains("primary agent"), "{e}");
+    }
+
+    // #4600: a repo-layer override of a primary must not hide a user-layer primary's preload.
+    #[tokio::test]
+    async fn a_repo_primary_cannot_hide_a_user_primary_preload() {
+        let ctx = ctx_with_repo(
+            "skill-primary-repo",
+            &[(
+                "boss",
+                "---\ndescription: Boss\nmode: primary\n---\n\nRepo boss.\n",
+            )],
+        );
+        let user = ctx.paths.user_dir.clone().unwrap();
+        // Test setup, written directly: a user-layer primary that preloads boss-notes.
+        let md = "---\nname: boss-notes\ndescription: x\n---\n\nx\n";
+        std::fs::create_dir_all(user.join("skills/boss-notes")).unwrap();
+        std::fs::write(user.join("skills/boss-notes/SKILL.md"), md).unwrap();
+        std::fs::create_dir_all(user.join("agents")).unwrap();
+        std::fs::write(
+            user.join("agents/boss.md"),
+            "---\ndescription: Boss\nmode: primary\nskills:\n  - boss-notes\n---\n\nBoss.\n",
+        )
+        .unwrap();
+        // With the repo layer on top, no primary preloads boss-notes.
+        let loaded = ctx.load().unwrap();
+        assert!(loaded.roles.get("boss").unwrap().primary);
+        assert!(
+            !loaded
+                .roles
+                .roles()
+                .any(|r| r.primary && r.skills.iter().any(|s| s == "boss-notes"))
+        );
+
+        let yes = Fake::new(true);
+        let t = tool(&ctx, Kind::Skill, Some(yes.clone()));
+        let e = call(
+            &t,
+            args("update", "boss-notes", &md.replace("x\n\nx", "y\n\ny")),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("preloaded by the primary agent boss"), "{e}");
+        assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            std::fs::read_to_string(user.join("skills/boss-notes/SKILL.md")).unwrap(),
+            md
+        );
+
+        // Create of a skill the user-layer primary preloads but nothing defines yet: refused
+        // (the user roster doesn't load without it), never asked, nothing written.
+        std::fs::remove_dir_all(user.join("skills/boss-notes")).unwrap();
+        let e = call(&t, args("create", "boss-notes", md))
+            .await
+            .unwrap_err();
+        assert!(e.contains("boss-notes"), "{e}");
+        assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
+        assert!(!user.join("skills/boss-notes").exists());
     }
 
     #[test]
