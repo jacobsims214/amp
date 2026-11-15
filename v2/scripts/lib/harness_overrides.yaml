@@ -57,6 +57,18 @@ files:
             - '  amp_manage_team_members: deny'
             - '  amp_manage_teams: deny'
             - '  amp_audit_log: deny'
+        # #4255: the manager's self-management (#4252/#4253) and worker-control (#4233/#4240) tools.
+        # The manager has no catch-all deny, so these allows only document intent; every worker
+        # role below denies the same six (policy.rs refuses worker control to children anyway, and
+        # workers never get the manager's extra tools: defence in depth).
+        - after: '  amp_audit_log: deny'
+          lines:
+            - '  amp_manage_agent: allow'
+            - '  amp_manage_skill: allow'
+            - '  amp_add_mcp_server: allow'
+            - '  amp_stop_worker: allow'
+            - '  amp_restart_worker: allow'
+            - '  amp_resume_worker: allow'
     body:
       - paragraph: "Your working set is: the full `amp_*` MCP tool surface"
         with: |
@@ -226,10 +238,49 @@ files:
           nothing the descriptions don't. (Reading a skill from your available skills to follow it is
           fine: that's how you load one.)
 
+  # #4255: no worker role may manage agents, skills or MCP servers, or stop/restart/resume
+  # workers; only the manager (above). One anchor, shared by every worker role.
   agent/amp-designer.md:
+    frontmatter: &worker_denies
+      add_lines:
+        - after: '  question: deny'
+          lines:
+            - '  amp_manage_agent: deny'
+            - '  amp_manage_skill: deny'
+            - '  amp_add_mcp_server: deny'
+            - '  amp_stop_worker: deny'
+            - '  amp_restart_worker: deny'
+            - '  amp_resume_worker: deny'
     body:
       - find: "Publish the file itself, don't paste it: in opencode, `amp_publish_artifact_file(path, task_id,\ntitle)`; elsewhere `amp-design-tools`' `publish_file.py`; only if neither works,"
         replace: "Publish the file itself, don't paste it: with `amp-design-tools`' `publish_file.py`; only if that\ndoesn't work,"
+
+  agent/amp-github-researcher.md:
+    frontmatter: *worker_denies
+
+  agent/amp-github-reviewer.md:
+    frontmatter: *worker_denies
+
+  agent/amp-kb-curator.md:
+    frontmatter: *worker_denies
+
+  agent/amp-media.md:
+    frontmatter: *worker_denies
+
+  agent/amp-researcher.md:
+    frontmatter: *worker_denies
+
+  agent/amp-reviewer.md:
+    frontmatter: *worker_denies
+
+  agent/amp-worker-backend.md:
+    frontmatter: *worker_denies
+
+  agent/amp-worker-docs.md:
+    frontmatter: *worker_denies
+
+  agent/amp-worker-frontend.md:
+    frontmatter: *worker_denies
 
   skills/amp-index/SKILL.md:
     body:

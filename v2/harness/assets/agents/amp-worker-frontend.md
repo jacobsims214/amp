@@ -12,6 +12,12 @@ permission:
   webfetch: allow
   todowrite: deny
   question: deny
+  amp_manage_agent: deny
+  amp_manage_skill: deny
+  amp_add_mcp_server: deny
+  amp_stop_worker: deny
+  amp_restart_worker: deny
+  amp_resume_worker: deny
 ---
 
 # AMP Frontend Specialist

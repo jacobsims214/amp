@@ -52,6 +52,30 @@ fn embedded_roster_is_the_eleven_roles() {
     assert_eq!(assets.manifest().source_sha256.len(), 64);
 }
 
+/// The manager's self-management tools (amp-harness `manage_tools`, #4252/#4253) and its
+/// worker-control tools (`policy::WORKER_CONTROL_TOOLS`, #4233/#4240): the generated manager
+/// allows all six, every worker role denies all six (#4255).
+#[test]
+fn manager_only_tools_are_allowed_for_the_manager_and_denied_for_every_worker() {
+    let mut tools = vec!["amp_manage_agent", "amp_manage_skill", "amp_add_mcp_server"];
+    tools.extend_from_slice(amp_core::policy::WORKER_CONTROL_TOOLS);
+    assert_eq!(tools.len(), 6);
+    let assets = Assets::embedded().unwrap();
+    let manager = assets.agent("amp-manager").unwrap();
+    for tool in &tools {
+        assert_eq!(
+            manager.frontmatter["permission"][tool], "allow",
+            "amp-manager {tool}"
+        );
+    }
+    for id in WORKERS {
+        let a = assets.agent(id).unwrap();
+        for tool in &tools {
+            assert_eq!(a.frontmatter["permission"][tool], "deny", "{id} {tool}");
+        }
+    }
+}
+
 #[test]
 fn embedded_skills_exclude_agent_builder_and_keep_files() {
     let assets = Assets::embedded().unwrap();

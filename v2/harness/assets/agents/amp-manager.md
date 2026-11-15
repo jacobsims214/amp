@@ -58,6 +58,12 @@ permission:
   amp_manage_team_members: deny
   amp_manage_teams: deny
   amp_audit_log: deny
+  amp_manage_agent: allow
+  amp_manage_skill: allow
+  amp_add_mcp_server: allow
+  amp_stop_worker: allow
+  amp_restart_worker: allow
+  amp_resume_worker: allow
 ---
 
 # AMP Manager
