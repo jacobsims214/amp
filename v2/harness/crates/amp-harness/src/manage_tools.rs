@@ -291,6 +291,137 @@ fn check_skill(ctx: &Ctx, action: Action, name: &str) -> Result<Plan, String> {
     })
 }
 
+/// Past this many cells (old lines times new lines, after the common prefix and suffix) the diff
+/// stops looking for common lines and shows every old line removed and every new line added.
+const DIFF_MAX_CELLS: usize = 4_000_000;
+
+/// The confirmation rows for the text being written (AMP #4302). Without a current file (create,
+/// or an update whose user-layer file doesn't exist yet): a header and every new line as `+ `.
+/// With one: a header with the totals, then only the changed lines, `- ` old and `+ ` new, under
+/// `@@ -a,b +c,d @@` hunk headers. No context lines, so the TUI's row cap keeps the changes.
+fn content_rows(current: Option<&str>, new: &str) -> Vec<String> {
+    let Some(old) = current else {
+        let lines: Vec<&str> = new.lines().collect();
+        let mut rows = vec![format!("new text ({} lines), in full:", lines.len())];
+        rows.extend(lines.iter().map(|l| format!("+ {l}")));
+        return rows;
+    };
+    let old: Vec<&str> = old.lines().collect();
+    let new: Vec<&str> = new.lines().collect();
+    let hunks = line_diff(&old, &new);
+    if hunks.is_empty() {
+        return vec!["diff: no change to the text".to_owned()];
+    }
+    let removed: usize = hunks.iter().map(|h| h.old_len).sum();
+    let added: usize = hunks.iter().map(|h| h.new_len).sum();
+    let mut rows = vec![format!(
+        "diff against the current file: -{removed} +{added} lines, changed lines only:"
+    )];
+    for h in &hunks {
+        rows.push(format!(
+            "@@ -{},{} +{},{} @@",
+            h.old_start + 1,
+            h.old_len,
+            h.new_start + 1,
+            h.new_len
+        ));
+        rows.extend(
+            old[h.old_start..h.old_start + h.old_len]
+                .iter()
+                .map(|l| format!("- {l}")),
+        );
+        rows.extend(
+            new[h.new_start..h.new_start + h.new_len]
+                .iter()
+                .map(|l| format!("+ {l}")),
+        );
+    }
+    rows
+}
+
+/// One run of changed lines: `old_len` old lines from `old_start` replaced by `new_len` new lines
+/// from `new_start` (0-based).
+#[derive(Debug, PartialEq, Eq)]
+struct Hunk {
+    old_start: usize,
+    old_len: usize,
+    new_start: usize,
+    new_len: usize,
+}
+
+/// A line diff by longest common subsequence, after trimming the common prefix and suffix.
+fn line_diff(old: &[&str], new: &[&str]) -> Vec<Hunk> {
+    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let a = &old[prefix..old.len() - suffix];
+    let b = &new[prefix..new.len() - suffix];
+    if a.is_empty() && b.is_empty() {
+        return Vec::new();
+    }
+    let whole = || {
+        vec![Hunk {
+            old_start: prefix,
+            old_len: a.len(),
+            new_start: prefix,
+            new_len: b.len(),
+        }]
+    };
+    if a.is_empty() || b.is_empty() || a.len().saturating_mul(b.len()) > DIFF_MAX_CELLS {
+        return whole();
+    }
+    // lcs[i][j]: the LCS length of a[i..] and b[j..].
+    let (n, m) = (a.len(), b.len());
+    let mut lcs = vec![0u32; (n + 1) * (m + 1)];
+    let at = |i: usize, j: usize| i * (m + 1) + j;
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[at(i, j)] = if a[i] == b[j] {
+                lcs[at(i + 1, j + 1)] + 1
+            } else {
+                lcs[at(i + 1, j)].max(lcs[at(i, j + 1)])
+            };
+        }
+    }
+    let mut hunks: Vec<Hunk> = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    let mut push = |i: usize, j: usize, del: bool| {
+        let (oi, nj) = (prefix + i, prefix + j);
+        match hunks.last_mut() {
+            Some(h) if h.old_start + h.old_len == oi && h.new_start + h.new_len == nj => {
+                if del {
+                    h.old_len += 1;
+                } else {
+                    h.new_len += 1;
+                }
+            }
+            _ => hunks.push(Hunk {
+                old_start: oi,
+                old_len: usize::from(del),
+                new_start: nj,
+                new_len: usize::from(!del),
+            }),
+        }
+    };
+    while i < n || j < m {
+        if i < n && j < m && a[i] == b[j] {
+            i += 1;
+            j += 1;
+        } else if j == m || (i < n && lcs[at(i + 1, j)] >= lcs[at(i, j + 1)]) {
+            push(i, j, true);
+            i += 1;
+        } else {
+            push(i, j, false);
+            j += 1;
+        }
+    }
+    hunks
+}
+
 struct ManageTool {
     kind: Kind,
     shared: Arc<Shared>,
@@ -390,6 +521,15 @@ impl ManageTool {
             args.content.lines().count(),
             self.kind.noun()
         ));
+        // The text itself, last (AMP #4302): the person's yes is the only gate on prompt
+        // content, so they see what they allow. The TUI caps the rows and says how many more.
+        let current = match args.action {
+            Action::Update => std::fs::read_to_string(&plan.path).ok(),
+            Action::Create => None,
+        };
+        for row in content_rows(current.as_deref(), &args.content) {
+            request = request.detail(row);
+        }
         let answer = tokio::select! {
             answer = confirm_or_deny(Some(confirmer), request, CONFIRM_TIMEOUT) => answer,
             () = cancel.cancelled() => return Err(not_written("the call was cancelled".into())),
@@ -1007,6 +1147,17 @@ mod tests {
             req.details.iter().any(|d| d.contains("new file")),
             "{req:?}"
         );
+        // The person sees the text they approve (#4302), after the notes.
+        assert!(
+            req.details
+                .iter()
+                .any(|d| d == "+ You answer SQL questions."),
+            "{req:?}"
+        );
+        assert!(
+            req.details.iter().any(|d| d == "+ description: SQL"),
+            "{req:?}"
+        );
         // The next run (a fresh load of the layers) sees it.
         assert_eq!(
             ctx.load()
@@ -1029,6 +1180,22 @@ mod tests {
         assert!(
             req.details.iter().any(|d| d.contains("backed up first")),
             "{req:?}"
+        );
+        // update: only the changed lines, old and new (#4302).
+        assert!(
+            req.details.iter().any(|d| d == "- description: SQL"),
+            "{req:?}"
+        );
+        assert!(
+            req.details.iter().any(|d| d == "+ description: SQL v2"),
+            "{req:?}"
+        );
+        assert!(req.details.iter().any(|d| d == "+   task:"), "{req:?}");
+        assert!(
+            !req.details
+                .iter()
+                .any(|d| d.contains("You answer SQL questions")),
+            "unchanged lines are left out: {req:?}"
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), narrower);
         assert_eq!(
@@ -1174,6 +1341,8 @@ mod tests {
         let md = "---\nname: my-skill\ndescription: Does things\n---\n\nDo it.\n";
         let out = call(&t, args("create", "my-skill", md)).await.unwrap();
         assert!(out.contains("Created skill my-skill"), "{out}");
+        let req = yes.last.lock().unwrap().clone().unwrap();
+        assert!(req.details.iter().any(|d| d == "+ Do it."), "{req:?}");
         assert_eq!(
             ctx.load_assets()
                 .unwrap()
@@ -1185,6 +1354,18 @@ mod tests {
         let md2 = md.replace("Does things", "Does more");
         let out = call(&t, args("update", "my-skill", &md2)).await.unwrap();
         assert!(out.contains(".edit/backup/skills/my-skill."), "{out}");
+        let req = yes.last.lock().unwrap().clone().unwrap();
+        assert!(
+            req.details
+                .iter()
+                .any(|d| d == "- description: Does things"),
+            "{req:?}"
+        );
+        assert!(
+            req.details.iter().any(|d| d == "+ description: Does more"),
+            "{req:?}"
+        );
+        assert!(!req.details.iter().any(|d| d == "+ Do it."), "{req:?}");
         assert_eq!(
             ctx.load_assets()
                 .unwrap()
@@ -1208,6 +1389,29 @@ mod tests {
                 .contains("no skill nope")
         );
         assert_eq!(yes.asked.load(Ordering::SeqCst), asked);
+    }
+
+    #[test]
+    fn content_rows_show_new_text_or_only_changed_lines() {
+        let rows = content_rows(None, "a\nb\n");
+        assert_eq!(rows[1..], ["+ a", "+ b"]);
+        assert!(rows[0].contains("2 lines"), "{rows:?}");
+
+        let rows = content_rows(Some("a\nb\nc\nd\ne\n"), "a\nB\nc\nd\ne\nf\n");
+        assert_eq!(
+            rows[1..],
+            ["@@ -2,1 +2,1 @@", "- b", "+ B", "@@ -6,0 +6,1 @@", "+ f"]
+        );
+        assert!(rows[0].contains("-1 +2"), "{rows:?}");
+        assert_eq!(
+            content_rows(Some("x\n"), "x\n"),
+            ["diff: no change to the text"]
+        );
+        // A pure deletion in the middle.
+        assert_eq!(
+            content_rows(Some("a\nb\nc\n"), "a\nc\n")[1..],
+            ["@@ -2,1 +2,0 @@", "- b"]
+        );
     }
 
     #[tokio::test]
