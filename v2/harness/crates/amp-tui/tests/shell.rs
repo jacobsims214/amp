@@ -32,6 +32,8 @@ struct Rig {
     events: UnboundedReceiver<AgentEvent>,
     done: UnboundedReceiver<amp_tui::RunDone>,
     model: Model,
+    /// The shell's clock when a test set one (AMP #4319, the confirm tests).
+    clock: Option<Arc<std::sync::Mutex<std::time::Instant>>>,
 }
 
 async fn rig(steps: Vec<FauxStep>) -> Rig {
@@ -108,6 +110,7 @@ async fn rig_system(
         events,
         done,
         model,
+        clock: None,
     }
 }
 
@@ -661,12 +664,42 @@ mod confirm {
         .detail("+ description: reviews Go code")
     }
 
-    /// The rig with the session's confirmer wired to its shell, as the chat does.
-    async fn wired() -> (Rig, Arc<ChannelConfirmer>) {
+    /// A clock the test moves by hand, for the confirmation's arm window (AMP #4319).
+    type TestClock = Arc<std::sync::Mutex<std::time::Instant>>;
+
+    fn advance(clock: &TestClock, by: Duration) {
+        *clock.lock().unwrap() += by;
+    }
+
+    /// The rig with the session's confirmer wired to its shell, as the chat does, on a clock
+    /// the test moves (AMP #4319).
+    async fn wired_clock() -> (Rig, Arc<ChannelConfirmer>, TestClock) {
         let mut rig = rig(vec![]).await;
         let (confirmer, confirms) = ChannelConfirmer::new();
         rig.shell.set_confirms(confirms);
-        (rig, Arc::new(confirmer))
+        let clock: TestClock = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+        let read = Arc::clone(&clock);
+        rig.shell.set_clock(Arc::new(move || *read.lock().unwrap()));
+        rig.clock = Some(Arc::clone(&clock));
+        (rig, Arc::new(confirmer), clock)
+    }
+
+    async fn wired() -> (Rig, Arc<ChannelConfirmer>) {
+        let (rig, c, _) = wired_clock().await;
+        (rig, c)
+    }
+
+    /// Polls (bounded) until a question is on screen, without letting time pass on the
+    /// shell's clock: the question is not armed yet.
+    async fn until_shown_unarmed(rig: &mut Rig) {
+        for _ in 0..200 {
+            rig.shell.poll();
+            if rig.shell.confirm_pending() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no confirmation shown:\n{}", rig.screen());
     }
 
     /// A tool asking with `timeout`, as `confirm_or_deny` is called from a manager tool.
@@ -680,16 +713,116 @@ mod confirm {
         tokio::spawn(async move { confirm_or_deny(Some(c.as_ref()), req, timeout).await })
     }
 
-    /// Polls (bounded) until a question is on screen.
+    /// Polls (bounded) until a question is on screen, then lets its arm window pass with no
+    /// key (AMP #4319), so it takes the next key as its answer.
     async fn until_shown(rig: &mut Rig) {
-        for _ in 0..200 {
-            rig.shell.poll();
-            if rig.shell.confirm_pending() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("no confirmation shown:\n{}", rig.screen());
+        until_shown_unarmed(rig).await;
+        let clock = rig.clock.clone().expect("wired() sets the clock");
+        advance(&clock, amp_tui::shell::CONFIRM_ARM);
+        assert!(rig.shell.confirm_armed());
+    }
+
+    /// A plain key as the terminal hands it to the shell while the person types ahead into a
+    /// non-empty editor: true means the shell used it and the editor never sees it.
+    async fn typed(rig: &mut Rig, c: char) -> bool {
+        rig.shell
+            .key(&KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), false)
+            .await
+    }
+
+    // AMP #4319: a `y` typed ahead as the question appears does not answer it.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_y_inside_the_arm_window_neither_allows_nor_reaches_the_editor() {
+        let (mut rig, c, clock) = wired_clock().await;
+        let h = ask(&c, "amp-typed", WAIT);
+        until_shown_unarmed(&mut rig).await;
+        assert!(!rig.shell.confirm_armed());
+        advance(&clock, Duration::from_millis(100));
+        assert!(typed(&mut rig, 'y').await, "the editor does not get the y");
+        assert!(rig.shell.confirm_pending(), "the y answered nothing");
+        assert!(!h.is_finished(), "the tool is still waiting");
+        let screen = rig.screen();
+        assert!(
+            screen.contains(amp_tui::shell::CONFIRM_WAIT_NOTICE),
+            "{screen}"
+        );
+        assert!(!screen.contains("Allowed:"), "{screen}");
+        assert!(!screen.contains("Refused:"), "{screen}");
+        // More type-ahead: also swallowed, and the notice is not repeated.
+        assert!(typed(&mut rig, 'e').await);
+        assert!(typed(&mut rig, 's').await);
+        assert!(rig.shell.confirm_pending());
+        assert_eq!(
+            rig.screen()
+                .matches(amp_tui::shell::CONFIRM_WAIT_NOTICE)
+                .count(),
+            1,
+            "{}",
+            rig.screen()
+        );
+        // Once armed, `y` allows.
+        advance(&clock, amp_tui::shell::CONFIRM_ARM);
+        assert!(rig.shell.confirm_armed());
+        assert!(typed(&mut rig, 'y').await);
+        assert_eq!(outcome(h).await, Confirmed::Approved);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_y_after_the_arm_window_allows() {
+        let (mut rig, c, clock) = wired_clock().await;
+        let h = ask(&c, "amp-read", WAIT);
+        until_shown_unarmed(&mut rig).await;
+        advance(&clock, amp_tui::shell::CONFIRM_ARM);
+        assert!(rig.shell.confirm_armed());
+        assert!(typed(&mut rig, 'y').await);
+        assert_eq!(outcome(h).await, Confirmed::Approved);
+        assert!(!rig.screen().contains(amp_tui::shell::CONFIRM_WAIT_NOTICE));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_inside_the_arm_window_starts_it_again() {
+        let (mut rig, c, clock) = wired_clock().await;
+        let h = ask(&c, "amp-restart", WAIT);
+        until_shown_unarmed(&mut rig).await;
+        let arm = amp_tui::shell::CONFIRM_ARM;
+        // A key just before the window ends: the window starts again from it.
+        advance(&clock, arm - Duration::from_millis(10));
+        assert!(typed(&mut rig, 'x').await);
+        assert!(rig.shell.confirm_pending(), "x refused nothing");
+        // The first window's end has passed, the new one has not.
+        advance(&clock, Duration::from_millis(50));
+        assert!(!rig.shell.confirm_armed());
+        assert!(typed(&mut rig, 'y').await);
+        assert!(rig.shell.confirm_pending(), "y answered nothing");
+        assert!(!h.is_finished());
+        // A full window after the last key: armed, and any other key still refuses.
+        advance(&clock, arm);
+        assert!(rig.shell.confirm_armed());
+        assert!(typed(&mut rig, 'n').await);
+        assert_eq!(outcome(h).await, Confirmed::Denied(DenyReason::Declined));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_next_question_has_its_own_arm_window() {
+        let (mut rig, c, clock) = wired_clock().await;
+        let first = ask(&c, "amp-first", WAIT);
+        until_shown(&mut rig).await;
+        let second = ask(&c, "amp-second", WAIT);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // `n` answers the first; the second appears at once, and a `y` right after it waits.
+        assert!(typed(&mut rig, 'n').await);
+        assert_eq!(
+            outcome(first).await,
+            Confirmed::Denied(DenyReason::Declined)
+        );
+        until_shown_unarmed(&mut rig).await;
+        assert!(!rig.shell.confirm_armed());
+        assert!(typed(&mut rig, 'y').await);
+        assert!(!second.is_finished());
+        advance(&clock, amp_tui::shell::CONFIRM_ARM);
+        assert!(typed(&mut rig, 'y').await);
+        assert_eq!(outcome(second).await, Confirmed::Approved);
     }
 
     async fn outcome(h: tokio::task::JoinHandle<Confirmed>) -> Confirmed {

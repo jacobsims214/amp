@@ -619,6 +619,16 @@ const CONFIRM_ROW_CHARS: usize = 300;
 /// What `y` says while part of a confirmation has not been shown yet (AMP #4317).
 pub const CONFIRM_VIEW_FIRST: &str =
     "Press v to see the whole change first; y allows it after that.";
+/// A confirmation takes no answer until it has been on screen this long with no key pressed
+/// (AMP #4319): a `y` typed ahead into the editor as the question appeared must not allow it.
+/// Each key inside the window is swallowed and starts the window again.
+pub const CONFIRM_ARM: Duration = Duration::from_millis(750);
+/// What a key pressed before the confirmation is armed says (AMP #4319), once per question.
+pub const CONFIRM_WAIT_NOTICE: &str = "A confirmation is waiting: read it, then press y or N.";
+
+/// Where the shell reads the time for the confirmation's arm window ([`CONFIRM_ARM`]): the real
+/// clock, or a test's ([`Shell::set_clock`]).
+pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// A confirmation's text as the terminal shows it: no control or escape characters, at most
 /// [`CONFIRM_ROW_CHARS`] characters (it comes from the model's tool call).
@@ -1491,6 +1501,13 @@ pub struct Shell {
     /// The detail rows of [`Self::confirm`] not yet shown in full (AMP #4317): `v` shows them,
     /// and `y` does not allow while any are left.
     confirm_unseen: Vec<String>,
+    /// When the confirmation on screen takes its first answer (AMP #4319): [`CONFIRM_ARM`]
+    /// after it was shown, pushed back by every key pressed before then.
+    confirm_armed_at: Option<Instant>,
+    /// The confirmation on screen already said [`CONFIRM_WAIT_NOTICE`].
+    confirm_wait_noted: bool,
+    /// The time for the confirmation's arm window: [`Instant::now`] unless a test set its own.
+    clock: Clock,
     /// The person clicked into the editor while a panel was open (#2344): the editor has the
     /// keys (↑↓ and Enter included) until the panel closes or something is sent.
     editor_clicked: bool,
@@ -1639,6 +1656,9 @@ impl Shell {
                 confirms: None,
                 confirm: None,
                 confirm_unseen: Vec::new(),
+                confirm_armed_at: None,
+                confirm_wait_noted: false,
+                clock: Arc::new(Instant::now),
                 editor_clicked: false,
                 mouse_press: None,
                 person: None,
@@ -1854,6 +1874,35 @@ impl Shell {
         self.confirms = Some(confirms);
     }
 
+    /// The clock the confirmation's arm window ([`CONFIRM_ARM`]) is measured with (AMP #4319):
+    /// [`Instant::now`] by default; tests pass one they move by hand.
+    pub fn set_clock(&mut self, clock: Clock) {
+        self.clock = clock;
+    }
+
+    /// The confirmation on screen takes answers now (AMP #4319): it has been shown for
+    /// [`CONFIRM_ARM`] with no key pressed in that time. False with none on screen.
+    pub fn confirm_armed(&self) -> bool {
+        self.confirm.is_some() && self.confirm_armed_at.is_some_and(|at| (self.clock)() >= at)
+    }
+
+    /// A key on a confirmation that is not armed yet (AMP #4319): it answers nothing and does
+    /// not reach the editor, the arm window starts again, and the first such key says
+    /// [`CONFIRM_WAIT_NOTICE`]. Returns false when the confirmation is armed (the key answers).
+    fn hold_unarmed_confirm(&mut self) -> bool {
+        let now = (self.clock)();
+        if self.confirm_armed_at.is_some_and(|at| now >= at) {
+            return false;
+        }
+        self.confirm_armed_at = Some(now + CONFIRM_ARM);
+        if !self.confirm_wait_noted {
+            self.confirm_wait_noted = true;
+            self.view.add_local_line(CONFIRM_WAIT_NOTICE, true);
+            self.view.scroll().to_end();
+        }
+        true
+    }
+
     /// A self-management confirmation is on screen, waiting for its `y`/`N` (AMP #4259).
     pub fn confirm_pending(&self) -> bool {
         self.confirm.is_some()
@@ -1919,6 +1968,8 @@ impl Shell {
                 Ok(prompt) => {
                     self.confirm_unseen = self.show_confirm(&prompt);
                     self.confirm = Some(prompt);
+                    self.confirm_armed_at = Some((self.clock)() + CONFIRM_ARM);
+                    self.confirm_wait_noted = false;
                     return true;
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return changed,
@@ -4743,8 +4794,13 @@ impl Shell {
         }
         // AMP #4259: a self-management confirmation takes the next key, also while the reply
         // that asked is running: `y` allows, anything else (Esc, `n`, Enter) refuses. AMP #4317:
-        // while part of it was cut, `v` shows the rest and `y` waits for that.
+        // while part of it was cut, `v` shows the rest and `y` waits for that. AMP #4319: until
+        // it has been on screen for CONFIRM_ARM with no key, a key (a `y` typed ahead into the
+        // editor as it appeared) answers nothing, doesn't reach the editor, and restarts that.
         if self.confirm_pending() {
+            if self.hold_unarmed_confirm() {
+                return true;
+            }
             let plain = !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
