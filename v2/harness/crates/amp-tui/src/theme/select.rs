@@ -26,6 +26,7 @@ pub const ENV_THEME: &str = "AMP_HARNESS_THEME";
 pub const ENV_COLOR: &str = "AMP_HARNESS_COLOR";
 pub const ENV_SHOW_THINKING: &str = "AMP_HARNESS_SHOW_THINKING";
 pub const ENV_MOUSE: &str = "AMP_HARNESS_MOUSE";
+pub const ENV_SELECT_COPY: &str = "AMP_HARNESS_SELECT_COPY";
 pub const ENV_PADDING: &str = "AMP_HARNESS_PADDING";
 pub const ENV_DENSITY: &str = "AMP_HARNESS_DENSITY";
 pub const ENV_ASCII: &str = "AMP_HARNESS_ASCII";
@@ -124,6 +125,8 @@ struct TuiTable {
     show_thinking: Option<String>,
     /// `true`/`false` (or `"on"`/`"off"`), #2185.
     mouse: Option<toml::Value>,
+    /// `true`/`false` (or `"on"`/`"off"`): drag in the transcript to select and copy, AMP #4218.
+    select_copy: Option<toml::Value>,
     /// Columns left and right of the chat, #2251.
     padding: Option<toml::Value>,
     /// `compact` or `comfortable`, #2346.
@@ -188,6 +191,37 @@ pub fn resolve_mouse(
         }
         Some(other) => Err(ThemeError(format!(
             "[tui] mouse: unknown value `{other}`: use true or false"
+        ))),
+    }
+}
+
+/// Whether a drag in the transcript selects text and copies it on release (AMP #4217/#4218):
+/// `AMP_HARNESS_SELECT_COPY`, then config.toml `[tui] select_copy`, then on. Only matters while
+/// [`resolve_mouse`] is on; off, a click acts on press and the terminal's own selection needs a
+/// modifier (Fn in Terminal.app, Option in iTerm2). Values: `on`, `off`, `true`, `false` (TOML
+/// booleans too).
+pub fn resolve_select_copy(
+    env: &dyn Fn(&str) -> Option<String>,
+    config: Option<&str>,
+) -> Result<bool, ThemeError> {
+    if let Some(v) = env(ENV_SELECT_COPY).filter(|v| !v.trim().is_empty()) {
+        return parse_on_off(&v).map_err(|e| ThemeError(format!("{ENV_SELECT_COPY}: {e}")));
+    }
+    let table = match config {
+        Some(text) => toml::from_str::<ConfigFile>(text)
+            .map_err(|e| ThemeError(format!("config.toml [tui]: {e}")))?
+            .tui
+            .unwrap_or_default(),
+        None => TuiTable::default(),
+    };
+    match table.select_copy {
+        None => Ok(true),
+        Some(toml::Value::Boolean(on)) => Ok(on),
+        Some(toml::Value::String(v)) => {
+            parse_on_off(&v).map_err(|e| ThemeError(format!("[tui] select_copy: {e}")))
+        }
+        Some(other) => Err(ThemeError(format!(
+            "[tui] select_copy: unknown value `{other}`: use true or false"
         ))),
     }
 }
@@ -629,6 +663,25 @@ mod tests {
         assert!(e.0.contains("[tui] mouse"), "{}", e.0);
         let e = resolve_mouse(&env_of(&[(ENV_MOUSE, "maybe")]), None).unwrap_err();
         assert!(e.0.contains(ENV_MOUSE), "{}", e.0);
+    }
+
+    #[test]
+    fn select_copy_from_env_then_config_then_on() {
+        let none = env_of(&[]);
+        assert!(resolve_select_copy(&none, None).unwrap());
+        assert!(resolve_select_copy(&none, Some("[tui]\nmouse = true\n")).unwrap());
+        assert!(!resolve_select_copy(&none, Some("[tui]\nselect_copy = false\n")).unwrap());
+        assert!(!resolve_select_copy(&none, Some("[tui]\nselect_copy = \"off\"\n")).unwrap());
+        // The other [tui] readers accept the key (the table denies unknown fields).
+        assert!(resolve_mouse(&none, Some("[tui]\nselect_copy = false\n")).unwrap());
+        let off = env_of(&[(ENV_SELECT_COPY, "off")]);
+        assert!(!resolve_select_copy(&off, Some("[tui]\nselect_copy = true\n")).unwrap());
+        let on = env_of(&[(ENV_SELECT_COPY, "on")]);
+        assert!(resolve_select_copy(&on, Some("[tui]\nselect_copy = false\n")).unwrap());
+        let e = resolve_select_copy(&none, Some("[tui]\nselect_copy = 3\n")).unwrap_err();
+        assert!(e.0.contains("[tui] select_copy"), "{}", e.0);
+        let e = resolve_select_copy(&env_of(&[(ENV_SELECT_COPY, "maybe")]), None).unwrap_err();
+        assert!(e.0.contains(ENV_SELECT_COPY), "{}", e.0);
     }
 
     #[test]

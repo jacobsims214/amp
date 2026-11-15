@@ -1444,6 +1444,10 @@ pub struct Shell {
     /// Whether the terminal reports the mouse to us (wheel scrolling, the pill's click). Off,
     /// the terminal's own click-drag selection works without a modifier (`[tui] mouse`, #2185).
     mouse_capture: bool,
+    /// Whether a drag in the transcript selects and copies (AMP #4218, `[tui] select_copy`,
+    /// default on). Only matters with [`Shell::mouse_capture`] on; off, clicks act on press as
+    /// before #4217 and the terminal's modifier-drag selects.
+    select_copy: bool,
     /// How this terminal starts a new line (#2349): the empty editor's hint and `/help` name the
     /// key that works.
     newline: NewlineMode,
@@ -1598,6 +1602,7 @@ impl Shell {
                 quit_confirm_until: None,
                 released: Vec::new(),
                 mouse_capture: true,
+                select_copy: true,
                 newline: NewlineMode::default(),
                 sessions: Default::default(),
                 viewing: None,
@@ -2152,7 +2157,10 @@ impl Shell {
         self.view
             .add_to_transcript(Arc::new(crate::remote_ui::LinkBlock::new(url)));
         // #2423: how else to get the link out of the chat.
-        self.view.add_notice(if self.mouse_capture {
+        self.view.add_notice(if self.select_copy_on() {
+            "/remote copy copies the link again, /remote open opens it in this computer's \
+             browser, or drag to select and copy it."
+        } else if self.mouse_capture {
             "/remote copy copies the link again, /remote open opens it in this computer's \
              browser. To select it yourself: Option-drag (iTerm2) or Fn-drag (Terminal.app)."
         } else {
@@ -2392,10 +2400,11 @@ impl Shell {
     ///   a `#ticket`, a worker notice).
     ///
     /// With mouse capture off (`[tui] mouse = false`) the terminal sends no events; any that
-    /// come anyway are a plain click on Down and nothing else.
+    /// come anyway are a plain click on Down and nothing else. With `[tui] select_copy = false`
+    /// (AMP #4218) it is the same: a click on Down, as before #4217, and nothing is selected.
     pub fn mouse(&mut self, width: usize, height: usize, event: &MouseEvent) -> bool {
         let (row, column) = (usize::from(event.row), usize::from(event.column));
-        if !self.mouse_capture {
+        if !self.select_copy_on() {
             self.mouse_press = None;
             return match event.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -2522,6 +2531,26 @@ impl Shell {
 
     pub fn mouse_capture(&self) -> bool {
         self.mouse_capture
+    }
+
+    /// Whether a drag in the transcript selects and copies (`[tui] select_copy`, default on,
+    /// AMP #4218). Off, [`Shell::mouse`] clicks on press as before #4217, `/help` and the
+    /// `/remote` hint name the terminal's modifier-drag, and any selection is dropped.
+    pub fn set_select_copy(&mut self, on: bool) {
+        self.select_copy = on;
+        if !on {
+            self.mouse_press = None;
+            self.view.clear_selection();
+        }
+    }
+
+    pub fn select_copy(&self) -> bool {
+        self.select_copy
+    }
+
+    /// Select-to-copy is live: mouse capture and `[tui] select_copy` both on.
+    fn select_copy_on(&self) -> bool {
+        self.mouse_capture && self.select_copy
     }
 
     /// This terminal's new-line keys (#2349; the terminal loop sets it once the kitty keyboard
@@ -4848,6 +4877,7 @@ impl Shell {
             "help" | "?" => self.view.add_to_transcript(Arc::new(
                 crate::slash::HelpBlock::new()
                     .mouse_capture(self.mouse_capture)
+                    .select_copy(self.select_copy)
                     .newline(self.newline),
             )),
             "usage" => {

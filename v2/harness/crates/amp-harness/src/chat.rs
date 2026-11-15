@@ -24,6 +24,8 @@
 //! shows every tool call's arguments and result (#2183). Mouse reporting (#2185):
 //! `AMP_HARNESS_MOUSE`, `[tui] mouse` (true|false), else on; off gives the terminal's plain
 //! click-drag selection back (the wheel then no longer scrolls the transcript; PageUp/PageDown do).
+//! Select-to-copy (AMP #4218): `AMP_HARNESS_SELECT_COPY`, `[tui] select_copy` (true|false), else
+//! on; with mouse reporting on, a drag in the transcript highlights text and copies it on release.
 //! Padding (#2251): `AMP_HARNESS_PADDING`, `[tui] padding` (0-8 columns each side), else 2; halved
 //! at 80 columns or fewer, with a blank row above and below the chat (#2344, amp_tui::inset).
 //! Density (#2346): `AMP_HARNESS_DENSITY`, `[tui] density` (compact|comfortable), else compact
@@ -197,6 +199,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     amp_tui::install_theme(&theme);
     let show_thinking = load_show_thinking(&args)?;
     let mouse = load_mouse(&args)?;
+    let select_copy = load_select_copy(&args)?;
     let padding = load_padding(&args)?;
     amp_tui::density::set(load_density(&args)?);
     amp_tui::frame::set_ascii(load_ascii(&args)?);
@@ -247,6 +250,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     let _feed_flusher = session.feed.spawn_flusher();
     shell.set_show_thinking(show_thinking);
     shell.set_mouse_capture(mouse);
+    // AMP #4218: drag in the transcript to select and copy, unless `[tui] select_copy = false`.
+    shell.set_select_copy(select_copy);
     shell.set_padding(padding);
     // #2425: after asking for plan approval, wait for it in AMP and resume the manager.
     shell.set_auto_resume(load_auto_resume(&args)?);
@@ -713,6 +718,14 @@ fn load_show_thinking(args: &ChatArgs) -> Result<amp_tui::ThinkingDisplay, CliEr
 fn load_mouse(args: &ChatArgs) -> Result<bool, CliError> {
     let env = |k: &str| std::env::var(k).ok();
     amp_tui::theme::select::resolve_mouse(&env, config_text(args).as_deref())
+        .map_err(|e| CliError::usage(e.to_string()))
+}
+
+/// Select-to-copy (AMP #4218): `AMP_HARNESS_SELECT_COPY`, then config.toml `[tui] select_copy`,
+/// else on.
+fn load_select_copy(args: &ChatArgs) -> Result<bool, CliError> {
+    let env = |k: &str| std::env::var(k).ok();
+    amp_tui::theme::select::resolve_select_copy(&env, config_text(args).as_deref())
         .map_err(|e| CliError::usage(e.to_string()))
 }
 

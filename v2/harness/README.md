@@ -1163,7 +1163,8 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   its source). `/reload` picks up agents, skills, models and MCP servers changed from another
   terminal (see below). AMP: `/amp` (server, user, MCP health), `/ticket [id|none]`, `/project
   [id]`, `/questions`, `/plan`, `/open [id|plan]`, `/workers`, `/worker [id]`. `/usage` prints the
-  session's tokens and cost, `/help` (also `/?`), `/abort`, `/stop` (the reply, or the wait for
+  session's tokens and cost, `/compact [instructions]` compacts the chat now (see Context window
+  and compaction below), `/help` (also `/?`), `/abort`, `/stop` (the reply, or the wait for
   plan approval), `/close` (the open panel), `/quit`
   (also `/exit`, `/q`). Typing `/` opens a completion menu (↑↓ choose, Tab complete, Enter run).
 - Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply (an Esc that closes a
@@ -1198,17 +1199,19 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   within a second of scrolling with it, so holding it stops at the bottom. While you are scrolled up
   and output arrives below, a `↓ new output · End` pill shows on the transcript's last row; End or a
   click on it jumps down and follows the stream again. Sending a prompt also jumps to the end.
-- Selecting text: the chat turns mouse reporting on (for the wheel), so a plain click-drag goes to
-  the chat instead of the terminal. Hold **Fn** while dragging in Terminal.app, or **Option (⌥)** in
-  iTerm2 (checked on macOS with both: Option-drag does not select in Terminal.app, nor Fn-drag in
-  iTerm2). To get plain click-drag selection back, turn mouse reporting off with `[tui] mouse =
-  false` (or `AMP_HARNESS_MOUSE=off`); the wheel then no longer scrolls the transcript (Terminal.app
-  may send it as ↑↓ instead), and PageUp/PageDown do.
+- Selecting text: drag in the transcript to highlight text, and it is copied when you let go
+  (see Selecting and copying text below). `[tui] select_copy = false` turns that off; then the
+  terminal's own selection needs **Fn** while dragging in Terminal.app, or **Option (⌥)** in iTerm2
+  (checked on macOS with both: Option-drag does not select in Terminal.app, nor Fn-drag in
+  iTerm2). To get plain click-drag terminal selection back, turn mouse reporting off with `[tui]
+  mouse = false` (or `AMP_HARNESS_MOUSE=off`); the wheel then no longer scrolls the transcript
+  (Terminal.app may send it as ↑↓ instead), and PageUp/PageDown do.
 - The `/remote` pairing link (#2423) is copied as it is shown: OSC 52 to the terminal plus
   `pbcopy` (macOS), `wl-copy` (Wayland) or `xclip`/`xsel` (X11) when found in `PATH`
   (`amp_tui::clipboard`). `/remote copy` copies it again, `/remote open` opens it with `open` /
-  `xdg-open`. Its rows start at the window's left edge (`inset::FLUSH_LEFT`: no padding), so a
-  modifier-drag from its first character to its last is the link plus line breaks. Only the
+  `xdg-open`. Drag across it to select and copy it; its rows start at the window's left edge
+  (`inset::FLUSH_LEFT`: no padding), so a terminal modifier-drag (with `select_copy = false`) from
+  its first character to its last is the link plus line breaks. Only the
   terminal loop turns the real clipboard on (`Shell::attach_terminal`); tests use
   `Desktop::with_path` and recording stand-ins.
 - Tool calls (#2183) are one line each: `✓ list_tasks · 3 tickets: 1 ready, 1 waiting · 12 ms`.
@@ -1391,6 +1394,48 @@ one with `/sessions`.
 - `[compaction]` is global: there is no per-model or per-role setting, only role caps on the
   window and output.
 
+### Selecting and copying text: drag, `[tui] select_copy` (#4210-#4218)
+
+With mouse reporting on (the default), a plain left drag in the transcript highlights text, and
+releasing the button copies it. This works in the manager chat, in a live worker's session and
+in a saved worker session. Only transcript text is ever copied: never the editor, a panel or a
+`/connect` key, and the copied text is never logged.
+
+- **What gets copied is the text, not the screen.** Box borders, padding, the scrollbar and the
+  `↓ new output` pill are left out. Soft-wrapped lines are joined back with a space, code keeps its
+  indentation and exact spacing, and quote and list continuations lose their repeated `│ ` and
+  hanging indent. A shortened tool line copies with its `…` (Ctrl+O shows the whole call).
+  Dragging past the top or bottom of the transcript scrolls it, so a selection can be longer than
+  the window.
+- **Clicks still work.** A click without a drag acts when you release: it opens or closes a
+  thinking section, or opens a worker or `#ticket`. A click in the editor moves the cursor at
+  once, as before.
+- **The highlight stays after the copy.** The next press, Esc, or any key that edits clears it.
+  Scrolling (wheel, PageUp/PageDown, arrows) keeps it. Anything that reflows the transcript also
+  clears it: Ctrl+O, Ctrl+T, switching sessions, or resizing the window.
+- **The status line says what happened, with a character count only:**
+  - `Copied N chars.`: a system tool took it (`pbcopy` on macOS, `wl-copy` on Wayland,
+    `xclip`/`xsel` on X11, found in `PATH`).
+  - `Sent N chars to the terminal's clipboard (OSC 52)…`: no tool did, so the text went only as
+    an OSC 52 escape to the terminal. This is the usual case over SSH and inside tmux. The terminal
+    doesn't confirm OSC 52, so if paste comes up empty, the terminal is blocking it. In iTerm2,
+    allow clipboard access (Settings › General › Selection, "Applications in terminal may access
+    clipboard"). In tmux, add `set -g set-clipboard on` to `~/.tmux.conf`.
+  - `Nothing copied: …`: neither worked. Use the terminal's own selection instead.
+  - A selection over 1 MB copies nothing and says `Selection too large to copy (… KB, limit
+    1024 KB).`
+
+| setting     | env                       | `config.toml` `[tui]` | default |
+|-------------|---------------------------|-----------------------|---------|
+| select_copy | `AMP_HARNESS_SELECT_COPY` | `select_copy`         | `true`  |
+
+`select_copy = false` (or `AMP_HARNESS_SELECT_COPY=off`) gives back the behaviour from before
+select-to-copy. A drag in the chat selects nothing, a click acts when pressed, and `/help` and
+the `/remote` hint name the terminal's modifier-drag again: Fn in Terminal.app, Option (⌥) in
+iTerm2. With `[tui] mouse = false` the chat gets no mouse events, so `select_copy` changes
+nothing, and a plain click-drag is the terminal's own selection. `/config` shows the setting and
+where it came from.
+
 ### Theme (M3-1)
 
 The chat uses the AMP theme: `amp-dark` or `amp-light` (provisional simstech tokens v1, #1815),
@@ -1402,6 +1447,7 @@ with square borders and AMP's ticket-state, epic and brand colours.
 | colours  | -         | `AMP_HARNESS_COLOR`         | `color`               | `auto`      |
 | thinking | -         | `AMP_HARNESS_SHOW_THINKING` | `show_thinking`       | `collapsed` |
 | mouse    | -         | `AMP_HARNESS_MOUSE`         | `mouse`               | `true`      |
+| select   | -         | `AMP_HARNESS_SELECT_COPY`   | `select_copy`         | `true`      |
 | padding  | -         | `AMP_HARNESS_PADDING`       | `padding`             | `2`         |
 | density  | -         | `AMP_HARNESS_DENSITY`       | `density`             | `compact`   |
 
@@ -1413,9 +1459,12 @@ with square borders and AMP's ticket-state, epic and brand colours.
 - `show_thinking`: `collapsed` (one `▸ Thought for Ns` line per section; a click or Ctrl+T opens
   one), `full` (every section expanded as plain dim text) or `hidden` (none shown; Ctrl+T still
   shows the last one). `/config thinking` changes it for one chat.
-- `mouse`: `true` (the wheel scrolls the transcript; select with Fn-drag in Terminal.app,
-  Option-drag in iTerm2) or `false` (no mouse reporting: plain click-drag selects). The env var
-  takes `on`/`off`.
+- `mouse`: `true` (the wheel scrolls the transcript; drag to select and copy, see Selecting and
+  copying text) or `false` (no mouse reporting: plain click-drag is the terminal's selection). The
+  env var takes `on`/`off`.
+- `select_copy`: `true` (drag in the transcript selects and copies on release) or `false` (the
+  chat doesn't select; use Fn-drag in Terminal.app, Option-drag in iTerm2). Only matters with
+  `mouse = true`. The env var takes `on`/`off`.
 - `padding`: columns of space left and right of every part of the chat (header, transcript,
   panels, editor, status line, footer), 0 to 8. At 80 columns or fewer it is halved, rounded up
   (the default 2 becomes 1), and it shrinks further so the content keeps at least 40 columns

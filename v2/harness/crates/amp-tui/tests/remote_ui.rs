@@ -503,7 +503,9 @@ async fn the_pairing_link_is_copied_opened_and_selectable() {
         screen.contains("/remote copy copies the link again"),
         "{screen}"
     );
-    assert!(screen.contains("Option-drag (iTerm2)"), "{screen}");
+    // AMP #4218: with select-to-copy on, a plain drag selects and copies the link.
+    assert!(screen.contains("drag to select and copy it"), "{screen}");
+    assert!(!screen.contains("Option-drag"), "{screen}");
     let copies = recorded(&r.stubs, "pbcopy");
     assert_eq!(copies.len(), 1, "{copies:?}");
     let link = copies[0].clone();
@@ -589,6 +591,18 @@ async fn the_pairing_link_is_copied_opened_and_selectable() {
         r.shell.poll();
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// AMP #4218: with `[tui] select_copy = false` the chat doesn't select, so the hint names the
+/// terminal's modifier-drag again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_select_copy_off_the_hint_names_the_modifier_drag() {
+    let mut r = rig("noselect", MockOptions::default(), (80, 24)).await;
+    r.shell.set_select_copy(false);
+    r.shell.submit("/remote").await;
+    let screen = r.until("Pairing link copied to the clipboard.").await;
+    assert!(screen.contains("Option-drag (iTerm2)"), "{screen}");
+    assert!(!screen.contains("drag to select and copy"), "{screen}");
 }
 
 /// #2423: with mouse capture off the hint says plain selection works.

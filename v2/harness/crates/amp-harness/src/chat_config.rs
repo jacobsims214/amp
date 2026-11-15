@@ -1373,6 +1373,8 @@ impl Inner {
         line(&mut rows, "show_thinking", v, src);
         let (v, src) = setting("tui", "mouse", "AMP_HARNESS_MOUSE", "true");
         line(&mut rows, "mouse", v, src);
+        let (v, src) = setting("tui", "select_copy", "AMP_HARNESS_SELECT_COPY", "true");
+        line(&mut rows, "select_copy", v, src);
         let (v, src) = setting(
             "tui",
             "padding",

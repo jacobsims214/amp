@@ -12,9 +12,11 @@
 //! Scrolling (#2185): the wheel, PageUp/PageDown, Ctrl+U/Ctrl+D and End move the transcript
 //! ([`Shell::scroll_key`], [`Shell::ctrl_d`]); while it is scrolled up and output arrives, rpi-tui's
 //! jump-to-end indicator shows [`crate::NEW_OUTPUT`] (clicking it jumps to the end). Mouse
-//! reporting is on unless [`Shell::mouse_capture`] is off (`[tui] mouse = false`), so the
-//! terminal's own click-drag selection needs a modifier while it is on: Fn-drag in Terminal.app,
-//! Option-drag in iTerm2 (see the README).
+//! reporting is on unless [`Shell::mouse_capture`] is off (`[tui] mouse = false`). While it is on,
+//! a plain left drag in the transcript selects text and copies it on release (AMP #4217,
+//! [`Shell::mouse`]); `[tui] select_copy = false` ([`Shell::set_select_copy`]) turns that off,
+//! and then the terminal's own selection needs a modifier: Fn-drag in Terminal.app, Option-drag
+//! in iTerm2. With capture off, plain click-drag is the terminal's own selection (see the README).
 //!
 //! The cursor (#2344): while the input has focus ([`Shell::input_focused`]) the terminal's own
 //! cursor shows at the insertion point as a blinking bar (`SetCursorStyle::BlinkingBar` on

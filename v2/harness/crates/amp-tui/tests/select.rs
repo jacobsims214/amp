@@ -683,6 +683,110 @@ mod shell {
         assert!(!r.screen().contains("Copied"));
     }
 
+    /// AMP #4218: `[tui] select_copy = false` with capture on is the chat before #4217: a drag
+    /// selects and copies nothing, and a click acts on the press (a thinking header opens on
+    /// Down, without waiting for Up).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_select_copy_off_a_drag_selects_nothing_and_clicks_act_on_press() {
+        let mut r = rig("select-off", Some("why oh why"), PARA).await;
+        r.shell.set_select_copy(false);
+        assert!(r.shell.mouse_capture() && !r.shell.select_copy());
+        let start = r.find("alpha");
+        let end = r.find("zulu");
+        r.down(start);
+        r.drag(end);
+        r.up(end);
+        r.settle().await;
+        assert!(r.shell.view().selection().is_none());
+        assert!(
+            !r.shell
+                .view()
+                .render_frame(W, H)
+                .iter()
+                .any(|l| l.contains("\x1b[7m"))
+        );
+        assert!(r.osc52().is_empty());
+        assert!(r.pbcopy().is_empty());
+        assert!(!r.screen().contains("Copied"));
+
+        let (row, _) = r.find("▸ Thought for ");
+        assert!(r.down((row, 8)), "a press is a click");
+        assert!(r.screen().contains("▾ Thought for "), "{}", r.screen());
+        assert!(!r.up((row, 8)), "the release does nothing");
+        assert!(r.screen().contains("▾ Thought for "), "{}", r.screen());
+
+        // Turning it off drops a selection that was already there.
+        r.shell.set_select_copy(true);
+        let start = r.find("alpha");
+        r.down(start);
+        r.drag((start.0, start.1 + 10));
+        assert!(r.shell.view().selection().is_some());
+        r.shell.set_select_copy(false);
+        assert!(r.shell.view().selection().is_none());
+        assert!(!r.up((start.0, start.1 + 10)));
+        assert!(r.osc52().is_empty());
+    }
+
+    /// AMP #4218: the status after a copy gives the count only, never the copied text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_copy_notice_gives_the_count_never_the_text() {
+        let mut r = rig("notice", None, PARA).await;
+        let start = r.find("charlie");
+        let end = (start.0, start.1 + "charlie delta echo".len() - 1);
+        r.down(start);
+        r.drag(end);
+        r.up(end);
+        let want = "charlie delta echo";
+        r.pbcopy_is(&[want]).await;
+        let notice = format!("Copied {} chars.", want.chars().count());
+        r.until(&notice).await;
+        let rows = r.rows();
+        let lines: Vec<&String> = rows.iter().filter(|l| l.contains("Copied")).collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(
+            lines[0]
+                .trim()
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.'),
+            notice,
+            "{lines:?}"
+        );
+        for word in want.split(' ') {
+            assert!(!lines[0].contains(word), "{word} in {:?}", lines[0]);
+        }
+
+        // Every wording copy_notice has (tool, OSC 52 only, failed tool): a count, no text.
+        use amp_tui::clipboard::{Copied, copy_notice};
+        let cases = [
+            Copied {
+                tool: Some("pbcopy"),
+                osc52: true,
+                tool_error: None,
+            },
+            Copied {
+                tool: None,
+                osc52: true,
+                tool_error: None,
+            },
+            Copied {
+                tool: None,
+                osc52: true,
+                tool_error: Some("xclip: no display".into()),
+            },
+            Copied {
+                tool: None,
+                osc52: false,
+                tool_error: Some("xclip: no display".into()),
+            },
+        ];
+        for c in &cases {
+            let text = copy_notice(want.chars().count(), c).expect("a notice");
+            for word in want.split(' ') {
+                assert!(!text.contains(word), "{word} in {text:?}");
+            }
+        }
+        assert_eq!(copy_notice(18, &Copied::default()), None);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn esc_editing_keys_and_the_next_press_clear_it_but_paging_keeps_it() {
         let mut r = rig("clear", None, PARA).await;

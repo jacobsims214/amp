@@ -370,9 +370,11 @@ fn help_lists_the_scroll_keys_and_selection() {
     for want in ["PgUp/PgDn", "Ctrl+U/D", "End"] {
         assert!(keys.contains(&want), "{keys:?}");
     }
+    // AMP #4218: with capture on a plain drag selects and copies; the modifier-drag row
+    // (Terminal.app / iTerm2) is only for `[tui] select_copy = false`.
+    assert_eq!(KEYS.last(), Some(&amp_tui::SELECT_COPY_KEY), "{KEYS:?}");
     assert!(
-        KEYS.iter()
-            .any(|(_, about)| about.contains("Terminal.app") && about.contains("iTerm2")),
-        "{KEYS:?}"
+        amp_tui::MODIFIER_DRAG_KEY.1.contains("Terminal.app")
+            && amp_tui::MODIFIER_DRAG_KEY.1.contains("iTerm2")
     );
 }
