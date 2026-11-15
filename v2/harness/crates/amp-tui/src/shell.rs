@@ -1358,6 +1358,18 @@ fn compacted_notice(before: i64, after: i64, saved: bool) -> String {
     )
 }
 
+/// A left press in the transcript still held down (AMP #4217, #4315).
+#[derive(Debug, Clone, Copy)]
+struct MousePress {
+    /// The screen cell `(row, column)` pressed.
+    cell: (usize, usize),
+    /// The transcript content cell under it when pressed. The follow-end view can scroll
+    /// before release, so a click acts on this row, not on whatever the cell shows by then.
+    at: crate::selection::Pos,
+    /// The pointer has been dragged off the pressed cell: a selection, never a click.
+    moved: bool,
+}
+
 pub struct Shell {
     view: ChatView,
     harness: Arc<AgentHarness>,
@@ -1465,10 +1477,10 @@ pub struct Shell {
     /// The person clicked into the editor while a panel was open (#2344): the editor has the
     /// keys (↑↓ and Enter included) until the panel closes or something is sent.
     editor_clicked: bool,
-    /// Select-to-copy (AMP #4217): the screen cell `(row, column)` of a left press in the
-    /// transcript still held down. It becomes a selection once the pointer moves to another
-    /// cell; released in place it is a click ([`Shell::mouse`]).
-    mouse_press: Option<(usize, usize)>,
+    /// Select-to-copy (AMP #4217): a left press in the transcript still held down. It becomes
+    /// a selection once the pointer moves to another screen cell; released in place it is a
+    /// click on the content row pressed ([`Shell::mouse`], #4315).
+    mouse_press: Option<MousePress>,
     /// Who stops workers from this chat ([`Shell::set_person`]); else the AMP user's email.
     person: Option<String>,
     /// The manager's scroll position while a worker's session is shown (#2347).
@@ -2393,12 +2405,15 @@ impl Shell {
     ///
     /// - **Down** drops any selection. Inside the transcript it only records the press;
     ///   anywhere else (editor, worker strip, panel) it is [`Shell::click`] at once, as before.
-    /// - **Drag** to another cell selects, from the press to the pointer, in content
-    ///   coordinates. Above or below the transcript it scrolls one line per event and the
+    /// - **Drag** to another screen cell selects, from the press to the pointer, in content
+    ///   coordinates. Click vs. drag is decided on the screen (#4315): output arriving while the
+    ///   button is down moves the follow-end view, not the pointer, so it never starts a
+    ///   selection. Above or below the transcript it scrolls one line per event and the
     ///   selection follows to the edge. Nothing is copied while dragging.
     /// - **Up** with a selection copies it ([`Shell::copy_selection`]); the highlight stays.
-    ///   Up in the pressed cell is [`Shell::click`] with the press's cell (a thinking header,
-    ///   a `#ticket`, a worker notice).
+    ///   Up in the pressed screen cell, with no drag away from it, is [`Shell::click`] on the
+    ///   content row that was pressed, wherever it now is on screen (a thinking header, a
+    ///   `#ticket`, a worker notice); if output has pushed that row out of sight, nothing.
     ///
     /// With mouse capture off (`[tui] mouse = false`) the terminal sends no events; any that
     /// come anyway are a plain click on Down and nothing else. With `[tui] select_copy = false`
@@ -2423,7 +2438,11 @@ impl Shell {
                 match self.view.content_pos(width, height, row, column) {
                     Some(at) => {
                         self.view.select_start(at);
-                        self.mouse_press = Some((row, column));
+                        self.mouse_press = Some(MousePress {
+                            cell: (row, column),
+                            at,
+                            moved: false,
+                        });
                     }
                     None => {
                         self.click(width, height, row, column);
@@ -2432,9 +2451,13 @@ impl Shell {
                 true
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if self.mouse_press.is_none() {
+                let Some(press) = self.mouse_press.as_mut() else {
+                    return false;
+                };
+                if !press.moved && press.cell == (row, column) {
                     return false;
                 }
+                press.moved = true;
                 if let Some(rect) = self.view.scroll_rect(width, height) {
                     if row < rect.y {
                         self.view.scroll().scroll_by(-1);
@@ -2448,22 +2471,36 @@ impl Shell {
                 true
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                let Some((press_row, press_column)) = self.mouse_press.take() else {
+                let Some(press) = self.mouse_press.take() else {
                     return false;
                 };
-                if let Some(to) = self.view.content_pos_clamped(width, height, row, column) {
-                    self.view.select_extend(to);
+                if press.moved || press.cell != (row, column) {
+                    if let Some(to) = self.view.content_pos_clamped(width, height, row, column) {
+                        self.view.select_extend(to);
+                    }
+                    if self.view.selection().is_some() {
+                        self.copy_selection();
+                    } else {
+                        self.view.clear_selection();
+                    }
+                    return true;
                 }
-                if self.view.selection().is_some() {
-                    self.copy_selection();
-                } else {
-                    self.view.clear_selection();
-                    self.click(width, height, press_row, press_column);
+                self.view.clear_selection();
+                if let Some(now) = self.screen_row_of(width, height, press.at.row) {
+                    self.click(width, height, now, press.cell.1);
                 }
                 true
             }
             _ => false,
         }
+    }
+
+    /// The screen row now showing transcript content row `line` (#4315), or `None` when it is
+    /// out of sight.
+    fn screen_row_of(&self, width: usize, height: usize, line: usize) -> Option<usize> {
+        let rect = self.view.scroll_rect(width, height)?;
+        let offset = line.checked_sub(self.view.scroll().top())?;
+        (offset < rect.height).then(|| rect.y + offset)
     }
 
     /// Copies the transcript's selection (AMP #4217) without waiting: OSC 52 goes out now, the

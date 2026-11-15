@@ -641,6 +641,87 @@ mod shell {
         assert!(r.shell.view().selection().is_some());
     }
 
+    /// AMP #4315: output arriving between press and release scrolls the follow-end view under
+    /// a pointer that never moved. Released in the pressed screen cell, it is still a click, on
+    /// the content row that was pressed (the thinking header), and nothing is copied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_click_while_output_scrolls_the_view_toggles_the_pressed_header_and_copies_nothing() {
+        // A reply nearly as tall as the view, so a little more output scrolls it while the
+        // thinking header stays in sight.
+        let reply: String = (1..=8)
+            .map(|i| format!("reply line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut r = rig("streaming", Some("why oh why"), &reply).await;
+        assert!(r.shell.view().scroll().at_end());
+        let (row, _) = r.find("▸ Thought for ");
+        let cell = (row, 8);
+        let top = r.shell.view().scroll().top();
+
+        r.down(cell);
+        // Output streams in while the button is down (the terminal repaints after each) until
+        // the follow-end view has scrolled.
+        for i in 0..H {
+            if r.shell.view().scroll().top() > top {
+                break;
+            }
+            r.shell.view().add_notice(&format!("streamed {i}"));
+            r.rows();
+        }
+        assert!(r.shell.view().scroll().at_end());
+        assert!(
+            r.shell.view().scroll().top() > top,
+            "the view followed the new output:\n{}",
+            r.screen()
+        );
+        let (now, _) = r.find("▸ Thought for ");
+        assert!(
+            now < row,
+            "the header moved up under the pointer:\n{}",
+            r.screen()
+        );
+        // Same screen cell: a drag event there doesn't start a selection either.
+        assert!(!r.drag(cell));
+        r.up(cell);
+
+        assert!(r.shell.view().selection().is_none(), "nothing selected");
+        assert!(r.screen().contains("▾ Thought for "), "{}", r.screen());
+        assert!(r.screen().contains("why oh why"), "{}", r.screen());
+        r.settle().await;
+        assert!(r.osc52().is_empty(), "no OSC 52: {:?}", r.osc52());
+        assert!(r.pbcopy().is_empty(), "no pbcopy run: {:?}", r.pbcopy());
+        assert!(!r.screen().contains("Copied"), "{}", r.screen());
+    }
+
+    /// AMP #4315: a press whose row output pushes out of sight before release clicks nothing
+    /// (not whatever row now sits in that cell) and copies nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_click_on_a_row_scrolled_out_of_sight_before_release_does_nothing() {
+        let reply: String = (1..=10)
+            .map(|i| format!("reply line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut r = rig("offscreen", Some("why oh why"), &reply).await;
+        let (row, _) = r.find("▸ Thought for ");
+        let cell = (row, 8);
+        r.down(cell);
+        // Enough output to push the header off the top.
+        for i in 0..H {
+            r.shell.view().add_notice(&format!("streamed {i}"));
+            r.rows();
+        }
+        assert!(!r.screen().contains("Thought for "), "{}", r.screen());
+        r.up(cell);
+        r.settle().await;
+        assert!(r.shell.view().selection().is_none());
+        assert!(r.osc52().is_empty() && r.pbcopy().is_empty());
+        // Scrolling back shows the header still closed.
+        while !r.screen().contains("Thought for ") && r.shell.view().scroll().top() > 0 {
+            r.shell.view().scroll().scroll_by(-1);
+        }
+        assert!(r.screen().contains("▸ Thought for "), "{}", r.screen());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_editor_click_moves_the_cursor_on_press_and_a_selection_never_edits() {
         let mut r = rig("editor", None, PARA).await;

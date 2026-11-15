@@ -1417,10 +1417,11 @@ in a saved worker session. Only transcript text is ever copied: never the editor
   - `Copied N chars.`: a system tool took it (`pbcopy` on macOS, `wl-copy` on Wayland,
     `xclip`/`xsel` on X11, found in `PATH`).
   - `Sent N chars to the terminal's clipboard (OSC 52)…`: no tool did, so the text went only as
-    an OSC 52 escape to the terminal. This is the usual case over SSH and inside tmux. The terminal
-    doesn't confirm OSC 52, so if paste comes up empty, the terminal is blocking it. In iTerm2,
-    allow clipboard access (Settings › General › Selection, "Applications in terminal may access
-    clipboard"). In tmux, add `set -g set-clipboard on` to `~/.tmux.conf`.
+    an OSC 52 escape to the terminal. This is the usual case over SSH, or where no clipboard tool
+    is installed. Inside tmux on a remote host, add `set -g set-clipboard on` to `~/.tmux.conf`
+    so the escape reaches your terminal. The terminal doesn't confirm OSC 52, so if paste comes
+    up empty, the terminal is blocking it. In iTerm2, allow clipboard access (Settings › General ›
+    Selection, "Applications in terminal may access clipboard").
   - `Nothing copied: …`: neither worked. Use the terminal's own selection instead.
   - A selection over 1 MB copies nothing and says `Selection too large to copy (… KB, limit
     1024 KB).`
@@ -1441,15 +1442,15 @@ where it came from.
 The chat uses the AMP theme: `amp-dark` or `amp-light` (provisional simstech tokens v1, #1815),
 with square borders and AMP's ticket-state, epic and brand colours.
 
-| setting  | flag      | env                         | `config.toml` `[tui]` | default     |
-|----------|-----------|-----------------------------|-----------------------|-------------|
-| theme    | `--theme` | `AMP_HARNESS_THEME`         | `theme`               | `auto`      |
-| colours  | -         | `AMP_HARNESS_COLOR`         | `color`               | `auto`      |
-| thinking | -         | `AMP_HARNESS_SHOW_THINKING` | `show_thinking`       | `collapsed` |
-| mouse    | -         | `AMP_HARNESS_MOUSE`         | `mouse`               | `true`      |
-| select   | -         | `AMP_HARNESS_SELECT_COPY`   | `select_copy`         | `true`      |
-| padding  | -         | `AMP_HARNESS_PADDING`       | `padding`             | `2`         |
-| density  | -         | `AMP_HARNESS_DENSITY`       | `density`             | `compact`   |
+| setting     | flag      | env                         | `config.toml` `[tui]` | default     |
+|-------------|-----------|-----------------------------|-----------------------|-------------|
+| theme       | `--theme` | `AMP_HARNESS_THEME`         | `theme`               | `auto`      |
+| colours     | -         | `AMP_HARNESS_COLOR`         | `color`               | `auto`      |
+| thinking    | -         | `AMP_HARNESS_SHOW_THINKING` | `show_thinking`       | `collapsed` |
+| mouse       | -         | `AMP_HARNESS_MOUSE`         | `mouse`               | `true`      |
+| select_copy | -         | `AMP_HARNESS_SELECT_COPY`   | `select_copy`         | `true`      |
+| padding     | -         | `AMP_HARNESS_PADDING`       | `padding`             | `2`         |
+| density     | -         | `AMP_HARNESS_DENSITY`       | `density`             | `compact`   |
 
 - `theme`: `auto` asks the terminal for its background (OSC 11) and picks light on a light
   background, else dark. Use `dark` / `light` to skip the query, or give a path to your own theme
