@@ -279,6 +279,8 @@ async fn the_model_receives_amp_instructions_and_project_context() {
     // 6. rpi's listing of every skill, with paths the model can read.
     assert!(prompt.contains("<available_skills>"));
     assert!(prompt.contains("<name>amp-execution</name>"));
+    // The harness-only self-management skill is listed for the manager (#4256).
+    assert!(prompt.contains("<name>amp-self-management</name>"));
     let order = [
         "# AMP Manager",
         "<amp_server_instructions",

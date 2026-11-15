@@ -10,7 +10,8 @@ Host glue (opencode's `task` tool, the `amp_amp_` prefix note, `subagent_depth`,
 edits, amp-agent-builder) is rewritten by the rules in harness_overrides.yaml. Every rule must
 match exactly as many times as it says (default once), so a change to the source that a rule no
 longer fits fails the build instead of shipping opencode wording silently. After the rules, the
-`banned` patterns must not appear in any generated markdown.
+`banned` patterns must not appear in any generated markdown. Skills about harness-only tools have
+no source there: they are written inline under `harness_skills` in the overrides file (#4256).
 """
 import hashlib
 import json
@@ -166,6 +167,25 @@ def main(argv):
             files.append(rel)
         fm, _ = front((out / "skills" / d.name / "SKILL.md").read_text())
         skills.append({"name": fm.get("name", d.name), "description": fm.get("description", ""), "files": files})
+
+    # Harness-only skills (#4256): written inline in harness_overrides.yaml under `harness_skills`
+    # (name -> {relative path: text}), because they describe tools only the harness has. They get
+    # the global rules and the banned check like every other skill, and may not shadow a source skill.
+    for name, files_spec in sorted((overrides.get("harness_skills") or {}).items()):
+        if (out / "skills" / name).exists() or name in exclude or (src / "skills" / name).exists():
+            raise RuleError(f"harness_skills: {name!r} clashes with a source skill")
+        if not isinstance(files_spec, dict) or "SKILL.md" not in files_spec:
+            raise RuleError(f"harness_skills: {name!r} needs a SKILL.md")
+        files = []
+        for rel in sorted(files_spec):
+            dest = out / "skills" / name / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(rewrite(files_spec[rel], f"harness_skills/{name}/{rel}", overrides, used))
+            files.append(rel)
+        fm, _ = front((out / "skills" / name / "SKILL.md").read_text())
+        if fm.get("name") != name or not fm.get("description"):
+            raise RuleError(f"harness_skills: {name!r} SKILL.md needs frontmatter name: {name} and a description")
+        skills.append({"name": name, "description": fm["description"], "files": files, "harness_only": True})
 
     unused = set(overrides.get("files", {})) - used
     if unused:

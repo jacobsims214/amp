@@ -76,6 +76,34 @@ fn manager_only_tools_are_allowed_for_the_manager_and_denied_for_every_worker() 
     }
 }
 
+/// The harness-only amp-self-management skill (#4256) ships, says when the manager may use each
+/// of those six tools, and the manager's prompt points at it.
+#[test]
+fn self_management_skill_ships_and_the_manager_prompt_names_it() {
+    let assets = Assets::embedded().unwrap();
+    let skill = assets
+        .skill("amp-self-management")
+        .expect("amp-self-management skill");
+    assert!(skill.description.contains("Manager only"));
+    let mut tools = vec!["amp_manage_agent", "amp_manage_skill", "amp_add_mcp_server"];
+    tools.extend_from_slice(amp_core::policy::WORKER_CONTROL_TOOLS);
+    for needle in tools.iter().copied().chain([
+        "explicitly asks",
+        "Never widen permissions",
+        "amp-harness mcp secret <name>",
+        "`roles` is required",
+        "/mcp enable",
+        "/mcp login",
+        "next turn",
+        "nothing_to_replay",
+        "**after** any",
+    ]) {
+        assert!(skill.content.contains(needle), "skill lacks {needle:?}");
+    }
+    let manager = assets.agent("amp-manager").unwrap();
+    assert!(manager.prompt.contains("**amp-self-management** skill"));
+}
+
 #[test]
 fn embedded_skills_exclude_agent_builder_and_keep_files() {
     let assets = Assets::embedded().unwrap();
