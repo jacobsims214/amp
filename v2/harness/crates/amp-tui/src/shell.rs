@@ -1679,7 +1679,8 @@ impl Shell {
         prompt_id: Option<String>,
     ) -> bool {
         let text = text.trim();
-        if text.is_empty() || self.running || self.compacting || self.switching {
+        // AMP #4301: nor while a reload runs (its policy swap would land inside the turn).
+        if text.is_empty() || self.running || self.compacting || self.reloading || self.switching {
             return false;
         }
         // #2376: a prompt from a paired device says so above its bubble. #2391 (L2): its text
@@ -3633,6 +3634,7 @@ impl Shell {
         if !self.wake_on_end
             || self.running
             || self.compacting
+            || self.reloading
             || self.switching
             || self.quitting
             || self.quit_confirm_until.is_some_and(|until| now < until)
@@ -3743,7 +3745,7 @@ impl Shell {
     /// Never while a reply runs or a server switch is going on.
     fn watch_approval(&mut self) -> bool {
         use amp_core::approval_wait::{self as aw, WaitCheck};
-        if self.running || self.compacting || self.switching {
+        if self.running || self.compacting || self.reloading || self.switching {
             return false;
         }
         let (Some(meta), Some(wait)) = (&self.meta, self.approval_wait.as_mut()) else {
@@ -4032,7 +4034,9 @@ impl Shell {
         self.editor_clicked = self.view.panel().is_open();
         // AMP #4222 (C5): a prompt typed during `/compact` waits for it like one typed during a
         // reply, and runs once the compaction has ended ([`Shell::finish_compaction`]).
-        if self.running || self.compacting {
+        // AMP #4301: and one typed during a reload waits for it to be applied
+        // (`ShellMsg::Reloaded`), so the tool policy never changes inside its turn.
+        if self.running || self.compacting || self.reloading {
             self.queue_prompt(trimmed);
             return Submit::Continue;
         }
@@ -4081,7 +4085,9 @@ impl Shell {
             }
             return;
         }
-        if self.switching {
+        // AMP #4301: a reload in flight swaps the tool policy when it lands, so no queued prompt
+        // starts its turn before then; the `Reloaded` handler runs this again once it is applied.
+        if self.switching || self.reloading {
             return;
         }
         if let Some(next) = self.prompt_queue.pop_front() {
@@ -4320,6 +4326,8 @@ impl Shell {
         }
         // AMP #4267: a reload asked for during the reply runs now, once, before the next queued
         // prompt starts a turn. One still running (or a compaction) runs it when it ends.
+        // AMP #4301: while it runs, `after_run` starts no queued prompt (only a stop drops them);
+        // they start once the reload has been applied (`ShellMsg::Reloaded`).
         if !self.reloading
             && !self.compacting
             && let Some(again) = self.reload_again.take()
@@ -4583,7 +4591,8 @@ impl Shell {
     }
 
     /// After `/compact` ended, however it ended: a reload asked for meanwhile runs, then the
-    /// oldest queued prompt (its own turn, as after a completed reply).
+    /// oldest queued prompt (its own turn, as after a completed reply) — once that reload has
+    /// been applied (AMP #4301: `after_run` waits while one is in flight).
     fn after_compaction(&mut self) {
         if !self.reloading
             && let Some(again) = self.reload_again.take()
@@ -5594,6 +5603,12 @@ impl Shell {
                     self.apply_reload(result, cause);
                     if let Some(again) = self.reload_again.take() {
                         self.reload_command(again);
+                    }
+                    // AMP #4301: queued prompts waited for this reload; with it applied (and no
+                    // further one started), the oldest runs now, as after a reply.
+                    if !self.reloading && !self.running && !self.compacting {
+                        self.after_run(false);
+                        self.refresh_remote_status();
                     }
                 }
                 ShellMsg::Config { result, command } => self.apply_config(result, &command),
@@ -7856,5 +7871,111 @@ mod tests {
         settle_reload(&mut shell).await;
         assert_eq!(reloads(&count), 2);
         assert_eq!(shell.reload_again, None);
+    }
+
+    /// AMP #4301: a prompt queued during a reply, with a watcher reload asked for meanwhile,
+    /// does not start its turn when the reply ends (the reload is still in flight and would swap
+    /// the tool policy inside it); it starts exactly once after `Reloaded` has been applied.
+    #[tokio::test]
+    async fn a_queued_prompt_waits_for_the_deferred_reload_to_be_applied() {
+        let (mut shell, count) = reloading_shell().await;
+        shell.running = true;
+        shell.view.set_working(true);
+        shell.submit("after the reload").await;
+        assert_eq!(shell.queued_prompts(), vec!["after the reload".to_owned()]);
+        shell.reload_command(super::ReloadCause::Watcher);
+        let prompts = shell.prompts;
+
+        shell.finish_run(Err("ended".into()));
+        assert!(shell.reloading, "the reply's end starts the pending reload");
+        assert!(
+            !shell.running,
+            "no turn starts while the reload is in flight"
+        );
+        assert_eq!(shell.prompts, prompts);
+        assert_eq!(shell.queued_prompts(), vec!["after the reload".to_owned()]);
+
+        settle_reload(&mut shell).await;
+        assert_eq!(reloads(&count), 1);
+        assert_eq!(shell.prompts, prompts + 1, "the queued prompt starts once");
+        assert!(shell.queued_prompts().is_empty());
+
+        // Nothing else starts afterwards.
+        for _ in 0..10 {
+            shell.poll();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(shell.prompts, prompts + 1);
+        assert_eq!(reloads(&count), 1);
+    }
+
+    /// AMP #4301: a prompt submitted while a reload runs is queued, not started; it runs once
+    /// the reload has been applied.
+    #[tokio::test]
+    async fn a_prompt_submitted_during_a_reload_is_queued() {
+        let (mut shell, count) = reloading_shell().await;
+        shell.reload_command(super::ReloadCause::Command);
+        assert!(shell.reloading);
+        let prompts = shell.prompts;
+        shell.submit("typed mid-reload").await;
+        assert!(
+            !shell.running,
+            "no turn starts while the reload is in flight"
+        );
+        assert_eq!(shell.prompts, prompts);
+        assert_eq!(shell.queued_prompts(), vec!["typed mid-reload".to_owned()]);
+        // A paired device's prompt is refused meanwhile too (the remote link keeps it queued).
+        assert!(!shell.send_prompt(
+            "remote mid-reload",
+            amp_core::chat_event::PromptOrigin::Local
+        ));
+        assert_eq!(shell.prompts, prompts);
+
+        settle_reload(&mut shell).await;
+        assert_eq!(reloads(&count), 1);
+        assert_eq!(shell.prompts, prompts + 1);
+        assert!(shell.queued_prompts().is_empty());
+    }
+
+    /// AMP #4301 (compaction-end path, review #4231): when `/compact` ends with a reload
+    /// pending and a prompt queued, the reload starts and the prompt waits for it to be
+    /// applied, then starts once.
+    #[tokio::test]
+    async fn a_queued_prompt_after_compaction_waits_for_the_pending_reload() {
+        let (mut shell, count) = reloading_shell().await;
+        shell.compacting = true;
+        shell.submit("after the compaction").await;
+        assert_eq!(
+            shell.queued_prompts(),
+            vec!["after the compaction".to_owned()]
+        );
+        shell.reload_command(super::ReloadCause::Watcher);
+        assert!(!shell.reloading, "no reload under a running compaction");
+        let prompts = shell.prompts;
+
+        shell.finish_compaction(super::CompactDone {
+            result: Err(super::CompactError {
+                busy: false,
+                message: "test".into(),
+            }),
+            already_compacted: false,
+            overhead: 0,
+        });
+        assert!(!shell.compacting);
+        assert!(
+            shell.reloading,
+            "the compaction's end starts the pending reload"
+        );
+        assert!(
+            !shell.running,
+            "no turn starts while the reload is in flight"
+        );
+        assert_eq!(shell.prompts, prompts);
+        assert_eq!(shell.queued_prompts().len(), 1);
+
+        settle_reload(&mut shell).await;
+        assert_eq!(reloads(&count), 1);
+        assert_eq!(shell.prompts, prompts + 1, "the queued prompt starts once");
+        assert!(shell.queued_prompts().is_empty());
     }
 }
