@@ -91,8 +91,9 @@ session will do first: recover quiet tickets, read answers, read the team's repo
 
 Offer the pages they'll want next: handovers and scope changes (`working/changes-outside-amp.md`),
 merging (`working/merging-and-ci.md`), verification receipts (`working/verification-receipts.md`), tracing a commit (`visibility/traceability.md`), the
-knowledge bases (`knowledge/kb-scopes.md`). When they ask "can AMP do X?", look it up with
-`amp_guide` before answering.
+knowledge bases (`knowledge/kb-scopes.md`), and the team inbox if work reaches them from outside
+the plan — customers, a colleague, a script, an alert (`working/team-inbox.md`). When they ask
+"can AMP do X?", look it up with `amp_guide` before answering.
 
 ## How to teach
 
