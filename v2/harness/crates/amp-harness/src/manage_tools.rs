@@ -29,7 +29,7 @@ use amp_core::{
     approval::{
         CONFIRM_TIMEOUT, ConfirmRequest, Confirmed, Confirmer, DenyReason, confirm_or_deny,
     },
-    assets::{AGENTS_DIR, Origin, SKILLS_DIR, valid_name},
+    assets::{AGENTS_DIR, Assets, Origin, OverrideDirs, SKILLS_DIR, valid_name},
     mcp_config::{self, McpConfig},
     roles::{self, RoleRegistry},
 };
@@ -161,8 +161,22 @@ struct Plan {
 
 /// The guard for an agent write (#4246): the role is not primary and does not become primary,
 /// the text loads, and the permissions do not widen.
+///
+/// The write lands in the user layer, which applies in every repo, so it is judged against the
+/// user + built-in roster only (#4316): a repo layer's agent (trusted or not) is never the
+/// baseline. An id the repo layer alone defines is judged as a new agent, against
+/// [`roles::new_agent_baseline`]; otherwise an untrusted repo's wide agent could be copied into
+/// the user layer as an "update" that widens nothing.
 fn check_agent(ctx: &Ctx, action: Action, name: &str, content: &str) -> Result<Plan, String> {
+    // Every layer: only for the primary/manager refusal and the "a repo file overrides it" note.
     let loaded = ctx.load().map_err(|e| e.message)?;
+    // What the user-layer write replaces: built-ins plus the user layer, no repo layer.
+    let user_assets = Assets::load(&OverrideDirs {
+        user: ctx.paths.user_dir.clone(),
+        repo: None,
+    })
+    .map_err(|e| e.to_string())?;
+    let user_roles = RoleRegistry::from_assets(&user_assets).map_err(|e| e.to_string())?;
     let name = name.trim();
     let id = match action {
         Action::Create => {
@@ -171,22 +185,23 @@ fn check_agent(ctx: &Ctx, action: Action, name: &str, content: &str) -> Result<P
                     "agent id {name:?} must be lowercase letters, digits and single hyphens"
                 ));
             }
-            if loaded.roles.get(name).is_some() {
+            if user_roles.get(name).is_some() {
                 return Err(format!("agent {name} already exists; use action update"));
             }
             name.to_owned()
         }
-        Action::Update => loaded
-            .roles
+        Action::Update => user_roles
             .get(name)
+            .or_else(|| loaded.roles.get(name))
             .map(|r| r.id.clone())
             .ok_or_else(|| format!("no agent {name}; use action create"))?,
     };
+    roles::refuse_primary(&user_roles, &id, false).map_err(|e| e.to_string())?;
     roles::refuse_primary(&loaded.roles, &id, false).map_err(|e| e.to_string())?;
 
     let dir = ctx.scope_dir(Scope::User).map_err(|e| e.message)?;
     let path = dir.join(AGENTS_DIR).join(format!("{id}.md"));
-    let mut assets = loaded.assets.clone();
+    let mut assets = user_assets.clone();
     assets
         .put_agent(&id, content, Origin::User(path.clone()))
         .map_err(|e| format!("the new text does not load: {e}"))?;
@@ -195,12 +210,11 @@ fn check_agent(ctx: &Ctx, action: Action, name: &str, content: &str) -> Result<P
     let new_role = registry
         .get(&id)
         .ok_or_else(|| format!("agent {id} does not load from this text"))?;
+    roles::refuse_primary(&user_roles, &id, new_role.primary).map_err(|e| e.to_string())?;
     roles::refuse_primary(&loaded.roles, &id, new_role.primary).map_err(|e| e.to_string())?;
 
-    let old = match action {
-        Action::Create => None,
-        Action::Update => loaded.roles.get(&id).map(|r| &r.policy),
-    };
+    // Never the repo layer's policy: an id only the repo defines is judged as a create.
+    let old = user_roles.get(&id).map(|r| &r.policy);
     let widening = roles::permission_widens(old, &new_role.policy, &roles::new_agent_baseline());
     if widening.widens {
         let against = if old.is_some() {
@@ -1323,6 +1337,74 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.contains("widens"), "{e}");
+        assert!(
+            !ctx.paths
+                .user_dir
+                .clone()
+                .unwrap()
+                .join("agents/amp-worker-backend.md")
+                .exists()
+        );
+    }
+
+    /// [`ctx`] plus a repo layer (`<d>/repo/.amp/harness`, never trusted) holding `agents`.
+    fn ctx_with_repo(name: &str, agents: &[(&str, &str)]) -> Ctx {
+        let mut ctx = ctx(name);
+        let repo = ctx.cwd.join("repo/.amp/harness");
+        std::fs::create_dir_all(repo.join("agents")).unwrap();
+        for (id, text) in agents {
+            std::fs::write(repo.join(format!("agents/{id}.md")), text).unwrap();
+        }
+        ctx.paths.repo_dir = Some(repo);
+        ctx
+    }
+
+    /// A subagent that allows bash, edit and webfetch and can be dispatched.
+    const WIDE_AGENT: &str = "---\ndescription: Helps\nmode: subagent\ndispatch: true\npermission:\n  bash:\n    \"*\": allow\n  edit:\n    \"*\": allow\n  webfetch:\n    \"*\": allow\n---\n\nYou help.\n";
+
+    // #4316: a repo layer's wide agent must not become the baseline for a user-layer write.
+    #[tokio::test]
+    async fn a_repo_only_wide_agent_is_not_laundered_into_the_user_layer() {
+        let ctx = ctx_with_repo("agent-repo-launder", &[("helper", WIDE_AGENT)]);
+        // The repo layer is loaded (every file, trusted or not) with its wide policy.
+        assert!(ctx.load().unwrap().roles.get("helper").is_some());
+        let yes = Fake::new(true);
+        let t = tool(&ctx, Kind::Agent, Some(yes.clone()));
+        let user_agents = ctx.paths.user_dir.clone().unwrap().join("agents");
+
+        for action in ["update", "create"] {
+            let e = call(&t, args(action, "helper", WIDE_AGENT))
+                .await
+                .unwrap_err();
+            assert!(
+                e.contains("widens") && e.contains("baseline") && e.contains("bash"),
+                "{action}: {e}"
+            );
+        }
+        assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
+        assert!(!user_agents.join("helper.md").exists());
+
+        // A narrow user-layer copy is still allowed (judged against the baseline).
+        call(&t, args("update", "helper", &narrow_agent("Helps", "")))
+            .await
+            .unwrap();
+        assert!(user_agents.join("helper.md").is_file());
+    }
+
+    // #4316: a built-in the repo layer widens is judged against the built-in's own policy.
+    #[tokio::test]
+    async fn a_built_in_widened_in_the_repo_is_judged_against_the_built_in() {
+        let ctx = ctx_with_repo("agent-repo-builtin", &[("amp-worker-backend", WIDE_AGENT)]);
+        let yes = Fake::new(true);
+        let t = tool(&ctx, Kind::Agent, Some(yes.clone()));
+        let e = call(&t, args("update", "amp-worker-backend", WIDE_AGENT))
+            .await
+            .unwrap_err();
+        assert!(
+            e.contains("widens") && e.contains("its current permissions"),
+            "{e}"
+        );
+        assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
         assert!(
             !ctx.paths
                 .user_dir
