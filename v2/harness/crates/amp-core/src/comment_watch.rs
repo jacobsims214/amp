@@ -8,9 +8,13 @@
 //! readiness review #3138):
 //!
 //! - **Per-run cursor.** The cursor is keyed by the run (ticket + the run's `since`), so a restart
-//!   or resume re-baselines on its own. The baseline is the newest comment id when the run is
-//!   first seen running: nothing posted before the worker started is steered (the worker reads
-//!   those itself). The claim comment that follows is the worker's own (below).
+//!   or resume re-baselines on its own. The baseline is the run's own claim comment
+//!   (`<agent_id> picked this up`, posted right before the worker's first turn; #4303): anything
+//!   after it is steered on the first poll, even when that poll comes late (round-robin, a failed
+//!   fetch). Until the claim comment is there the worker has not read its ticket and will read
+//!   every comment itself, so the baseline is then the newest comment id. A claim comment from an
+//!   earlier run of the ticket (older than this run, or not newer than where an earlier run's
+//!   cursor stopped) is not this run's: the newest id is the baseline then too.
 //! - **No gaps.** `amp_get_task` returns only the newest 30 comments; when every one of a full
 //!   page is new, the watcher refetches with `limit: 0`.
 //! - **At least once, then once.** The cursor advances past a comment only after its steer
@@ -45,6 +49,11 @@ pub const DEFAULT_PAGE: usize = 30;
 pub const MAX_BODY_BYTES: usize = 4 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 const RATE_WINDOW: Duration = Duration::from_secs(60);
+/// The end of AMP's claim comment, `"{agent} picked this up"`.
+const CLAIM_SUFFIX: &str = "picked this up";
+/// How much earlier than the run's `since` (local clock) a claim comment's `created_at` (AMP's
+/// clock) may be and still count as this run's: the claim follows `since`, so this is clock skew.
+const CLAIM_SKEW: Duration = Duration::from_secs(120);
 
 /// One comment on a ticket, as `amp_get_task(include=comments)` returns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,6 +223,9 @@ pub struct CommentWatcher<S, K> {
     sink: K,
     config: WatchConfig,
     runs: HashMap<RunKey, RunState>,
+    /// Per ticket, the furthest cursor of a run that is gone: a later run never baselines on a
+    /// claim comment at or below it (that claim belonged to an earlier run).
+    retired: HashMap<i64, i64>,
     /// Round-robin start, so a capped fan-out reaches every ticket in turn.
     next: usize,
 }
@@ -225,6 +237,7 @@ impl<S: CommentSource, K: SteerSink> CommentWatcher<S, K> {
             sink,
             config,
             runs: HashMap::new(),
+            retired: HashMap::new(),
             next: 0,
         }
     }
@@ -234,7 +247,15 @@ impl<S: CommentSource, K: SteerSink> CommentWatcher<S, K> {
         let mut running = self.sink.running()?;
         running.sort_by_key(|w| w.task_id);
         let keys: HashSet<RunKey> = running.iter().map(|w| (w.task_id, w.since)).collect();
-        self.runs.retain(|k, _| keys.contains(k));
+        let retired = &mut self.retired;
+        self.runs.retain(|k, s| {
+            let keep = keys.contains(k);
+            if !keep && let Some(c) = s.cursor {
+                let r = retired.entry(k.0).or_insert(c);
+                *r = (*r).max(c);
+            }
+            keep
+        });
         running.retain(|w| !self.runs.get(&(w.task_id, w.since)).is_some_and(|s| s.done));
 
         let mut report = TickReport::default();
@@ -262,12 +283,36 @@ impl<S: CommentSource, K: SteerSink> CommentWatcher<S, K> {
                 return;
             }
         };
+        let first = self.runs.get(&key).and_then(|s| s.cursor).is_none();
+        if first {
+            // First sight of this run: baseline on its claim comment (#4303). One not in the
+            // newest page may still be there: read everything before deciding there is none.
+            let floor = self.retired.get(&w.task_id).copied();
+            let mut claim = claim_comment(&comments, w, floor);
+            if claim.is_none() && comments.len() >= DEFAULT_PAGE {
+                match self.source.comments(w.task_id, true).await {
+                    Ok(all) => {
+                        comments = all;
+                        claim = claim_comment(&comments, w, floor);
+                    }
+                    Err(e) => {
+                        tracing::debug!(ticket = w.task_id, error = %e, "comment watch: full refetch failed");
+                        return;
+                    }
+                }
+            }
+            let state = self.runs.entry(key).or_default();
+            match claim {
+                Some(id) => state.cursor = Some(id),
+                None => {
+                    // Not claimed yet (or not by this run): the worker reads everything there.
+                    state.cursor = Some(comments.iter().map(|c| c.id).max().unwrap_or(0));
+                    return;
+                }
+            }
+        }
         let state = self.runs.entry(key).or_default();
-        let Some(cursor) = state.cursor else {
-            // First sight of this run: everything already there is old.
-            state.cursor = Some(comments.iter().map(|c| c.id).max().unwrap_or(0));
-            return;
-        };
+        let cursor = state.cursor.expect("baseline set above");
         if comments.len() >= DEFAULT_PAGE && comments.iter().all(|c| c.id > cursor) {
             match self.source.comments(w.task_id, true).await {
                 Ok(all) => comments = all,
@@ -327,6 +372,26 @@ impl<S: CommentSource, K: SteerSink> CommentWatcher<S, K> {
             state.cursor = Some(cursor);
         }
     }
+}
+
+/// The id of `w`'s run's claim comment in `comments`, if it is there: the newest comment by the
+/// worker's agent id ending in [`CLAIM_SUFFIX`], above `floor` (an earlier run's cursor) and not
+/// older than the run (`created_at` >= `since` - [`CLAIM_SKEW`]; an unreadable time does not count).
+fn claim_comment(comments: &[Comment], w: &RunningWorker, floor: Option<i64>) -> Option<i64> {
+    let c = comments
+        .iter()
+        .filter(|c| c.author.trim() == w.agent_id && c.body.trim_end().ends_with(CLAIM_SUFFIX))
+        .max_by_key(|c| c.id)?;
+    if floor.is_some_and(|f| c.id <= f) {
+        return None;
+    }
+    let at = chrono::DateTime::parse_from_rfc3339(c.created_at.trim()).ok()?;
+    let at = SystemTime::from(at.with_timezone(&chrono::Utc));
+    let earliest = w
+        .since
+        .checked_sub(CLAIM_SKEW)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    (at >= earliest).then_some(c.id)
 }
 
 /// [`CommentSource`] over AMP's MCP: `amp_get_task(include=["comments"])`.
@@ -576,6 +641,109 @@ mod tests {
         w.tick(t).await.unwrap();
         w.tick(t).await.unwrap();
         assert_eq!(sup.steered.lock().unwrap().len(), 1);
+    }
+
+    fn claim(id: i64) -> Comment {
+        c(id, AGENT, &format!("{AGENT} picked this up"))
+    }
+
+    /// A run that started at `2026-11-14T00:00:<secs>Z`, the clock of [`c`]'s `created_at`.
+    fn worker_at(task_id: i64, secs: i64) -> RunningWorker {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-14T00:00:00Z").unwrap()
+            + chrono::Duration::seconds(secs);
+        RunningWorker {
+            since: SystemTime::from(at.with_timezone(&chrono::Utc)),
+            ..worker(task_id, 0)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_comment_after_the_claim_is_steered_on_the_first_poll() {
+        // #4303: the first poll comes late; a person commented between the claim and it.
+        let amp = FakeAmp::default();
+        amp.add(
+            7,
+            c(1, "jane@example.com", "old note from before the worker"),
+        );
+        amp.add(7, claim(2));
+        amp.add(7, c(3, AGENT, "Starting work."));
+        amp.add(7, c(4, "jane@example.com", "use the v2 endpoint instead"));
+        let sup = FakeSup::with(vec![worker_at(7, 2)]);
+        let mut w = watcher(&amp, &sup);
+        let t = Instant::now();
+
+        let r = w.tick(t).await.unwrap();
+        assert_eq!(
+            r.steered,
+            vec![(7, 4)],
+            "only the person's comment after the claim"
+        );
+        assert_eq!(
+            sup.steered_ids(),
+            vec!["ticket comment #4 by jane@example.com"]
+        );
+        w.tick(t).await.unwrap();
+        assert_eq!(sup.steered.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_run_first_seen_before_its_claim_baselines_on_everything() {
+        let amp = FakeAmp::default();
+        amp.add(7, c(1, "jane@example.com", "read by the worker itself"));
+        amp.add(7, c(2, "amp-manager", "also read by the worker itself"));
+        let sup = FakeSup::with(vec![worker_at(7, 2)]);
+        let mut w = watcher(&amp, &sup);
+        let t = Instant::now();
+
+        assert!(w.tick(t).await.unwrap().steered.is_empty());
+        amp.add(7, claim(3));
+        assert!(w.tick(t).await.unwrap().steered.is_empty());
+        amp.add(7, c(4, "jane@example.com", "new"));
+        assert_eq!(w.tick(t).await.unwrap().steered, vec![(7, 4)]);
+    }
+
+    #[tokio::test]
+    async fn an_earlier_runs_claim_is_not_a_baseline() {
+        // A resumed run seen before its own claim: the old claim must not replay #2.
+        let amp = FakeAmp::default();
+        amp.add(7, claim(1));
+        amp.add(7, c(2, "jane@example.com", "handled by run one"));
+        let sup = FakeSup::with(vec![worker_at(7, 1_000)]);
+        let mut w = watcher(&amp, &sup);
+        let t = Instant::now();
+        assert!(
+            w.tick(t).await.unwrap().steered.is_empty(),
+            "claim older than the run"
+        );
+
+        // In this process: run one's cursor bounds run two's claim, whatever the clocks say.
+        let amp = FakeAmp::default();
+        let sup = FakeSup::with(vec![worker_at(7, 1)]);
+        let mut w = watcher(&amp, &sup);
+        amp.add(7, claim(1));
+        amp.add(7, c(2, "jane@example.com", "steered to run one"));
+        assert_eq!(w.tick(t).await.unwrap().steered, vec![(7, 2)]);
+        *sup.running.lock().unwrap() = Some(vec![worker_at(7, 3)]);
+        assert!(w.tick(t).await.unwrap().steered.is_empty());
+        assert_eq!(sup.steered.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_claim_beyond_the_first_page_is_found_by_a_full_refetch() {
+        let amp = FakeAmp::default();
+        amp.add(7, claim(1));
+        for id in 2..=35 {
+            amp.add(7, c(id, "jane@example.com", &format!("comment {id}")));
+        }
+        let sup = FakeSup::with(vec![worker_at(7, 1)]);
+        let cfg = WatchConfig {
+            max_steers_per_minute: 100,
+            ..WatchConfig::default()
+        };
+        let mut w = CommentWatcher::new(amp.clone(), sup.clone(), cfg);
+        let r = w.tick(Instant::now()).await.unwrap();
+        assert_eq!(*amp.full_fetches.lock().unwrap(), 1);
+        assert_eq!(r.steered, (2..=35).map(|id| (7, id)).collect::<Vec<_>>());
     }
 
     #[tokio::test]
