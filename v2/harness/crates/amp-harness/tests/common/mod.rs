@@ -7,6 +7,7 @@ pub mod provider;
 
 use std::{
     borrow::Cow,
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -73,6 +74,44 @@ pub struct MockAmp {
     /// web UI would change it; with it, project 2 requires plan approval. `None`: the fixed
     /// answer below.
     pub plan: Option<Arc<Mutex<Value>>>,
+    /// #4241: ticket comments, stored like AMP stores them. With it, `amp_add_task_comment` is
+    /// listed and stores a comment (ids increasing, `author` defaulting to `agent`), a claim
+    /// posts AMP's "{agent} picked this up", and `amp_get_task(include=comments)` answers for
+    /// any ticket other than 2085 with its newest `limit` comments (default 30, 0 for all).
+    /// `None`: none of that (the fixed 2085 answer only).
+    pub comments: Option<Arc<Mutex<Comments>>>,
+}
+
+/// The mock's comment store (#4241).
+#[derive(Debug, Default)]
+pub struct Comments {
+    next_id: i64,
+    /// Every comment, oldest first: `{id, task_id, author, body, created_at}`.
+    pub all: Vec<Value>,
+    /// The agent each ticket was last dispatched to (AMP authors the claim comment with it).
+    dispatched_to: HashMap<i64, String>,
+}
+
+impl Comments {
+    /// Stores a comment and returns its id.
+    pub fn add(&mut self, task_id: i64, author: &str, body: &str) -> i64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.all.push(json!({
+            "id": id, "task_id": task_id, "author": author, "body": body,
+            "author_user_id": 7, "created_at": format!("2026-11-14T15:{:02}:00Z", id % 60),
+        }));
+        id
+    }
+
+    /// `task_id`'s comments, oldest first.
+    pub fn on(&self, task_id: i64) -> Vec<Value> {
+        self.all
+            .iter()
+            .filter(|c| c["task_id"] == task_id)
+            .cloned()
+            .collect()
+    }
 }
 
 impl MockAmp {
@@ -82,7 +121,34 @@ impl MockAmp {
             omit: Vec::new(),
             calls: Arc::default(),
             plan: None,
+            comments: None,
         }
+    }
+
+    /// A mock that stores ticket comments (#4241).
+    pub fn with_comments() -> Self {
+        Self {
+            comments: Some(Arc::default()),
+            ..Self::new()
+        }
+    }
+
+    /// Posts a comment on `task_id` as `author` (a person in the web UI, say); returns its id.
+    pub fn add_comment(&self, task_id: i64, author: &str, body: &str) -> i64 {
+        self.comments
+            .as_ref()
+            .expect("MockAmp::with_comments")
+            .lock()
+            .unwrap()
+            .add(task_id, author, body)
+    }
+
+    /// `task_id`'s stored comments, oldest first.
+    pub fn comments_on(&self, task_id: i64) -> Vec<Value> {
+        self.comments
+            .as_ref()
+            .map(|c| c.lock().unwrap().on(task_id))
+            .unwrap_or_default()
     }
 
     pub fn calls_to(&self, tool: &str) -> Vec<Value> {
@@ -194,6 +260,72 @@ pub fn get_task_json(with_comments: bool) -> Value {
     out
 }
 
+impl MockAmp {
+    /// #4241: the calls the comment store answers or adds to, when there is one. `None`: the
+    /// call goes on to the fixed answers (a claim is answered there after its comment is posted).
+    fn comment_call(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Option<Result<CallToolResponse, ErrorData>> {
+        let store = self.comments.as_ref()?;
+        let task_id = args["task_id"].as_i64();
+        match (name, task_id) {
+            ("amp_add_task_comment", Some(id)) => {
+                let author = args["author"].as_str().unwrap_or("agent");
+                let body = args["body"].as_str().unwrap_or("");
+                store.lock().unwrap().add(id, author, body);
+                Some(ok_json(json!({"comment_added": true, "task_id": id})))
+            }
+            ("amp_add_task_comment", None) => Some(tool_error("task_id is required")),
+            ("amp_dispatch_task", Some(id)) => {
+                if let Some(agent) = args["agent_id"].as_str() {
+                    let mut store = store.lock().unwrap();
+                    store.dispatched_to.insert(id, agent.to_owned());
+                }
+                None
+            }
+            // AMP's claim posts "{agent} picked this up" as that agent (task_actor.go).
+            ("amp_claim_task", Some(id))
+                if args["dispatch_id"].as_str() == Some(format!("d_mock{id}").as_str()) =>
+            {
+                let mut store = store.lock().unwrap();
+                let agent = store
+                    .dispatched_to
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| "agent".to_owned());
+                store.add(id, &agent, &format!("{agent} picked this up"));
+                None
+            }
+            ("amp_get_task", Some(id)) if id != 2085 => {
+                let all = store.lock().unwrap().on(id);
+                let with_comments = args["include"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|v| v == "comments"));
+                let mut out = json!({
+                    "task": task(id, "Worker control", "in_progress",
+                                 json!({"assigned_to": "amp:amp-worker-backend"})),
+                    "effective_metadata": {}
+                });
+                if with_comments {
+                    // AMP's lastN: the newest `limit` (default 30; 0 for all), oldest first.
+                    let limit = match args["limit"].as_i64() {
+                        Some(0) => all.len(),
+                        Some(n) if n > 0 => n as usize,
+                        _ => 30,
+                    };
+                    let newest = all[all.len().saturating_sub(limit)..].to_vec();
+                    out["comments"] = Value::Array(newest);
+                    out["comments_total"] = json!(all.len());
+                }
+                Some(ok_json(out))
+            }
+            _ => None,
+        }
+    }
+}
+
 impl ServerHandler for MockAmp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
@@ -228,9 +360,11 @@ impl ServerHandler for MockAmp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        let comment_tool = self.comments.as_ref().map(|_| &"amp_add_task_comment");
         let tools = CONTRACT
             .iter()
             .chain(EXTRA_TOOLS)
+            .chain(comment_tool)
             .filter(|name| !self.omit.contains(name))
             .map(|name| tool(name))
             .collect();
@@ -255,6 +389,9 @@ impl ServerHandler for MockAmp {
                 format!("tool '{}' not found: tool not found", request.name),
                 None,
             ));
+        }
+        if let Some(answer) = self.comment_call(request.name.as_ref(), &args) {
+            return answer;
         }
         match request.name.as_ref() {
             "amp_whoami" => ok_json(whoami_json()),
