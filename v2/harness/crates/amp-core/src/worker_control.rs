@@ -17,6 +17,7 @@
 
 use std::{
     collections::HashSet,
+    path::Path,
     sync::{Arc, LazyLock, Mutex, PoisonError},
     time::Duration,
 };
@@ -485,6 +486,33 @@ impl Drop for InFlight {
     }
 }
 
+/// How often [`wait_session_free`] tries the session's lock.
+const LOCK_POLL: Duration = Duration::from_millis(25);
+
+/// Waits until no writer holds `session`'s lock, trying it every [`LOCK_POLL`] (the lock is taken
+/// and dropped at once), until `deadline`. `true` once it is free; `false` when it is still held
+/// at `deadline` or `cancel` fires first (#4281). A stopped run's lock can outlive its live entry
+/// by ~1.5 s when its killed tool was a long bash command, so a resume right after a stop waits
+/// here instead of being refused `busy`.
+async fn wait_session_free(
+    session: &Path,
+    deadline: tokio::time::Instant,
+    cancel: &CancellationToken,
+) -> bool {
+    loop {
+        if crate::session_lock::claim_session_lock(session).is_ok() {
+            return true;
+        }
+        if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(LOCK_POLL) => {}
+            () = cancel.cancelled() => return false,
+        }
+    }
+}
+
 /// The prompt addition that tells the new worker why it runs again.
 fn relaunch_instructions(what: Relaunch, reason: &str, extra: Option<&str>) -> String {
     let mut text = match what {
@@ -518,8 +546,10 @@ pub struct RelaunchOptions {
 
 /// Restarts or resumes the worker on `task_id` for the manager (#4240): stops it with `reason`
 /// if it is live ([`stop_worker`], waiting at most `bound`), refuses `busy` while it is still
-/// live or when handing its ticket back failed, then runs the ticket again through the
-/// supervisor's normal dispatch path, exactly once per call. `cancel` (the manager's turn) ends
+/// live or when handing its ticket back failed, waits (resume only, #4281) until the old
+/// session's lock is free, then runs the ticket again through the supervisor's normal dispatch
+/// path, exactly once per call. `bound` is the limit for all the waiting together: a lock still
+/// held when it runs out is `busy`, with nothing dispatched. `cancel` (the manager's turn) ends
 /// the waits early, which is `busy`, and cancels a run not dispatched yet:
 /// `Err(RunTicketError::Cancelled)`.
 pub async fn relaunch(
@@ -531,6 +561,7 @@ pub async fn relaunch(
     bound: Duration,
     cancel: &CancellationToken,
 ) -> Result<RelaunchResult, RunTicketError> {
+    let deadline = tokio::time::Instant::now() + bound;
     let mut out = RelaunchResult {
         task_id,
         action: what.action(),
@@ -639,6 +670,27 @@ pub async fn relaunch(
                  AMP, then try again."
             ),
         );
+    }
+
+    // A resume opens the old session file, whose lock the stopped run may still hold for a
+    // moment after it is no longer live (#4281). Wait for it, within what is left of `bound`.
+    // A restart starts a new session file, so it has nothing to wait for.
+    if let (Relaunch::Resume(_), Some(session)) = (what, sup.latest_session_file(task_id)) {
+        let free = wait_session_free(&session, deadline, cancel).await;
+        if cancel.is_cancelled() {
+            return Err(RunTicketError::Cancelled);
+        }
+        if !free {
+            return refuse(
+                out,
+                RelaunchStatus::Busy,
+                format!(
+                    "the session of #{task_id} ({}) is still held by the stopped worker; nothing \
+                     was dispatched. Try again in a moment.",
+                    session.display()
+                ),
+            );
+        }
     }
 
     let (resume, control) = what.request_fields();
@@ -1047,6 +1099,54 @@ mod tests {
             assert_eq!(s.as_str(), r.code());
         }
         assert_eq!(RelaunchStatus::from_refusal_code("other"), None);
+    }
+
+    /// #4281: a resume waits for the stopped run's session lock, but only until the limit.
+    #[tokio::test]
+    async fn the_session_wait_ends_when_the_lock_frees_or_the_limit_runs_out() {
+        use tokio::time::Instant;
+        // Never /tmp (D13): cargo's target tmp dir, as the session_lock tests do.
+        let dir = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("CARGO_MANIFEST_DIR")
+                    .map(|d| std::path::PathBuf::from(d).join("../../target").join("tmp"))
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("target/tmp"))
+            .join("amp-core-worker-control")
+            .join("session-wait");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = dir.join("1-a.jsonl");
+        let cancel = CancellationToken::new();
+
+        // Free: at once.
+        assert!(wait_session_free(&session, Instant::now(), &cancel).await);
+
+        // Held past the limit: false, after waiting out the limit.
+        let held = crate::session_lock::claim_session_lock(&session).unwrap();
+        let start = Instant::now();
+        let limit = Duration::from_millis(150);
+        assert!(!wait_session_free(&session, start + limit, &cancel).await);
+        assert!(start.elapsed() >= limit, "gave up early");
+
+        // Freed during the wait: true, before the limit.
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(held);
+        });
+        let start = Instant::now();
+        assert!(wait_session_free(&session, start + Duration::from_secs(10), &cancel).await);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        release.await.unwrap();
+
+        // Cancelled: false at once, even with time left.
+        let _held = crate::session_lock::claim_session_lock(&session).unwrap();
+        cancel.cancel();
+        let start = Instant::now();
+        assert!(!wait_session_free(&session, start + Duration::from_secs(10), &cancel).await);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

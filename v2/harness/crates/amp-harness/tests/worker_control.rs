@@ -11,7 +11,9 @@
 //!   id), and the acknowledgement is not steered back (the steer count stays 1);
 //! - the manager stops it (abandoned run with the reason, ticket handed back), resumes it with
 //!   `continue` (same session: the comment and the ack are in its context, nothing re-steered),
-//!   and restarts it (fresh session), with never two live workers on the ticket;
+//!   resumes the live continued worker again in the middle of its `sleep 30` (first time, no
+//!   `busy`: #4281), and restarts it (fresh session), with never two live workers on the ticket;
+//!   a session lock still held past the limit is `busy` with nothing dispatched;
 //! - a comment after the worker's `amp_complete_task` is refused `Closed` and never reaches the
 //!   model;
 //! - (wave check #4234) a steer taken while a tool is blocked, then a stop in that same step:
@@ -494,36 +496,14 @@ async fn a_steered_worker_acknowledges_then_is_stopped_resumed_and_restarted() {
     // Resume continue: one new dispatch and claim, the same session (the comment and the ack
     // are in the model's context), and the old comment is not steered again.
     let before = log.len();
-    // Found here: the stopped run's session lock outlives its live entry by up to ~1.5 s
-    // when a long tool (`sleep 30`) was killed, so a resume right after the stop may be refused
-    // `busy` (session owned by this process). That refusal dispatches nothing; the manager tries
-    // again. Bounded, so a lock that never frees fails the test.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let resumed = loop {
-        let out = control_tool(
-            &sup,
-            "amp_resume_worker",
-            json!({"task_id": T, "mode": "continue", "reason": "carry on with the comment"}),
-        )
-        .await;
-        let locked = out["status"] == "busy"
-            && out["note"]
-                .as_str()
-                .is_some_and(|n| n.contains("owned by another live process"));
-        if !locked {
-            break out;
-        }
-        assert_eq!(
-            f.calls("amp_dispatch_task").len(),
-            1,
-            "a busy refusal dispatches nothing"
-        );
-        assert!(
-            Instant::now() < deadline,
-            "the session lock never freed: {out}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    // The stopped run was killed in `sleep 30`, whose session lock outlives the run's live entry
+    // by up to ~1.5 s; the resume waits for it (#4281), so it succeeds first time, no retry.
+    let resumed = control_tool(
+        &sup,
+        "amp_resume_worker",
+        json!({"task_id": T, "mode": "continue", "reason": "carry on with the comment"}),
+    )
+    .await;
     assert_eq!(resumed["status"], "resumed", "{resumed}");
     assert_eq!(resumed["mode"], "continue", "{resumed}");
     f.wait_for_calls("amp_claim_task", 2).await;
@@ -539,6 +519,35 @@ async fn a_steered_worker_acknowledges_then_is_stopped_resumed_and_restarted() {
         let r = tick(&mut watcher).await;
         assert!(r.steered.is_empty(), "re-steered after resume: {r:?}");
     }
+
+    // #4281: continue on the LIVE continued worker while it is inside its long bash command
+    // (`sleep 30`): the resume stops it, waits for its session lock, and resumes first time.
+    // Its first turn (awaited above) answered `sleep 30`; give bash a moment to start it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        live_tickets(&sup).contains(&T),
+        "the continued worker is live"
+    );
+    let before = log.len();
+    let resumed_live = control_tool(
+        &sup,
+        "amp_resume_worker",
+        json!({"task_id": T, "mode": "continue", "reason": "pick up the new comment"}),
+    )
+    .await;
+    assert_eq!(resumed_live["status"], "resumed", "{resumed_live}");
+    assert_eq!(resumed_live["stop"]["status"], "stopped", "{resumed_live}");
+    let continued_end = launch_end(&sup, T)
+        .await
+        .expect("the first continued run's report");
+    assert_eq!(continued_end.outcome, WorkerOutcome::Cancelled);
+    assert_eq!(continued_end.session_file.as_ref(), Some(&first_session));
+    f.wait_for_calls("amp_claim_task", 3).await;
+    wait_until("the second continued worker's first turn", || {
+        log.len() > before
+    })
+    .await;
+    assert_eq!(steered_ids(&log.get(before)), vec![comment]);
 
     // Restart: the continued run is stopped first, then a fresh session (nothing from before in
     // its context).
@@ -560,14 +569,14 @@ async fn a_steered_worker_acknowledges_then_is_stopped_resumed_and_restarted() {
         Some(&first_session),
         "continue reused the first run's session file"
     );
-    f.wait_for_calls("amp_claim_task", 3).await;
+    f.wait_for_calls("amp_claim_task", 4).await;
     wait_until("the restarted worker's first turn", || log.len() > before).await;
     let fresh = log.get(before);
     assert!(steered_ids(&fresh).is_empty(), "a fresh session");
     assert!(!has_tool_result(&fresh), "a fresh session");
     assert_eq!(tool_calls(&fresh, "amp_add_task_comment"), 0);
 
-    // Done: stop it. Three runs, three dispatches, each handed back, none completed, and never
+    // Done: stop it. Four runs, four dispatches, each handed back, none completed, and never
     // two live workers on the ticket.
     let last = control_tool(
         &sup,
@@ -584,11 +593,51 @@ async fn a_steered_worker_acknowledges_then_is_stopped_resumed_and_restarted() {
         Some(&first_session),
         "restart started a new session file"
     );
+
+    // #4281: a session lock still held when the limit runs out is `busy`, and nothing is
+    // dispatched. The stopped run's lock lingers a moment after its `sleep 30` was killed (the
+    // very thing #4281 waits for), so take it over once it is free, then hold it.
+    let session = sup.latest_session_file(T).expect("a session file");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let held = loop {
+        match amp_core::session_lock::claim_session_lock(&session) {
+            Ok(guard) => break guard,
+            Err(e) => assert!(Instant::now() < deadline, "the lock never freed: {e}"),
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let limit = Duration::from_millis(300);
+    let started = Instant::now();
+    let busy = worker_control::relaunch(
+        &sup,
+        T,
+        worker_control::Relaunch::Resume(amp_core::run_report::ResumeMode::Continue),
+        "held lock",
+        worker_control::RelaunchOptions::default(),
+        limit,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("not cancelled");
+    assert!(started.elapsed() >= limit, "waited out the limit");
+    assert_eq!(
+        busy.status,
+        worker_control::RelaunchStatus::Busy,
+        "{busy:?}"
+    );
+    assert!(busy.note.contains("still held"), "{busy:?}");
+    assert_eq!(
+        f.calls("amp_dispatch_task").len(),
+        4,
+        "a busy refusal dispatches nothing"
+    );
+    drop(held);
+
     watching.cancel();
     assert_eq!(live_most.await.unwrap(), 1, "never two live workers");
-    assert_eq!(f.calls("amp_dispatch_task").len(), 3);
-    assert_eq!(f.calls("amp_report_run").len(), 3);
-    assert_eq!(f.calls("amp_return_task").len(), 3);
+    assert_eq!(f.calls("amp_dispatch_task").len(), 4);
+    assert_eq!(f.calls("amp_report_run").len(), 4);
+    assert_eq!(f.calls("amp_return_task").len(), 4);
     assert!(f.calls("amp_complete_task").is_empty());
     // One steer in the whole test, acknowledged once.
     let steers: usize = log

@@ -854,28 +854,14 @@ async fn case6_resume_continue_never_replays_a_side_effect() {
     std::fs::remove_file(&entered).unwrap();
 
     let before = log.len();
-    // #4281: after a stop, the stopped run's session lock can outlive its live entry for a
-    // moment, so continue may be refused `busy` (session owned by this process). That refusal
-    // dispatches nothing; retry, bounded. Remove the retry once #4281 lands.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let resumed = loop {
-        let out = control_tool(
-            &sup,
-            "amp_resume_worker",
-            json!({"task_id": T, "mode": "continue", "reason": "carry on"}),
-        )
-        .await;
-        if out["status"] != "busy" {
-            break out;
-        }
-        assert_eq!(
-            f.count("amp_dispatch_task"),
-            1,
-            "a busy refusal dispatched: {out}"
-        );
-        assert!(Instant::now() < deadline, "still busy: {out}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    // The stopped run's session lock can outlive its live entry for a moment; the resume waits
+    // for it (#4281), so it is never `busy` here.
+    let resumed = control_tool(
+        &sup,
+        "amp_resume_worker",
+        json!({"task_id": T, "mode": "continue", "reason": "carry on"}),
+    )
+    .await;
     assert_eq!(resumed["status"], "resumed", "{resumed}");
     assert_eq!(resumed["mode"], "continue", "{resumed}");
     f.wait_for_calls("amp_claim_task", 2).await;
@@ -967,27 +953,14 @@ async fn case7_replay_after_a_normal_stop_is_nothing_to_replay() {
     assert_eq!(report.outcome, WorkerOutcome::Cancelled);
     let model_calls = log.len();
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let replay = loop {
-        let out = control_tool(
-            &sup,
-            "amp_resume_worker",
-            json!({"task_id": T, "mode": "replay", "reason": "replay it"}),
-        )
-        .await;
-        // #4281: the stopped run's session lock can outlive its live entry for a moment (a
-        // killed `sleep 30`); that `busy` dispatches nothing. Remove the retry once #4281 lands.
-        if out["status"] != "busy" {
-            break out;
-        }
-        assert_eq!(
-            f.count("amp_dispatch_task"),
-            1,
-            "a busy refusal dispatched: {out}"
-        );
-        assert!(Instant::now() < deadline, "still busy: {out}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    // The killed `sleep 30` leaves the session locked for a moment after the run; the resume
+    // waits for it (#4281), so it is never `busy` here.
+    let replay = control_tool(
+        &sup,
+        "amp_resume_worker",
+        json!({"task_id": T, "mode": "replay", "reason": "replay it"}),
+    )
+    .await;
     assert_eq!(replay["status"], "nothing_to_replay", "{replay}");
     assert_eq!(replay["mode"], "replay", "{replay}");
 
