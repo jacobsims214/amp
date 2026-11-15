@@ -322,3 +322,440 @@ fn long_word_in_the_user_bubble_rejoins_without_fill() {
         Some(format!("zsee {token} okz").as_str())
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// AMP #4217: the shell's mouse wiring. Press, drag and release go through `Shell::mouse` as the
+// terminal loop hands them on; the clipboard is a recording stand-in (a `pbcopy` script in a
+// temporary directory plus an OSC 52 sink), never the real one.
+// ---------------------------------------------------------------------------------------------
+
+mod shell {
+    use std::{
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use amp_core::{agent::memory_session, events::ChannelEmitter};
+    use amp_tui::clipboard::osc52;
+    use amp_tui::{Desktop, Platform, Shell, ShellInfo, Submit};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    use rpi_agent::AgentEvent;
+    use rpi_ai::{
+        ThinkingLevel,
+        providers::faux::{FauxBlock, FauxProvider, FauxScript, FauxStep, faux_assistant_message},
+        types::StopReason,
+    };
+    use rpi_harness::{agent_harness::AgentHarness, types::AgentHarnessOptions};
+    use rpi_tui::visible_width;
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    const W: usize = 80;
+    const H: usize = 30;
+    const WAIT: Duration = Duration::from_secs(20);
+
+    /// One paragraph that wraps over several rows at 80 columns.
+    const PARA: &str = "alpha bravo charlie delta echo foxtrot golf hotel india juliett kilo lima \
+                        mike november oscar papa quebec romeo sierra tango uniform victor whiskey \
+                        xray yankee zulu";
+
+    struct Rig {
+        shell: Shell,
+        _events: UnboundedReceiver<AgentEvent>,
+        _done: UnboundedReceiver<amp_tui::RunDone>,
+        dir: PathBuf,
+        stubs: PathBuf,
+        terminal: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn stub(dir: &Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A chat that answered `reply` (with thinking first when `thinking` is set), its desktop
+    /// a recording stand-in.
+    async fn rig(tag: &str, thinking: Option<&str>, reply: &str) -> Rig {
+        let mut blocks = Vec::new();
+        if let Some(t) = thinking {
+            blocks.push(FauxBlock::Thinking(t.to_owned()));
+        }
+        blocks.push(FauxBlock::Text(reply.to_owned()));
+        let script = FauxScript::new();
+        script.set_responses(vec![FauxStep::message(faux_assistant_message(
+            blocks,
+            StopReason::Stop,
+        ))]);
+        let provider = FauxProvider::new(script);
+        let model = provider.default_model().clone();
+        let (emitter, events) = ChannelEmitter::new();
+        let harness = AgentHarness::create(AgentHarnessOptions {
+            model: model.clone(),
+            session: memory_session(),
+            models: vec![provider],
+            agent_emitter: Some(emitter.into_emitter()),
+            ..Default::default()
+        })
+        .await
+        .expect("harness");
+        let info = ShellInfo {
+            role: "amp-manager".into(),
+            provider: model.provider.to_string(),
+            model_id: model.id.clone(),
+            thinking: ThinkingLevel::Off,
+            requested_thinking: None,
+            context_window: 200_000,
+            cwd: "/work/amp".into(),
+            git_branch: None,
+            session_file: None,
+            banner: vec!["AMP harness · manager".into()],
+        };
+        let (mut shell, mut done) = Shell::new(Arc::new(harness), info, Vec::new());
+        shell.set_screen(W, H);
+        let dir = std::env::temp_dir().join(format!(
+            "amp-select-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let stubs = dir.join("bin");
+        std::fs::create_dir_all(&stubs).unwrap();
+        stub(&stubs, "pbcopy", "cat > \"$0.$$.out\"");
+        let terminal = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&terminal);
+        // macOS's tool on every OS, so Linux runs the same stand-in.
+        shell.set_desktop(
+            Desktop::with_path(Platform::Mac, &stubs).with_terminal(Arc::new(move |s: &str| {
+                sink.lock().unwrap().push(s.to_owned())
+            })),
+        );
+        let mut events = events;
+        assert_eq!(shell.submit("go").await, Submit::Continue);
+        shell
+            .drive_until_idle(&mut events, &mut done, WAIT)
+            .await
+            .expect("idle");
+        let rig = Rig {
+            shell,
+            _events: events,
+            _done: done,
+            dir,
+            stubs,
+            terminal,
+        };
+        rig.rows();
+        rig
+    }
+
+    impl Rig {
+        fn rows(&self) -> Vec<String> {
+            self.shell.view().render_plain(W, H)
+        }
+
+        fn screen(&self) -> String {
+            self.rows().join("\n")
+        }
+
+        /// The screen cell `(row, column)` of the first `needle` (its first character).
+        fn find(&self, needle: &str) -> (usize, usize) {
+            let rows = self.rows();
+            let (row, line) = rows
+                .iter()
+                .enumerate()
+                .find(|(_, l)| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} not on screen:\n{}", rows.join("\n")));
+            (row, visible_width(&line[..line.find(needle).unwrap()]))
+        }
+
+        fn mouse(&mut self, kind: MouseEventKind, (row, column): (usize, usize)) -> bool {
+            let used = self.shell.mouse(
+                W,
+                H,
+                &MouseEvent {
+                    kind,
+                    column: column as u16,
+                    row: row as u16,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+            self.rows();
+            used
+        }
+
+        fn down(&mut self, at: (usize, usize)) -> bool {
+            self.mouse(MouseEventKind::Down(MouseButton::Left), at)
+        }
+
+        fn drag(&mut self, at: (usize, usize)) -> bool {
+            self.mouse(MouseEventKind::Drag(MouseButton::Left), at)
+        }
+
+        fn up(&mut self, at: (usize, usize)) -> bool {
+            self.mouse(MouseEventKind::Up(MouseButton::Left), at)
+        }
+
+        /// What the `pbcopy` stand-in received, one entry per run.
+        fn pbcopy(&self) -> Vec<String> {
+            let mut out: Vec<String> = std::fs::read_dir(&self.stubs)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n.starts_with("pbcopy.") && n.ends_with(".out")
+                })
+                .map(|e| std::fs::read_to_string(e.path()).unwrap())
+                .collect();
+            out.sort();
+            out
+        }
+
+        /// Waits (bounded) for the `pbcopy` stand-in to have received exactly `want`. The
+        /// clipboard stops waiting on a slow tool after 2 s and reports it done, so under load
+        /// the notice can come before the stand-in has written its file.
+        async fn pbcopy_is(&self, want: &[&str]) {
+            let deadline = tokio::time::Instant::now() + WAIT;
+            while self.pbcopy() != want && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(self.pbcopy(), want);
+        }
+
+        fn osc52(&self) -> Vec<String> {
+            self.terminal
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.starts_with("\x1b]52;"))
+                .cloned()
+                .collect()
+        }
+
+        /// Polls (bounded) until the screen holds `needle`.
+        async fn until(&mut self, needle: &str) {
+            let deadline = tokio::time::Instant::now() + WAIT;
+            loop {
+                self.shell.poll();
+                if self.screen().contains(needle) {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no {needle:?} on screen:\n{}",
+                    self.screen()
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        /// Gives a background copy time to land (bounded), then polls.
+        async fn settle(&mut self) {
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                self.shell.poll();
+            }
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drag_across_a_wrapped_reply_copies_it_exactly_on_release() {
+        let mut r = rig("wrapped", None, PARA).await;
+        let start = r.find("alpha");
+        let end = r.find("zulu");
+        assert!(end.0 > start.0, "the reply wraps:\n{}", r.screen());
+        let last = (end.0, end.1 + 3);
+
+        assert!(r.down(start));
+        // Nothing is selected or copied while the button is down or dragging.
+        assert!(r.shell.view().selection().is_none());
+        assert!(r.drag((start.0, start.1 + 4)));
+        assert!(r.drag(last));
+        assert!(r.shell.view().selection().is_some());
+        assert!(r.osc52().is_empty() && r.pbcopy().is_empty());
+        assert!(
+            r.shell
+                .view()
+                .render_frame(W, H)
+                .iter()
+                .any(|l| l.contains("\x1b[7m")),
+            "the selection is highlighted"
+        );
+
+        assert!(r.up(last));
+        assert_eq!(r.osc52(), vec![osc52(PARA)], "one OSC 52 with the text");
+        r.until(&format!("Copied {} chars.", PARA.chars().count()))
+            .await;
+        r.pbcopy_is(&[PARA]).await;
+        // The highlight stays after the copy.
+        assert!(r.shell.view().selection().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_backwards_drag_copies_the_same_text() {
+        let mut r = rig("backwards", None, PARA).await;
+        let start = r.find("charlie");
+        let end = r.find("victor");
+        let last = (end.0, end.1 + 5);
+        r.down(last);
+        r.drag(start);
+        r.up(start);
+        let want = &PARA[PARA.find("charlie").unwrap()..PARA.find("victor").unwrap() + 6];
+        assert_eq!(r.osc52(), vec![osc52(want)]);
+        r.until("Copied").await;
+        r.pbcopy_is(&[want]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_click_on_a_thinking_header_toggles_it_on_release_and_copies_nothing() {
+        let mut r = rig("thinking", Some("why oh why"), "the answer").await;
+        let (row, _) = r.find("▸ Thought for ");
+        r.down((row, 8));
+        // The press alone does nothing: a drag starting here must not open it.
+        assert!(r.screen().contains("▸ Thought for "), "{}", r.screen());
+        r.up((row, 8));
+        assert!(r.screen().contains("▾ Thought for "), "{}", r.screen());
+        assert!(r.screen().contains("why oh why"), "{}", r.screen());
+        // A drag that starts on the header selects instead and leaves it as it is.
+        let (row, _) = r.find("▾ Thought for ");
+        r.down((row, 8));
+        r.drag((row, 14));
+        r.up((row, 14));
+        assert!(r.screen().contains("▾ Thought for "), "{}", r.screen());
+        assert_eq!(r.osc52().len(), 1);
+        r.settle().await;
+        assert!(r.shell.view().selection().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_editor_click_moves_the_cursor_on_press_and_a_selection_never_edits() {
+        let mut r = rig("editor", None, PARA).await;
+        let editor = r.shell.view().editor().clone();
+        editor.handle_paste("draft text");
+        r.shell.sync_focus();
+        let (row, end) = r.shell.view().cursor_position(W, H).expect("cursor");
+        // On the press, as before: no release needed.
+        assert!(r.down((row, end - 4)));
+        assert_eq!(r.shell.view().cursor_position(W, H), Some((row, end - 4)));
+        assert!(r.shell.view().selection().is_none());
+        assert!(
+            !r.up((row, end - 4)),
+            "a release outside the transcript does nothing"
+        );
+
+        // Select and copy from the transcript: the editor keeps its text and is never copied.
+        let start = r.find("alpha");
+        r.down(start);
+        r.drag((start.0, start.1 + 10));
+        r.up((start.0, start.1 + 10));
+        r.until("Copied").await;
+        assert_eq!(editor.get_text(), "draft text");
+        r.pbcopy_is(&["alpha bravo"]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_mouse_capture_off_nothing_is_selected_or_copied() {
+        let mut r = rig("capture-off", None, PARA).await;
+        r.shell.set_mouse_capture(false);
+        let start = r.find("alpha");
+        let end = r.find("zulu");
+        r.down(start);
+        r.drag(end);
+        r.up(end);
+        r.settle().await;
+        assert!(r.shell.view().selection().is_none());
+        assert!(r.osc52().is_empty());
+        assert!(r.pbcopy().is_empty());
+        assert!(!r.screen().contains("Copied"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn esc_editing_keys_and_the_next_press_clear_it_but_paging_keeps_it() {
+        let mut r = rig("clear", None, PARA).await;
+        let start = r.find("alpha");
+        let select = |r: &mut Rig| {
+            r.down(start);
+            r.drag((start.0, start.1 + 4));
+            assert!(r.shell.view().selection().is_some());
+        };
+        select(&mut r);
+        for code in [
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Up,
+            KeyCode::End,
+        ] {
+            assert!(!r.shell.selection_key(&key(code)));
+            assert!(r.shell.view().selection().is_some(), "{code:?} keeps it");
+        }
+        assert!(r.shell.selection_key(&key(KeyCode::Esc)));
+        assert!(r.shell.view().selection().is_none());
+        // Released after Esc dropped it: neither a copy nor a click.
+        assert!(!r.up((start.0, start.1 + 4)));
+        select(&mut r);
+        assert!(r.shell.selection_key(&key(KeyCode::Char('x'))));
+        assert!(r.shell.view().selection().is_none());
+        select(&mut r);
+        r.up((start.0, start.1 + 4));
+        assert!(r.shell.selection_key(&key(KeyCode::Backspace)));
+        assert!(r.shell.view().selection().is_none());
+        // The next press drops a finished selection.
+        select(&mut r);
+        r.up((start.0, start.1 + 4));
+        r.down(start);
+        assert!(r.shell.view().selection().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dragging_above_the_transcript_scrolls_and_extends_the_selection() {
+        let long: String = (1..=80)
+            .map(|i| format!("line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut r = rig("autoscroll", None, &long).await;
+        assert!(r.shell.view().scroll().at_end());
+        let top = r.shell.view().scroll().top();
+        assert!(top > 0, "the reply is taller than the screen");
+        let at = r.find("line 80");
+        let at = (at.0, at.1 + 6);
+        // The oldest line in sight before the drag.
+        let first: usize = r
+            .rows()
+            .iter()
+            .find_map(|l| {
+                let i = l.find("line ")?;
+                l[i + 5..i + 7].parse().ok()
+            })
+            .expect("a line in sight");
+        r.down(at);
+        // Row 0 is above the transcript's scroll view (the header).
+        for _ in 0..5 {
+            r.drag((0, at.1));
+        }
+        assert_eq!(r.shell.view().scroll().top(), top - 5);
+        r.up((0, at.1));
+        // Scrolled up, the notice lands below the view: wait for the stand-in instead.
+        let text = r.shell.view().select_text().expect("selected");
+        assert_eq!(r.osc52(), vec![osc52(&text)]);
+        r.pbcopy_is(&[text.as_str()]).await;
+        assert!(text.ends_with("line 80"), "{text:?}");
+        assert!(
+            text.contains(&format!("line {:02}", first - 1)),
+            "it reaches above the first screen (line {first} was the oldest in sight): {text:?}"
+        );
+    }
+}

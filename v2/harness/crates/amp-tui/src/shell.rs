@@ -82,7 +82,7 @@ use amp_core::meta::{MetaHandle, Topics};
 use amp_core::models::thinking_name;
 use amp_core::supervisor::{DispatchMode, Supervisor};
 use amp_core::tickets::Status;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use rpi_agent::AgentEvent;
 use rpi_ai::{Model, ThinkingLevel};
 use rpi_harness::agent_harness::{
@@ -196,6 +196,12 @@ enum ShellMsg {
     Sessions(Result<SessionList, String>),
     /// A confirmed resume finished: the harness switched to that session, or why it refused.
     Resumed(Box<ResumeRequest>, Result<Resumed, String>),
+    /// Select-to-copy (AMP #4217): a copy of `chars` characters finished (never the text).
+    /// Not counted in `in_flight`.
+    Copied {
+        chars: usize,
+        copied: crate::clipboard::Copied,
+    },
 }
 
 /// The shell's watch on its harness's event bus (#2388: compaction progress). rpi's watch
@@ -1455,6 +1461,10 @@ pub struct Shell {
     /// The person clicked into the editor while a panel was open (#2344): the editor has the
     /// keys (↑↓ and Enter included) until the panel closes or something is sent.
     editor_clicked: bool,
+    /// Select-to-copy (AMP #4217): the screen cell `(row, column)` of a left press in the
+    /// transcript still held down. It becomes a selection once the pointer moves to another
+    /// cell; released in place it is a click ([`Shell::mouse`]).
+    mouse_press: Option<(usize, usize)>,
     /// Who stops workers from this chat ([`Shell::set_person`]); else the AMP user's email.
     person: Option<String>,
     /// The manager's scroll position while a worker's session is shown (#2347).
@@ -1595,6 +1605,7 @@ impl Shell {
                 confirms: None,
                 confirm: None,
                 editor_clicked: false,
+                mouse_press: None,
                 person: None,
                 scroll_back: None,
                 noticed: Default::default(),
@@ -2364,6 +2375,137 @@ impl Shell {
         self.view.editor().set_cursor(line, byte);
         self.sync_focus();
         true
+    }
+
+    /// A mouse event from the terminal loop on a `width` x `height` screen (AMP #4217:
+    /// select-to-copy). Only the left button is handled here; the wheel and the jump-to-end
+    /// pill stay with the terminal loop. Returns whether anything may have changed (the loop
+    /// then repaints in full, which a selection change needs).
+    ///
+    /// - **Down** drops any selection. Inside the transcript it only records the press;
+    ///   anywhere else (editor, worker strip, panel) it is [`Shell::click`] at once, as before.
+    /// - **Drag** to another cell selects, from the press to the pointer, in content
+    ///   coordinates. Above or below the transcript it scrolls one line per event and the
+    ///   selection follows to the edge. Nothing is copied while dragging.
+    /// - **Up** with a selection copies it ([`Shell::copy_selection`]); the highlight stays.
+    ///   Up in the pressed cell is [`Shell::click`] with the press's cell (a thinking header,
+    ///   a `#ticket`, a worker notice).
+    ///
+    /// With mouse capture off (`[tui] mouse = false`) the terminal sends no events; any that
+    /// come anyway are a plain click on Down and nothing else.
+    pub fn mouse(&mut self, width: usize, height: usize, event: &MouseEvent) -> bool {
+        let (row, column) = (usize::from(event.row), usize::from(event.column));
+        if !self.mouse_capture {
+            self.mouse_press = None;
+            return match event.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.click(width, height, row, column);
+                    true
+                }
+                _ => false,
+            };
+        }
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.screen = Some((width, height));
+                self.mouse_press = None;
+                self.view.clear_selection();
+                match self.view.content_pos(width, height, row, column) {
+                    Some(at) => {
+                        self.view.select_start(at);
+                        self.mouse_press = Some((row, column));
+                    }
+                    None => {
+                        self.click(width, height, row, column);
+                    }
+                }
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.mouse_press.is_none() {
+                    return false;
+                }
+                if let Some(rect) = self.view.scroll_rect(width, height) {
+                    if row < rect.y {
+                        self.view.scroll().scroll_by(-1);
+                    } else if row >= rect.y + rect.height {
+                        self.view.scroll().scroll_by(1);
+                    }
+                }
+                if let Some(to) = self.view.content_pos_clamped(width, height, row, column) {
+                    self.view.select_extend(to);
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some((press_row, press_column)) = self.mouse_press.take() else {
+                    return false;
+                };
+                if let Some(to) = self.view.content_pos_clamped(width, height, row, column) {
+                    self.view.select_extend(to);
+                }
+                if self.view.selection().is_some() {
+                    self.copy_selection();
+                } else {
+                    self.view.clear_selection();
+                    self.click(width, height, press_row, press_column);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Copies the transcript's selection (AMP #4217) without waiting: OSC 52 goes out now, the
+    /// system tool runs in the background, and [`Shell::poll`] posts what happened
+    /// ([`crate::clipboard::copy_notice`]). An oversize selection says so and sends nothing.
+    /// Only transcript text is ever copied (never the editor, a panel or a `/connect` key), and
+    /// the text is never logged. Returns whether a copy started. Needs a tokio runtime.
+    pub fn copy_selection(&mut self) -> bool {
+        let Some(text) = self.view.select_text() else {
+            return false;
+        };
+        let chars = crate::clipboard::sanitize_for_copy(&text).chars().count();
+        match self.desktop.copy_async(text) {
+            Ok(job) => {
+                let tx = self.msgs_tx.clone();
+                tokio::spawn(async move {
+                    let copied = job.await.unwrap_or_default();
+                    let _ = tx.send(ShellMsg::Copied { chars, copied });
+                });
+                true
+            }
+            Err(crate::clipboard::CopyError::Empty) => false,
+            Err(e) => {
+                self.view.add_error(&e.to_string());
+                false
+            }
+        }
+    }
+
+    /// A key while text may be selected (AMP #4217): Esc and keys that edit drop the
+    /// selection; moving around (PageUp/PageDown, arrows, Home/End, Ctrl+U/Ctrl+D) keeps it.
+    /// The key itself still goes on to its usual handler. Returns whether a selection or a
+    /// press was dropped.
+    pub fn selection_key(&mut self, key: &KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let edits = match key.code {
+            KeyCode::Esc
+            | KeyCode::Enter
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Insert => true,
+            KeyCode::Char(c) => !ctrl || matches!(c, 'h' | 'j' | 'k' | 'y'),
+            _ => false,
+        };
+        if !edits {
+            return false;
+        }
+        let had = self.mouse_press.take().is_some() || self.view.selection().is_some();
+        self.view.clear_selection();
+        had
     }
 
     /// Whether the terminal loop turns mouse reporting on (`[tui] mouse`, default on, #2185).
@@ -5350,6 +5492,12 @@ impl Shell {
                 self.automatic_compaction_ended(run, landed);
                 continue;
             }
+            if let ShellMsg::Copied { chars, copied } = &msg {
+                if let Some(text) = crate::clipboard::copy_notice(*chars, copied) {
+                    self.view.add_notice(&text);
+                }
+                continue;
+            }
             if let ShellMsg::ReloadRequest = &msg {
                 self.reload_command(ReloadCause::Watcher);
                 continue;
@@ -5431,6 +5579,7 @@ impl Shell {
                 | ShellMsg::Remote(_)
                 | ShellMsg::ProjectLinked(_)
                 | ShellMsg::CompactionLanded { .. }
+                | ShellMsg::Copied { .. }
                 | ShellMsg::Compaction { .. } => {}
                 ShellMsg::Answered { ticket, result } => match result {
                     Ok(_) => {

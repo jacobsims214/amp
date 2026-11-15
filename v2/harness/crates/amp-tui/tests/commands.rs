@@ -1525,3 +1525,74 @@ async fn usage_summary_budget_uses_the_role_capped_max_tokens() {
     assert!(screen.contains(&capped), "{screen}");
     assert!(!screen.contains(&uncapped), "{screen}");
 }
+
+/// AMP #4217's paste regressions: select-to-copy's mouse wiring leaves bracketed paste alone.
+mod paste {
+    use super::*;
+
+    /// `/connect` asks for a key; nothing is ever checked or stored.
+    struct AskKey;
+
+    impl amp_tui::ProviderConnect for AskKey {
+        fn list(&self) -> amp_tui::ConnectFuture {
+            Box::pin(async { Err("not in the stub".to_owned()) })
+        }
+        fn prepare(&self, _args: &str) -> Result<String, String> {
+            Ok("Test API key".to_owned())
+        }
+        fn connect(&self, _args: &str, _key: String) -> amp_tui::ConnectFuture {
+            Box::pin(async { Err("not in the stub".to_owned()) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_multi_line_paste_lands_in_the_editor_and_sends_nothing() {
+        let mut rig = rig(vec![FauxStep::text("never")], false).await;
+        rig.shell.paste("a\nb\nc");
+        rig.settle().await;
+        assert_eq!(rig.editor_text(), "a\nb\nc");
+        assert!(!rig.shell.is_running());
+        assert!(!rig.screen().contains("never"), "{}", rig.screen());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_eleven_line_paste_folds_into_a_marker_and_expands_exactly() {
+        let mut rig = rig(Vec::new(), false).await;
+        let text: String = (1..=11)
+            .map(|i| format!("row {i}\twith a tab"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        rig.shell.paste(&text);
+        rig.settle().await;
+        assert_eq!(rig.editor_text(), "[paste #1 +11 lines]");
+        assert_eq!(
+            rig.shell.view().editor().get_expanded_text(),
+            text.replace('\t', "    ")
+        );
+        assert!(!rig.shell.is_running());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paste_during_connect_never_reaches_the_editor_or_the_transcript() {
+        let mut rig = rig(Vec::new(), false).await;
+        rig.shell.set_connect(Arc::new(AskKey));
+        rig.say("/connect openrouter").await;
+        rig.shell.view().editor().clear();
+        assert!(rig.shell.secret_active(), "{}", rig.screen());
+        rig.shell.paste("sk-test-SECRET-4217\n");
+        rig.settle().await;
+        assert_eq!(rig.editor_text(), "");
+        assert!(!rig.screen().contains("SECRET"), "{}", rig.screen());
+        // Esc cancels: still nothing of it anywhere.
+        assert!(rig.shell.secret_key(&key(KeyCode::Esc)));
+        rig.settle().await;
+        assert!(!rig.shell.secret_active());
+        assert_eq!(rig.editor_text(), "");
+        assert!(!rig.screen().contains("SECRET"), "{}", rig.screen());
+        assert!(
+            rig.screen().contains("/connect cancelled"),
+            "{}",
+            rig.screen()
+        );
+    }
+}

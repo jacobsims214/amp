@@ -929,7 +929,8 @@ impl ChatView {
         self.content_pos(width, height, row, column)
     }
 
-    fn scroll_rect(&self, width: usize, height: usize) -> Option<rpi_tui::LayoutRect> {
+    /// The transcript's scroll view on screen (select-to-copy's autoscroll, AMP #4217).
+    pub(crate) fn scroll_rect(&self, width: usize, height: usize) -> Option<rpi_tui::LayoutRect> {
         let frame = self.layout(width, height);
         let view: Arc<dyn Component> = self.scroll.view().clone();
         find_box(&frame.root, &view)
