@@ -1089,6 +1089,48 @@ impl WorkerSessionInfo {
 struct FinishedWorker {
     info: WorkerSessionInfo,
     feed: Arc<WorkerFeed>,
+    /// The dispatch token the run worked under ("" before a dispatch, or on an old server): what
+    /// [`Supervisor::ticket_hold`] compares AMP's current dispatch with (#4304).
+    dispatch_id: String,
+}
+
+/// Who holds a ticket in AMP now, as [`Supervisor::ticket_hold`] reads it (#4304).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TicketHold {
+    /// In progress under the given dispatch (or under one AMP doesn't name, or one this process
+    /// can't tell apart): the old run may still hold it.
+    Held,
+    /// In progress under another dispatch (its id): someone dispatched it again.
+    HeldElsewhere(String),
+    /// Not in progress any more (its AMP state, e.g. `backlog` once returned).
+    Free(String),
+}
+
+/// How long [`Supervisor::ticket_hold`]'s one `amp_get_task` may take.
+pub const TICKET_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// [`Supervisor::ticket_hold`]'s reading of an `amp_get_task` answer (`{task: {state,
+/// dispatch_id}}`, or the ticket at the top level).
+pub fn ticket_hold_of(answer: &Value, dispatch_id: &str) -> Result<TicketHold, String> {
+    let task = if answer["task"].is_object() {
+        &answer["task"]
+    } else {
+        answer
+    };
+    let state = task["state"]
+        .as_str()
+        .ok_or_else(|| "amp_get_task's answer has no ticket state".to_owned())?;
+    if state != "in_progress" {
+        return Ok(TicketHold::Free(state.to_owned()));
+    }
+    match task["dispatch_id"].as_str().map(str::trim) {
+        Some(current)
+            if !current.is_empty() && !dispatch_id.is_empty() && current != dispatch_id =>
+        {
+            Ok(TicketHold::HeldElsewhere(current.to_owned()))
+        }
+        _ => Ok(TicketHold::Held),
+    }
 }
 
 /// What a stop from the chat says (#2252): the worker's error, the abandoned run's note
@@ -1662,6 +1704,40 @@ impl Supervisor {
             .map(|f| f.info.clone())
     }
 
+    /// The dispatch token of ticket `task_id`'s last finished run in this process (#4304). `None`
+    /// when no run of it finished here; `Some("")` when that run had no dispatch token.
+    pub fn finished_dispatch_id(&self, task_id: i64) -> Option<String> {
+        self.finished
+            .lock()
+            .unwrap()
+            .get(&task_id)
+            .map(|f| f.dispatch_id.clone())
+    }
+
+    /// Reads ticket `task_id` from AMP (`amp_get_task`) and says whether it is still in progress
+    /// under `dispatch_id` (#4304): after a failed hand-back, a person or the manager may have
+    /// returned it since, which only AMP knows. An in-progress ticket counts as [`TicketHold::Held`]
+    /// unless AMP names a different, non-empty dispatch and `dispatch_id` is known. `Err` when the
+    /// read fails or its answer has no state.
+    pub async fn ticket_hold(&self, task_id: i64, dispatch_id: &str) -> Result<TicketHold, String> {
+        let Value::Object(args) = json!({"task_id": task_id}) else {
+            unreachable!()
+        };
+        let out = self
+            .rt
+            .mcp
+            .call_tool_with_timeout("amp_get_task", Some(args), TICKET_CHECK_TIMEOUT)
+            .await
+            .map_err(|e| e.to_string())?;
+        let text = crate::tools::result_text(&out);
+        if out.is_error == Some(true) {
+            return Err(text.trim().to_owned());
+        }
+        let answer: Value = serde_json::from_str(text.trim())
+            .map_err(|e| format!("amp_get_task answered something that isn't JSON: {e}"))?;
+        ticket_hold_of(&answer, dispatch_id)
+    }
+
     /// Hands `text` to the running worker on `task_id`, verbatim, as a steering message from
     /// `from` (#4232): the worker's model reads it before its next model call, which is after the
     /// tool calls of its current turn have finished, never in the middle of one. The message is
@@ -1739,10 +1815,14 @@ impl Supervisor {
             branch: report.branch.clone(),
             context_window,
         };
-        self.finished
-            .lock()
-            .unwrap()
-            .insert(report.task_id, FinishedWorker { info, feed });
+        self.finished.lock().unwrap().insert(
+            report.task_id,
+            FinishedWorker {
+                info,
+                feed,
+                dispatch_id: report.dispatch_id.clone(),
+            },
+        );
     }
 
     /// The roles this manager may dispatch, from the roster as it is now (a `/reload` may have
@@ -3801,6 +3881,41 @@ pub fn live_tickets(sup: &Supervisor) -> BTreeSet<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4304: after a failed hand-back, only an in-progress ticket under the old run's dispatch
+    /// (or one AMP or this process can't tell apart) is still held; another dispatch is someone
+    /// else's, any other state is free; an answer without a state is an error.
+    #[test]
+    fn ticket_hold_reads_state_and_dispatch() {
+        let hold = |answer: Value, old: &str| ticket_hold_of(&answer, old);
+        let task = |state: &str, d: Option<&str>| json!({"task": {"id": 7, "state": state, "dispatch_id": d}});
+        assert_eq!(
+            hold(task("in_progress", Some("d1")), "d1"),
+            Ok(TicketHold::Held)
+        );
+        assert_eq!(hold(task("in_progress", None), "d1"), Ok(TicketHold::Held));
+        assert_eq!(
+            hold(task("in_progress", Some("")), "d1"),
+            Ok(TicketHold::Held)
+        );
+        assert_eq!(
+            hold(task("in_progress", Some("d2")), ""),
+            Ok(TicketHold::Held)
+        );
+        assert_eq!(
+            hold(task("in_progress", Some("d2")), "d1"),
+            Ok(TicketHold::HeldElsewhere("d2".into()))
+        );
+        assert_eq!(
+            hold(task("backlog", Some("d1")), "d1"),
+            Ok(TicketHold::Free("backlog".into()))
+        );
+        assert_eq!(
+            hold(json!({"id": 7, "state": "completed"}), "d1"),
+            Ok(TicketHold::Free("completed".into()))
+        );
+        assert!(hold(json!({"task": {"id": 7}}), "d1").is_err());
+    }
 
     /// AMP #2946: only the ticket's own absence spends a ledger record; an older server's missing
     /// tool (mcp-go's "tool 'X' not found: tool not found") does not.

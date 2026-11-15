@@ -7,7 +7,7 @@ pub mod provider;
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -85,6 +85,11 @@ pub struct MockAmp {
     /// with its current id (an earlier one is refused as stale), so a test can tell a run's
     /// dispatch from the one before it. `None`: every dispatch of a ticket is `d_mock<id>`.
     pub fresh_dispatches: Option<Arc<Mutex<HashMap<i64, u32>>>>,
+    /// #4304: tickets a person returned in AMP's web UI ([`MockAmp::return_in_ui`]) since their
+    /// last dispatch. With `fresh_dispatches` (and no `comments`), `amp_get_task` answers a
+    /// ticket's state from it: `backlog` once returned, else `in_progress` under its current
+    /// dispatch id once dispatched.
+    pub returned_in_ui: Arc<Mutex<HashSet<i64>>>,
 }
 
 /// The mock's comment store (#4241).
@@ -128,7 +133,14 @@ impl MockAmp {
             plan: None,
             comments: None,
             fresh_dispatches: None,
+            returned_in_ui: Arc::default(),
         }
+    }
+
+    /// Returns `task_id` to ready as a person in AMP's web UI would (#4304): `amp_get_task`
+    /// answers `backlog` until the ticket is dispatched again.
+    pub fn return_in_ui(&self, task_id: i64) {
+        self.returned_in_ui.lock().unwrap().insert(task_id);
     }
 
     /// A mock that issues a new dispatch id per dispatch (#4265).
@@ -351,7 +363,20 @@ impl MockAmp {
         let issued = self.fresh_dispatches.as_ref()?;
         let id = args["task_id"].as_i64()?;
         match name {
+            // #4304: the ticket as AMP has it now, when no comment store answers it instead.
+            "amp_get_task" if self.comments.is_none() => {
+                let current = issued.lock().unwrap().get(&id).copied();
+                let returned = self.returned_in_ui.lock().unwrap().contains(&id);
+                let task = match current {
+                    Some(n) if !returned => json!({
+                        "id": id, "state": "in_progress", "dispatch_id": format!("d_mock{id}-{n}"),
+                    }),
+                    _ => json!({"id": id, "state": "backlog"}),
+                };
+                Some(ok_json(json!({"task": task, "effective_metadata": {}})))
+            }
             "amp_dispatch_task" => {
+                self.returned_in_ui.lock().unwrap().remove(&id);
                 let n = {
                     let mut issued = issued.lock().unwrap();
                     let n = issued.entry(id).or_insert(0);

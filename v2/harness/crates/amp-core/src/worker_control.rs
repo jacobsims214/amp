@@ -34,7 +34,7 @@ use crate::{
     run_report::ResumeMode,
     supervisor::{
         ControlNote, DispatchMode, RunRequest, RunTicketError, StopBy, StopError, Supervisor,
-        WorkerSessionInfo, task_id_arg,
+        TicketHold, WorkerSessionInfo, task_id_arg,
     },
 };
 
@@ -393,8 +393,9 @@ pub enum RelaunchStatus {
     /// The ticket's last session was started again through a new dispatch.
     Resumed,
     /// Nothing was dispatched: the old worker is still live (its stop had not finished, or
-    /// another restart/resume of the ticket is under way), or its hand-back failed and the
-    /// ticket may still be held by the old dispatch, or the session's lock is held.
+    /// another restart/resume of the ticket is under way), or its hand-back failed and AMP still
+    /// has the ticket in progress under the old dispatch (or checking AMP failed, #4304), or the
+    /// session's lock is held.
     Busy,
     /// Resume only: no session of the ticket's to resume here (none, unreadable, other cwd).
     NoSession,
@@ -546,7 +547,10 @@ pub struct RelaunchOptions {
 
 /// Restarts or resumes the worker on `task_id` for the manager (#4240): stops it with `reason`
 /// if it is live ([`stop_worker`], waiting at most `bound`), refuses `busy` while it is still
-/// live or when handing its ticket back failed, waits (resume only, #4281) until the old
+/// live or when handing its ticket back failed and AMP still has the ticket under the old
+/// run's dispatch (#4304: re-read with [`Supervisor::ticket_hold`], so returning the ticket in
+/// AMP lets the next call through; another dispatch is `refused`), waits (resume only, #4281)
+/// until the old
 /// session's lock is free, then runs the ticket again through the supervisor's normal dispatch
 /// path, exactly once per call. `bound` is the limit for all the waiting together: a lock still
 /// held when it runs out is `busy`, with nothing dispatched. `cancel` (the manager's turn) ends
@@ -661,15 +665,56 @@ pub async fn relaunch(
         );
     }
     if let Some(Err(e)) = sup.finished_session(task_id).and_then(|s| s.returned) {
-        return refuse(
-            out,
-            RelaunchStatus::Busy,
-            format!(
-                "the last worker on #{task_id} could not hand its ticket back ({e}), so it may \
-                 still be held by the old dispatch; nothing was dispatched. Return the ticket in \
-                 AMP, then try again."
-            ),
-        );
+        // That record stays until the ticket runs again here, so ask AMP who holds the ticket
+        // now: once a person or the manager has returned it, the relaunch goes ahead (#4304).
+        let old = sup.finished_dispatch_id(task_id).unwrap_or_default();
+        let hold = tokio::select! {
+            hold = sup.ticket_hold(task_id, &old) => hold,
+            () = cancel.cancelled() => return Err(RunTicketError::Cancelled),
+        };
+        let old_named = if old.is_empty() {
+            "the old dispatch".to_owned()
+        } else {
+            format!("the old dispatch ({old})")
+        };
+        match hold {
+            Ok(TicketHold::Free(_)) => {}
+            Ok(TicketHold::Held) => {
+                return refuse(
+                    out,
+                    RelaunchStatus::Busy,
+                    format!(
+                        "the last worker on #{task_id} could not hand its ticket back ({e}), and \
+                         AMP still has it in progress under {old_named}; nothing was dispatched. \
+                         Return the ticket in AMP (amp_return_task with that dispatch_id), then \
+                         try again."
+                    ),
+                );
+            }
+            Ok(TicketHold::HeldElsewhere(current)) => {
+                return refuse(
+                    out,
+                    RelaunchStatus::Refused,
+                    format!(
+                        "#{task_id} is in progress in AMP under another dispatch ({current}), not \
+                         this chat's last run ({old}); nothing was dispatched. Another worker has \
+                         it now: leave it, or return it in AMP first."
+                    ),
+                );
+            }
+            Err(why) => {
+                return refuse(
+                    out,
+                    RelaunchStatus::Busy,
+                    format!(
+                        "the last worker on #{task_id} could not hand its ticket back ({e}), and \
+                         checking the ticket in AMP failed ({why}), so it may still be held by \
+                         {old_named}; nothing was dispatched. Return the ticket in AMP, then try \
+                         again."
+                    ),
+                );
+            }
+        }
     }
 
     // A resume opens the old session file, whose lock the stopped run may still hold for a
@@ -789,7 +834,8 @@ impl RelaunchTool {
              ended, the ticket is dispatched again through the normal path (a new dispatch and \
              claim, in the same worktree), recorded `restarted`. Never a second worker on one \
              ticket. Returns `status`: restarted, busy (it had not ended within the abort grace \
-             plus {}s, its hand-back failed, or another restart/resume of it is under way: \
+             plus {}s, its hand-back failed and AMP still has the ticket under the old dispatch \
+             (return it in AMP, then call again), or another restart/resume of it is under way: \
              nothing was dispatched), closed_before_stop (it completed or blocked first; that \
              stands), not_found (no worker on it in this chat and no agent_id) or refused. For \
              launched workers (the chat): while amp_run_ticket awaits a worker, your turn is \

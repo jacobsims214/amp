@@ -690,7 +690,9 @@ async fn case4_restart_waits_for_the_old_run_and_claims_with_the_new_dispatch() 
 
 /// Case 5: when the stopped run's hand-back fails (the mock refuses `amp_return_task` for 4048,
 /// and its `amp_set_task_state` fallback too), restart and resume are refused `busy` and dispatch
-/// nothing: the ticket may still be held by the old dispatch.
+/// nothing while AMP still has the ticket under the old dispatch. #4304: each retry re-reads the
+/// ticket (`amp_get_task`, its only AMP call), so once a person returns it in AMP the next
+/// restart dispatches exactly once; and a new run's own failed hand-back is `busy` again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn case5_restart_and_resume_are_busy_when_the_hand_back_failed() {
     // The mock refuses both hand-back paths for this ticket.
@@ -731,8 +733,9 @@ async fn case5_restart_and_resume_are_busy_when_the_hand_back_failed() {
     assert_eq!(f.count("amp_set_task_state"), 1, "the fallback was tried");
     let calls = f.all_calls();
 
-    // Now finished with a failed hand-back: restart and both resume modes are busy, and none of
-    // them calls AMP at all.
+    // Now finished with a failed hand-back and AMP still has the ticket in progress under the
+    // old dispatch: restart and both resume modes are busy. Each re-reads the ticket in AMP
+    // (#4304) and makes no other AMP call.
     for (tool, args) in [
         (
             "amp_restart_worker",
@@ -750,15 +753,73 @@ async fn case5_restart_and_resume_are_busy_when_the_hand_back_failed() {
         let out = control_tool(&sup, tool, args.clone()).await;
         assert_eq!(out["status"], "busy", "{tool} {args}: {out}");
         assert!(out.get("run").is_none(), "{out}");
+        let note = out["note"].as_str().unwrap_or_default();
+        assert!(note.contains("could not hand its ticket back"), "{out}");
         assert!(
-            out["note"]
-                .as_str()
-                .is_some_and(|n| n.contains("could not hand its ticket back")),
+            note.contains(&format!(
+                "still has it in progress under the old dispatch ({})",
+                dispatch_id(T, 1)
+            )),
             "{out}"
         );
     }
-    assert_eq!(f.all_calls(), calls, "busy refusals call AMP");
+    let mut expected = calls.clone();
+    expected.extend(std::iter::repeat_n("amp_get_task".to_owned(), 3));
+    assert_eq!(
+        f.all_calls(),
+        expected,
+        "busy refusals only read the ticket"
+    );
     assert_eq!(f.count("amp_dispatch_task"), 1);
+    assert!(live_tickets(&sup).is_empty());
+
+    // A person returns the ticket in AMP: the next restart goes ahead, through exactly one new
+    // dispatch that the new run claims.
+    f.amp.mock.return_in_ui(T);
+    let restart = control_tool(
+        &sup,
+        "amp_restart_worker",
+        json!({"task_id": T, "reason": "returned in AMP"}),
+    )
+    .await;
+    assert_eq!(restart["status"], "restarted", "{restart}");
+    assert!(restart.get("stop").is_none(), "{restart}");
+    f.wait_for_calls("amp_claim_task", 2).await;
+    assert_eq!(f.count("amp_dispatch_task"), 2, "exactly one new dispatch");
+    assert_eq!(
+        f.calls("amp_claim_task")[1]["dispatch_id"],
+        dispatch_id(T, 2)
+    );
+    assert!(live_tickets(&sup).contains(&T));
+
+    // The new run's hand-back fails too, and the ticket was not returned since: busy again, with
+    // the new run's dispatch named, and nothing dispatched.
+    let stop = control_tool(
+        &sup,
+        "amp_stop_worker",
+        json!({"task_id": T, "reason": "stop again"}),
+    )
+    .await;
+    assert_eq!(stop["status"], "stopped_not_returned", "{stop}");
+    let out = control_tool(
+        &sup,
+        "amp_restart_worker",
+        json!({"task_id": T, "reason": "not returned"}),
+    )
+    .await;
+    assert_eq!(out["status"], "busy", "{out}");
+    assert!(out.get("run").is_none(), "{out}");
+    assert!(
+        out["note"]
+            .as_str()
+            .is_some_and(|n| n.contains(&format!("under the old dispatch ({})", dispatch_id(T, 2)))),
+        "{out}"
+    );
+    assert_eq!(
+        f.count("amp_dispatch_task"),
+        2,
+        "the busy refusal dispatched nothing"
+    );
     assert_eq!(f.count("amp_complete_task"), 0);
     assert!(live_tickets(&sup).is_empty());
 }
