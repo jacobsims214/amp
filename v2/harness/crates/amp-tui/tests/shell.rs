@@ -45,6 +45,17 @@ async fn rig_with(
     window: Option<u64>,
     compaction: CompactionSettings,
 ) -> Rig {
+    rig_system(steps, window, compaction, None).await
+}
+
+/// [`rig_with`] with a system prompt, which the faux provider's reported usage includes, as
+/// the real manager's system prompt and tools are (AMP #4280).
+async fn rig_system(
+    steps: Vec<FauxStep>,
+    window: Option<u64>,
+    compaction: CompactionSettings,
+    system_prompt: Option<String>,
+) -> Rig {
     let script = FauxScript::new();
     script.set_responses(steps);
     let provider = FauxProvider::new(script);
@@ -59,6 +70,7 @@ async fn rig_with(
         models: vec![provider],
         agent_emitter: Some(emitter.into_emitter()),
         compaction,
+        system_prompt,
         ..Default::default()
     })
     .await
@@ -424,6 +436,46 @@ async fn footer_context_drops_after_compaction() {
     rig.say("/compact").await;
     assert!(flat(&rig).contains("nothing to compact"), "{}", flat(&rig));
     assert_eq!(rig.shell.view().footer().context().unwrap().tokens, after);
+}
+
+/// AMP #4280: `/compact` on a short chat (the whole conversation is the kept tail) shows no
+/// large drop. Before, "before" was the reported usage (system prompt + tools + messages) and
+/// "after" chars/4 of the summary and tail only, so it printed `~11k → ~21` and the footer fell
+/// below the system prompt's own size. Now both include the request overhead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_on_a_short_chat_shows_no_large_drop() {
+    let mut rig = rig_system(
+        vec![
+            FauxStep::text("Got it: 42."),
+            FauxStep::text("SUMMARY: the user asked to remember 42."),
+        ],
+        None,
+        CompactionSettings::default(),
+        // ~45k characters: about the default manager's ~11k tokens of system prompt and tools.
+        Some("You are the AMP manager; follow the protocol. ".repeat(1_000)),
+    )
+    .await;
+    rig.say("hello there, please remember the number 42").await;
+    let before = rig.shell.view().footer().context().expect("ctx").tokens;
+    assert!(
+        before > 10_000,
+        "the usage includes the system prompt: {before}"
+    );
+
+    rig.say("/compact").await;
+    let screen = flat(&rig);
+    let after = rig.shell.view().footer().context().expect("ctx").tokens;
+    // Nothing was summarized away (the tail is the whole chat) and a summary was added.
+    assert!(after >= before, "after {after} before {before}: {screen}");
+    assert!(
+        screen.contains(&format!(
+            "compacted: ~{} → ~{} tokens (estimate)",
+            amp_tui::footer::format_tokens(before),
+            amp_tui::footer::format_tokens(after)
+        )),
+        "{screen}"
+    );
+    assert_eq!(rig.shell.totals().context_tokens, after);
 }
 
 /// AMP #4263: a faux model that answers rpi's summarization requests from one queue and the

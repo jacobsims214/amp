@@ -1029,6 +1029,8 @@ struct CompactDone {
     result: Result<CompactionResult, CompactError>,
     /// A decline whose branch already ends in a compaction (O2).
     already_compacted: bool,
+    /// A completed one's [`compaction_overhead`] (AMP #4280).
+    overhead: i64,
 }
 
 /// `/compact`'s call failed before rpi gave an outcome.
@@ -1045,10 +1047,16 @@ const COMPACT_WAIT_REPLY: &str = "wait for the reply to finish (Esc stops it), t
 const COMPACT_STOPPED: &str = "compaction stopped — context unchanged";
 
 /// The model context right after a compaction, estimated (spec E2): chars/4 over the summary
-/// message plus the retained tail. Not `estimate_context_tokens`: that takes the last assistant
-/// message's reported usage, and the retained tail still carries the pre-compaction figure.
+/// message plus the retained tail, plus `overhead` (see [`request_overhead`]). Not
+/// `estimate_context_tokens`: that takes the last assistant message's reported usage, and the
+/// retained tail still carries the pre-compaction figure.
+///
+/// AMP #4280: without `overhead` this is on a different basis from the entry's `tokens_before`
+/// (which comes from a reported usage, so it includes the system prompt and the tool
+/// definitions), and a short chat whose whole conversation is kept showed `~11k → ~21`.
 pub(crate) fn compacted_context_tokens(
     entry: &rpi_harness::session::types::CompactionEntry,
+    overhead: i64,
 ) -> i64 {
     use rpi_harness::compaction::estimate_tokens;
     let summary = rpi_harness::messages::create_compaction_summary_message(
@@ -1056,7 +1064,47 @@ pub(crate) fn compacted_context_tokens(
         entry.tokens_before,
         entry.base.timestamp,
     );
-    estimate_tokens(&summary) + entry.retained_tail.iter().map(estimate_tokens).sum::<i64>()
+    overhead
+        + estimate_tokens(&summary)
+        + entry.retained_tail.iter().map(estimate_tokens).sum::<i64>()
+}
+
+/// AMP #4280: what a compaction's `tokens_before` holds beyond chars/4 of the messages it was
+/// computed from: the system prompt and tool definitions (and the tokenizer's difference from
+/// chars/4) that the last reply's reported usage includes. `before` is the model context the
+/// compaction started from (`build_session_context` of the branch up to the entry). Never
+/// negative; 0 when `tokens_before` had no reported usage in it (then it is chars/4 only).
+pub(crate) fn request_overhead(tokens_before: i64, before: &[rpi_agent::AgentMessage]) -> i64 {
+    use rpi_harness::compaction::estimate_tokens;
+    (tokens_before - before.iter().map(estimate_tokens).sum::<i64>()).max(0)
+}
+
+/// [`request_overhead`] for a compaction entry on this chat's branch: the branch up to (not
+/// including) the entry is the context `tokens_before` was estimated from. 0 when the entry is
+/// not on the branch (then the estimate is messages-only, as before #4280).
+async fn compaction_overhead(
+    harness: &AgentHarness,
+    entry: &rpi_harness::session::types::CompactionEntry,
+) -> i64 {
+    use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery};
+    let query = EntryQuery {
+        order: Some(EntryOrder::OldestFirst),
+        ..Default::default()
+    };
+    let Ok(path) = harness
+        .find_entries_on_branch(&query, &BranchBounds::default())
+        .await
+    else {
+        return 0;
+    };
+    let Some(at) = path.iter().position(|e| e.id() == entry.base.id) else {
+        return 0;
+    };
+    let ctx = rpi_harness::session::context::build_session_context(
+        &path[..at],
+        &rpi_harness::session::context::SessionContextBuildOptions::default(),
+    );
+    request_overhead(entry.tokens_before, &ctx.messages)
 }
 
 /// What the shell knows about this chat's compactions (AMP #4226). The footer and `/usage`
@@ -1097,14 +1145,16 @@ pub(crate) struct LandedCompaction {
 }
 
 impl LandedCompaction {
+    /// `overhead`: [`compaction_overhead`], so `after` is on `tokens_before`'s basis (#4280).
     fn of(
         entry: &rpi_harness::session::types::CompactionEntry,
         footer_at_end: Option<i64>,
+        overhead: i64,
     ) -> Self {
         Self {
             entry_id: entry.base.id.clone(),
             tokens_before: entry.tokens_before,
-            after: compacted_context_tokens(entry),
+            after: compacted_context_tokens(entry, overhead),
             footer_at_end,
         }
     }
@@ -1153,7 +1203,8 @@ async fn landed_compaction(
                 })
                 .last()
         {
-            return Some(LandedCompaction::of(c, footer_at_end));
+            let overhead = compaction_overhead(harness, c).await;
+            return Some(LandedCompaction::of(c, footer_at_end, overhead));
         }
         tokio::time::sleep(LANDED_EVERY).await;
     }
@@ -4159,9 +4210,22 @@ impl Shell {
                 ),
                 _ => false,
             };
+            // AMP #4280: the system prompt + tools inside `tokens_before`, for the "after".
+            let overhead = match &result {
+                Ok(CompactionResult {
+                    outcome:
+                        CompactionOutcome::Completed {
+                            entry: rpi_harness::session::types::Entry::Compaction(c),
+                            ..
+                        },
+                    ..
+                }) => compaction_overhead(&harness, c).await,
+                _ => 0,
+            };
             let _ = tx.send(ShellMsg::Compacted(Box::new(CompactDone {
                 result,
                 already_compacted,
+                overhead,
             })));
         });
         self.refresh_remote_status();
@@ -4190,7 +4254,7 @@ impl Shell {
                         self.view.add_notice("compacted the context");
                         return self.after_compaction();
                     };
-                    let landed = LandedCompaction::of(c, None);
+                    let landed = LandedCompaction::of(c, None, done.overhead);
                     let after = landed.after;
                     self.apply_landed(landed);
                     self.view.add_notice(&compacted_notice(
@@ -6637,6 +6701,55 @@ fn count(n: u64, one: &str, many: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{clean_answer, parse_id, short_role, worker_summaries};
+
+    /// AMP #4280: a compaction that kept the whole short conversation is not shown as a large
+    /// drop. `tokens_before` came from a reported usage (system prompt + tools + messages);
+    /// the "after" adds the same overhead back, so it is at least `tokens_before` when the
+    /// retained tail is everything that was there before (the summary only adds to it).
+    #[test]
+    fn compaction_after_is_on_the_same_basis_as_before() {
+        use super::{compacted_context_tokens, request_overhead};
+        use rpi_harness::session::types::{CompactionEntry, EntryBase};
+        let user = |text: &str| {
+            rpi_agent::AgentMessage::User(rpi_ai::types::UserMessage::new(text.to_owned(), 1))
+        };
+        let conversation = vec![
+            user("hello there, please remember the number 42"),
+            user("Got it — I'll remember 42."),
+        ];
+        let messages: i64 = conversation
+            .iter()
+            .map(rpi_harness::compaction::estimate_tokens)
+            .sum();
+        // ~11k of system prompt and tool definitions inside the reported usage.
+        let tokens_before = 11_338;
+        let overhead = request_overhead(tokens_before, &conversation);
+        assert_eq!(overhead, tokens_before - messages);
+        let entry = CompactionEntry {
+            base: EntryBase {
+                entry_type: "compaction".into(),
+                id: "c1".into(),
+                seq: 3,
+                parent_id: None,
+                timestamp: 2,
+            },
+            summary: "The user asked to remember 42.".into(),
+            retained_tail: conversation.clone(),
+            tokens_before,
+            details: None,
+            usage: None,
+        };
+        let after = compacted_context_tokens(&entry, overhead);
+        assert!(
+            after >= tokens_before,
+            "after {after} before {tokens_before}"
+        );
+        // Messages-only (the pre-#4280 figure) is the ~11k → ~21 the smoke saw.
+        assert!(compacted_context_tokens(&entry, 0) < tokens_before / 100);
+        // Without a reported usage `tokens_before` is chars/4 only: no overhead, never negative.
+        assert_eq!(request_overhead(messages, &conversation), 0);
+        assert_eq!(request_overhead(0, &conversation), 0);
+    }
 
     /// AMP #2891's loop guard: at most WAKE_LIMIT automatic turns within WAKE_WINDOW; the next
     /// trips it once and it stays paused (silently) until the person's prompt resets it. Turns

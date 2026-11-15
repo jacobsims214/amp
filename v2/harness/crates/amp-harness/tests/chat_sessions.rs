@@ -2732,14 +2732,41 @@ async fn the_footer_drops_when_an_automatic_compaction_lands_then_shows_the_repl
     let found = chat.compactions().await;
     assert_eq!(found.len(), 1, "{}", chat.screen());
     let entry = &found[0].0;
+    // AMP #4280: the estimate is on `tokens_before`'s basis: the summary + kept tail (chars/4)
+    // plus what `tokens_before` holds beyond chars/4 of the messages it was computed from
+    // (the system prompt and tools inside the reported usage).
     let estimate = {
         use rpi_harness::compaction::estimate_tokens;
+        use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery};
+        let path = chat
+            .harness
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+            .expect("branch");
+        let at = path
+            .iter()
+            .position(|e| e.id() == entry.base.id)
+            .expect("the entry is on the branch");
+        let ctx = rpi_harness::session::context::build_session_context(
+            &path[..at],
+            &rpi_harness::session::context::SessionContextBuildOptions::default(),
+        );
+        let overhead =
+            (entry.tokens_before - ctx.messages.iter().map(estimate_tokens).sum::<i64>()).max(0);
         let summary = rpi_harness::messages::create_compaction_summary_message(
             entry.summary.as_str(),
             entry.tokens_before,
             entry.base.timestamp,
         );
-        estimate_tokens(&summary) + entry.retained_tail.iter().map(estimate_tokens).sum::<i64>()
+        overhead
+            + estimate_tokens(&summary)
+            + entry.retained_tail.iter().map(estimate_tokens).sum::<i64>()
     };
     assert!(
         estimate < before,
