@@ -743,6 +743,17 @@ fn check_mcp(ctx: &Ctx, args: &McpArgs) -> Result<McpPlan, String> {
         Some(fix) => format!("{message} ({fix})"),
         None => message,
     })?;
+    // No `${env:..}` anywhere the loader expands (AMP #4318): the value would come from the
+    // person's environment and go to the server (an http URL is sent on the next reload).
+    if let Some(url) = &args.url {
+        refuse_env_refs(name, "url", url)?;
+    }
+    if let Some(command) = &args.command {
+        refuse_env_refs(name, "command", command)?;
+    }
+    for (i, a) in args.args.iter().enumerate() {
+        refuse_env_refs(name, &format!("args[{i}]"), a)?;
+    }
     // Add-only, and never over a repo server: a user table would shadow it for this person.
     let loaded = McpConfig::load(&ctx.paths);
     let mut layers = Vec::new();
@@ -784,6 +795,8 @@ fn check_mcp(ctx: &Ctx, args: &McpArgs) -> Result<McpPlan, String> {
         return Err(secrets_hint(name));
     }
     let mut table = spec.table;
+    // The same over everything the builders produced, in case one ever derives another field.
+    refuse_env_refs_in(name, "", &toml::Value::Table(table.clone()))?;
     table.insert(
         "roles".into(),
         toml::Value::Array(
@@ -824,6 +837,51 @@ fn check_mcp(ctx: &Ctx, args: &McpArgs) -> Result<McpPlan, String> {
     })
 }
 
+/// Refuses a value that would read the environment once written and loaded: `${env:VAR}` /
+/// `${env:VAR:-default}` (the only template the loader fills from the environment;
+/// [`mcp_config::parse_template`] is what it expands with), and the Claude-style `${VAR}` /
+/// `${VAR:-default}` that the builders rewrite into it ([`mcp_crud::env_refs`]). `$${` is a literal
+/// and passes; `${home}`, `${repo}`, `${worktree}` and `${config_dir}` are paths, not secrets, and
+/// stay. The error names the field, never the value. A value that does not parse is left to the
+/// loader's own checks, which refuse it.
+fn refuse_env_refs(name: &str, field: &str, value: &str) -> Result<(), String> {
+    let reads_env = mcp_config::parse_template(&mcp_crud::env_refs(value)).is_ok_and(|pieces| {
+        pieces
+            .iter()
+            .any(|p| matches!(p, mcp_config::Piece::Env { .. }))
+    });
+    if reads_env {
+        return Err(format!(
+            "{field} references an environment variable (`${{env:..}}`), which this tool never \
+             writes: the server would be handed that value from the person's environment; {}",
+            secrets_hint(name)
+        ));
+    }
+    Ok(())
+}
+
+/// [`refuse_env_refs`] over every string in a TOML value; `field` is its dotted path.
+fn refuse_env_refs_in(name: &str, field: &str, value: &toml::Value) -> Result<(), String> {
+    let at = |key: &str| {
+        if field.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{field}.{key}")
+        }
+    };
+    match value {
+        toml::Value::String(s) => refuse_env_refs(name, field, s),
+        toml::Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .try_for_each(|(i, v)| refuse_env_refs_in(name, &format!("{field}[{i}]"), v)),
+        toml::Value::Table(t) => t
+            .iter()
+            .try_for_each(|(k, v)| refuse_env_refs_in(name, &at(k), v)),
+        _ => Ok(()),
+    }
+}
+
 /// `amp_add_mcp_server`: adds an http, sse or stdio MCP server to the person's user config.toml
 /// after their "yes", with the same gates as [`ManageTool`]: refused with no confirmer, checked
 /// ([`check_mcp`]), confirmed with the exact TOML block on screen, checked again, then written by
@@ -851,7 +909,8 @@ impl AddMcpTool {
                 Add-only: a name that exists in any config is refused (changes are made by the \
                 person with `amp-harness mcp edit <name>`). Never ask for, and never pass, \
                 tokens, API keys, headers or environment values: this tool has no field for \
-                them; the person sets them in a terminal with `amp-harness mcp secret <name>`. \
+                them, and an environment reference (${env:VAR}) in url, command or args is refused; \
+                the person sets them in a terminal with `amp-harness mcp secret <name>`. \
                 stdio servers are added DISABLED (the person starts one with `/mcp enable \
                 <name>`). The server appears after your current reply ends, once live reload \
                 picks it up (or after /reload if auto-reload is off); http servers that need a \
@@ -863,9 +922,9 @@ impl AddMcpTool {
                 "properties": {
                     "name": {"type": "string", "description": "REQUIRED. Server name: lowercase letters, digits and hyphens (up to 32); amp_* is reserved."},
                     "transport": {"type": "string", "enum": ["http", "sse", "stdio"], "description": "REQUIRED. http (streamable HTTP), sse (legacy HTTP+SSE) or stdio (a local command)."},
-                    "url": {"type": "string", "description": "http/sse only, REQUIRED there. The server URL, with no credentials in it."},
-                    "command": {"type": "string", "description": "stdio only, REQUIRED there. The program to run, e.g. npx."},
-                    "args": {"type": "array", "items": {"type": "string"}, "description": "stdio only. The command's arguments, with no secrets in them."},
+                    "url": {"type": "string", "description": "http/sse only, REQUIRED there. The server URL, with no credentials in it. Environment references (${env:VAR}) are refused."},
+                    "command": {"type": "string", "description": "stdio only, REQUIRED there. The program to run, e.g. npx. Environment references (${env:VAR}) are refused."},
+                    "args": {"type": "array", "items": {"type": "string"}, "description": "stdio only. The command's arguments, with no secrets in them. Environment references (${env:VAR}) are refused."},
                     "roles": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "REQUIRED. The agent ids that get this server's tools; [\"*\"] means every role, workers included."},
                     "dry_run": {"type": "boolean", "description": "Optional. Return the TOML block and file without asking or writing."}
                 },
@@ -1657,7 +1716,7 @@ mod tests {
         let t = mcp_tool(&ctx, Some(yes.clone()));
         let out = mcp_call(
             &t,
-            json!({"name": "files", "transport": "stdio", "command": "npx", "args": ["-y", "@acme/files-mcp", "${TMPDIR}"], "roles": ["*"]}),
+            json!({"name": "files", "transport": "stdio", "command": "npx", "args": ["-y", "@acme/files-mcp", "${home}/files"], "roles": ["*"]}),
         )
         .await
         .unwrap();
@@ -1667,7 +1726,7 @@ mod tests {
         assert!(
             req.details
                 .iter()
-                .any(|d| d == "command: npx -y @acme/files-mcp ${env:TMPDIR}"),
+                .any(|d| d == "command: npx -y @acme/files-mcp ${home}/files"),
             "{req:?}"
         );
         assert!(
@@ -1803,5 +1862,112 @@ mod tests {
         }
         assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
         assert_eq!(user_text(&ctx), before);
+    }
+
+    #[tokio::test]
+    async fn env_references_are_refused_before_asking_and_never_written() {
+        // AMP #4318: `${env:..}` would be filled from the person's environment on load, and an
+        // http server sends its URL on the next reload.
+        let ctx = mcp_ctx("mcp-env-refs");
+        let before = user_text(&ctx);
+        let yes = Fake::new(true);
+        let t = mcp_tool(&ctx, Some(yes.clone()));
+        let cases = [
+            // In the query, the path and the host of an http URL, a whole sse URL, with a default.
+            (
+                "url",
+                json!({"name": "gh", "transport": "http", "url": "https://x.example/mcp?t=${env:GITHUB_TOKEN}", "roles": ["*"]}),
+            ),
+            (
+                "url",
+                json!({"name": "gh", "transport": "http", "url": "https://x.example/${env:AMP_TOKEN}/mcp", "roles": ["*"]}),
+            ),
+            (
+                "url",
+                json!({"name": "gh", "transport": "http", "url": "https://${env:AWS_SECRET_ACCESS_KEY}.x.example/mcp", "roles": ["*"]}),
+            ),
+            (
+                "url",
+                json!({"name": "gh", "transport": "sse", "url": "${env:MCP_URL}", "roles": ["*"]}),
+            ),
+            (
+                "url",
+                json!({"name": "gh", "transport": "http", "url": "https://x.example/mcp?t=${env:UNSET_ONE:-fallback}", "roles": ["*"]}),
+            ),
+            // stdio: any argument, and the command.
+            (
+                "args[1]",
+                json!({"name": "gh", "transport": "stdio", "command": "gh-mcp", "args": ["--token", "${env:GITHUB_TOKEN}"], "roles": ["*"]}),
+            ),
+            (
+                "args[0]",
+                json!({"name": "gh", "transport": "stdio", "command": "gh-mcp", "args": ["--url=https://x.example/?k=${env:ANTHROPIC_API_KEY}"], "roles": ["*"]}),
+            ),
+            (
+                "command",
+                json!({"name": "gh", "transport": "stdio", "command": "${env:TOOL_DIR}/bin/mcp", "roles": ["*"]}),
+            ),
+            // The Claude-style shorthand, which the builders turn into `${env:..}`.
+            (
+                "url",
+                json!({"name": "gh", "transport": "http", "url": "https://x.example/mcp?t=${GITHUB_TOKEN}", "roles": ["*"]}),
+            ),
+            (
+                "args[0]",
+                json!({"name": "gh", "transport": "stdio", "command": "gh-mcp", "args": ["${AMP_TOKEN:-fallback}"], "roles": ["*"]}),
+            ),
+        ];
+        for (field, a) in cases {
+            // Dry runs too: the check comes before anything is shown.
+            for dry_run in [false, true] {
+                let mut a = a.clone();
+                a["dry_run"] = json!(dry_run);
+                let e = mcp_call(&t, a.clone()).await.unwrap_err();
+                assert!(
+                    e.contains(&format!("{field} references an environment variable")),
+                    "{a}: {e}"
+                );
+                assert!(e.contains("amp-harness mcp secret gh"), "{a}: {e}");
+                for value in [
+                    "GITHUB_TOKEN",
+                    "AMP_TOKEN",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "ANTHROPIC_API_KEY",
+                    "TOOL_DIR",
+                    "fallback",
+                ] {
+                    assert!(!e.contains(value), "echoed the value: {e}");
+                }
+            }
+        }
+        assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
+        assert_eq!(user_text(&ctx), before);
+
+        // Path references are not secrets and stay allowed, and `$${` is a literal.
+        mcp_call(
+            &t,
+            json!({"name": "fs", "transport": "stdio", "command": "${home}/bin/fs-mcp", "args": ["--root", "${home}/notes", "$${env:NOT_A_REF}"], "roles": ["*"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(yes.asked.load(Ordering::SeqCst), 1);
+        assert!(user_text(&ctx).contains("[mcp.fs]"));
+    }
+
+    #[test]
+    fn the_env_check_covers_every_string_the_builders_produce() {
+        let table: toml::Value = toml::from_str(
+            "url = \"https://x.example/mcp\"\n[nested]\nlist = [\"ok\", \"${env:SECRET}\"]\n",
+        )
+        .unwrap();
+        let e = refuse_env_refs_in("gh", "", &table).unwrap_err();
+        assert!(
+            e.starts_with("nested.list[1] references an environment variable"),
+            "{e}"
+        );
+        assert!(!e.contains("SECRET"), "{e}");
+        let ok: toml::Value =
+            toml::from_str("command = \"${home}/x\"\nargs = [\"${repo}\"]\n").unwrap();
+        refuse_env_refs_in("gh", "", &ok).unwrap();
     }
 }
