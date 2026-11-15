@@ -819,4 +819,144 @@ mod confirm {
         assert!(rig.shell.press("y").await.unwrap());
         assert_eq!(outcome(second).await, Confirmed::Approved);
     }
+
+    // AMP #4317: nothing cut from a request can be allowed unseen.
+
+    /// A request for `name` with `rows` as its detail lines.
+    fn request_with(name: &str, rows: &[String]) -> ConfirmRequest {
+        let mut req = ConfirmRequest::self_management(
+            "amp_manage_agent",
+            format!("/home/me/.config/amp-harness/agents/{name}.md"),
+            "user",
+            format!("override agent {name}"),
+        );
+        for row in rows {
+            req = req.detail(row.clone());
+        }
+        req
+    }
+
+    fn ask_with(
+        c: &Arc<ChannelConfirmer>,
+        req: ConfirmRequest,
+    ) -> tokio::task::JoinHandle<Confirmed> {
+        let c = Arc::clone(c);
+        tokio::spawn(async move { confirm_or_deny(Some(c.as_ref()), req, WAIT).await })
+    }
+
+    /// The whole transcript, unstyled, not only what fits the screen.
+    fn transcript(rig: &Rig) -> String {
+        rig.shell
+            .view()
+            .transcript_component()
+            .render(W)
+            .iter()
+            .map(|l| rpi_tui::strip_ansi(l).trim_end().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `y` on a request with unseen rows says to press `v` and leaves it open.
+    async fn y_waits_for_v(rig: &mut Rig, h: &tokio::task::JoinHandle<Confirmed>) {
+        assert!(rig.shell.press("y").await.unwrap());
+        assert!(rig.shell.confirm_pending(), "y did not allow it unseen");
+        assert!(rig.shell.confirm_has_unseen());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!h.is_finished(), "the tool got no answer yet");
+        let t = transcript(rig);
+        assert!(t.contains(amp_tui::shell::CONFIRM_VIEW_FIRST), "{t}");
+        assert!(!t.contains("Allowed:"), "{t}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_long_request_needs_v_before_y_allows_it() {
+        let (mut rig, c) = wired().await;
+        let rows: Vec<String> = (1..=60)
+            .map(|i| format!("+ row-{i:02} of the agent"))
+            .collect();
+        let h = ask_with(&c, request_with("amp-long", &rows));
+        until_shown(&mut rig).await;
+        let t = transcript(&rig);
+        assert!(t.contains("+ row-24 of the agent"), "{t}");
+        assert!(!t.contains("+ row-25 of the agent"), "{t}");
+        assert!(
+            t.contains("… 36 more lines, press v to show them all"),
+            "{t}"
+        );
+        assert!(t.contains("Press v to see the whole change, then y"), "{t}");
+
+        y_waits_for_v(&mut rig, &h).await;
+
+        assert!(rig.shell.press("v").await.unwrap());
+        assert!(rig.shell.confirm_pending(), "v does not answer");
+        assert!(!rig.shell.confirm_has_unseen());
+        let t = transcript(&rig);
+        for row in &rows {
+            assert!(t.contains(row.as_str()), "{row} missing:\n{t}");
+        }
+        assert!(
+            t.trim_end().ends_with("it is refused."),
+            "the y/N line again:\n{t}"
+        );
+        assert!(rig.shell.press("y").await.unwrap());
+        assert_eq!(outcome(h).await, Confirmed::Approved);
+        assert!(!rig.shell.confirm_pending());
+        assert!(transcript(&rig).contains("Allowed: amp_manage_agent may write"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_short_request_is_allowed_by_the_first_y() {
+        let (mut rig, c) = wired().await;
+        let rows: Vec<String> = (1..=10)
+            .map(|i| format!("+ row-{i:02} of the agent"))
+            .collect();
+        let h = ask_with(&c, request_with("amp-short", &rows));
+        until_shown(&mut rig).await;
+        assert!(!rig.shell.confirm_has_unseen());
+        let t = transcript(&rig);
+        for row in &rows {
+            assert!(t.contains(row.as_str()), "{row} missing:\n{t}");
+        }
+        assert!(!t.contains("press v"), "{t}");
+        assert!(rig.shell.press("y").await.unwrap());
+        assert_eq!(outcome(h).await, Confirmed::Approved);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wide_row_is_cut_visibly_and_shown_in_full_after_v() {
+        let (mut rig, c) = wired().await;
+        // 500 characters: 100 numbered words of five.
+        let wide: String = (0..100).map(|i| format!("w{i:03} ")).collect();
+        assert_eq!(wide.chars().count(), 500);
+        let rows = vec!["+ short row".to_owned(), wide.trim_end().to_owned()];
+        let h = ask_with(&c, request_with("amp-wide", &rows));
+        until_shown(&mut rig).await;
+        let t = transcript(&rig);
+        assert!(t.contains("w059"), "{t}");
+        assert!(!t.contains("w060"), "cut at 300 characters:\n{t}");
+        assert!(t.contains("more characters)"), "the cut is marked:\n{t}");
+        assert!(t.contains("press v to show them in full"), "{t}");
+
+        y_waits_for_v(&mut rig, &h).await;
+
+        assert!(rig.shell.press("v").await.unwrap());
+        let t = transcript(&rig);
+        for i in 0..100 {
+            assert!(t.contains(&format!("w{i:03}")), "w{i:03} missing:\n{t}");
+        }
+        // Any other key still refuses, unseen or not.
+        assert!(rig.shell.press("n").await.unwrap());
+        assert_eq!(outcome(h).await, Confirmed::Denied(DenyReason::Declined));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn any_other_key_refuses_a_request_with_unseen_rows() {
+        let (mut rig, c) = wired().await;
+        let rows: Vec<String> = (1..=30).map(|i| format!("+ row-{i:02}")).collect();
+        let h = ask_with(&c, request_with("amp-esc", &rows));
+        until_shown(&mut rig).await;
+        assert!(rig.shell.press("esc").await.unwrap());
+        assert_eq!(outcome(h).await, Confirmed::Denied(DenyReason::Declined));
+        assert!(!rig.shell.confirm_pending());
+    }
 }

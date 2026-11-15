@@ -67,7 +67,9 @@
 //! diff or other details), one at a time, while the reply that asked keeps running. The next key
 //! answers it: only `y` allows; Esc, `n` or any other key refuses. A request whose tool already
 //! gave up (timed out or cancelled) is never shown, one on screen that goes stale is closed, and a
-//! `y` that arrives too late says nothing was written.
+//! `y` that arrives too late says nothing was written. Details longer than the first view
+//! ([`CONFIRM_DETAIL_ROWS`] rows of at most [`CONFIRM_ROW_CHARS`] characters) are cut visibly, and
+//! `y` does not allow until `v` has shown the rest in full (AMP #4317).
 
 use std::{
     future::Future,
@@ -608,13 +610,25 @@ pub const ESC_HINT: &str = "Esc again to stop the reply";
 
 /// What a `y` to a confirmation that had already timed out says (AMP #4259, #4277).
 pub const CONFIRM_TOO_LATE: &str = "That request already timed out; nothing was written.";
-/// At most this many detail rows (a diff, a TOML block) of a confirmation are shown (AMP #4259).
+/// At most this many detail rows (a diff, a TOML block) of a confirmation are shown at first
+/// (AMP #4259); `v` shows the rest (AMP #4317).
 const CONFIRM_DETAIL_ROWS: usize = 24;
+/// At most this many characters of a confirmation row are shown at first; a longer row is cut
+/// with a visible `…` and `v` shows it in full (AMP #4317).
+const CONFIRM_ROW_CHARS: usize = 300;
+/// What `y` says while part of a confirmation has not been shown yet (AMP #4317).
+pub const CONFIRM_VIEW_FIRST: &str =
+    "Press v to see the whole change first; y allows it after that.";
 
 /// A confirmation's text as the terminal shows it: no control or escape characters, at most
-/// 300 characters a row (it comes from the model's tool call).
+/// [`CONFIRM_ROW_CHARS`] characters (it comes from the model's tool call).
 fn confirm_text(s: &str) -> String {
-    amp_core::remote::pairing::sanitize_for_terminal(s, 300)
+    amp_core::remote::pairing::sanitize_for_terminal(s, CONFIRM_ROW_CHARS)
+}
+
+/// A confirmation detail row in full: no control or escape characters, nothing cut (AMP #4317).
+fn confirm_row(s: &str) -> String {
+    amp_core::remote::pairing::sanitize_for_terminal(s, usize::MAX)
 }
 
 /// At most this many prompts wait for the running reply, here as on a paired device (AMP #2889).
@@ -1474,6 +1488,9 @@ pub struct Shell {
     confirms: Option<tokio::sync::mpsc::Receiver<PendingConfirm>>,
     /// The confirmation on screen, waiting for its `y`/`N`.
     confirm: Option<PendingConfirm>,
+    /// The detail rows of [`Self::confirm`] not yet shown in full (AMP #4317): `v` shows them,
+    /// and `y` does not allow while any are left.
+    confirm_unseen: Vec<String>,
     /// The person clicked into the editor while a panel was open (#2344): the editor has the
     /// keys (↑↓ and Enter included) until the panel closes or something is sent.
     editor_clicked: bool,
@@ -1621,6 +1638,7 @@ impl Shell {
                 stop_confirm: None,
                 confirms: None,
                 confirm: None,
+                confirm_unseen: Vec::new(),
                 editor_clicked: false,
                 mouse_press: None,
                 person: None,
@@ -1841,13 +1859,26 @@ impl Shell {
         self.confirm.is_some()
     }
 
+    /// Part of the confirmation on screen was cut and has not been shown with `v` yet (AMP
+    /// #4317): until it has, `y` does not allow it.
+    pub fn confirm_has_unseen(&self) -> bool {
+        self.confirm.is_some() && !self.confirm_unseen.is_empty()
+    }
+
     /// Answers the confirmation on screen (AMP #4259): `yes` only from a `y` typed on this
     /// keyboard. A request that had already timed out says nothing was written; then the next
-    /// waiting request, if any, is shown.
+    /// waiting request, if any, is shown. A `yes` while part of the request is unseen (AMP
+    /// #4317) answers nothing: it says to press `v` first and the question stays open.
     pub fn answer_confirm(&mut self, yes: bool) {
+        if yes && self.confirm_has_unseen() {
+            self.view.add_local_line(CONFIRM_VIEW_FIRST, true);
+            self.view.scroll().to_end();
+            return;
+        }
         let Some(prompt) = self.confirm.take() else {
             return;
         };
+        self.confirm_unseen.clear();
         let tool = confirm_text(&prompt.request.tool);
         let path = confirm_text(&prompt.request.path.display().to_string());
         let line = match (prompt.answer(yes), yes) {
@@ -1866,6 +1897,7 @@ impl Shell {
         let mut changed = false;
         if self.confirm.as_ref().is_some_and(PendingConfirm::is_stale) {
             let prompt = self.confirm.take();
+            self.confirm_unseen.clear();
             let tool = prompt
                 .map(|p| confirm_text(&p.request.tool))
                 .unwrap_or_default();
@@ -1885,7 +1917,7 @@ impl Shell {
                 // Dropping it is a "no" nobody waits for.
                 Ok(prompt) if prompt.is_stale() => continue,
                 Ok(prompt) => {
-                    self.show_confirm(&prompt);
+                    self.confirm_unseen = self.show_confirm(&prompt);
                     self.confirm = Some(prompt);
                     return true;
                 }
@@ -1899,8 +1931,10 @@ impl Shell {
     }
 
     /// The confirmation question, on this terminal only: what the tool wants, where, the
-    /// details (capped at [`CONFIRM_DETAIL_ROWS`]), and how to answer.
-    fn show_confirm(&mut self, prompt: &PendingConfirm) {
+    /// details (the first [`CONFIRM_DETAIL_ROWS`] rows, each cut at [`CONFIRM_ROW_CHARS`]), and
+    /// how to answer. Returns the rows not shown in full, from the first one that was cut: empty
+    /// when everything fit (AMP #4317).
+    fn show_confirm(&mut self, prompt: &PendingConfirm) -> Vec<String> {
         let r = &prompt.request;
         self.view.add_local_line(
             &format!(
@@ -1921,27 +1955,75 @@ impl Shell {
         let rows: Vec<String> = r
             .details
             .iter()
-            .flat_map(|d| d.lines().map(confirm_text).collect::<Vec<_>>())
+            .flat_map(|d| d.lines().map(confirm_row).collect::<Vec<_>>())
             .collect();
-        for row in rows.iter().take(CONFIRM_DETAIL_ROWS) {
-            self.view.add_local_line(&format!("  {row}"), false);
+        let mut first_cut = None;
+        for (i, row) in rows.iter().take(CONFIRM_DETAIL_ROWS).enumerate() {
+            let len = row.chars().count();
+            if len > CONFIRM_ROW_CHARS {
+                first_cut.get_or_insert(i);
+                let head: String = row.chars().take(CONFIRM_ROW_CHARS).collect();
+                self.view.add_local_line(
+                    &format!("  {head} … ({} more characters)", len - CONFIRM_ROW_CHARS),
+                    false,
+                );
+            } else {
+                self.view.add_local_line(&format!("  {row}"), false);
+            }
         }
         if rows.len() > CONFIRM_DETAIL_ROWS {
+            first_cut.get_or_insert(CONFIRM_DETAIL_ROWS);
             self.view.add_local_line(
-                &format!("  … {} more lines", rows.len() - CONFIRM_DETAIL_ROWS),
+                &format!(
+                    "  … {} more lines, press v to show them all",
+                    rows.len() - CONFIRM_DETAIL_ROWS
+                ),
                 false,
             );
+        } else if first_cut.is_some() {
+            self.view
+                .add_local_line("  … lines cut short, press v to show them in full", false);
         }
+        let unseen = first_cut.map(|i| rows[i..].to_vec()).unwrap_or_default();
+        self.show_confirm_answer(!unseen.is_empty());
+        unseen
+    }
+
+    /// How to answer the confirmation on screen; with `unseen`, that `v` comes first.
+    fn show_confirm_answer(&mut self, unseen: bool) {
         let minutes = CONFIRM_TIMEOUT.as_secs().div_ceil(60);
+        let first = if unseen {
+            "Press v to see the whole change, then y to allow it"
+        } else {
+            "Press y to allow it"
+        };
         self.view.add_local_line(
             &format!(
-                "Press y to allow it; Esc or any other key refuses. Only this keyboard can \
-                 answer; with no answer within {minutes} minute{} it is refused.",
+                "{first}; Esc or any other key refuses. Only this keyboard can answer; with no \
+                 answer within {minutes} minute{} it is refused.",
                 if minutes == 1 { "" } else { "s" }
             ),
             false,
         );
         self.view.scroll().to_end();
+    }
+
+    /// `v` on a confirmation with unseen rows (AMP #4317): shows every one of them in full,
+    /// from the first row that was cut (a long row wraps, nothing is cut), then the y/N line
+    /// again. `y` allows from then on.
+    fn show_confirm_rest(&mut self) {
+        let rows = std::mem::take(&mut self.confirm_unseen);
+        self.view.add_local_line(
+            &format!(
+                "The whole change, from the first line that was cut ({} lines):",
+                rows.len()
+            ),
+            true,
+        );
+        for row in &rows {
+            self.view.add_local_line(&format!("  {row}"), false);
+        }
+        self.show_confirm_answer(false);
     }
 
     /// The screen's size for the QR code: the last one seen, else the terminal's, else 80x24.
@@ -4660,11 +4742,19 @@ impl Shell {
             return true;
         }
         // AMP #4259: a self-management confirmation takes the next key, also while the reply
-        // that asked is running: `y` allows, anything else (Esc, `n`, Enter) refuses.
+        // that asked is running: `y` allows, anything else (Esc, `n`, Enter) refuses. AMP #4317:
+        // while part of it was cut, `v` shows the rest and `y` waits for that.
         if self.confirm_pending() {
             let plain = !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            if plain
+                && self.confirm_has_unseen()
+                && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+            {
+                self.show_confirm_rest();
+                return true;
+            }
             let yes = plain && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
             self.answer_confirm(yes);
             return true;
