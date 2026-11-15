@@ -331,6 +331,9 @@ pub struct ReloadReply {
 
 pub type ReloadFuture = Pin<Box<dyn Future<Output = Result<ReloadReply, String>> + Send>>;
 
+/// A `/reload` or a panel's change asked for while the manager replies (AMP #4267).
+const RELOAD_QUEUED: &str = "reload queued until the manager's reply ends";
+
 /// Who asked for a reload: it decides what the transcript says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReloadCause {
@@ -3142,7 +3145,9 @@ impl Shell {
             return;
         };
         // AMP #4222 (C5): no reload under a running compaction; it follows the compaction.
-        if self.reloading || self.compacting {
+        // AMP #4267 (G3): nor under a running reply: a reload swaps the tool policy at once, so
+        // it would change inside the turn. It follows the reply (`finish_run`).
+        if self.reloading || self.compacting || self.running {
             // A panel's or a person's request outranks the watcher's (it says what changed).
             if self.reload_again != Some(ReloadCause::Command) {
                 self.reload_again = match (self.reload_again, cause) {
@@ -3150,12 +3155,18 @@ impl Shell {
                     _ => Some(cause),
                 };
             }
-            if cause == ReloadCause::Command {
-                self.view.add_notice(if self.reloading {
-                    "/reload: already reloading; once more when it is done"
-                } else {
-                    "/reload: compacting the context; reloading once that is done"
-                });
+            let notice = match cause {
+                ReloadCause::Command if self.reloading => {
+                    Some("/reload: already reloading; once more when it is done")
+                }
+                ReloadCause::Command | ReloadCause::Panel if self.running => Some(RELOAD_QUEUED),
+                ReloadCause::Command => {
+                    Some("/reload: compacting the context; reloading once that is done")
+                }
+                ReloadCause::Panel | ReloadCause::Watcher => None,
+            };
+            if let Some(notice) = notice {
+                self.view.add_notice(notice);
             }
             return;
         }
@@ -4135,6 +4146,14 @@ impl Shell {
                 "✗ run failed: {}",
                 amp_core::provider_error::summarize("", &e)
             )),
+        }
+        // AMP #4267: a reload asked for during the reply runs now, once, before the next queued
+        // prompt starts a turn. One still running (or a compaction) runs it when it ends.
+        if !self.reloading
+            && !self.compacting
+            && let Some(again) = self.reload_again.take()
+        {
+            self.reload_command(again);
         }
         self.after_run(stopped);
     }
@@ -7521,5 +7540,142 @@ mod tests {
 
     fn get_phase(shell: &super::Shell, task_id: i64) -> Phase {
         roster_entry(shell, task_id).expect("listed").phase
+    }
+
+    /// Counts the reloads that actually start.
+    struct CountingReload(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl super::ReloadControl for CountingReload {
+        fn reload(&self) -> super::ReloadFuture {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(super::ReloadReply {
+                    lines: Vec::new(),
+                    providers: Vec::new(),
+                    models: Vec::new(),
+                    switch_to: None,
+                    stays: None,
+                    warnings: Vec::new(),
+                })
+            })
+        }
+    }
+
+    async fn reloading_shell() -> (super::Shell, Arc<std::sync::atomic::AtomicUsize>) {
+        let ends = amp_core::supervisor::LaunchEnds::default();
+        let (mut shell, _feed) = watching_shell(&ends).await;
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        shell.set_reload(Arc::new(CountingReload(Arc::clone(&count))));
+        (shell, count)
+    }
+
+    /// Polls until the running reload has been applied (bounded: 5 s).
+    async fn settle_reload(shell: &mut super::Shell) {
+        for _ in 0..500 {
+            shell.poll();
+            if !shell.reloading {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the reload never finished");
+    }
+
+    fn reloads(count: &std::sync::atomic::AtomicUsize) -> usize {
+        count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// AMP #4267 (G3): the watcher's requests during a reply start no reload (its policy swap
+    /// would land inside the turn); exactly one runs when the reply ends, and no more after.
+    #[tokio::test]
+    async fn a_watcher_reload_during_a_reply_waits_for_it_and_runs_once() {
+        let (mut shell, count) = reloading_shell().await;
+        shell.running = true;
+        shell.view.set_working(true);
+        for _ in 0..3 {
+            shell.reload_command(super::ReloadCause::Watcher);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        shell.poll();
+        assert!(!shell.reloading, "no reload starts mid-reply");
+        assert_eq!(reloads(&count), 0);
+        assert_eq!(shell.reload_again, Some(super::ReloadCause::Watcher));
+        let screen = shell.view().render_plain(160, 60).join("\n");
+        assert!(
+            !screen.contains(super::RELOAD_QUEUED),
+            "the watcher stays quiet"
+        );
+
+        shell.finish_run(Err("ended".into()));
+        assert!(shell.reloading, "the reply's end starts the pending reload");
+        assert_eq!(shell.reload_again, None);
+        settle_reload(&mut shell).await;
+        assert_eq!(reloads(&count), 1);
+
+        // Nothing is left pending: another ended reply starts nothing.
+        shell.running = true;
+        shell.finish_run(Err("ended".into()));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        shell.poll();
+        assert!(!shell.reloading);
+        assert_eq!(reloads(&count), 1);
+    }
+
+    /// AMP #4267: `/reload` during a reply says it is queued, outranks a watcher request, and
+    /// runs once after the reply; a panel's change says the same.
+    #[tokio::test]
+    async fn slash_reload_during_a_reply_is_queued_and_runs_after_it() {
+        let (mut shell, count) = reloading_shell().await;
+        shell.running = true;
+        shell.view.set_working(true);
+        shell.submit("/reload").await;
+        shell.reload_command(super::ReloadCause::Watcher);
+        assert!(!shell.reloading);
+        assert_eq!(shell.reload_again, Some(super::ReloadCause::Command));
+        let screen = shell.view().render_plain(160, 60).join("\n");
+        assert!(screen.contains(super::RELOAD_QUEUED), "{screen}");
+
+        shell.finish_run(Err("ended".into()));
+        assert!(shell.reloading);
+        settle_reload(&mut shell).await;
+        assert_eq!(reloads(&count), 1);
+        assert_eq!(shell.reload_again, None);
+
+        // A panel's change mid-reply: queued with the same notice, then run once.
+        shell.running = true;
+        shell.reload_command(super::ReloadCause::Watcher);
+        shell.reload_command(super::ReloadCause::Panel);
+        assert_eq!(shell.reload_again, Some(super::ReloadCause::Panel));
+        let queued = shell
+            .view()
+            .render_plain(160, 80)
+            .iter()
+            .filter(|l| l.contains(super::RELOAD_QUEUED))
+            .count();
+        assert_eq!(queued, 2, "one notice for /reload, one for the panel");
+        shell.finish_run(Err("ended".into()));
+        settle_reload(&mut shell).await;
+        assert_eq!(reloads(&count), 2);
+    }
+
+    /// AMP #4267: a reply that ends while a reload still runs leaves the pending one to that
+    /// reload's end; it runs once, not twice.
+    #[tokio::test]
+    async fn a_reload_pending_when_a_reply_ends_mid_reload_runs_once() {
+        let (mut shell, count) = reloading_shell().await;
+        shell.reload_command(super::ReloadCause::Command);
+        assert!(shell.reloading);
+        shell.running = true;
+        shell.reload_command(super::ReloadCause::Watcher);
+        shell.finish_run(Err("ended".into()));
+        assert_eq!(
+            shell.reload_again,
+            Some(super::ReloadCause::Watcher),
+            "still waiting on the running reload"
+        );
+        settle_reload(&mut shell).await; // the first ends and starts the pending one
+        settle_reload(&mut shell).await;
+        assert_eq!(reloads(&count), 2);
+        assert_eq!(shell.reload_again, None);
     }
 }
