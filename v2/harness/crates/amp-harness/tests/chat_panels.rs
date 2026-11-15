@@ -1189,6 +1189,38 @@ async fn config_shows_compaction_with_sources() {
     );
 }
 
+/// AMP #4294 (spec §4 "doctor + load notice"): the models config's load warnings are in the
+/// transcript when the chat opens, before any prompt, worded as `/config` shows them; the
+/// doctor-only W2 (a model's max_tokens above reserve_tokens) is not.
+async fn load_warnings_show_when_the_chat_starts() {
+    let extra = "\n[compaction]\nreserve_tokens = 9000\n\n[providers.oc]\napi = \"openai-completions\"\n\
+                 base_url = \"http://127.0.0.1:9/v1\"\nkey_env = \"OC_KEY\"\n[providers.oc.models.\"oc-1\"]\n";
+    let dir = setup("load-warnings", extra, "");
+    let cache = dir.join("home/.cache");
+    let config = dir.join("home/.config/amp-harness/config.toml");
+    let out = chat(
+        &dir,
+        None,
+        &[],
+        &[
+            ("XDG_CACHE_HOME", cache.to_str().unwrap()),
+            ("AMP_HARNESS_CONFIG", config.to_str().unwrap()),
+        ],
+    )
+    .await;
+    let screen = flat(&out.stdout);
+    assert!(
+        screen.contains("warning: context_window not set for oc/oc-1; assuming 128000"),
+        "W3 missing from the opening transcript:\n{}",
+        out.stdout
+    );
+    assert!(
+        !screen.contains("is above [compaction] reserve_tokens"),
+        "W2 is doctor-only:\n{}",
+        out.stdout
+    );
+}
+
 /// `/help` lists the new commands in its Config group.
 async fn help_lists_the_panels() {
     let dir = setup("help", "", "");
@@ -1240,6 +1272,7 @@ fn main() {
         agents_and_skills,
         config_overview_with_sources,
         config_shows_compaction_with_sources,
+        load_warnings_show_when_the_chat_starts,
         help_lists_the_panels,
     ];
     let rt = tokio::runtime::Builder::new_multi_thread()

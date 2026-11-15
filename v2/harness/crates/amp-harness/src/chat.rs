@@ -248,6 +248,13 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     // the agent's own events, for the remote link; a quiet delta is numbered after ~100 ms.
     shell.set_feed(Some(Arc::clone(&session.feed)));
     let _feed_flusher = session.feed.spawn_flusher();
+    // AMP #4294 (spec §4 "doctor + load notice, never silent"): the models config's load warnings
+    // (W1, W3, W4, compaction that does not fit) go in the transcript before the first prompt,
+    // worded as `/config` shows them. Doctor-only kinds (W2) stay out: `load_warnings` skips them.
+    // After `set_feed`, so the remote link sees them too.
+    for w in session.rt.current_models().load_warnings() {
+        shell.view().add_warning(&format!("warning: {w}"));
+    }
     shell.set_show_thinking(show_thinking);
     shell.set_mouse_capture(mouse);
     // AMP #4218: drag in the transcript to select and copy, unless `[tui] select_copy = false`.
