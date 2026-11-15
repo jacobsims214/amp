@@ -80,6 +80,11 @@ pub struct MockAmp {
     /// any ticket other than 2085 with its newest `limit` comments (default 30, 0 for all).
     /// `None`: none of that (the fixed 2085 answer only).
     pub comments: Option<Arc<Mutex<Comments>>>,
+    /// #4265: a new dispatch id per dispatch, like AMP. With it, `amp_dispatch_task` answers
+    /// `d_mock<id>-<n>` (n = 1, 2, ... per ticket) and `amp_claim_task` starts the ticket only
+    /// with its current id (an earlier one is refused as stale), so a test can tell a run's
+    /// dispatch from the one before it. `None`: every dispatch of a ticket is `d_mock<id>`.
+    pub fresh_dispatches: Option<Arc<Mutex<HashMap<i64, u32>>>>,
 }
 
 /// The mock's comment store (#4241).
@@ -122,6 +127,15 @@ impl MockAmp {
             calls: Arc::default(),
             plan: None,
             comments: None,
+            fresh_dispatches: None,
+        }
+    }
+
+    /// A mock that issues a new dispatch id per dispatch (#4265).
+    pub fn with_fresh_dispatches() -> Self {
+        Self {
+            fresh_dispatches: Some(Arc::default()),
+            ..Self::new()
         }
     }
 
@@ -326,6 +340,58 @@ impl MockAmp {
     }
 }
 
+impl MockAmp {
+    /// #4265: dispatch and claim with a new dispatch id per dispatch, when enabled. `None`: the
+    /// call goes on to the other answers.
+    fn fresh_dispatch_call(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Option<Result<CallToolResponse, ErrorData>> {
+        let issued = self.fresh_dispatches.as_ref()?;
+        let id = args["task_id"].as_i64()?;
+        match name {
+            "amp_dispatch_task" => {
+                let n = {
+                    let mut issued = issued.lock().unwrap();
+                    let n = issued.entry(id).or_insert(0);
+                    *n += 1;
+                    *n
+                };
+                Some(ok_json(json!({
+                    "task_id": id,
+                    "agent_id": args["agent_id"],
+                    "state": "in_progress",
+                    "phase": "not_started",
+                    "dispatch_id": format!("d_mock{id}-{n}"),
+                    "start_by": "2026-10-29T15:40:00Z",
+                    "flag_after_minutes": 10,
+                    "next": "Start the worker now, in this same turn.",
+                })))
+            }
+            "amp_claim_task" => {
+                let current = issued
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .map(|n| format!("d_mock{id}-{n}"));
+                Some(match (args["dispatch_id"].as_str(), current) {
+                    (Some(d), Some(current)) if d == current => ok_json(json!({
+                        "task": {"id": id}, "started_at": "2026-10-29T15:41:00Z",
+                        "phase": "started", "dispatch_id": d, "already_started": false,
+                    })),
+                    (d, current) => tool_error(&format!(
+                        "ticket {id}: dispatch {} is no longer current (current: {})",
+                        d.unwrap_or(""),
+                        current.as_deref().unwrap_or("none")
+                    )),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
 impl ServerHandler for MockAmp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
@@ -389,6 +455,9 @@ impl ServerHandler for MockAmp {
                 format!("tool '{}' not found: tool not found", request.name),
                 None,
             ));
+        }
+        if let Some(answer) = self.fresh_dispatch_call(request.name.as_ref(), &args) {
+            return answer;
         }
         if let Some(answer) = self.comment_call(request.name.as_ref(), &args) {
             return answer;
