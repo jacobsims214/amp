@@ -31,9 +31,9 @@ import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { RequestDetail } from './RequestDetail'
 import type {
-  Member, RequestAttachmentPanel, RequestEvent, RequestComment, RequestOutcome, RequestStatus, Team, TeamRequest,
+  Member, RequestAttachmentPanel, RequestEvent, RequestComment, RequestLink, RequestOutcome, RequestStatus, Team,
+  TeamRequest,
 } from '../types'
-import type { ResolvedRequestLink } from '../lib/requestControls'
 
 const ME = 12
 const TEAM_ID = 4
@@ -74,13 +74,6 @@ const attachments = (): RequestAttachmentPanel => ({
   limits: { max_file_bytes: 25 << 20, max_files: 5, max_total_bytes: 60 << 20, retention_days: 90 },
 })
 
-const link = (over: Partial<ResolvedRequestLink> = {}): ResolvedRequestLink => ({
-  id: 1, request_id: 7, link_kind: 'planned_as', target_kind: 'task', target_id: 3712,
-  created_by: ME, created_at: '2026-11-13T09:00:00Z',
-  target: { kind: 'task', id: 3712, title: 'AMP-V2-3712 — Berlin SSO group mapping', approved: false },
-  ...over,
-})
-
 // ---- The server ----
 
 interface Call { method: string; path: string; ifMatch: string | null; body: string }
@@ -106,11 +99,42 @@ beforeEach(() => { calls = [] })
 afterEach(() => { server.resetHandlers() })
 afterAll(() => server.close())
 
-/** The team read and the attachments read, which every detail render makes. */
+/** The team read and the three sub-reads, which every detail render makes. */
 function serveTeam() {
   server.use(record('get', `*/api/teams/${TEAM_ID}`, { team: TEAM, members }))
   server.use(record('get', `*/api/teams/${TEAM_ID}/requests/7/attachments`, attachments()))
   server.use(record('get', '*/api/projects/3', { project: { id: 3, name: 'AMP v2' } }))
+  // Empty, and overridden per case by a later registration (MSW prepends, so
+  // the last `use` for a path is the one that answers).
+  serveSubReads()
+}
+
+/**
+ * The three sub-reads, as the server answers them.
+ *
+ * Every page render makes all three (the record's load path reads them), so
+ * without these the page would be stating three failed reads in tests that are
+ * about something else. The shapes are the routes' own: `comments` is the
+ * team's arm with its rows, `events` carries `next_after_id` only when another
+ * page exists, and `links` is the plain stored row (no resolved `target`).
+ */
+function serveSubReads(over: {
+  comments?: RequestComment[]
+  events?: RequestEvent[]
+  links?: RequestLink[]
+} = {}) {
+  const comments = over.comments ?? []
+  const events = over.events ?? []
+  const links = over.links ?? []
+  server.use(record('get', `*/api/teams/${TEAM_ID}/requests/7/comments`, {
+    view: 'team', request_id: 7, count: comments.length, comments,
+  }))
+  server.use(record('get', `*/api/teams/${TEAM_ID}/requests/7/events`, {
+    view: 'team', request_id: 7, count: events.length, events,
+  }))
+  server.use(record('get', `*/api/teams/${TEAM_ID}/requests/7/links`, {
+    view: 'team', request_id: 7, count: links.length, links,
+  }))
 }
 
 /** The detail read as the team arm: the record plus its aggregate. */
@@ -401,7 +425,7 @@ describe('a failed write preserves the draft and explains itself', () => {
     }))
     // The discussion is served here (empty thread), which is what draws the
     // composer: the page never posts a comment it has nowhere to show.
-    renderPage({ reads: { comments: [] } })
+    renderPage()
 
     const composer = await screen.findByLabelText('Comment') as HTMLTextAreaElement
     await userEvent.type(composer, 'Reopened because the requester clarified the groups.')
@@ -523,46 +547,215 @@ describe('no private-route or auth bypass', () => {
   })
 })
 
-// ---- The read the shipped server does not serve ----
+// ---- The served reads: the thread, the history and the lineage ----
 
-describe('the rows this build’s read does not carry', () => {
-  it('states the gap for discussion, history and links instead of an empty list', async () => {
-    serveTeam()
-    serveDetail()
-    renderPage()
-    await screen.findByTestId('request-brief')
-    // Each panel says the rows are not served — the words "No discussion yet"
-    // would be a claim about the record the page has no basis for.
-    expect(screen.getByTestId('unserved-discussion')).toHaveTextContent(/no route/)
-    expect(screen.getByTestId('unserved-history')).toHaveTextContent(/no route/)
-    expect(screen.getByTestId('unserved-links')).toHaveTextContent(/no route/)
-    expect(screen.queryByText(/No discussion yet/)).toBeNull()
-    expect(screen.queryByText(/No acts recorded yet/)).toBeNull()
+describe('the reads the page makes beside the record', () => {
+  const comments: RequestComment[] = [
+    { id: 1, request_id: 7, kind: 'comment', body: 'Metadata checks out.', author: 'Jacob Sims', author_user_id: ME, created_at: '2026-11-14T09:00:00Z' },
+    { id: 2, request_id: 7, kind: 'question', body: 'Which group should be the default?', author: 'Jacob Sims', author_user_id: ME, created_at: '2026-11-14T09:05:00Z' },
+  ]
+  const events: RequestEvent[] = [
+    { id: 1, request_id: 7, org_id: 2, team_id: TEAM_ID, action: 'submit', actor: 'it-admin@acme.example', actor_user_id: null, created_at: '2026-11-12T09:00:00Z' },
+    { id: 2, request_id: 7, org_id: 2, team_id: TEAM_ID, action: 'transition', from_status: 'new', to_status: 'triaging', actor: 'Jacob Sims', actor_user_id: ME, created_at: '2026-11-13T08:00:00Z' },
+  ]
+  const storedLink = (over: Partial<RequestLink> = {}): RequestLink => ({
+    id: 1, request_id: 7, link_kind: 'planned_as', target_kind: 'task', target_id: 3712,
+    created_by: ME, created_at: '2026-11-13T09:00:00Z', ...over,
   })
 
-  it('renders the thread, the history and the plan rows when a seam serves them', async () => {
+  it('renders the discussion, the history and the linked work the routes answer', async () => {
     serveTeam()
     serveDetail()
-    const comments: RequestComment[] = [
-      { id: 1, request_id: 7, kind: 'comment', body: 'Metadata checks out.', author: 'Jacob Sims', author_user_id: ME, created_at: '2026-11-14T09:00:00Z' },
-      { id: 2, request_id: 7, kind: 'question', body: 'Which group should be the default?', author: 'Jacob Sims', author_user_id: ME, created_at: '2026-11-14T09:05:00Z' },
-    ]
-    const events: RequestEvent[] = [
-      { id: 1, request_id: 7, org_id: 2, team_id: TEAM_ID, action: 'submit', actor: 'it-admin@acme.example', actor_user_id: null, created_at: '2026-11-12T09:00:00Z' },
-      { id: 2, request_id: 7, org_id: 2, team_id: TEAM_ID, action: 'transition', from_status: 'new', to_status: 'triaging', actor: 'Jacob Sims', actor_user_id: ME, created_at: '2026-11-13T08:00:00Z' },
-    ]
-    renderPage({ reads: { comments, events, links: [link()] } })
+    serveSubReads({ comments, events, links: [storedLink()] })
+    renderPage()
 
+    // The thread: both rows, in append order, beside the composer.
     expect(await screen.findByText('Metadata checks out.')).toBeInTheDocument()
     expect(screen.getByText('Which group should be the default?')).toBeInTheDocument()
+    expect(screen.getByLabelText('Comment')).toBeInTheDocument()
+
+    // The history: the append-only rows, each a history row in the rail.
     expect(screen.getAllByTestId('history-row').length).toBeGreaterThan(0)
-    // The plan row is the seam's own, with its approval fact.
-    expect(screen.getByText('AMP-V2-3712')).toBeInTheDocument()
-    expect(screen.getByText('awaiting approval')).toBeInTheDocument()
-    // And the gap sentences are gone, because the gap is.
+    expect(screen.queryByText(/No acts recorded yet/)).toBeNull()
+
+    // The plan row is the read's own. The server resolves no target, so the page
+    // names it by the id it was attached with and says the name is unread —
+    // never "This item is no longer available", which would be a claim about a
+    // record nothing read.
+    expect(screen.getByText(/unnamed here/)).toBeInTheDocument()
+    expect(screen.queryByText('This item is no longer available')).toBeNull()
+
+    // And there is no "not served" copy left anywhere on the page.
     expect(screen.queryByTestId('unserved-discussion')).toBeNull()
     expect(screen.queryByTestId('unserved-history')).toBeNull()
     expect(screen.queryByTestId('unserved-links')).toBeNull()
+    expect(document.body.textContent).not.toMatch(/not served|no route that returns/)
+  })
+
+  it('draws an empty thread as empty — the read answered, and it said nobody has spoken', async () => {
+    // The one case where an empty list is the truth: the read succeeded. This is
+    // the distinction the failed cases below turn on.
+    serveTeam()
+    serveDetail()
+    renderPage()
+    expect(await screen.findByText(/No discussion yet/)).toBeInTheDocument()
+    expect(screen.getByText(/No acts recorded yet/)).toBeInTheDocument()
+    expect(screen.queryByTestId('subread-failure-discussion')).toBeNull()
+    expect(screen.queryByTestId('subread-failure-history')).toBeNull()
+    expect(screen.queryByTestId('subread-failure-links')).toBeNull()
+  })
+
+  it('states a failed thread instead of rendering an empty one', async () => {
+    serveTeam()
+    serveDetail()
+    server.use(http.get(`*/api/teams/${TEAM_ID}/requests/7/comments`, () =>
+      HttpResponse.json({ error: 'The thread read timed out.' }, { status: 503 })))
+    renderPage()
+
+    const failure = await screen.findByTestId('subread-failure-discussion')
+    expect(failure).toHaveTextContent(/did not load/)
+    expect(failure).toHaveTextContent(/not an empty discussion/)
+    // "No discussion yet" would be a claim about the record the page has no
+    // basis for: the read never answered.
+    expect(screen.queryByText(/No discussion yet/)).toBeNull()
+    // The other two reads still answered, and the record is still on screen.
+    expect(screen.getByTestId('request-brief')).toBeInTheDocument()
+    expect(screen.getByText(/No acts recorded yet/)).toBeInTheDocument()
+  })
+
+  it('states a failed history instead of rendering an empty one', async () => {
+    serveTeam()
+    serveDetail()
+    server.use(http.get(`*/api/teams/${TEAM_ID}/requests/7/events`, () =>
+      HttpResponse.json({ error: 'The history read failed.' }, { status: 500 })))
+    renderPage()
+
+    const failure = await screen.findByTestId('subread-failure-history')
+    expect(failure).toHaveTextContent(/not an empty history/)
+    expect(screen.queryByText(/No acts recorded yet/)).toBeNull()
+    // The refused link is not because the request is quiet.
+    expect(screen.getByTestId('request-brief')).toBeInTheDocument()
+  })
+
+  it('states a failed lineage read beside the rail, and still shows the aggregate’s route', async () => {
+    serveTeam()
+    serveDetail(request(), outcome({ routed_project_id: 3 }))
+    server.use(http.get(`*/api/teams/${TEAM_ID}/requests/7/links`, () =>
+      HttpResponse.json({ error: 'The link read failed.' }, { status: 500 })))
+    renderPage()
+
+    const failure = await screen.findByTestId('subread-failure-links')
+    expect(failure).toHaveTextContent(/not an empty linked work/)
+    // The aggregate's route does not depend on that read, so it is still drawn:
+    // a failed lineage read must not make a routed request read as unrouted.
+    await waitFor(() => expect(screen.getAllByText('AMP v2').length).toBeGreaterThan(0))
+    expect(screen.queryByText(/Not routed yet/)).toBeNull()
+  })
+
+  it('names an unresolved row by its id, and never buries it as deleted', async () => {
+    // The lineage read answers the stored row with no `target`: the server
+    // invents no title, no approval fact and no tombstone. Both rails draw an
+    // absent target as "This item is no longer available" — a claim about the
+    // target's record — and for a ticket attached a minute ago that is false.
+    serveTeam()
+    serveDetail()
+    serveSubReads({ links: [storedLink()] })
+    renderPage()
+
+    expect(await screen.findByText(/unnamed here/)).toBeInTheDocument()
+    expect(screen.queryByText('This item is no longer available')).toBeNull()
+    // It is still a plan row, with the reference the read gave it.
+    expect(screen.getByText('#3712')).toBeInTheDocument()
+  })
+
+  it('keeps the approval fact a tombstoned row does carry', async () => {
+    // A row the page *did* resolve keeps what it was resolved to: this is the
+    // other side of the rule above — the page fills a gap, it does not overwrite
+    // a fact.
+    serveTeam()
+    serveDetail()
+    server.use(http.get(`*/api/teams/${TEAM_ID}/requests/7/links`, () => HttpResponse.json({
+      view: 'team', request_id: 7, count: 1,
+      links: [{ id: 1, request_id: 7, link_kind: 'planned_as', target_kind: 'task', target_id: 3712,
+        target: { kind: 'task', id: 3712, title: 'AMP-V2-3712 — Berlin SSO group mapping', approved: false },
+        created_by: ME, created_at: '2026-11-13T09:00:00Z' }],
+    })))
+    renderPage()
+    expect(await screen.findByText('Berlin SSO group mapping')).toBeInTheDocument()
+    expect(screen.getByText('awaiting approval')).toBeInTheDocument()
+    expect(screen.queryByText(/unnamed here/)).toBeNull()
+  })
+
+  it('keeps one panel’s failure out of the other two and out of the record', async () => {
+    serveTeam()
+    serveDetail()
+    serveSubReads({ events, links: [storedLink()] })
+    // Registered AFTER serveSubReads, because MSW's `use` prepends: the last
+    // handler for a path is the one that answers.
+    server.use(http.get(`*/api/teams/${TEAM_ID}/requests/7/comments`, () =>
+      HttpResponse.json({ error: 'down' }, { status: 503 })))
+    renderPage()
+    await screen.findByTestId('subread-failure-discussion')
+    // The other two answered normally.
+    expect(screen.getAllByTestId('history-row').length).toBeGreaterThan(0)
+    expect(screen.getByText(/unnamed here/)).toBeInTheDocument()
+    expect(screen.queryByTestId('subread-failure-history')).toBeNull()
+    expect(screen.queryByTestId('subread-failure-links')).toBeNull()
+  })
+
+  it('follows the forward cursor, so the newest rows are not the ones dropped', async () => {
+    serveTeam()
+    serveDetail()
+    // The thread is append-only and read forward: page one is the OLDEST rows.
+    // A page that showed only page one would hide the comment the reader just
+    // posted.
+    let page = 0
+    server.use(http.get(`*/api/teams/${TEAM_ID}/requests/7/comments`, ({ request: req }) => {
+      const after = new URL(req.url).searchParams.get('after_id')
+      page += 1
+      const first = { view: 'team', request_id: 7, count: 1, next_after_id: 2,
+        comments: [{ id: 1, request_id: 7, kind: 'comment', body: 'The first thing said.', author: 'Jacob Sims', author_user_id: ME, created_at: '2026-11-14T09:00:00Z' }] }
+      const second = { view: 'team', request_id: 7, count: 1,
+        comments: [{ id: 2, request_id: 7, kind: 'comment', body: 'The newest thing said.', author: 'Jacob Sims', author_user_id: ME, created_at: '2026-11-14T10:00:00Z' }] }
+      return HttpResponse.json(after == null ? first : second)
+    }))
+    renderPage()
+    expect(await screen.findByText('The newest thing said.')).toBeInTheDocument()
+    expect(screen.getByText('The first thing said.')).toBeInTheDocument()
+    expect(page).toBe(2)
+  })
+
+  it('says a bounded read stopped short rather than presenting it as the whole list', async () => {
+    serveTeam()
+    serveDetail()
+    // Every page claims another exists, so only the page's own bound stops it.
+    server.use(http.get(`*/api/teams/${TEAM_ID}/requests/7/events`, ({ request: req }) => {
+      const after = Number(new URL(req.url).searchParams.get('after_id') ?? '0')
+      return HttpResponse.json({ view: 'team', request_id: 7, count: 1, next_after_id: after + 1,
+        events: [{ id: after + 1, request_id: 7, org_id: 2, team_id: TEAM_ID, action: 'claim', actor: 'Jacob Sims', actor_user_id: ME, created_at: '2026-11-13T08:00:00Z' }] })
+    }))
+    renderPage()
+    expect(await screen.findByTestId('subread-truncated-history')).toHaveTextContent(/not all of it/)
+    expect(screen.getAllByTestId('history-row').length).toBeGreaterThan(0)
+  })
+
+  it('reads the three panels without a fetch inside any of them', async () => {
+    serveTeam()
+    serveDetail()
+    serveSubReads({ comments, events, links: [storedLink()] })
+    renderPage()
+    await screen.findByText('Metadata checks out.')
+
+    // Every request-scoped read went to the page's load path, and the requester's
+    // own sub-routes were never touched (this caller is on the inbox).
+    const sub = calls.filter(c => /\/(comments|events|links)$/.test(c.path))
+    expect(sub.map(c => c.path).sort()).toEqual([
+      `/api/teams/${TEAM_ID}/requests/7/comments`,
+      `/api/teams/${TEAM_ID}/requests/7/events`,
+      `/api/teams/${TEAM_ID}/requests/7/links`,
+    ])
+    // And each is a read: no sub-read posts anything.
+    for (const c of sub) expect(c.method).toBe('GET')
   })
 
   it('titles the aggregate’s route from one project read, and keeps the id when that read fails', async () => {
@@ -584,14 +777,29 @@ describe('the rows this build’s read does not carry', () => {
     expect(screen.queryByText(/Not routed yet/)).toBeNull()
   })
 
-  it('never invents the discussion from the clarification state', async () => {
+  it('draws the last question in the clarification card, from the real thread', async () => {
     serveTeam()
     serveDetail(request({ state: 'needs_information', needs_info_since: '2026-11-13T08:00:00Z' }))
+    serveSubReads({ comments })
     renderPage()
-    // The card knows a question is open and since when; it says the text is not
-    // in this read instead of inventing one.
     expect(await screen.findByText(/needs the requester’s answer/)).toBeInTheDocument()
-    expect(screen.getByTestId('clarification-unserved')).toBeInTheDocument()
+    // The last `question` row is the open one, and it is drawn rather than
+    // invented or described as missing. The card renders as soon as the record
+    // answers and the thread arrives on its own read, so this waits for it.
+    await waitFor(() => expect(screen.getAllByText('Which group should be the default?').length).toBeGreaterThan(1))
+    expect(screen.queryByTestId('clarification-read-failed')).toBeNull()
+  })
+
+  it('states a failed thread in the clarification card, not "not carried"', async () => {
+    serveTeam()
+    serveDetail(request({ state: 'needs_information', needs_info_since: '2026-11-13T08:00:00Z' }))
+    server.use(http.get(`*/api/teams/${TEAM_ID}/requests/7/comments`, () =>
+      HttpResponse.json({ error: 'down' }, { status: 503 })))
+    renderPage()
+    expect(await screen.findByTestId('clarification-read-failed')).toHaveTextContent(/did not load/)
+    // A failure is not an absence: the card does not claim the question is
+    // missing from the record.
+    expect(screen.queryByTestId('clarification-unrecorded')).toBeNull()
   })
 })
 

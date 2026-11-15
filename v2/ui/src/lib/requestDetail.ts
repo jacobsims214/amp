@@ -23,7 +23,8 @@
  * the server's own sentence.
  */
 import type {
-  Member, RequestLink, RequestOutcome, RequestReadAnswer, RequestStatus, TeamRequest,
+  Member, RequestComment, RequestLink, RequestOutcome, RequestReadAnswer, RequestStatus,
+  RequestThreadAnswer, TeamRequest,
 } from '../types'
 import { REQUEST_STATUSES } from '../types'
 import type { ResolvedRequestLink } from './requestControls'
@@ -311,82 +312,170 @@ export function detailPanels(state: RequestStatus): DetailPanels {
   }
 }
 
-// ---- The links the shipped read does not carry ----
+// ---- The record's three sub-reads: discussion, history, lineage ----
 
-/**
- * TEMPORARY SCAFFOLDING — not the approved end state.
- *
- * The approved detail design (artifact 37 v1) shows a request's discussion, its
- * history and its linked work. This build cannot render them, because the reads
- * do not exist yet:
- *
- *   - `GET /api/teams/{id}/requests/{request}` answers the record and the
- *     delivery aggregate only. The only other request reads registered in
- *     `internal/api/rest.go` are the queue, the summary and the attachments
- *     panel.
- *   - `POST …/comments` exists but there is no GET for the thread.
- *   - `POST …/links` exists but there is no GET for the link rows.
- *   - `request_events` is written all over the repository layer and has no list
- *     read at all (`domain.RequestEvent` exists; no `Repo` method returns one).
- *
- * These are gaps in the product, not in the request. They are tracked by the
- * read tickets filed alongside this page (comments, events, links) and this
- * seam exists only so the page can be assembled and reviewed before they land.
- * When those routes ship, the page passes real rows into `reads` and every
- * "not served" notice below disappears — no other change to this page.
- *
- * What the page must never do, while the gap is open, is the other two options:
- * invent an empty thread (which reads as "nobody has said anything" — a claim
- * about the record), or let a panel fetch (opening a request would then perform
- * a write-capable mount).
- *
- * Removing this seam is the acceptance bar for the read tickets, not an
- * optional cleanup.
- */
-export interface DetailReads {
-  comments?: import('../types').RequestComment[]
-  events?: import('../types').RequestEvent[]
-  links?: ResolvedRequestLink[]
+/** The three reads the page makes beside the record, named the way the panels are. */
+export type SubReadName = 'discussion' | 'history' | 'links'
+
+/** The noun each sub-read's failure sentence uses, so three panels say it the same way. */
+const SUB_READ_NOUN: Readonly<Record<SubReadName, string>> = {
+  discussion: 'discussion',
+  history: 'history',
+  links: 'linked work',
 }
 
-/** Which of the three unserved reads are present. */
-export function servedReads(reads: DetailReads): { comments: boolean; events: boolean; links: boolean } {
+/**
+ * One sub-read's state: the rows the last successful read answered, and why the
+ * latest attempt failed.
+ *
+ * The two are held together on purpose, and neither is a stand-in for the other:
+ *
+ *   - `rows: null` means no read has ever succeeded. It is **not** an empty
+ *     list: "No discussion yet" is a claim about the record, and a page that has
+ *     not read the thread has no basis for it.
+ *   - `failure` sits *beside* the rows rather than replacing them, so a failed
+ *     re-read leaves what the reader was reading on screen — the same rule the
+ *     record's own soft re-read follows, and the reason a half-typed comment
+ *     survives a 409 and a Refresh.
+ */
+export interface SubRead<T> {
+  rows: T | null
+  failure: string | null
+  /** The read stopped at its page bound with rows still unread. Only meaningful with rows. */
+  truncated?: boolean
+}
+
+/**
+ * The three sub-reads, keyed by the panel each fills — the same words the page
+ * and the failure sentences use, so "which read failed" cannot be said three
+ * different ways.
+ */
+export interface SubReads {
+  discussion: SubRead<RequestComment[]>
+  history: SubRead<import('../types').RequestEvent[]>
+  links: SubRead<ResolvedRequestLink[]>
+}
+
+/** Nothing read yet: not empty, and not failed. */
+export const NO_SUB_READS: SubReads = {
+  discussion: { rows: null, failure: null },
+  history: { rows: null, failure: null },
+  links: { rows: null, failure: null },
+}
+
+/**
+ * The thread rows a discussion answer may be rendered from, with the cursor for
+ * the next page — or null when the answer is not the team's arm.
+ *
+ * The route answers two shapes and exactly one of them is this page's: a team
+ * answer carries `comments` (stored rows, attribution and all), a requester's
+ * carries `shared_comments` (no id, no author) and omits `comments` entirely.
+ * Reading `comments ?? []` would hand the triage page an empty thread where the
+ * request has a real one, so the arm is decided on the server's own `view` word
+ * and anything else is a shape this page does not render.
+ */
+export function teamThreadPage(
+  answer: RequestThreadAnswer | null | undefined,
+): { rows: RequestComment[]; nextAfterId: number | null } | null {
+  if (!answer || typeof answer !== 'object') return null
+  if (answer.view !== 'team') return null
   return {
-    comments: Array.isArray(reads.comments),
-    events: Array.isArray(reads.events),
-    links: Array.isArray(reads.links),
+    rows: Array.isArray(answer.comments) ? answer.comments : [],
+    // The cursor is only worth following when the server says another page
+    // really exists; it omits the field on the last one.
+    nextAfterId: answer.next_after_id ?? null,
   }
 }
 
 /**
- * The one sentence a panel says instead of a fake empty list.
+ * What a panel says when a read stopped before the end of its list.
  *
- * TEMPORARY: this notice is the seam's visible face and goes away when the read
- * tickets land. It says three things on purpose — which rows are missing, that
- * the gap is in this build rather than in the request, and that "empty" is not
- * what the reader is looking at.
+ * A page is bounded (the server clamps it, and the page follows the cursor that
+ * many times), so a long thread or history can outrun what one screen reads. It
+ * is stated rather than left as a silent truncation: a list that stops early
+ * without saying so reads as the whole record.
  */
-export function unservedReadSentence(what: 'discussion' | 'history' | 'links'): string {
-  const noun = what === 'discussion' ? 'discussion' : what === 'history' ? 'history' : 'linked work'
-  return `The request read that reaches this page answers the record and the delivery summary, not its ${noun}. `
-    + 'Nothing is missing from the request: this build has no route that returns the rows yet, so they are not shown '
-    + 'rather than shown as empty.'
+export function subReadTruncationNotice(what: SubReadName): string {
+  return `More ${SUB_READ_NOUN[what]} exists than this page reads: the rows shown are the start of it, not all of it.`
 }
 
 /**
- * The route row, built from the one link-ish fact the shipped read *does*
- * carry: the aggregate's `routed_project_id`.
+ * How many forwarded pages one sub-read follows before it stops.
  *
- * Without this the planning rail would say "Not routed yet" for a request that
- * has a route — the aggregate reports `routed_project_id` and counts the route
- * in `linked`, so a page ignoring it would contradict the server's own answer.
- * The row is a `routes_to` link with its id; the title is resolved separately
- * (see `resolveRoutedProject`) because it costs a read of its own.
+ * The two paged reads (thread, history) are append-only and read forward from
+ * where they began, so a request with a long life has more rows than one page.
+ * A page that showed only the server's first page would silently drop the
+ * *newest* rows — including the comment the reader just posted — so the cursor is
+ * followed. The bound is what keeps that finite: past it the page says there is
+ * more rather than reading forever, and the number is deliberately the same for
+ * both reads so one screen cannot read one list deeper than the other.
+ */
+export const SUB_READ_PAGE_LIMIT = 8
+
+/**
+ * Read every page of a forward-cursored list, up to a bound.
+ *
+ * `fetchPage` receives the cursor (null for the first page) and answers the rows
+ * it read plus the next cursor, or null when that was the last page. Rows are
+ * concatenated in the server's own order, which is append order — the order the
+ * thread and the history are read and drawn in.
+ *
+ * `truncated` is true only when the bound was reached and the server still had
+ * more: it is the difference between "this is the whole list" and "this is the
+ * start of it", and a caller that ignored it would state the first as the
+ * second. A rejected fetch propagates — a partial list silently presented as
+ * complete is the failure this whole file is about.
+ */
+export async function collectForwardPages<T>(
+  fetchPage: (afterId: number | null) => Promise<{ rows: T[]; nextAfterId: number | null }>,
+  maxPages: number = SUB_READ_PAGE_LIMIT,
+): Promise<{ rows: T[]; truncated: boolean }> {
+  const rows: T[] = []
+  let after: number | null = null
+  for (let page = 0; page < maxPages; page += 1) {
+    const answer = await fetchPage(after)
+    rows.push(...answer.rows)
+    if (answer.nextAfterId == null) return { rows, truncated: false }
+    after = answer.nextAfterId
+  }
+  // The bound was reached with a cursor still in hand: there is more.
+  return { rows, truncated: true }
+}
+
+/**
+ * What a panel says when its read failed, in the page's own voice.
+ *
+ * Two sentences, because they are two different facts: a read that never
+ * answered (so there is nothing to show, and "empty" would be a claim about the
+ * record the page cannot make) and a re-read that failed over rows already on
+ * screen (those rows are real — they are what the last successful read said).
+ * Both name the read that failed rather than the request, so a reader can tell a
+ * broken connection from a quiet request.
+ */
+export function subReadFailureNotice(what: SubReadName, overRowsAlreadyShown: boolean): string {
+  const noun = SUB_READ_NOUN[what]
+  return overRowsAlreadyShown
+    ? `Re-reading the ${noun} failed, so what is shown is what the last successful read returned.`
+    : `The ${noun} did not load, so it is not shown. That is a failed read, not an empty ${noun}: `
+      + 'nothing is missing from the request itself — retry to read it.'
+}
+
+/**
+ * The route row, built from the aggregate's `routed_project_id`.
+ *
+ * The links read serves the real `routes_to` row, so this is no longer the only
+ * way to see a route — but it is still the authoritative one, for a reason that
+ * outlives the read's absence: a re-route appends a row and keeps the previous
+ * one as lineage (`ActiveRequestRoute`), so the raw rows can carry two
+ * `routes_to` rows and `groupLinks` takes the *first* — the stale project. The
+ * aggregate's `routed_project_id` is the server's answer to "which project is
+ * this request on now", so it is the row the rail must show, and it is also what
+ * keeps the rail honest when the links read itself fails.
  *
  * A `delivered_by`/`planned_as` row can **not** be reconstructed this way: the
  * aggregate carries counts and per-item kinds/ids only for evidence, and no
  * title, so a synthesised `planned_as` row would be a guess. Only the route is
- * synthesised, because it is the one relation with exactly one target.
+ * synthesised, because it is the one relation with exactly one active target.
  */
 export function routedProjectLink(req: Pick<TeamRequest, 'id'>, outcome: RequestOutcome): ResolvedRequestLink | null {
   const projectId = outcome.routed_project_id
@@ -405,23 +494,69 @@ export function routedProjectLink(req: Pick<TeamRequest, 'id'>, outcome: Request
 }
 
 /**
- * The planning rail's link list: whatever the seam supplied, plus the route the
- * aggregate reported when the seam has none.
+ * The planning rail's link list: the aggregate's active route, then the read's
+ * own rows.
  *
- * The order matters only in that a second `routes_to` would be a lie:
- * `groupLinks` takes the first, and the aggregate's route is the active one, so
- * it goes first when the seam did not name a route itself.
+ * Exactly one `routes_to` row reaches the rail. `groupLinks` takes the first
+ * route it is given, so leaving the read's own `routes_to` rows in place beside
+ * the aggregate's would either double the route or — worse — show the project a
+ * re-route superseded. The aggregate names the active one, so the read's route
+ * rows are dropped when it does; when it names none, the rows stand as they are
+ * (the request is not routed, and the read's own history is all there is).
+ *
+ * The other rows keep the read's attach order, which is the order the mockup
+ * draws them in.
  */
-export function planningLinks(reads: DetailReads, req: Pick<TeamRequest, 'id'>, outcome: RequestOutcome): ResolvedRequestLink[] {
-  const supplied = reads.links ?? []
-  const hasRoute = supplied.some(l => l.link_kind === 'routes_to')
-  const route = hasRoute ? null : routedProjectLink(req, outcome)
-  return route ? [route, ...supplied] : supplied
+export function planningLinkRows(
+  rows: readonly ResolvedRequestLink[],
+  req: Pick<TeamRequest, 'id'>,
+  outcome: RequestOutcome,
+): ResolvedRequestLink[] {
+  const route = routedProjectLink(req, outcome)
+  if (!route) return [...rows]
+  return [route, ...rows.filter(l => l.link_kind !== 'routes_to')]
 }
 
-/** The evidence rows the deliver panel shows: the `delivered_by` links, when the seam served any. */
-export function evidenceLinks(reads: DetailReads): ResolvedRequestLink[] {
-  return (reads.links ?? []).filter(l => l.link_kind === 'delivered_by')
+/**
+ * The delivery's evidence rows: the `delivered_by` links, which is the only kind
+ * that proves a delivery (`groupLinks` reads the same subset).
+ */
+export function evidenceLinkRows(rows: readonly ResolvedRequestLink[]): ResolvedRequestLink[] {
+  return rows.filter(l => l.link_kind === 'delivered_by')
+}
+
+/**
+ * Name a row's target from the id it was attached with, when nothing resolved
+ * it.
+ *
+ * The lineage read answers the plain stored row: `RequestLink` plus an OPTIONAL
+ * `target` that the server deliberately never invents (a title, a project, an
+ * approval or a tombstone are facts about the *target's* own record, not about
+ * the link). Something has to fill it, and the panels' contract is that the page
+ * does — `ResolvedRequestLink`'s own doc comment says so.
+ *
+ * This is the honest floor for a row whose target the page has not read, and the
+ * important half of it is what is *absent*: no `gone`, and no invented name.
+ * Both rails draw a missing target as "This item is no longer available", which
+ * is a claim about the target's record — and for a ticket somebody attached a
+ * minute ago it is simply false. So the row keeps its place, says `#<id>`, and
+ * says in the rail's own `reference — name` convention that the name is not in
+ * this read.
+ *
+ * Reading each target's own record for a real title (and a ticket's `approved`
+ * fact) costs one read per target and is its own concern; until it lands every
+ * row is honestly unnamed rather than wrongly buried.
+ */
+export function nameTargetById(link: Pick<RequestLink, 'target_kind' | 'target_id'>): NonNullable<ResolvedRequestLink['target']> {
+  return { kind: link.target_kind, id: link.target_id, title: `#${link.target_id} — unnamed here` }
+}
+
+/**
+ * The link rows as the rail may draw them: the read's rows, each named by id
+ * where nothing resolved its target.
+ */
+export function namedLinkRows(rows: readonly ResolvedRequestLink[]): ResolvedRequestLink[] {
+  return rows.map(r => (r.target ? r : { ...r, target: nameTargetById(r) }))
 }
 
 /**
@@ -437,18 +572,6 @@ export function withRouteTitle(links: readonly ResolvedRequestLink[], title: str
   return links.map(l =>
     l.link_kind === 'routes_to' && l.target ? { ...l, target: { ...l.target, title } } : l,
   )
-}
-
-/**
- * Whether **every** link row the mockup needs came from the seam.
- *
- * The planning rail can be honest from a partial list only if it says which half
- * is missing; the page therefore tells the rail when the seam served no links at
- * all (the shipped case), and the rail's own "not routed" copy is then never
- * reached with a route present. This is the flag for that.
- */
-export function linksServed(reads: DetailReads): boolean {
-  return Array.isArray(reads.links)
 }
 
 // ---- The request block's own facts ----
@@ -514,8 +637,8 @@ export function duplicateFacts(req: Pick<TeamRequest, 'duplicate_of' | 'closed_a
 export const DETAIL_STATES: readonly RequestStatus[] = REQUEST_STATUSES
 
 /**
- * A link row's stable key — the same identity the rails use, so a seam-supplied
- * row and a synthesised route cannot collide in React's reconciliation.
+ * A link row's stable key — the same identity the rails use, so the aggregate's
+ * synthesised route and a read row cannot collide in React's reconciliation.
  */
 export function detailLinkKey(link: Pick<RequestLink, 'link_kind' | 'target_kind' | 'target_id'>): string {
   return `${link.link_kind}:${link.target_kind}:${link.target_id}`

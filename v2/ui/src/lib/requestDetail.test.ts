@@ -23,10 +23,11 @@ import { describe, expect, it } from 'vitest'
 import { REQUEST_STATUSES } from '../types'
 import type { Member, RequestOutcome, RequestReadAnswer, TeamRequest } from '../types'
 import {
-  DETAIL_STATE_REACHABLE, MOCKUP_DETAIL_STATES, REQUESTER_VIEW_NOTICE, briefMutability, detailLinkKey,
-  detailPanels, detailState, duplicateFacts, evidenceLinks, inboxStanding, linksServed, mockupStateName,
-  notAMemberReason, planningLinks, rejectionFacts, reopenCopy, reopenOffer, resolveDetailRead, routedProjectLink,
-  servedReads, unservedReadSentence, withRouteTitle, DETAIL_STATES,
+  DETAIL_STATE_REACHABLE, MOCKUP_DETAIL_STATES, NO_SUB_READS, REQUESTER_VIEW_NOTICE, briefMutability,
+  collectForwardPages, detailLinkKey, detailPanels, detailState, duplicateFacts, evidenceLinkRows, inboxStanding,
+  mockupStateName, namedLinkRows, notAMemberReason, planningLinkRows, rejectionFacts, reopenCopy, reopenOffer,
+  resolveDetailRead, routedProjectLink, subReadFailureNotice, subReadTruncationNotice, teamThreadPage, withRouteTitle,
+  DETAIL_STATES,
 } from './requestDetail'
 import type { ResolvedRequestLink } from './requestControls'
 
@@ -276,25 +277,94 @@ describe('detailPanels', () => {
   })
 })
 
-// ---- The read the shipped server does not serve ----
+// ---- The record's three sub-reads ----
 
-describe('the unserved reads', () => {
-  it('reports which of the three rows the seam supplied, treating absent and empty differently', () => {
-    // An absent key is "not served"; an empty array is "served, and there are
-    // none". A page that conflated them would print "No discussion yet" over a
-    // thread it never read.
-    expect(servedReads({})).toEqual({ comments: false, events: false, links: false })
-    expect(servedReads({ comments: [], events: [], links: [] })).toEqual({ comments: true, events: true, links: true })
-    expect(servedReads({ comments: [] })).toEqual({ comments: true, events: false, links: false })
+describe('the sub-reads', () => {
+  it('starts every panel unread, which is neither empty nor failed', () => {
+    // The distinction the whole mechanism is for: a panel with no rows and no
+    // failure has not been read, so it must say nothing about the record.
+    for (const name of ['discussion', 'history', 'links'] as const) {
+      expect(NO_SUB_READS[name]).toEqual({ rows: null, failure: null })
+    }
   })
 
-  it('says the rows are not served, not that they are empty', () => {
+  it('reads only the team arm of a discussion answer, and keeps its cursor', () => {
+    const rows = [{ id: 1, request_id: 7, kind: 'comment' as const, body: 'hi', author: 'a', author_user_id: null, created_at: '' }]
+    expect(teamThreadPage({ view: 'team', request_id: 7, count: 1, comments: rows })).toEqual({ rows, nextAfterId: null })
+    expect(teamThreadPage({ view: 'team', request_id: 7, count: 1, next_after_id: 41, comments: rows }))
+      .toEqual({ rows, nextAfterId: 41 })
+    // An empty team thread is a real answer: it is the record saying nobody has
+    // spoken, which the page may state.
+    expect(teamThreadPage({ view: 'team', request_id: 7, count: 0, comments: [] })).toEqual({ rows: [], nextAfterId: null })
+  })
+
+  it('refuses a requester’s thread rather than reading it as an empty one', () => {
+    // A requester's answer carries `shared_comments` and omits `comments`. A
+    // page that read `comments ?? []` would draw "No discussion yet" over a
+    // thread it never received.
+    expect(teamThreadPage({ view: 'requester', count: 2, shared_comments: [] })).toBeNull()
+    expect(teamThreadPage(null)).toBeNull()
+    expect(teamThreadPage(undefined)).toBeNull()
+  })
+
+  it('states a failure as a failure, and never as an empty list', () => {
     for (const what of ['discussion', 'history', 'links'] as const) {
-      const sentence = unservedReadSentence(what)
-      expect(sentence).toContain('not its')
-      expect(sentence).toContain('no route')
-      expect(sentence).toContain('rather than shown as empty')
+      const never = subReadFailureNotice(what, false)
+      // Three facts: which read, that it is not empty, and what to do.
+      expect(never).toContain('did not load')
+      expect(never).toContain('not an empty')
+      expect(never).toContain('retry')
+      expect(never).toContain(what === 'links' ? 'linked work' : what)
     }
+  })
+
+  it('says a failed re-read left the rows on screen alone', () => {
+    // Over rows already shown, the rows are real — they are the last successful
+    // read's — so calling the list "empty" would contradict what is visible.
+    const over = subReadFailureNotice('discussion', true)
+    expect(over).toContain('Re-reading the discussion failed')
+    expect(over).toContain('last successful read')
+    expect(over).not.toContain('not an empty')
+  })
+
+  it('says a bounded read stopped short instead of presenting it as the whole list', () => {
+    for (const what of ['discussion', 'history', 'links'] as const) {
+      const sentence = subReadTruncationNotice(what)
+      expect(sentence).toContain('More')
+      expect(sentence).toContain('not all of it')
+    }
+  })
+
+  it('follows a forward cursor to the end, in append order', async () => {
+    const pages = [
+      { rows: ['a', 'b'], nextAfterId: 2 },
+      { rows: ['c'], nextAfterId: 3 },
+      { rows: ['d'], nextAfterId: null },
+    ]
+    const seen: (number | null)[] = []
+    const got = await collectForwardPages(async after => {
+      seen.push(after)
+      return pages[seen.length - 1]
+    })
+    expect(got).toEqual({ rows: ['a', 'b', 'c', 'd'], truncated: false })
+    // The first page asks for no cursor, each later one for the server's own.
+    expect(seen).toEqual([null, 2, 3])
+  })
+
+  it('stops at the page bound and says it did', async () => {
+    let calls = 0
+    const got = await collectForwardPages(async () => {
+      calls += 1
+      // Every page claims another exists, so only the bound can stop it.
+      return { rows: [calls], nextAfterId: calls * 10 }
+    }, 3)
+    expect(got).toEqual({ rows: [1, 2, 3], truncated: true })
+    expect(calls).toBe(3)
+  })
+
+  it('propagates a failed page rather than returning a partial list as the whole one', async () => {
+    await expect(collectForwardPages<string>(async () => { throw new Error('the read failed') }))
+      .rejects.toThrow('the read failed')
   })
 
   it('reconstructs the route row from the one link-ish fact the aggregate carries', () => {
@@ -308,33 +378,68 @@ describe('the unserved reads', () => {
     expect(routedProjectLink(request(), outcome({ routed_project_id: 0 }))).toBeNull()
   })
 
-  it('puts the aggregate’s route first and never doubles it', () => {
+  it('puts the aggregate’s active route first and never doubles it', () => {
     const out = outcome({ routed_project_id: 12 })
-    const served = planningLinks({ links: [] }, request(), out)
-    expect(served).toHaveLength(1)
-    expect(served[0].link_kind).toBe('routes_to')
+    // With no rows read, the aggregate's route is still the rail's only row: a
+    // request the aggregate counted as routed must not read as unrouted.
+    const alone = planningLinkRows([], request(), out)
+    expect(alone).toHaveLength(1)
+    expect(alone[0].link_kind).toBe('routes_to')
 
-    // When the seam named the route itself, the aggregate's id does not add a
-    // second one: two active routes is the thing D9 forbids.
-    const supplied = link({ link_kind: 'routes_to', target_kind: 'project', target_id: 12 })
-    const both = planningLinks({ links: [supplied] }, request(), out)
+    // A read that carries the route itself: one route reaches the rail, and it
+    // is the aggregate's — the active one, not whichever row came first.
+    const stale = link({ id: 9, link_kind: 'routes_to', target_kind: 'project', target_id: 3 })
+    const both = planningLinkRows([stale], request(), out)
     expect(both).toHaveLength(1)
-    expect(both[0].id).toBe(supplied.id)
+    expect(both[0].target_id).toBe(12)
+    expect(both[0].id).toBe(0)
   })
 
-  it('keeps the planned rows the seam supplied, in order, after the route', () => {
+  it('keeps the read’s planned rows, in attach order, after the route', () => {
     const out = outcome({ routed_project_id: 12 })
-    const planned = link()
-    const rows = planningLinks({ links: [planned] }, request(), out)
-    expect(rows.map(r => r.link_kind)).toEqual(['routes_to', 'planned_as'])
+    const rows = planningLinkRows([link({ id: 2 }), link({ id: 3, target_kind: 'epic', target_id: 401 })], request(), out)
+    expect(rows.map(r => r.link_kind)).toEqual(['routes_to', 'planned_as', 'planned_as'])
+    expect(rows.slice(1).map(r => r.id)).toEqual([2, 3])
+  })
+
+  it('leaves the read’s own route in place when the aggregate names none', () => {
+    // Not routed now, but the lineage remembers being routed: dropping the row
+    // would rewrite the record.
+    const historic = link({ link_kind: 'routes_to', target_kind: 'project', target_id: 3 })
+    const rows = planningLinkRows([historic], request(), outcome({ routed_project_id: 0 }))
+    expect(rows).toHaveLength(1)
+    expect(rows[0].id).toBe(historic.id)
   })
 
   it('takes only delivered_by rows as delivery evidence', () => {
     const rows = [link({ link_kind: 'planned_as' }), link({ link_kind: 'delivered_by' }), link({ link_kind: 'relates_to' })]
-    const evidence = evidenceLinks({ links: rows })
+    const evidence = evidenceLinkRows(rows)
     expect(evidence).toHaveLength(1)
     expect(evidence[0].link_kind).toBe('delivered_by')
-    expect(evidenceLinks({})).toEqual([])
+    expect(evidenceLinkRows([])).toEqual([])
+  })
+
+  it('names a row nothing resolved by its id, and does not bury it as deleted', () => {
+    // The lineage read answers the stored row: no `target`, and so no approval
+    // fact and no tombstone. The rails read a missing target as "no longer
+    // available", which is a claim about the target's record.
+    const bare = link({ link_kind: 'planned_as', target_kind: 'task', target_id: 3712, target: undefined })
+    const named = namedLinkRows([bare])
+    expect(named).toHaveLength(1)
+    expect(named[0].target).toEqual({ kind: 'task', id: 3712, title: '#3712 — unnamed here' })
+    expect(named[0].target?.gone).toBeUndefined()
+    expect(named[0].target?.approved).toBeUndefined()
+    // The relation itself is untouched.
+    expect(named[0].link_kind).toBe('planned_as')
+    expect(named[0].target_kind).toBe('task')
+  })
+
+  it('never overwrites a target the read did resolve', () => {
+    const resolved = link({ target: { kind: 'task', id: 3712, title: 'AMP-V2-3712 — Berlin SSO group mapping', approved: true } })
+    const gone = link({ id: 2, target: { kind: 'task', id: 99, title: 'AMP-V2-99 — Removed', gone: true } })
+    const named = namedLinkRows([resolved, gone])
+    expect(named[0]).toBe(resolved)
+    expect(named[1]).toBe(gone)
   })
 
   it('fills the route’s name in once the project read answers, and leaves the id when it does not', () => {
@@ -347,11 +452,6 @@ describe('the unserved reads', () => {
 
     // A failed project read: the route is still a fact, so the row keeps its id.
     expect(withRouteTitle([route], null)[0].target?.title).toBe('Project #12')
-  })
-
-  it('knows whether the link rows were served at all', () => {
-    expect(linksServed({})).toBe(false)
-    expect(linksServed({ links: [] })).toBe(true)
   })
 
   it('keys a row by its relation identity, so a synthesised route cannot collide', () => {
