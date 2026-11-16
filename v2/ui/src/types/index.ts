@@ -2160,7 +2160,12 @@ export interface RequestOutcomeItem {
  */
 export interface RequestOutcome {
   phase: RequestPhase
-  items: RequestOutcomeItem[]
+  /**
+   * The evidence items. `null`, not `[]`, when the request has no
+   * `delivered_by` links: the server appends onto a nil Go slice, and Go
+   * marshals a nil slice as `null`. Read it as `outcome.items ?? []`.
+   */
+  items: RequestOutcomeItem[] | null
   total: number
   done: number
   open: number

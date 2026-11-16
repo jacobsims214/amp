@@ -232,6 +232,38 @@ describe('every approved detail state', () => {
     }
   })
 
+  // The server's own bytes, not the fixture's. BuildRequestOutcome appends onto
+  // a nil Items slice (request_outcome.go), and Go marshals a nil slice as
+  // `null` — so `"items": null` is what EVERY request with no delivered_by
+  // link answers, in all six open states. This row is the tray those states
+  // were rendered from while the page crashed (AMP #4282).
+  const openStates: RequestStatus[] = ['new', 'triaging', 'needs_information', 'accepted', 'in_progress', 'delivered']
+  it.each(openStates)('renders a %s request whose outcome arrives with items: null, the server’s real shape', async (state) => {
+    serveTeam()
+    serveDetail(
+      request({
+        state,
+        needs_info_since: state === 'needs_information' ? '2026-11-13T08:00:00Z' : null,
+        outcome_brief: state === 'delivered' ? 'Group mapping live in production.' : '',
+        delivered_at: state === 'delivered' ? '2026-11-13T12:00:00Z' : null,
+      }),
+      // `null`, exactly as the Go encoder sends it for an empty aggregate.
+      outcome({ phase: state === 'new' || state === 'triaging' ? 'unlinked' : 'in_progress', items: null }),
+    )
+    renderPage()
+
+    // The page mounted: its heading and body are there rather than a blank root.
+    await screen.findByTestId('request-brief')
+    expect(screen.getByTestId('detail-state-tag')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('SSO group mapping')
+    // And the deliver panel — the crash site, which reads `items` on every
+    // render of every open state — is present with its act, not unmounted.
+    if (state !== 'delivered') {
+      expect(screen.getByRole('region', { name: 'Delivery' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /Mark delivered/ })).toBeInTheDocument()
+    }
+  })
+
   it('renders the conflict reading from a lost claim race, over the request’s whole body', async () => {
     serveTeam()
     serveDetail(request({ claim_user_id: null, claimed_at: null, owner_user_id: null }))

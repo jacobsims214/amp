@@ -540,6 +540,28 @@ describe('RequestDeliverPanel: the evidence guard and its explanations', () => {
     expect(screen.queryByRole('button', { name: /accept/i })).toBeNull()
   })
 
+  it('renders the panel when the server sends items: null, the shape every undelivered request has', () => {
+    // The real API marshals the aggregate's items as `null` (a nil Go slice:
+    // request_outcome.go appends onto a nil Items), so this is the FIRST render
+    // of every request that has no delivered_by link — not an edge case. A bare
+    // `for...of outcome.items` here threw and blanked the whole detail page
+    // (AMP #4282); the fixture defaults to `[]`, which is why it went unseen.
+    render(
+      <RequestDeliverPanel
+        request={request({ state: 'in_progress' })}
+        outcome={outcome({ phase: 'unlinked', items: null })}
+        evidence={[]}
+        canDeliver
+        onDeliver={async () => ({ request: { id: 7, public_ref: 'x', state: 'delivered', rev: 5 }, changed: true })}
+      />,
+    )
+    // The panel rendered rather than throwing: its own act and its empty-evidence
+    // facts are both present.
+    expect(screen.getByRole('button', { name: /Mark delivered/ })).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Outcome brief' })).toBeInTheDocument()
+    expect(screen.getByText(/No delivered work is linked yet/)).toBeInTheDocument()
+  })
+
   it('explains a closed request instead of asking for a brief it can never use', () => {
     render(
       <RequestDeliverPanel

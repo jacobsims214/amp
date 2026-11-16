@@ -431,10 +431,16 @@ export interface EvidenceRow {
  * tombstone the aggregate reports as deleted. Both halves are needed, so a row
  * can never show "done" for a piece the aggregate counts as gating the
  * delivery.
+ *
+ * `outcome.items` is `null` — not `[]` — whenever the request has no
+ * `delivered_by` links, which is every request before its first delivery: the
+ * server builds the list with `append` on a nil slice, and Go marshals a nil
+ * slice as `null`. Iterating it bare threw `TypeError: ... is not iterable` and
+ * unmounted the whole detail page (AMP #4282), so the guard is load-bearing.
  */
 export function evidenceRows(links: readonly ResolvedRequestLink[], outcome: RequestOutcome): EvidenceRow[] {
   const items = new Map<string, RequestOutcomeItem>()
-  for (const it of outcome.items) items.set(`${it.kind}:${it.id}`, it)
+  for (const it of outcome.items ?? []) items.set(`${it.kind}:${it.id}`, it)
   return links.map(link => {
     const item = isEvidenceKind(link.target_kind) ? items.get(`${link.target_kind}:${link.target_id}`) : undefined
     const gone = link.target?.gone === true || item?.state === 'deleted'

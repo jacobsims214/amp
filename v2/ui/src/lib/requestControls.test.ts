@@ -345,6 +345,20 @@ describe('evidence rows carry each piece’s own state, never an assumed “done
     expect(rows[0].note).toContain('not part of the delivery aggregate')
   })
 
+  it('reads an aggregate whose items are null — the shape the server sends before a first delivery', () => {
+    // Go marshals a nil slice as `null`, and BuildRequestOutcome appends onto a
+    // nil Items (request_outcome.go), so EVERY request with no delivered_by
+    // link arrives as `"items": null`, never `[]`. Iterating it bare threw
+    // "is not iterable" and unmounted the detail page (AMP #4282).
+    const rows = evidenceRows(
+      [link({ link_kind: 'delivered_by', target_kind: 'task', target_id: 21 })],
+      outcome({ items: null }),
+    )
+    expect(rows).toHaveLength(1)
+    expect(rows[0].word).toBe('unverified')
+    expect(rows[0].note).toContain('not part of the delivery aggregate')
+  })
+
   it('reads an approved artifact as approved and a done ticket as merged', () => {
     const rows = evidenceRows(
       [link({ id: 1, link_kind: 'delivered_by', target_kind: 'artifact', target_id: 41 }),
