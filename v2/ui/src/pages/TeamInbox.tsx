@@ -1,7 +1,9 @@
 /**
  * The team inbox queue (`/teams/:teamId/requests` in the routing ticket's
- * shape; this page takes the team id as a prop so it can be mounted without a
- * router edit — the ticket deliberately does not touch App.tsx).
+ * shape; this page takes the team id as a prop, so mounting it costs no edit to
+ * the route table — no ticket here touches App.tsx). It does render its one
+ * link with react-router's `Link`, so it must sit under a router, which it
+ * always does: `TeamInboxRoute` mounts it inside AppShell.
  *
  * Mockup artifact 37 v1, view 1: the shared queue. The approved product
  * contract's rule that shapes everything here is that a request is **not** a
@@ -17,14 +19,29 @@
  *  - Claim is the row's only primary action, first-write-wins, and a lost race
  *    is the 409 banner naming the winner — never a silent steal, and never an
  *    automatic expiry (D4).
+ *  - The header's **Manage submit access** link is how this queue reaches its own
+ *    access management (AMP #4879; approved mockup artifact 112 v1). Submit
+ *    access has a home and it is not here: it is the team's row in Teams & orgs,
+ *    where every other access decision lives (#4877). This page links there and
+ *    renders nothing that decides access itself — no second admin page, and two
+ *    surfaces that reach each other instead of one that dead-ends. The link is
+ *    offered only when `canManageSubmitAccess` says the viewer may manage it, the
+ *    same hint the panel itself uses, so the entry point and the panel cannot
+ *    disagree about who a manager is. A viewer who may not manage gets nothing,
+ *    not a link to a refusal.
  *
- * Three deliberate departures from the mockup, each because the surface behind
- * it does not exist yet or the API has no term for it. They are stated here and
- * in the completion note rather than left for a reader to notice:
+ * Two deliberate departures from the mockup, each because the surface behind it
+ * does not exist yet or the API has no term for it. They are stated here and in
+ * the completion note rather than left for a reader to notice:
  *
- *  1. **The page actions are not rendered.** The mockup's "New request" (J4),
- *     "Submit access" and "Invite a requester" (#3975's grant routes) have no
- *     route or page in this slice, and a dead button is worse than its absence.
+ *  1. **Two page actions are still not rendered.** The mockup's "New request"
+ *     (J4) and "Invite a requester" (#3975's grant routes) have no staff-facing
+ *     page in this slice, and a dead button is worse than its absence. (The
+ *     mockup's third action, "Submit access", is now rendered as the
+ *     manager-only link described above. It is an `<a>` where the mockup drew a
+ *     `<button>`: the mockup has no router, and a control that changes location
+ *     must be a link, so it is reachable, middle-clickable and announced as
+ *     one.)
  *  2. **The owner select is a view of the loaded page.** The queue API has no
  *     claim/assignee filter term — only `submitter`, `source_kind`, dates,
  *     `attached`, `q` and the `mine` id list — so filtering server-side would
@@ -37,14 +54,17 @@
  *     "1 restricted attachment" / "Northwind" chips have nothing behind them.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Search, X } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { Search, ShieldCheck, X } from 'lucide-react'
 import { api, requestApi } from '../api/client'
 import type { RequestQueue, RequestStatus, Team, TeamRequest } from '../types'
 import { RequestRow } from '../components/requests/RequestRow'
 import { LoadError } from '../components/ui/LoadError'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Skeleton } from '../components/ui/Skeleton'
+import { useAuth } from '../hooks/useAuth'
 import { useDelayedFlag } from '../hooks/useDelayedFlag'
+import { canManageSubmitAccess } from '../lib/requestAccess'
 import { withTimeout } from '../lib/timeout'
 import {
   CLAIM_NEVER_EXPIRES, REQUEST_OWNER_OPTIONS, REQUEST_QUEUE_PILLS, claimConflictNotice,
@@ -76,6 +96,23 @@ const EMPTY: QueueState = { queue: null, loading: true, loadingMore: false, erro
 /** How many rows a page asks for. The server's default is 50; this is the queue's own page size. */
 const PAGE_SIZE = 25
 
+/**
+ * Where a team's submit-access administration lives: Teams & orgs, the Teams tab,
+ * with this team's row expanded to its "Inbox access" section (approved mockup
+ * artifact 112 v1).
+ *
+ * The destination is *named* here rather than in `lib/requestRoutes.ts` because
+ * that module's rule is about **request** paths, and this is not one: it is the
+ * admin surface the shell already links to by name (`AppShell`'s "Teams & orgs"
+ * nav item). The `?team=` value is the mockup's contract for what the
+ * destination should open; Orgs reads nothing off its URL today, so a person who
+ * follows this link still picks the team's row there. Sending the id anyway
+ * costs nothing and means the destination can honour it without this page
+ * changing.
+ */
+const TEAMS_AND_ORGS_PATH = '/admin/orgs'
+const teamAccessPath = (teamId: number) => `${TEAMS_AND_ORGS_PATH}?team=${teamId}`
+
 export function TeamInbox({ teamId, meId, people: peopleProp, onOpenRequest }: Props) {
   const [state, setState] = useState<QueueState>(EMPTY)
   const [team, setTeam] = useState<Team | null>(null)
@@ -86,6 +123,10 @@ export function TeamInbox({ teamId, meId, people: peopleProp, onOpenRequest }: P
   const [attempt, setAttempt] = useState(0)
   const [claiming, setClaiming] = useState<number | null>(null)
   const [conflict, setConflict] = useState<ClaimConflictNotice | null>(null)
+  // The viewer, for the one decision this page makes about them: whether the
+  // header may offer the team's access management (#4879). Everything the queue
+  // shows and every write it makes is still the server's answer.
+  const { me, isAdmin } = useAuth()
 
   // Every load bumps this; a late answer from an older load is ignored, so a
   // filter change during a slow request cannot overwrite the newer result.
@@ -188,6 +229,24 @@ export function TeamInbox({ teamId, meId, people: peopleProp, onOpenRequest }: P
     [state.queue, owner, meId],
   )
 
+  /**
+   * The header's one action, or nothing (#4879).
+   *
+   * `canManageSubmitAccess` — the panel's own hint, so this link and the panel it
+   * opens cannot disagree about who a manager is — needs the team, which this
+   * page loads best-effort for its name and its people. With no team yet (or a
+   * failed fetch) there is nothing to decide from and no link: the page cannot
+   * name the team it would send a person to, so it does not offer to send them.
+   * The server's `RequireTeamManager` gates every write either way.
+   */
+  const accessLink = team && canManageSubmitAccess(me, team, isAdmin) ? (
+    <Link to={teamAccessPath(team.id)} className="amp-btn amp-btn-sm"
+      aria-label={`Manage submit access for ${team.name}`}
+      title="Who may send requests to this inbox — on the team's page in Teams & orgs">
+      <ShieldCheck size={12} aria-hidden="true" />Manage submit access
+    </Link>
+  ) : null
+
   const totals = state.queue?.totals
   const filteredByOwner = owner !== 'everyone'
   const hasFilters = selected != null || query.trim() !== '' || filteredByOwner
@@ -201,6 +260,7 @@ export function TeamInbox({ teamId, meId, people: peopleProp, onOpenRequest }: P
         crumb={team ? `Teams / ${team.name}` : 'Teams'}
         title="Requests"
         meta="What customers and API clients asked this team for. One shared queue — claiming a request never creates a ticket for anyone."
+        actions={accessLink}
       />
 
       <div className="flex-1 min-h-0 overflow-y-auto px-5 py-5 flex flex-col gap-4">
