@@ -14,7 +14,7 @@ import { MOCK_SESSION_ID, MockRelay, mockCrypto, mockTransport, workerScene } fr
 import parityStream from '../remote/mock/parityStream.json'
 import { loadVectors } from '../test/vectors'
 import type { Me } from '../types'
-import type { ChatEvent, SessionDetail } from '../remote/types'
+import type { ChatEvent, SessionDetail, SessionStatus } from '../remote/types'
 
 vi.setConfig({ testTimeout: 10_000 }) // the fake harness streams on real timers
 
@@ -36,11 +36,44 @@ function renderSession(deps: RemoteDeps, opts: { me?: Me; id?: string } = {}) {
   )
 }
 
-function mockSession(opts: { seed?: boolean; online?: boolean; paired?: boolean } = {}) {
+/** A current ticket on the status, the way the harness sends one mid-ticket: the header chip needs
+ *  a name or a state as well as the id. */
+const TICKET_STATUS: Partial<SessionStatus> = {
+  ticket_id: 2372, ticket_name: 'M1-5 ChatEvent carries everything the TUI shows', ticket_state: 'in_progress',
+  epic: 'Remote control', story: 'M1',
+}
+
+function mockSession(opts: { seed?: boolean; online?: boolean; paired?: boolean; status?: Partial<SessionStatus> } = {}) {
   // Each fake run takes ~1.2 s (8 steps), long enough to queue a second prompt behind it.
-  const relay = new MockRelay({ stepMs: 150, seed: opts.seed ?? true, online: opts.online })
+  const relay = new MockRelay({ stepMs: 150, seed: opts.seed ?? true, online: opts.online, status: opts.status })
   const deps: RemoteDeps = { transport: mockTransport(relay), crypto: mockCrypto({ paired: opts.paired }), mock: false }
   return { relay, deps }
+}
+
+/**
+ * A session with a jsdom stand-in for `visualViewport`, so the keyboard case can be exercised
+ * without a phone. jsdom ships neither a `visualViewport` nor a layout engine: `innerHeight` stays
+ * whatever we set it to, and `viewport.resize(height)` moves only the visual viewport — which is
+ * exactly the pair of facts a phone keyboard produces (the layout viewport does not change; the
+ * visual one shrinks). `layoutWidth` stands in for the `window.innerWidth` that the
+ * desktop-pinch-zoom guard reads.
+ */
+function keyboardSession(layoutWidth = 390) {
+  const listeners = new Set<() => void>()
+  const vv = {
+    height: 844, width: layoutWidth, offsetTop: 0, offsetLeft: 0, pageTop: 0, pageLeft: 0, scale: 1,
+    addEventListener: (_: string, fn: () => void) => { listeners.add(fn) },
+    removeEventListener: (_: string, fn: () => void) => { listeners.delete(fn) },
+    resize(height: number) {
+      vv.height = height
+      for (const fn of listeners) fn()
+    },
+  }
+  Object.defineProperty(window, 'innerWidth', { configurable: true, writable: true, value: layoutWidth })
+  Object.defineProperty(window, 'innerHeight', { configurable: true, writable: true, value: 844 })
+  Object.defineProperty(window, 'visualViewport', { configurable: true, writable: true, value: vv })
+  const { relay, deps } = mockSession({ status: TICKET_STATUS })
+  return { relay, deps, viewport: vv }
 }
 
 describe('Session page', () => {
@@ -290,6 +323,126 @@ describe('Session page', () => {
     expect(await screen.findByText('No such session')).toBeInTheDocument()
     renderSession(deps, { id: 'not-a-session' })
     expect((await screen.findAllByText('No such session')).length).toBeGreaterThan(0)
+  })
+
+  it('a phone header is one row plus the ticket chip, and Disconnect lives in the overflow menu (#4897)', async () => {
+    const user = userEvent.setup()
+    const { relay, deps } = mockSession({ status: TICKET_STATUS })
+    renderSession(deps)
+    await screen.findByText('Laptop online')
+    const header = document.querySelector('header')!
+    const ticket = screen.getByTestId('ticket-chip')
+
+    // One header: the ticket chip lives inside it on a phone, not as a second bar above the chat
+    // (audit #3026 F4 — the header wrapped to three rows and the ticket added a fourth).
+    expect(header).toContainElement(ticket)
+    // The desktop strip is still there for `sm` and up, and it is a separate node: the two layouts
+    // never fight over one element's display.
+    const strip = screen.getByTestId('ticket-line')
+    expect(header).not.toContainElement(strip)
+    expect(strip).toHaveClass('hidden', 'sm:flex')
+    // The chip keeps the state as well as the id and the name: the one thing a person checking in
+    // from a phone needs at a glance never drops out at any width.
+    expect(ticket).toHaveTextContent('In progress')
+    expect(ticket).toHaveTextContent('#2372')
+    expect(ticket).toHaveTextContent('ChatEvent carries everything')
+
+    // The header's right side is on row 1 with back and host, not wrapped onto rows of its own.
+    const row1 = header.firstElementChild as HTMLElement
+    expect(row1).toHaveClass('w-full', 'sm:contents')
+    expect(within(row1).getByRole('link', { name: 'All sessions' })).toBeInTheDocument()
+    expect(within(row1).getByRole('heading', { level: 1 })).toHaveTextContent('jacobs-mbp')
+    expect(within(row1).getByText('Laptop online')).toBeInTheDocument()
+
+    // Disconnect is reachable from the overflow menu (the phone's only way to it: the desktop
+    // button is `hidden sm:block`, so it is not on a phone's header), and it still takes two steps:
+    // the menu's Disconnect arms the confirm, Disconnect now does the detach.
+    expect(screen.getByRole('button', { name: /^Disconnect$/ }).parentElement).toHaveClass('hidden', 'sm:block')
+    expect(within(header).getByTestId('session-menu')).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByTestId('session-menu-panel')).toBeNull()
+    await user.click(within(header).getByRole('button', { name: 'Session menu' }))
+    expect(within(header).getByTestId('session-menu')).toHaveAttribute('aria-expanded', 'true')
+    const panel = within(header).getByTestId('session-menu-panel')
+    expect(panel).toHaveAttribute('role', 'menu')
+    await user.click(within(panel).getByRole('menuitem', { name: /Disconnect/ }))
+    // The desktop header's own Disconnect is still there and untouched: the menu is a second way in.
+    await user.click(within(panel).getByRole('button', { name: 'Disconnect now' }))
+    await waitFor(() => expect(relay.ended).toBe('disconnected'))
+    expect(relay.received.map(c => c.op)).toEqual(['detach'])
+    await screen.findAllByText(/You disconnected this session/)
+    // Nothing left to disconnect once it has ended: no menu, no button.
+    expect(screen.queryByTestId('session-menu')).toBeNull()
+  })
+
+  it('the overflow menu closes on a tap outside and on Escape, without disconnecting', async () => {
+    const user = userEvent.setup()
+    const { relay, deps } = mockSession({ seed: false })
+    renderSession(deps)
+    await screen.findByText('Laptop online')
+    const open = () => user.click(screen.getByRole('button', { name: 'Session menu' }))
+    await open()
+    await user.click(document.body)
+    await waitFor(() => expect(screen.queryByTestId('session-menu-panel')).toBeNull())
+    await open()
+    await user.keyboard('{Escape}')
+    await waitFor(() => expect(screen.queryByTestId('session-menu-panel')).toBeNull())
+    expect(relay.received.map(c => c.op)).toEqual([])
+  })
+
+  it('with a phone keyboard up the status line, ticket chip and dock extras yield to the chat (#4897)', async () => {
+    const { viewport, deps } = keyboardSession()
+    try {
+      renderSession(deps)
+      await screen.findByText('Laptop online')
+
+      // Idle: the whole dock is there and the status line carries the phone's safe-area padding.
+      expect(screen.getByTestId('status-line')).toBeInTheDocument()
+      expect(screen.getByTestId('ticket-chip')).toBeInTheDocument()
+      expect(screen.getByTestId('composer')).not.toHaveClass('pb-[calc(0.625rem+env(safe-area-inset-bottom))]')
+      expect(screen.getByTestId('status-line').parentElement).toHaveClass('pb-[env(safe-area-inset-bottom)]')
+
+      // The keyboard opens: visualViewport shrinks to 55% while the layout viewport is unchanged,
+      // which is exactly how a phone reports a soft keyboard (window resize never fires).
+      act(() => viewport.resize(464))
+
+      // The status line and the ticket chip yield — but the transcript and composer keep the height.
+      await waitFor(() => expect(screen.queryByTestId('status-line')).toBeNull())
+      expect(screen.queryByTestId('ticket-chip')).toBeNull()
+      expect(screen.queryByLabelText('Workers')).toBeNull()
+      expect(screen.getByTestId('transcript')).toHaveClass('flex-1', 'min-h-0', 'overflow-y-auto')
+      expect(screen.getByLabelText('Message')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Send' })).toBeInTheDocument()
+      // The header's first row stays: back, host, presence, the menu.
+      const header = document.querySelector('header')!
+      expect(within(header).getByRole('heading', { level: 1 })).toHaveTextContent('jacobs-mbp')
+      expect(within(header).getByTestId('session-menu')).toBeInTheDocument()
+      // F6: the safe-area inset moves from the (now hidden) status line onto the composer dock, or
+      // it slides under the home indicator.
+      expect(screen.getByTestId('composer')).toHaveClass('pb-[calc(0.625rem+env(safe-area-inset-bottom))]')
+
+      // The keyboard goes away and everything comes back.
+      act(() => viewport.resize(844))
+      await waitFor(() => expect(screen.getByTestId('status-line')).toBeInTheDocument())
+      expect(screen.getByTestId('ticket-chip')).toBeInTheDocument()
+      expect(screen.getByTestId('composer')).not.toHaveClass('pb-[calc(0.625rem+env(safe-area-inset-bottom))]')
+    } finally {
+      delete (window as { visualViewport?: unknown }).visualViewport
+    }
+  })
+
+  it('a desktop pinch-zoom is not a keyboard: the status line stays', async () => {
+    const { viewport, deps } = keyboardSession(1200)
+    try {
+      renderSession(deps)
+      await screen.findByText('Laptop online')
+      expect(screen.getByTestId('status-line')).toBeInTheDocument()
+      act(() => viewport.resize(700))
+      // A wide layout viewport has no soft keyboard, so the shrunken visual viewport is a zoom.
+      await new Promise(r => setTimeout(r, 0))
+      expect(screen.getByTestId('status-line')).toBeInTheDocument()
+    } finally {
+      delete (window as { visualViewport?: unknown }).visualViewport
+    }
   })
 })
 

@@ -6,9 +6,9 @@
  * Served with a strict CSP (src/remote/csp.ts). Links into this page are
  * full page loads so the header applies.
  */
-import { useEffect, useLayoutEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
-import { ArrowLeft, MonitorSmartphone, Unplug } from 'lucide-react'
+import { ArrowLeft, MonitorSmartphone, MoreHorizontal, Unplug } from 'lucide-react'
 import { useAuth } from '../hooks/useAuth'
 import { remoteAvailable, useRemote } from '../remote/remote-context'
 import { useRemoteSession } from '../remote/useRemoteSession'
@@ -18,24 +18,111 @@ import { BandLoader } from '../components/brand/BandLoader'
 import { PairingPanel } from '../components/remote/PairingPanel'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
 import {
-  AmpConnectionBadge, Banner, Composer, HeaderFacts, OutgoingRow, PresenceBadge, QueueStrip, StatusLine, TicketLine, ToolGroup,
+  AmpConnectionBadge, Banner, Composer, HeaderFacts, OutgoingRow, PresenceBadge, QueueStrip, StatusLine, TicketChip, TicketLine, ToolGroup,
   TranscriptRow, WorkerChips, WorkingLine,
 } from '../components/remote/SessionParts'
 import { groupRows, useNow } from '../remote/transcriptView'
 
 const SESSION_ID = /^rs_[A-Za-z0-9_-]{22}$/
 
-function Frame({ title, children, right, sub }: { title: React.ReactNode; children: React.ReactNode; right?: React.ReactNode; sub?: React.ReactNode }) {
+/**
+ * Whether a soft keyboard is covering the screen, read the only way a browser reports it:
+ * `visualViewport` shrinks while `window.innerHeight` (the layout viewport) does not. A `window`
+ * resize listener would never fire — the page size doesn't change when a phone keyboard opens.
+ *
+ * The layout viewport's width rules it out above 1024px: a desktop has no soft keyboard, so a
+ * shrunken visual viewport there can only be a pinch-zoom, which should not cost the status line.
+ */
+function useKeyboardOpen() {
+  const [open, setOpen] = useState(false)
+  useEffect(() => {
+    const vv = window.visualViewport
+    if (!vv) return
+    const read = () => {
+      const layout = window.innerHeight
+      // A soft keyboard takes roughly a third of the screen or more; a URL bar or a pinch-zoom by a
+      // few percent never crosses this. With no `visualViewport` at all (older browsers), never.
+      setOpen(window.innerWidth <= 1024 && layout > 0 && vv.height < layout * 0.7)
+    }
+    read()
+    vv.addEventListener('resize', read)
+    return () => vv.removeEventListener('resize', read)
+  }, [])
+  return open
+}
+
+/** The header's ⋯ menu: on a phone it is where Disconnect lives, so the header stays one row
+ *  (audit #3026 F4: three header rows plus the ticket strip were 157px of chrome). Two steps, as
+ *  the header's own Disconnect has always been — a deliberate tap, then the confirm. */
+function SessionMenu({ onDisconnect }: { onDisconnect: () => void }) {
+  const [open, setOpen] = useState(false)
+  const [confirming, setConfirming] = useState(false)
+  const wrap = useRef<HTMLDivElement>(null)
+  // Close on a tap outside the menu, or Escape. Both listeners exist only while it is open.
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: MouseEvent) => { if (!wrap.current?.contains(e.target as Node)) setOpen(false) }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.preventDefault(); setOpen(false) } }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => { document.removeEventListener('mousedown', onDown); document.removeEventListener('keydown', onKey) }
+  }, [open])
+  const close = () => { setOpen(false); setConfirming(false) }
+  return (
+    <div ref={wrap} className="relative shrink-0 sm:hidden">
+      <button type="button" onClick={() => setOpen(o => !o)} aria-haspopup="menu" aria-expanded={open}
+        aria-label="Session menu" title="More" data-testid="session-menu"
+        className="inline-flex items-center justify-center w-8 h-[30px] border border-line-str bg-surface text-ink-2 hover:bg-surface-3 hover:text-ink focus-visible:outline-2 focus-visible:outline-accent">
+        <MoreHorizontal size={15} aria-hidden="true" />
+      </button>
+      {open && (
+        <div role="menu" aria-label="Session actions" data-testid="session-menu-panel"
+          className="absolute right-0 top-[calc(100%+4px)] z-30 min-w-[190px] p-1 bg-surface border border-line"
+          style={{ borderRadius: 3, boxShadow: '0 8px 24px color-mix(in srgb, var(--ink) 16%, transparent)' }}>
+          {!confirming ? (
+            <button role="menuitem" type="button" onClick={() => setConfirming(true)}
+              className="flex items-center gap-2 w-full text-left px-2.5 py-2 text-[12.5px] text-danger-ink hover:bg-surface-3">
+              <Unplug size={13} aria-hidden="true" />Disconnect
+            </button>
+          ) : (
+            <div className="flex gap-1.5 p-1">
+              <button type="button" className="amp-btn amp-btn-sm amp-btn-accent flex-1"
+                onClick={() => { close(); onDisconnect() }}>Disconnect now</button>
+              <button type="button" className="amp-btn amp-btn-sm amp-btn-ghost" onClick={() => setConfirming(false)}>Cancel</button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * The page frame. From `sm` up it is the header it has always been: back, host and facts, then the
+ * right-hand cluster, wrapping when it must. On a phone it is one row — back, host, the right
+ * cluster held on the same line — plus, when there is one, the ticket as a chip on the second row.
+ * `sm:contents` hands the row's children back to the header's own flex line, so the desktop header
+ * keeps its exact markup and wrapping.
+ */
+function Frame({ title, children, right, sub, ticket }: {
+  title: React.ReactNode; children: React.ReactNode; right?: React.ReactNode; sub?: React.ReactNode; ticket?: React.ReactNode
+}) {
   return (
     <div className="flex flex-col h-dvh bg-bg">
-      <header className="bg-surface border-b border-line px-3 sm:px-5 py-2 flex items-center gap-x-3 gap-y-1 flex-wrap">
-        {/* Full page loads: this page has its own strict CSP, the rest of the app doesn't. */}
-        <a href="/sessions" className="amp-btn amp-btn-ghost amp-btn-sm" aria-label="All sessions"><ArrowLeft size={14} />Sessions</a>
-        <div className="min-w-0 flex items-baseline gap-x-2.5 gap-y-0 flex-wrap">
-          <h1 className="amp-heading m-0 text-[17px] text-ink min-w-0 truncate inline-flex items-center gap-1.5"><MonitorSmartphone size={15} className="shrink-0 self-center" aria-hidden="true" />{title}</h1>
-          {sub}
+      <header className="bg-surface border-b border-line px-3 sm:px-5 py-1.5 sm:py-2 flex items-center gap-x-3 gap-y-1 flex-wrap">
+        <div className="flex items-center gap-x-2 gap-y-1 min-w-0 w-full sm:contents">
+          {/* Full page loads: this page has its own strict CSP, the rest of the app doesn't. */}
+          <a href="/sessions" className="amp-btn amp-btn-ghost amp-btn-sm shrink-0" aria-label="All sessions"><ArrowLeft size={14} /><span className="hidden sm:inline">Sessions</span></a>
+          <div className="min-w-0 flex-1 flex items-baseline gap-x-2.5 gap-y-0 flex-nowrap sm:flex-none sm:flex-wrap">
+            {/* The host never shrinks; the facts after it give up their room instead (the mockup's
+                priority order): a phone shows the whole laptop name and lets the detail truncate.
+                `min-w-0` on the host wrapper lets the facts below it shrink to nothing. */}
+            <h1 className="amp-heading m-0 text-[15px] sm:text-[17px] text-ink shrink-0 truncate inline-flex items-center gap-1.5"><MonitorSmartphone size={15} className="shrink-0 self-center" aria-hidden="true" />{title}</h1>
+            {sub}
+          </div>
+          {right && <div className="ml-auto flex items-center gap-1.5 sm:gap-2 flex-nowrap shrink-0 sm:flex-wrap sm:shrink">{right}</div>}
         </div>
-        {right && <div className="ml-auto flex items-center gap-2 flex-wrap">{right}</div>}
+        {ticket && <div className="flex items-center gap-2 min-w-0 w-full pl-[42px] sm:hidden">{ticket}</div>}
       </header>
       {children}
     </div>
@@ -74,6 +161,10 @@ function SessionView({ sessionId }: { sessionId: string }) {
   const scroller = useRef<HTMLDivElement>(null)
   const stick = useRef(true)
   const busy = isBusy(state)
+  // A phone keyboard covers the bottom of the screen; what it covers should be the rows a person is
+  // not using while typing (audit #3026 F2/F6, the approved mockup's keyboard state). Called up here
+  // with the other hooks: the render has early returns below, and a hook may never come after one.
+  const keyboard = useKeyboardOpen()
   // Live timers (thinking, running calls, workers, the working line, uptime) tick once a second.
   const now = useNow(phase.kind === 'ready')
 
@@ -131,14 +222,20 @@ function SessionView({ sessionId }: { sessionId: string }) {
   const lastItem = state.items.at(-1)
   const retry = busy && lastItem?.kind === 'retry' ? lastItem : null
   const status = state.status ?? (detail.project ? { ...emptyStatus, project: detail.project } : null)
+  const hasTicket = status?.ticket_id != null && !!(status.ticket_name || status.ticket_state)
 
   return (
-    <Frame title={host} sub={<HeaderFacts status={status} os={state.hello?.harness.os ?? detail.os} />} right={<>
-      <AmpConnectionBadge status={status} />
-      <PresenceBadge online={ended ? false : state.online} connection={state.connection} />
-      {!ended && <ConfirmButton label="Disconnect" confirmLabel="Disconnect now" icon={<Unplug size={13} />}
-        onConfirm={() => { disconnect().catch(() => {}) }} />}
-    </>}>
+    <Frame title={host} sub={<HeaderFacts status={status} os={state.hello?.harness.os ?? detail.os} />}
+      ticket={hasTicket && !keyboard ? <TicketChip status={status} /> : undefined}
+      right={<>
+        <AmpConnectionBadge status={status} />
+        <PresenceBadge online={ended ? false : state.online} connection={state.connection} />
+        {/* Two ways to disconnect, one per layout: the button belongs to the desktop header (from
+            `sm` up), the ⋯ menu to the phone, where the header has to stay one row. */}
+        {!ended && <div className="hidden sm:block"><ConfirmButton label="Disconnect" confirmLabel="Disconnect now" icon={<Unplug size={13} />}
+          onConfirm={() => { disconnect().catch(() => {}) }} /></div>}
+        {!ended && <SessionMenu onDisconnect={() => { disconnect().catch(() => {}) }} />}
+      </>}>
       <TicketLine status={status} />
       {ended && <Banner tone="info">{endReasonText(ended.reason, state.hello?.idle_timeout_s)} The laptop session keeps running locally.</Banner>}
       {state.versionMismatch && <Banner tone="danger">This laptop runs a newer harness; update AMP. Nothing more from it is shown.</Banner>}
@@ -159,14 +256,25 @@ function SessionView({ sessionId }: { sessionId: string }) {
         </div>
       </div>
 
-      <WorkerChips workers={state.workers} now={now} />
-      <WorkingLine busy={busy && !ended} runStartedAt={state.runStartedAt} retry={retry} compaction={ended ? null : state.compaction} now={now} />
-      <QueueStrip queue={state.queue} myDeviceId={phase.deviceId} online={online} onClear={stop} />
+      {/* With a phone keyboard up, only the header's first row, the transcript and the composer keep
+          the screen (audit #3026 F2/F6, approved mockup item 5): the ticket chip, the roster, the
+          working line, the queue strip and the status line are all still there when the keyboard
+          goes away, and until then every pixel belongs to the chat. The room is already known from
+          the composer's reason line ("Agent busy — your message joins the queue (2 ahead)") and the
+          chat itself. */}
+      {!keyboard && <WorkerChips workers={state.workers} now={now} />}
+      {!keyboard && <WorkingLine busy={busy && !ended} runStartedAt={state.runStartedAt} retry={retry} compaction={ended ? null : state.compaction} now={now} />}
+      {!keyboard && <QueueStrip queue={state.queue} myDeviceId={phase.deviceId} online={online} onClear={stop} />}
+      {/* The bottom dock row carries the safe-area inset, and with the keyboard up that is the
+          composer: the status line is hidden then, and padding on a hidden row is no padding at all
+          (audit F6 — the inset used to live only on the status line). */}
       <Composer disabled={composerDisabled} disabledReason={disabledReason} busy={busy} queued={state.queue.length}
-        online={online && canSign} onSend={sendPrompt} onStop={stop} />
-      <div className="pb-[env(safe-area-inset-bottom)] bg-surface-2">
-        <StatusLine status={status} totals={state.totals} startedAt={state.hello?.started_at_ms ?? detail.started_at_ms} workers={state.workers} now={now} />
-      </div>
+        online={online && canSign} onSend={sendPrompt} onStop={stop} safeArea={keyboard} />
+      {!keyboard && (
+        <div className="pb-[env(safe-area-inset-bottom)] bg-surface-2">
+          <StatusLine status={status} totals={state.totals} startedAt={state.hello?.started_at_ms ?? detail.started_at_ms} workers={state.workers} now={now} />
+        </div>
+      )}
     </Frame>
   )
 }

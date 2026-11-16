@@ -573,17 +573,33 @@ export function HeaderFacts({ status, os }: { status: SessionStatus | null; os: 
   if (s?.role) facts.push(clean(s.role))
   if (os) facts.push(os)
   if (!facts.length) return null
-  return <span className="amp-num text-[11.5px] text-ink-2 truncate min-w-0" data-testid="header-facts">{facts.join(' · ')}</span>
+  // A phone has one header row for the back link, the host, these facts, the AMP dot, presence and
+  // the ⋯ menu (mockup item 1). It keeps the project — the one fact that says *where* this laptop
+  // is working — and the rest of the detail waits for `sm` up, so the host never has to truncate.
+  const first = facts[0]
+  return (
+    <>
+      <span className="amp-num text-[11.5px] text-ink-2 truncate min-w-0 sm:hidden" data-testid="header-facts-short">{first}</span>
+      <span className="amp-num text-[11.5px] text-ink-2 truncate min-w-0 hidden sm:inline" data-testid="header-facts">{facts.join(' · ')}</span>
+    </>
+  )
 }
 
-/** The TUI header's second line while a ticket is current: `■ In progress #2388 Name    ▌ Epic › Story`. */
+/**
+ * The TUI header's second line while a ticket is current: `■ In progress #2388 Name    ▌ Epic › Story`.
+ *
+ * `sm` and up only: on a phone it would be a second strip of chrome above the chat (audit #3026
+ * F4 — with the three-row header it came to 157px), so a phone gets the same ticket as one chip in
+ * the header instead (`TicketChip`). The state tag never drops out at any width: it is the one
+ * thing a person checking in from a phone needs at a glance.
+ */
 export function TicketLine({ status }: { status: SessionStatus | null }) {
   const s = status
   if (s?.ticket_id == null || (!s.ticket_name && !s.ticket_state)) return null
   const st = displayStateOf(s.ticket_state)
   const es = epicStory(s.epic, s.story)
   return (
-    <div className="bg-surface border-b border-line px-3 sm:px-5 py-1.5 flex items-center gap-2 min-w-0 text-[12.5px]" data-testid="ticket-line">
+    <div className="hidden sm:flex bg-surface border-b border-line px-3 sm:px-5 py-1.5 items-center gap-2 min-w-0 text-[12.5px]" data-testid="ticket-line">
       {st && <StateTag state={st} />}
       <span className="amp-num font-semibold text-ink shrink-0">#{s.ticket_id}</span>
       {s.ticket_name && <span className="truncate min-w-0 text-ink">{clean(s.ticket_name)}</span>}
@@ -592,15 +608,39 @@ export function TicketLine({ status }: { status: SessionStatus | null }) {
   )
 }
 
-/** The harness's own AMP connection (the TUI header's `● connected`), when its status carries it. */
+/** The same ticket, as the one chip a phone header carries instead of `TicketLine`: state tag,
+ *  `#id` and the name, cut to what fits. Separately rendered rather than re-shaped by `sm:` utilities
+ *  so the desktop strip's markup stays exactly what it was. */
+export function TicketChip({ status }: { status: SessionStatus | null }) {
+  const s = status
+  if (s?.ticket_id == null || (!s.ticket_name && !s.ticket_state)) return null
+  const st = displayStateOf(s.ticket_state)
+  return (
+    <span className="inline-flex items-center gap-1.5 min-w-0 max-w-full border border-line bg-surface-2 px-1.5 py-0.5 text-[11.5px] leading-none"
+      style={{ borderRadius: 'var(--radius)' }} data-testid="ticket-chip">
+      {st && <StateTag state={st} />}
+      <span className="amp-num font-semibold text-ink shrink-0">#{s.ticket_id}</span>
+      {s.ticket_name && <span className="truncate min-w-0 text-ink-2">{clean(s.ticket_name)}</span>}
+    </span>
+  )
+}
+
+/** The harness's own AMP connection (the TUI header's `● connected`), when its status carries it.
+ *
+ * A phone gets the dot alone, the mockup's own `narrow` rule for this badge: the full word is the
+ * widest thing in a one-row header (`slow 812 ms`, `disconnected · retrying…`) and the row has to
+ * hold back, host, facts, this, presence and the ⋯ menu. The dot keeps the tone colour, so a slow
+ * or lost connection is never invisible, and the word stays in the title and the accessible label. */
 export function AmpConnectionBadge({ status }: { status: SessionStatus | null }) {
   const c = ampConnectionWord(status?.amp_connection)
   if (!c) return null
   const cls = c.tone === 'ok' ? 'text-success-ink' : c.tone === 'warn' ? 'text-warning-ink' : 'text-danger-ink'
   return (
     <span className="inline-flex items-center gap-1.5 text-[11.5px] whitespace-nowrap text-ink-2" data-testid="amp-connection"
-      title="The laptop's own connection to AMP (its AMP tools), as the harness header shows it">
-      <span className="amp-label !text-[9.5px]">AMP</span><span className={`w-1.5 h-1.5 rounded-full bg-current ${cls}`} aria-hidden="true" /><span className={c.tone === 'ok' ? '' : cls}>{c.word}</span>
+      title="The laptop's own connection to AMP (its AMP tools), as the harness header shows it" aria-label={`AMP tools ${c.word}`}>
+      <span className="amp-label !text-[9.5px] hidden sm:inline">AMP</span>
+      <span className={`w-1.5 h-1.5 rounded-full bg-current ${cls}`} aria-hidden="true" />
+      <span className={`hidden sm:inline ${c.tone === 'ok' ? '' : cls}`}>{c.word}</span>
     </span>
   )
 }
@@ -616,11 +656,14 @@ export function PresenceBadge({ online, connection }: { online: boolean | null; 
   )
 }
 
-export function Composer({ disabled, disabledReason, busy, queued = 0, online, onSend, onStop }: {
+export function Composer({ disabled, disabledReason, busy, queued = 0, online, onSend, onStop, safeArea = false }: {
   disabled: boolean; disabledReason: string | null; busy: boolean
   /** Messages already waiting behind the running one, for the reason line. */
   queued?: number
   online: boolean; onSend: (text: string) => void; onStop: () => void
+  /** True when the composer is the bottom dock row (keyboard up): it then carries the phone's
+   *  safe-area inset, which otherwise sits on the status line below it (audit #3026 F6). */
+  safeArea?: boolean
 }) {
   const [text, setText] = useState('')
   const [problem, setProblem] = useState<string | null>(null)
@@ -639,7 +682,7 @@ export function Composer({ disabled, disabledReason, busy, queued = 0, online, o
   return (
     // `shrink-0`: the transcript is the dock's only flexible row (audit F2), so a tall dock never
     // squeezes the chat and the chat never squeezes the rows you type and steer with.
-    <div className="shrink-0 border-t border-line bg-surface px-3 sm:px-5 pt-2 pb-2.5 grid gap-1.5" data-testid="composer">
+    <div className={`shrink-0 border-t border-line bg-surface px-3 sm:px-5 pt-2 pb-2.5 grid gap-1.5${safeArea ? ' pb-[calc(0.625rem+env(safe-area-inset-bottom))]' : ''}`} data-testid="composer">
       {reason && <p className="m-0 px-0.5 text-[11px] text-ink-3" data-testid="composer-reason">{reason}</p>}
       <form className="flex gap-2 items-end" onSubmit={e => { e.preventDefault(); submit() }}>
         <label htmlFor="remote-message" className="sr-only">Message</label>
