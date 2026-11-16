@@ -1,43 +1,37 @@
 # Releasing amp-harness
 
-This is the checklist for cutting an `amp-harness` release. Pushing a tag named
-`harness-v<version>` is the only thing that publishes. The `Harness release` workflow
-(`.github/workflows/harness-release.yml`) then builds, checks and publishes a GitHub Release on
-`jacobsims214/amp`. Branch pushes, PRs and manual runs of the workflow stop after packaging, and
-their files stay workflow artifacts.
+This is the checklist for cutting an `amp-harness` release. A new tag named
+`harness-v<version>` is the only thing that publishes. Create it either from the GitHub UI
+(Releases → Draft a new release, section 3a) or by pushing it with git (section 3b): both start
+the `Harness release` workflow (`.github/workflows/harness-release.yml`), which waits for Harness
+CI on the tagged commit, then builds, checks and publishes the GitHub Release on
+`jacobsims214/amp`, filling in its files, title and notes. Branch pushes, PRs and manual runs of
+the workflow stop after packaging, and their files stay workflow artifacts.
 
 Background, gotchas and the record of the test run are in the AMP project 2 KB:
 `how-to/harness-release.md`. The version policy (what counts as a major, minor or patch) is D14
 in `decisions/amp-harness-architecture.md`. Packaging and install.sh are covered in
 `how-to/amp-harness-packaging-and-install.md`.
 
-Tagging is a person's step. Agents prepare the commit, and a person pushes the tag.
+Tagging is a person's step. Agents prepare the commit, and a person creates the tag (in the UI
+or with git).
 
 ## 1. Before you start
 
 - [ ] The code to release is merged into `main`. The release notes' install line downloads
       `install.sh` from `main` (`raw.githubusercontent.com/<repo>/main/v2/harness/install.sh`),
       so tag a commit on `main`, after the harness branch has merged.
-- [ ] `Harness` (`harness.yml`: fmt, clippy, tests, asset drift) and `Harness smoke`
-      (`harness-smoke.yml`: the smoke test in modes auto, 2026-07-28 and 2025-11-25) are green
-      on that commit. The release workflow doesn't run them itself, but its `gate` job
-      **enforces** this: on a `harness-v*` tag it fails, and nothing is published, unless
-      **both** workflows have a successful run on the tagged commit. Check beforehand so the
-      release run doesn't stop at the gate:
+- [ ] Nothing on that commit is known to be red. `Harness` (`harness.yml`: fmt, clippy,
+      tests, asset drift) and `Harness smoke` (`harness-smoke.yml`: the smoke test in modes
+      auto, 2026-07-28 and 2025-11-25) must pass on it before anything is published, but you
+      **don't have to wait for them before tagging**. The release workflow's `gate` job waits
+      for them (up to 60 minutes) and dispatches them if they have no run on the commit, so
+      tagging right after a merge is fine (section 4). A run that already failed does stop the
+      gate, so a glance first saves a wasted release run:
 
       ```sh
       gh run list --workflow harness.yml --commit <sha>
       gh run list --workflow harness-smoke.yml --commit <sha>
-      ```
-
-      Both workflows have path filters, so a commit that changed nothing they watch may have
-      no run of one or both. Run them on the commit (on the tag, once pushed; both have
-      `workflow_dispatch`), wait for them to pass, then re-run the failed release run:
-
-      ```sh
-      gh workflow run harness.yml --ref harness-vX.Y.Z
-      gh workflow run harness-smoke.yml --ref harness-vX.Y.Z
-      gh run rerun <release run id> --failed     # re-runs gate, then publish
       ```
 
 - [ ] Choose the version under D14 (semver).
@@ -74,8 +68,34 @@ The version is already `0.1.0` for the first release, so v0.1.0 needs only the C
 
 ## 3. Tag and push
 
-The tag must be exactly `harness-v` plus the crate version, for example `harness-v0.1.0`. A
-tag that doesn't match fails every build job.
+The tag must be exactly `harness-v` plus the crate version (`[workspace.package] version` in
+`v2/harness/Cargo.toml` on the commit you tag), for example `harness-v0.1.0`. A tag that
+doesn't match fails every build job. Use one of the two paths below, not both.
+
+### 3a. From the GitHub UI
+
+1. On `jacobsims214/amp`: **Releases → Draft a new release**.
+2. **Choose a tag**: type `harness-vX.Y.Z` and pick "Create new tag: harness-vX.Y.Z on publish".
+   **Target**: `main` (the merged release commit from section 2 must be its head; otherwise
+   tag with git, section 3b).
+3. Leave the title and the description empty, and **don't attach any files**: the workflow
+   replaces the title with `amp-harness X.Y.Z`, the notes with the generated install notes,
+   and uploads the 11 assets (section 5).
+4. **Untick "Set as the latest release"** if GitHub ticks it. AMP's own releases keep Latest;
+   the workflow tries to unmark a harness release anyway (section 5). For a prerelease version (with a `-`, e.g.
+   `0.2.0-rc.1`), tick **"Set as a pre-release"**: the workflow doesn't change that flag on a
+   release that already exists. Never use the UI for a `-test` version (section 9).
+5. **Publish release.** That creates the tag, which starts the `Harness release` run.
+
+The release is visible at once but has **no files until `publish` finishes** (up to about an
+hour and a quarter if the gate has to wait for CI). Meanwhile `install.sh` without `--version`
+may pick it and fail to download; that clears when the assets land. Watch the run:
+
+```sh
+gh run list --workflow harness-release.yml --limit 3     # then: gh run watch <id>
+```
+
+### 3b. Push the tag with git
 
 ```sh
 git fetch origin
@@ -84,19 +104,31 @@ git push origin harness-vX.Y.Z
 gh run list --workflow harness-release.yml --limit 3     # then: gh run watch <id>
 ```
 
-A run takes about 15 minutes, mostly the Intel macOS build.
+The workflow creates the release itself; nothing exists on the Releases page until `publish`.
+
+A run takes about 15 minutes, mostly the Intel macOS build, plus however long the gate waits for
+CI on the tagged commit (section 4).
 
 ## 4. What CI checks on a tag
 
 The jobs run in order, and the release is created only if all of them pass. `gate` runs alongside
 them; only `publish` waits for it.
 
-0. **gate** (`harness-v*` tags only; `actions: read`): for each of `harness.yml` and
-   `harness-smoke.yml` it asks the API for successful runs on the tagged commit
-   (`actions/workflows/<file>/runs?head_sha=$GITHUB_SHA&status=success`). If **either** has
-   none, or the API call fails, the job fails with an `::error::` that gives the
-   `gh workflow run <file> --ref <tag>` recovery (section 1), and `publish` doesn't run. It is
-   skipped (passes at once) for `-test` versions, whose off-branch commits have no CI runs.
+0. **gate** (`harness-v*` tags only; `actions: write`): it needs a successful run of **both**
+   `harness.yml` and `harness-smoke.yml` on the tagged commit, and **waits** for them, so a tag
+   cut seconds after a merge is fine. Every 30 seconds it lists each workflow's runs on the
+   commit (`actions/workflows/<file>/runs?head_sha=$GITHUB_SHA`):
+   - a successful run: that workflow is done;
+   - a run still in progress: it keeps waiting;
+   - no run at all after a 2-minute grace (a path filter didn't fire, or the commit is on no
+     branch): it dispatches the workflow on the tag (`gh workflow run <file> --ref <tag>`) and
+     waits for that run; if none appears within 5 minutes it fails;
+   - every run completed and none succeeded: it fails at once.
+
+   It gives up after **60 minutes** (job limit 65) and also fails after 5 API errors in a row.
+   Each failure prints an `::error::` with the `gh run rerun <run id> --failed` recovery
+   (section 8), and `publish` doesn't run. It is skipped (passes at once) for `-test` versions,
+   whose off-branch commits have no CI runs.
 1. **install-test** (ubuntu-latest and macos-latest): shellcheck (Linux), then
    `scripts/test-install.sh`, the offline installer tests. On Linux it also runs
    `scripts/test-install-distros.sh`, which installs in Debian, Ubuntu, glibc 2.31 and Alpine
@@ -126,12 +158,21 @@ them; only `publish` waits for it.
    Homebrew formula `amp-harness.rb` from the four checksums (`ruby -c`) and copies `install.sh`.
 4. **publish** (`harness-v*` tags only; needs `package` and `gate`; `contents: write` with
    `GITHUB_TOKEN`, so no extra secrets): it checks `SHA256SUMS` again, expects exactly 4 lines in it, and checks that
-   `install.sh` and `amp-harness.rb` are not empty. Then it creates the release.
+   `install.sh` and `amp-harness.rb` are not empty. Then it creates the release, or fills in
+   the one made in the UI (section 5).
 
 ## 5. What gets published
 
+With no release for the tag yet (tag pushed with git):
 `gh release create <tag> dist/* --verify-tag --title "amp-harness <version>" --latest=false`,
 with release notes giving the install line and the build commit.
+
+With a release already there (made in the GitHub UI, or a re-run): `gh release upload <tag>
+dist/* --clobber`, then `gh release edit` sets the title `amp-harness <version>` and the same
+generated notes, then `--latest=false`. GitHub refuses `--latest=false` when no other release
+could be Latest; that only logs a `::warning::`, so check `gh release view <tag>` and fix the
+badge in the UI if it shows as Latest. The draft and prerelease flags of an existing release are
+left as they are (section 3a).
 
 | version | GitHub Release | installable how |
 |---|---|---|
@@ -147,7 +188,8 @@ with release notes giving the install line and the build commit.
   - `install.sh`;
   - `amp-harness.rb`.
 - **Re-running `publish`** on a tag whose release already exists uploads the files again with
-  `--clobber`. It does not change the title, the notes or the draft and prerelease flags.
+  `--clobber` and resets the title and notes. It does not change the draft and prerelease
+  flags.
 - **No signing or notarization** in v1.
 
 ## 6. Verify the install
@@ -192,16 +234,32 @@ The formula template is `packaging/homebrew/`, rendered by `scripts/render-formu
 
 ## 8. Rollback
 
-**The run failed before `publish`.** Nothing was released. Fix the problem, then delete the tag
-and tag again:
+**The release run failed** (the gate timed out or saw red CI, a flaky build, `publish`
+itself). Re-run the failed jobs of the same run; it rebuilds from the same tag and fills in the
+release:
 
 ```sh
-git push origin :refs/tags/harness-vX.Y.Z && git tag -d harness-vX.Y.Z
+gh run list --workflow harness-release.yml --limit 5   # the failed run's id
+gh run rerun <id> --failed                              # gate, builds and publish as needed
+gh release view harness-vX.Y.Z --json assets --jq '[.assets[].name] | length'   # 11 when done
 ```
 
-A flaky job can be re-run with `gh run rerun <id> --failed`.
+- If the gate failed on red CI, fix or re-run that workflow first (its `::error::` names the
+  run), let it pass, then re-run the release run.
+- **Never delete and recreate a published release** (one made in the UI, or by `publish`) to
+  retry. Re-running is enough, and a deleted release leaves its tag behind.
+- If a code fix is needed and the run was a git tag push with no release yet, nothing was
+  released: delete the tag and tag the fixed commit again:
 
-**A bad release was published.** Delete the release and its tag:
+  ```sh
+  git push origin :refs/tags/harness-vX.Y.Z && git tag -d harness-vX.Y.Z
+  ```
+
+  If a release already exists for the tag (UI path), don't move the tag: release the fix as the
+  next patch, and treat the empty release as below.
+
+**A bad release was published** (its contents are wrong, not just its run). This is the only
+case for deleting a release. Delete the release and its tag:
 
 ```sh
 gh release delete harness-vX.Y.Z --cleanup-tag --yes
