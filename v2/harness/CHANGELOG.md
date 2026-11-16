@@ -5,6 +5,98 @@ from AMP's server images, and follows [Semantic Versioning](https://semver.org/)
 tagged `harness-vX.Y.Z`. The versioning and compatibility policy is D14 in the AMP project 2 KB,
 `decisions/amp-harness-architecture.md`. How to cut a release: [RELEASING.md](RELEASING.md).
 
+## [0.4.0] - 2026-11-15
+
+The manager can control its running workers and manage its own agents, skills and MCP servers
+with your confirmation, transcript text can be selected and copied with the mouse, and the chat
+manages its context window.
+
+### Added
+
+- Worker control for the manager: `amp_stop_worker` stops a running worker with a reason and
+  hands its ticket back, `amp_restart_worker` runs the ticket again in a fresh session, and
+  `amp_resume_worker` continues the stopped worker's own session. Resume continues without
+  re-running any tool, or replays only when the run has a pending step that is safe to repeat.
+  The tools refuse with `busy`, `no_session` or `nothing_to_replay` rather than dispatch twice,
+  and runs record `stopped by manager: <reason>`, `restarted` or `resumed:<mode>` (#4233, #4239,
+  #4240, #4241, #4265).
+- Comments on a running worker's ticket reach the worker: new comments are steered into it
+  between turns, never mid-tool, in a fenced envelope that says a comment cannot approve, grant
+  permissions or change policy. The worker acknowledges each one on its ticket, its own comments
+  are never steered back, and a steer it never received becomes a run note (#4232, #4235, #4236,
+  #4237).
+- Self-management for the manager: `amp_manage_agent` and `amp_manage_skill` create or update
+  agents and skills in your user layer, and `amp_add_mcp_server` adds an http, sse or stdio MCP
+  server to your user `config.toml` (add-only, roles required, stdio servers added disabled). An
+  update first backs up the old file under `<layer>/.edit/backup/`. The tools refuse primary and
+  manager agents, any permission widening, skills a primary preloads, and secret-looking values,
+  and they never run headless (#4244, #4245, #4246, #4252, #4253).
+- Every self-management write asks you first: a y/N question in the chat with the tool, scope,
+  path and the text being written (all of it for a new file, a diff for an update). Only a plain
+  `y` allows it. When the question is cut short, `y` waits until `v` has shown every line. The
+  question arms only after 750 ms on screen with no key pressed, so a key typed ahead answers
+  nothing. A request that has already timed out says so and writes nothing (#4247, #4259, #4277,
+  #4302, #4317, #4319).
+- Workers cannot use the self-management or worker-control tools: the generated agents allow
+  them for `amp-manager` only, and the harness refuses them to child roles. A new
+  `amp-self-management` skill tells the manager when it may use them (#4255, #4256).
+- `/mcp login amp` signs in to AMP again from inside the chat, and calls in flight carry on over
+  the new login. When AMP needs a new login, the `/amp` panel offers the command on its first row
+  and the header names it (#4250, #4251).
+- Select-to-copy: drag over transcript text (the manager chat, a worker's session or a restored
+  one) to select it, and it is copied when you release, over OSC 52 and the system clipboard,
+  without blocking the chat. Wrapped lines, list hangs, quote borders and code blocks copy as
+  their source text. A click that doesn't move still acts as a click. Turn it off with
+  `[tui] select_copy = false` or `AMP_HARNESS_SELECT_COPY`, and see "Selecting and copying text"
+  in the README (#4210, #4211, #4212, #4214, #4215, #4217, #4218).
+- Context management: a `[compaction]` table in your `config.toml` (`enabled`, `reserve_tokens`,
+  `keep_recent_tokens`; defaults true / 16384 / 20000), checked against every model's context
+  window, and `[roles.X] context_window` / `max_tokens` caps that can only lower a role's window and
+  output per turn. Both reach the manager chat and every worker. `/compact [instructions]`
+  summarizes the manager chat's older turns now. Compaction is lossy, and the full history stays
+  in the session file. `/usage` and the footer show the compaction threshold, the count and
+  estimated sizes, `/config` and `doctor` show the settings in force with their sources, and
+  `/reload` says that budget changes apply to new sessions and workers. The chat also says when
+  automatic compaction fails or frees nothing. See "Context window and compaction" in the README
+  (#4221, #4222, #4224, #4225, #4226, #4227, #4229, #4262, #4263, #4264).
+
+### Fixed
+
+- The models-config load warnings (a window larger than the model's, an assumed window, a capped
+  role, compaction that does not fit) are shown in the chat when it starts, not only in `/config`
+  and `doctor` (#4294).
+- `/compact` reports its after-estimate on the same basis as its before-estimate, so a short chat
+  no longer shows "~11k -> ~21"; `/usage` budgets the summary with the role-capped `max_tokens`
+  (#4276, #4280).
+- A reload never changes the manager's tools inside a running turn: it waits until the reply
+  ends, and no turn starts while a reload is in flight (#4267, #4301).
+- An external MCP server whose login expires mid-session moves to needs-login, so `/mcp login` is
+  offered, instead of failing every call while it shows as ready (#4248).
+- Skills are materialized into content-addressed directories that are never rewritten while
+  workers read them, and old copies and crash-left temp directories are pruned (#4266, #4278).
+- Worker control: a comment posted before the watcher's first poll is still steered; resume waits
+  for the stopped worker's session lock instead of answering `busy`; restart and resume check AMP
+  again after a failed hand-back instead of staying `busy` (#4281, #4303, #4304).
+- Select-to-copy decides click or drag on screen, so a click on a thinking header or a `#ticket`
+  while output streams is not a copy and acts on the row that was pressed (#4315).
+- Test isolation: every spawned child pins `XDG_STATE_HOME`, `XDG_CACHE_HOME` and `XDG_DATA_HOME`,
+  and a notice assertion no longer depends on the target directory's length (#4275, #4279).
+
+### Security
+
+- `amp_manage_agent` judges a write against the built-ins and your user layer, not the current
+  repo, so an untrusted repo's wide agent cannot be copied into your user config as an update that
+  "widens nothing" (#4316).
+- `amp_manage_skill` refuses a skill a user-layer primary preloads even when a repo file overrides
+  that primary and hides the preload (#4600).
+- `amp_add_mcp_server` refuses environment references (`${env:VAR}`, `${VAR}` and their defaults)
+  in `url`, `command` and `args`, naming the field but never the value, so one y/N cannot send an
+  environment secret to another host (#4318).
+- A steered comment's author and time are cleaned to one line outside the fence, so an author
+  name cannot add its own lines to the worker's prompt (#4305).
+- The remote pairing y/N question arms after 750 ms on screen like the self-management
+  confirmation, so a key typed ahead cannot pair a device (#4599).
+
 ## [0.3.0] - 2026-11-05
 
 Resume a saved conversation from the chat, and worker runs that change nothing no longer ask for a

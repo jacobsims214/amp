@@ -24,6 +24,8 @@
 //! shows every tool call's arguments and result (#2183). Mouse reporting (#2185):
 //! `AMP_HARNESS_MOUSE`, `[tui] mouse` (true|false), else on; off gives the terminal's plain
 //! click-drag selection back (the wheel then no longer scrolls the transcript; PageUp/PageDown do).
+//! Select-to-copy (AMP #4218): `AMP_HARNESS_SELECT_COPY`, `[tui] select_copy` (true|false), else
+//! on; with mouse reporting on, a drag in the transcript highlights text and copies it on release.
 //! Padding (#2251): `AMP_HARNESS_PADDING`, `[tui] padding` (0-8 columns each side), else 2; halved
 //! at 80 columns or fewer, with a blank row above and below the chat (#2344, amp_tui::inset).
 //! Density (#2346): `AMP_HARNESS_DENSITY`, `[tui] density` (compact|comfortable), else compact
@@ -197,6 +199,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     amp_tui::install_theme(&theme);
     let show_thinking = load_show_thinking(&args)?;
     let mouse = load_mouse(&args)?;
+    let select_copy = load_select_copy(&args)?;
     let padding = load_padding(&args)?;
     amp_tui::density::set(load_density(&args)?);
     amp_tui::frame::set_ascii(load_ascii(&args)?);
@@ -210,6 +213,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         None
     };
 
+    let (confirmer, confirms) = confirm_channel();
     let session = session::build(session::SessionRequest {
         conn: &args.conn,
         role: args.role.as_deref(),
@@ -223,6 +227,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         // AMP #2837: workers run in the background, so the person can keep talking to the manager
         // while they work; an explicit `[workers] dispatch = "await"` (or the env var) still wins.
         dispatch: session::CHAT_DISPATCH,
+        // AMP #4259: the manager's self-management writes ask the person here (below).
+        confirmer: Some(confirmer),
     })
     .await?;
     let settings = args.conn.settings()?;
@@ -233,12 +239,26 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         &session.rt.current_providers(),
     );
     let (mut shell, mut done) = Shell::new(session.agent.harness.clone(), info, models);
+    // AMP #4259: each self-management write the manager asks for is a y/N question in the chat.
+    shell.set_confirms(confirms);
+    // AMP #4224 (spec M2): the role's context_window / max_tokens caps hold on any model /model
+    // or /reload switches this chat to.
+    shell.set_role_caps(session.agent.resolved.caps);
     // #2370: the chat as numbered ChatEvents (prompts, outcomes, notices, worker chips) next to
     // the agent's own events, for the remote link; a quiet delta is numbered after ~100 ms.
     shell.set_feed(Some(Arc::clone(&session.feed)));
     let _feed_flusher = session.feed.spawn_flusher();
+    // AMP #4294 (spec §4 "doctor + load notice, never silent"): the models config's load warnings
+    // (W1, W3, W4, compaction that does not fit) go in the transcript before the first prompt,
+    // worded as `/config` shows them. Doctor-only kinds (W2) stay out: `load_warnings` skips them.
+    // After `set_feed`, so the remote link sees them too.
+    for w in session.rt.current_models().load_warnings() {
+        shell.view().add_warning(&format!("warning: {w}"));
+    }
     shell.set_show_thinking(show_thinking);
     shell.set_mouse_capture(mouse);
+    // AMP #4218: drag in the transcript to select and copy, unless `[tui] select_copy = false`.
+    shell.set_select_copy(select_copy);
     shell.set_padding(padding);
     // #2425: after asking for plan approval, wait for it in AMP and resume the manager.
     shell.set_auto_resume(load_auto_resume(&args)?);
@@ -317,6 +337,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
             theme_flag: args.theme.clone(),
             notes: shell.notifier(),
             browser: args.snapshot.is_none(),
+            switcher: Some(Arc::clone(&switcher)),
         },
     )));
     // AMP unreachable (#2178): say why and what to do, and keep trying in the background.
@@ -529,6 +550,19 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+/// The chat's side of self-management confirmations (AMP #4247, #4259): the [`Confirmer`] the
+/// session's tools ask, and the receiver the shell shows each request from as a y/N question.
+/// Headless `run -p` has neither, so its writes are denied.
+///
+/// [`Confirmer`]: amp_core::approval::Confirmer
+fn confirm_channel() -> (
+    Arc<dyn amp_core::approval::Confirmer>,
+    tokio::sync::mpsc::Receiver<amp_core::approval::PendingConfirm>,
+) {
+    let (confirmer, confirms) = amp_core::approval::ChannelConfirmer::new();
+    (Arc::new(confirmer), confirms)
+}
+
 /// Puts each MCP hub change in the transcript until the hub goes away. A server's failure is
 /// shown once, and again only when it changes (#2334): every reload retries a stopped server.
 async fn forward_mcp_events(
@@ -691,6 +725,14 @@ fn load_show_thinking(args: &ChatArgs) -> Result<amp_tui::ThinkingDisplay, CliEr
 fn load_mouse(args: &ChatArgs) -> Result<bool, CliError> {
     let env = |k: &str| std::env::var(k).ok();
     amp_tui::theme::select::resolve_mouse(&env, config_text(args).as_deref())
+        .map_err(|e| CliError::usage(e.to_string()))
+}
+
+/// Select-to-copy (AMP #4218): `AMP_HARNESS_SELECT_COPY`, then config.toml `[tui] select_copy`,
+/// else on.
+fn load_select_copy(args: &ChatArgs) -> Result<bool, CliError> {
+    let env = |k: &str| std::env::var(k).ok();
+    amp_tui::theme::select::resolve_select_copy(&env, config_text(args).as_deref())
         .map_err(|e| CliError::usage(e.to_string()))
 }
 
@@ -1003,8 +1045,59 @@ fn git_branch(cwd: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_line, parse_size, session_banner, session_id, tilde};
+    use super::{confirm_channel, exit_line, parse_size, session_banner, session_id, tilde};
     use std::path::Path;
+
+    use amp_core::approval::{ConfirmRequest, Confirmed, DenyReason, confirm_or_deny};
+
+    fn write_request() -> ConfirmRequest {
+        ConfirmRequest::self_management(
+            "amp_manage_agent",
+            "/tmp/agents/amp-foo.md",
+            "user",
+            "create agent amp-foo",
+        )
+    }
+
+    /// AMP #4259: the chat's confirmer delivers each request to the shell's receiver, and the
+    /// answer given there is what the tool gets: only a yes approves.
+    #[tokio::test]
+    async fn the_chat_confirmer_hands_requests_to_the_shell_and_takes_its_answer() {
+        for (yes, want) in [
+            (true, Confirmed::Approved),
+            (false, Confirmed::Denied(DenyReason::Declined)),
+        ] {
+            let (confirmer, mut confirms) = confirm_channel();
+            let ask = tokio::spawn(async move {
+                confirm_or_deny(
+                    Some(confirmer.as_ref()),
+                    write_request(),
+                    std::time::Duration::from_secs(10),
+                )
+                .await
+            });
+            let prompt = tokio::time::timeout(std::time::Duration::from_secs(5), confirms.recv())
+                .await
+                .expect("prompt in time")
+                .expect("prompt");
+            assert_eq!(prompt.request.summary, "create agent amp-foo");
+            assert!(prompt.answer(yes), "the tool is still waiting");
+            assert_eq!(ask.await.unwrap(), want);
+        }
+    }
+
+    /// AMP #4259: headless `run -p` builds its session without a confirmer, so a write is
+    /// denied with a message that says why.
+    #[tokio::test]
+    async fn headless_has_no_confirmer_and_denies_with_a_clear_message() {
+        let got = confirm_or_deny(None, write_request(), std::time::Duration::from_secs(1)).await;
+        assert_eq!(got, Confirmed::Denied(DenyReason::NoResponder));
+        let msg = got.denial_message().unwrap();
+        assert!(
+            msg.contains("not written") && msg.contains("headless"),
+            "{msg}"
+        );
+    }
 
     #[test]
     fn the_exit_line_names_the_session_file_with_a_tilde() {

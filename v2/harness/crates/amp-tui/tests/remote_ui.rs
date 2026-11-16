@@ -52,7 +52,12 @@ struct Rig {
     stubs: PathBuf,
     /// What the chat sent the terminal (OSC 52).
     terminal: Arc<Mutex<Vec<String>>>,
+    /// The shell's clock for the pairing question's arm window (AMP #4599): moved by hand.
+    clock: TestClock,
 }
+
+/// A clock the test moves by hand, for the pairing question's arm window (AMP #4599).
+type TestClock = Arc<Mutex<std::time::Instant>>;
 
 /// A recording stand-in for a tool: `pbcopy` keeps its input, `open` its argument, each run in
 /// its own `<name>.<pid>.out`.
@@ -179,6 +184,9 @@ async fn rig(tag: &str, opts: MockOptions, size: (usize, usize)) -> Rig {
         tuning: tuning(),
     });
     shell.set_remote(Ok(link), None);
+    let clock: TestClock = Arc::new(Mutex::new(std::time::Instant::now()));
+    let read = Arc::clone(&clock);
+    shell.set_clock(Arc::new(move || *read.lock().unwrap()));
     Rig {
         shell,
         events,
@@ -188,6 +196,7 @@ async fn rig(tag: &str, opts: MockOptions, size: (usize, usize)) -> Rig {
         dir,
         stubs,
         terminal,
+        clock,
     }
 }
 
@@ -216,6 +225,36 @@ impl Rig {
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {}
             }
         }
+    }
+
+    /// Moves the shell's clock on by `by` (AMP #4599).
+    fn advance(&self, by: Duration) {
+        *self.clock.lock().unwrap() += by;
+    }
+
+    /// Lets the pairing question's arm window pass with no key (AMP #4599), so it takes the
+    /// next key as its answer.
+    fn arm_pairing(&self) {
+        self.advance(amp_tui::shell::CONFIRM_ARM);
+        assert!(self.shell.pairing_armed());
+    }
+
+    /// A plain key as the terminal hands it to the shell while the person types ahead into a
+    /// non-empty editor: true means the shell used it and the editor never sees it.
+    async fn typed(&mut self, c: char) -> bool {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        self.shell
+            .key(&KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), false)
+            .await
+    }
+
+    /// The pair results the mock relay has seen so far.
+    fn pair_results(&self) -> usize {
+        self.mock
+            .events()
+            .iter()
+            .filter(|e| e["op"] == "pair_result")
+            .count()
     }
 
     fn screen(&self) -> String {
@@ -326,6 +365,7 @@ async fn remote_in_the_chat() {
     assert!(r.shell.pairing_pending());
     assert!(!r.shell.input_focused(), "the question has the keys");
     // A remote prompt can't answer it: it is only a prompt (and this device isn't paired).
+    r.arm_pairing();
     r.shell.press("enter").await.unwrap();
     assert_eq!(r.pair_result(1).await["body"]["result"], "rejected");
     r.until("Refused \"Safari on iPhone\": it was not paired.")
@@ -341,6 +381,7 @@ async fn remote_in_the_chat() {
     }
     let code = r.pair_request(&device);
     r.until(&format!("code {code} [y/N]")).await;
+    r.arm_pairing();
     r.shell.press("y").await.unwrap();
     let res = r.pair_result(2).await;
     assert_eq!(res["body"]["result"], "accepted", "{res}\n{}", r.screen());
@@ -391,6 +432,83 @@ async fn remote_in_the_chat() {
     assert!(!screen.contains("REMOTE ON"), "{screen}");
     r.shell.submit("/remote off").await;
     r.until("Remote control is already off.").await;
+}
+
+/// Turns remote control on and sends a pairing request with the link on screen; returns once the
+/// question is on screen (not armed yet: the rig's clock has not moved).
+async fn pairing_question(r: &mut Rig, device: &KeyPair) {
+    r.shell.submit("/remote").await;
+    r.until("https://amp.local/sessions/").await;
+    r.wait_hello().await;
+    let code = r.pair_request(device);
+    r.until(&format!("code {code} [y/N]")).await;
+    assert!(r.shell.pairing_pending());
+}
+
+// AMP #4599: a `y` typed ahead as the pairing question pops up does not pair the device.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_y_inside_the_pairing_arm_window_neither_pairs_nor_reaches_the_editor() {
+    let mut r = rig("typed", MockOptions::default(), (120, 40)).await;
+    let device = KeyPair::generate();
+    pairing_question(&mut r, &device).await;
+    assert!(!r.shell.pairing_armed());
+    r.advance(Duration::from_millis(100));
+    assert!(r.typed('y').await, "the editor does not get the y");
+    assert!(r.shell.pairing_pending(), "the y answered nothing");
+    let screen = r.screen();
+    assert!(
+        screen.contains(amp_tui::shell::PAIRING_WAIT_NOTICE),
+        "{screen}"
+    );
+    assert!(!screen.contains("Allowed \""), "{screen}");
+    assert!(!screen.contains("Refused \""), "{screen}");
+    // More type-ahead: also swallowed, the notice is not repeated.
+    assert!(r.typed('e').await);
+    assert!(r.typed('s').await);
+    assert!(r.shell.pairing_pending());
+    assert_eq!(
+        r.screen()
+            .matches(amp_tui::shell::PAIRING_WAIT_NOTICE)
+            .count(),
+        1,
+        "{}",
+        r.screen()
+    );
+    // A key just before the window ends starts it again: a y just after the first window's
+    // end still answers nothing.
+    r.advance(amp_tui::shell::CONFIRM_ARM - Duration::from_millis(10));
+    assert!(r.typed('x').await);
+    r.advance(Duration::from_millis(50));
+    assert!(!r.shell.pairing_armed());
+    assert!(r.typed('y').await);
+    assert!(r.shell.pairing_pending(), "y answered nothing");
+    // Give the link time to have sent a result if one had been given: none was.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    r.shell.poll();
+    assert_eq!(r.pair_results(), 0, "nothing answered the relay");
+    // A full window with no key: armed, and y pairs.
+    r.arm_pairing();
+    assert!(r.typed('y').await);
+    let res = r.pair_result(1).await;
+    assert_eq!(res["body"]["result"], "accepted", "{res}\n{}", r.screen());
+    r.until("Allowed \"Safari on iPhone\"").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_y_after_the_pairing_arm_window_pairs() {
+    let mut r = rig("armed", MockOptions::default(), (120, 40)).await;
+    let device = KeyPair::generate();
+    pairing_question(&mut r, &device).await;
+    r.arm_pairing();
+    assert!(r.typed('y').await);
+    let res = r.pair_result(1).await;
+    assert_eq!(res["body"]["result"], "accepted", "{res}\n{}", r.screen());
+    let screen = r.until("Allowed \"Safari on iPhone\"").await;
+    assert!(
+        !screen.contains(amp_tui::shell::PAIRING_WAIT_NOTICE),
+        "{screen}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -503,7 +621,9 @@ async fn the_pairing_link_is_copied_opened_and_selectable() {
         screen.contains("/remote copy copies the link again"),
         "{screen}"
     );
-    assert!(screen.contains("Option-drag (iTerm2)"), "{screen}");
+    // AMP #4218: with select-to-copy on, a plain drag selects and copies the link.
+    assert!(screen.contains("drag to select and copy it"), "{screen}");
+    assert!(!screen.contains("Option-drag"), "{screen}");
     let copies = recorded(&r.stubs, "pbcopy");
     assert_eq!(copies.len(), 1, "{copies:?}");
     let link = copies[0].clone();
@@ -589,6 +709,18 @@ async fn the_pairing_link_is_copied_opened_and_selectable() {
         r.shell.poll();
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// AMP #4218: with `[tui] select_copy = false` the chat doesn't select, so the hint names the
+/// terminal's modifier-drag again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_select_copy_off_the_hint_names_the_modifier_drag() {
+    let mut r = rig("noselect", MockOptions::default(), (80, 24)).await;
+    r.shell.set_select_copy(false);
+    r.shell.submit("/remote").await;
+    let screen = r.until("Pairing link copied to the clipboard.").await;
+    assert!(screen.contains("Option-drag (iTerm2)"), "{screen}");
+    assert!(!screen.contains("drag to select and copy"), "{screen}");
 }
 
 /// #2423: with mouse capture off the hint says plain selection works.

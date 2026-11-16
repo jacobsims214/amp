@@ -12,9 +12,11 @@
 //! Scrolling (#2185): the wheel, PageUp/PageDown, Ctrl+U/Ctrl+D and End move the transcript
 //! ([`Shell::scroll_key`], [`Shell::ctrl_d`]); while it is scrolled up and output arrives, rpi-tui's
 //! jump-to-end indicator shows [`crate::NEW_OUTPUT`] (clicking it jumps to the end). Mouse
-//! reporting is on unless [`Shell::mouse_capture`] is off (`[tui] mouse = false`), so the
-//! terminal's own click-drag selection needs a modifier while it is on: Fn-drag in Terminal.app,
-//! Option-drag in iTerm2 (see the README).
+//! reporting is on unless [`Shell::mouse_capture`] is off (`[tui] mouse = false`). While it is on,
+//! a plain left drag in the transcript selects text and copies it on release (AMP #4217,
+//! [`Shell::mouse`]); `[tui] select_copy = false` ([`Shell::set_select_copy`]) turns that off,
+//! and then the terminal's own selection needs a modifier: Fn-drag in Terminal.app, Option-drag
+//! in iTerm2. With capture off, plain click-drag is the terminal's own selection (see the README).
 //!
 //! The cursor (#2344): while the input has focus ([`Shell::input_focused`]) the terminal's own
 //! cursor shows at the insertion point as a blinking bar (`SetCursorStyle::BlinkingBar` on
@@ -252,7 +254,11 @@ pub async fn run(
     // #2423: `/remote` copies its pairing link with the system's tools and OSC 52.
     {
         let terminal = Arc::clone(&terminal);
-        shell.attach_terminal(Arc::new(move |seq: &str| terminal.write(seq)));
+        // AMP #4217: `write` only buffers; flush so the OSC 52 reaches the terminal now.
+        shell.attach_terminal(Arc::new(move |seq: &str| {
+            terminal.write(seq);
+            terminal.flush();
+        }));
     }
     let tui = Arc::new(TuiAltScreen::new(
         Box::new(MouseGate {
@@ -416,26 +422,31 @@ async fn event_loop(
                             continue;
                         }
                         match mouse.kind {
+                            // The wheel keeps a selection's anchor: it is in content cells.
                             MouseEventKind::ScrollUp => shell.view().scroll().scroll_by(-WHEEL_LINES),
                             MouseEventKind::ScrollDown => shell.view().scroll().scroll_by(WHEEL_LINES),
-                            MouseEventKind::Down(MouseButton::Left) => {
-                                // #2344: a click into the editor focuses it, cursor where it landed;
-                                // #2347: a click on a worker (or its #ticket) opens its session.
-                                // #2345: one on a thinking header opens or closes it.
-                                if let Ok((w, h)) = crossterm::terminal::size() {
-                                    shell.click(
-                                        usize::from(w),
-                                        usize::from(h),
-                                        usize::from(mouse.row),
-                                        usize::from(mouse.column),
-                                    );
+                            MouseEventKind::Down(MouseButton::Left)
+                            | MouseEventKind::Drag(MouseButton::Left)
+                            | MouseEventKind::Up(MouseButton::Left) => {
+                                // AMP #4217: press, drag and release select transcript text and
+                                // copy it on release; a press released in place is a click
+                                // (#2344 editor focus, #2347 worker, #2345 thinking header),
+                                // which outside the transcript still acts on the press.
+                                let Ok((w, h)) = crossterm::terminal::size() else {
+                                    continue;
+                                };
+                                if !shell.mouse(usize::from(w), usize::from(h), &mouse) {
+                                    continue;
                                 }
                             }
-                            _ => {}
+                            _ => continue,
                         }
+                        // A full render: a selection change can't reuse the cached rows.
                         repaint(shell, tui);
                     }
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        // AMP #4217: Esc and editing keys drop a selection; the key goes on.
+                        shell.selection_key(&key);
                         let editor_empty = shell.view().editor().get_text().is_empty();
                         if !is_ctrl(&key, 'c') {
                             // The quit window is two Ctrl+Cs in a row.

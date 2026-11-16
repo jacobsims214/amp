@@ -7,6 +7,7 @@ pub mod provider;
 
 use std::{
     borrow::Cow,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -73,6 +74,54 @@ pub struct MockAmp {
     /// web UI would change it; with it, project 2 requires plan approval. `None`: the fixed
     /// answer below.
     pub plan: Option<Arc<Mutex<Value>>>,
+    /// #4241: ticket comments, stored like AMP stores them. With it, `amp_add_task_comment` is
+    /// listed and stores a comment (ids increasing, `author` defaulting to `agent`), a claim
+    /// posts AMP's "{agent} picked this up", and `amp_get_task(include=comments)` answers for
+    /// any ticket other than 2085 with its newest `limit` comments (default 30, 0 for all).
+    /// `None`: none of that (the fixed 2085 answer only).
+    pub comments: Option<Arc<Mutex<Comments>>>,
+    /// #4265: a new dispatch id per dispatch, like AMP. With it, `amp_dispatch_task` answers
+    /// `d_mock<id>-<n>` (n = 1, 2, ... per ticket) and `amp_claim_task` starts the ticket only
+    /// with its current id (an earlier one is refused as stale), so a test can tell a run's
+    /// dispatch from the one before it. `None`: every dispatch of a ticket is `d_mock<id>`.
+    pub fresh_dispatches: Option<Arc<Mutex<HashMap<i64, u32>>>>,
+    /// #4304: tickets a person returned in AMP's web UI ([`MockAmp::return_in_ui`]) since their
+    /// last dispatch. With `fresh_dispatches` (and no `comments`), `amp_get_task` answers a
+    /// ticket's state from it: `backlog` once returned, else `in_progress` under its current
+    /// dispatch id once dispatched.
+    pub returned_in_ui: Arc<Mutex<HashSet<i64>>>,
+}
+
+/// The mock's comment store (#4241).
+#[derive(Debug, Default)]
+pub struct Comments {
+    next_id: i64,
+    /// Every comment, oldest first: `{id, task_id, author, body, created_at}`.
+    pub all: Vec<Value>,
+    /// The agent each ticket was last dispatched to (AMP authors the claim comment with it).
+    dispatched_to: HashMap<i64, String>,
+}
+
+impl Comments {
+    /// Stores a comment and returns its id.
+    pub fn add(&mut self, task_id: i64, author: &str, body: &str) -> i64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.all.push(json!({
+            "id": id, "task_id": task_id, "author": author, "body": body,
+            "author_user_id": 7, "created_at": format!("2026-11-14T15:{:02}:00Z", id % 60),
+        }));
+        id
+    }
+
+    /// `task_id`'s comments, oldest first.
+    pub fn on(&self, task_id: i64) -> Vec<Value> {
+        self.all
+            .iter()
+            .filter(|c| c["task_id"] == task_id)
+            .cloned()
+            .collect()
+    }
 }
 
 impl MockAmp {
@@ -82,7 +131,50 @@ impl MockAmp {
             omit: Vec::new(),
             calls: Arc::default(),
             plan: None,
+            comments: None,
+            fresh_dispatches: None,
+            returned_in_ui: Arc::default(),
         }
+    }
+
+    /// Returns `task_id` to ready as a person in AMP's web UI would (#4304): `amp_get_task`
+    /// answers `backlog` until the ticket is dispatched again.
+    pub fn return_in_ui(&self, task_id: i64) {
+        self.returned_in_ui.lock().unwrap().insert(task_id);
+    }
+
+    /// A mock that issues a new dispatch id per dispatch (#4265).
+    pub fn with_fresh_dispatches() -> Self {
+        Self {
+            fresh_dispatches: Some(Arc::default()),
+            ..Self::new()
+        }
+    }
+
+    /// A mock that stores ticket comments (#4241).
+    pub fn with_comments() -> Self {
+        Self {
+            comments: Some(Arc::default()),
+            ..Self::new()
+        }
+    }
+
+    /// Posts a comment on `task_id` as `author` (a person in the web UI, say); returns its id.
+    pub fn add_comment(&self, task_id: i64, author: &str, body: &str) -> i64 {
+        self.comments
+            .as_ref()
+            .expect("MockAmp::with_comments")
+            .lock()
+            .unwrap()
+            .add(task_id, author, body)
+    }
+
+    /// `task_id`'s stored comments, oldest first.
+    pub fn comments_on(&self, task_id: i64) -> Vec<Value> {
+        self.comments
+            .as_ref()
+            .map(|c| c.lock().unwrap().on(task_id))
+            .unwrap_or_default()
     }
 
     pub fn calls_to(&self, tool: &str) -> Vec<Value> {
@@ -194,6 +286,137 @@ pub fn get_task_json(with_comments: bool) -> Value {
     out
 }
 
+impl MockAmp {
+    /// #4241: the calls the comment store answers or adds to, when there is one. `None`: the
+    /// call goes on to the fixed answers (a claim is answered there after its comment is posted).
+    fn comment_call(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Option<Result<CallToolResponse, ErrorData>> {
+        let store = self.comments.as_ref()?;
+        let task_id = args["task_id"].as_i64();
+        match (name, task_id) {
+            ("amp_add_task_comment", Some(id)) => {
+                let author = args["author"].as_str().unwrap_or("agent");
+                let body = args["body"].as_str().unwrap_or("");
+                store.lock().unwrap().add(id, author, body);
+                Some(ok_json(json!({"comment_added": true, "task_id": id})))
+            }
+            ("amp_add_task_comment", None) => Some(tool_error("task_id is required")),
+            ("amp_dispatch_task", Some(id)) => {
+                if let Some(agent) = args["agent_id"].as_str() {
+                    let mut store = store.lock().unwrap();
+                    store.dispatched_to.insert(id, agent.to_owned());
+                }
+                None
+            }
+            // AMP's claim posts "{agent} picked this up" as that agent (task_actor.go).
+            ("amp_claim_task", Some(id))
+                if args["dispatch_id"].as_str() == Some(format!("d_mock{id}").as_str()) =>
+            {
+                let mut store = store.lock().unwrap();
+                let agent = store
+                    .dispatched_to
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| "agent".to_owned());
+                store.add(id, &agent, &format!("{agent} picked this up"));
+                None
+            }
+            ("amp_get_task", Some(id)) if id != 2085 => {
+                let all = store.lock().unwrap().on(id);
+                let with_comments = args["include"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|v| v == "comments"));
+                let mut out = json!({
+                    "task": task(id, "Worker control", "in_progress",
+                                 json!({"assigned_to": "amp:amp-worker-backend"})),
+                    "effective_metadata": {}
+                });
+                if with_comments {
+                    // AMP's lastN: the newest `limit` (default 30; 0 for all), oldest first.
+                    let limit = match args["limit"].as_i64() {
+                        Some(0) => all.len(),
+                        Some(n) if n > 0 => n as usize,
+                        _ => 30,
+                    };
+                    let newest = all[all.len().saturating_sub(limit)..].to_vec();
+                    out["comments"] = Value::Array(newest);
+                    out["comments_total"] = json!(all.len());
+                }
+                Some(ok_json(out))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl MockAmp {
+    /// #4265: dispatch and claim with a new dispatch id per dispatch, when enabled. `None`: the
+    /// call goes on to the other answers.
+    fn fresh_dispatch_call(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Option<Result<CallToolResponse, ErrorData>> {
+        let issued = self.fresh_dispatches.as_ref()?;
+        let id = args["task_id"].as_i64()?;
+        match name {
+            // #4304: the ticket as AMP has it now, when no comment store answers it instead.
+            "amp_get_task" if self.comments.is_none() => {
+                let current = issued.lock().unwrap().get(&id).copied();
+                let returned = self.returned_in_ui.lock().unwrap().contains(&id);
+                let task = match current {
+                    Some(n) if !returned => json!({
+                        "id": id, "state": "in_progress", "dispatch_id": format!("d_mock{id}-{n}"),
+                    }),
+                    _ => json!({"id": id, "state": "backlog"}),
+                };
+                Some(ok_json(json!({"task": task, "effective_metadata": {}})))
+            }
+            "amp_dispatch_task" => {
+                self.returned_in_ui.lock().unwrap().remove(&id);
+                let n = {
+                    let mut issued = issued.lock().unwrap();
+                    let n = issued.entry(id).or_insert(0);
+                    *n += 1;
+                    *n
+                };
+                Some(ok_json(json!({
+                    "task_id": id,
+                    "agent_id": args["agent_id"],
+                    "state": "in_progress",
+                    "phase": "not_started",
+                    "dispatch_id": format!("d_mock{id}-{n}"),
+                    "start_by": "2026-10-29T15:40:00Z",
+                    "flag_after_minutes": 10,
+                    "next": "Start the worker now, in this same turn.",
+                })))
+            }
+            "amp_claim_task" => {
+                let current = issued
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .map(|n| format!("d_mock{id}-{n}"));
+                Some(match (args["dispatch_id"].as_str(), current) {
+                    (Some(d), Some(current)) if d == current => ok_json(json!({
+                        "task": {"id": id}, "started_at": "2026-10-29T15:41:00Z",
+                        "phase": "started", "dispatch_id": d, "already_started": false,
+                    })),
+                    (d, current) => tool_error(&format!(
+                        "ticket {id}: dispatch {} is no longer current (current: {})",
+                        d.unwrap_or(""),
+                        current.as_deref().unwrap_or("none")
+                    )),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
 impl ServerHandler for MockAmp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
@@ -228,9 +451,11 @@ impl ServerHandler for MockAmp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        let comment_tool = self.comments.as_ref().map(|_| &"amp_add_task_comment");
         let tools = CONTRACT
             .iter()
             .chain(EXTRA_TOOLS)
+            .chain(comment_tool)
             .filter(|name| !self.omit.contains(name))
             .map(|name| tool(name))
             .collect();
@@ -255,6 +480,12 @@ impl ServerHandler for MockAmp {
                 format!("tool '{}' not found: tool not found", request.name),
                 None,
             ));
+        }
+        if let Some(answer) = self.fresh_dispatch_call(request.name.as_ref(), &args) {
+            return answer;
+        }
+        if let Some(answer) = self.comment_call(request.name.as_ref(), &args) {
+            return answer;
         }
         match request.name.as_ref() {
             "amp_whoami" => ok_json(whoami_json()),
@@ -605,10 +836,6 @@ pub fn flat(screen: &str) -> String {
 /// test's pty. A new session plus `TIOCSCTTY` on stdin make `/dev/tty` the test's pty. This
 /// crate forbids `unsafe` (`Command::pre_exec`), so python3 does that and then execs the binary,
 /// keeping the same pid, like `setup_ctrl_c.rs`. Add the binary's arguments with `.args`.
-///
-/// It pins no environment itself: the caller sets `HOME`, `XDG_CONFIG_HOME` and `XDG_STATE_HOME`
-/// under its test dir (D13, as [`run`] does; an unset `XDG_STATE_HOME` leaks the caller's real
-/// `~/.local/state` in, #3690).
 pub fn pty_command() -> std::process::Command {
     let mut cmd = std::process::Command::new("python3");
     cmd.args([
@@ -622,24 +849,29 @@ pub fn pty_command() -> std::process::Command {
     cmd
 }
 
-/// Runs the binary in `dir/project` with HOME in `dir/home`, the file credential store,
+/// `XDG_STATE_HOME`, `XDG_CACHE_HOME` and `XDG_DATA_HOME` under `home`, for every amp-harness
+/// child a test spawns (#4279). Left inherited, a developer's or CI's exported XDG_STATE_HOME
+/// sends trust records, MCP logs and sessions into that real state dir (with
+/// `~/.local/state`, the live harness's), and the child disagrees with the in-process runtime
+/// that looks under `home/.local/state`. Pass to `Command::envs` before per-test overrides.
+pub fn xdg_env(home: &Path) -> [(&'static str, PathBuf); 3] {
+    [
+        ("XDG_STATE_HOME", home.join(".local/state")),
+        ("XDG_CACHE_HOME", home.join(".cache")),
+        ("XDG_DATA_HOME", home.join(".local/share")),
+    ]
+}
+
+/// Runs the binary in `dir/project` with HOME in `dir/home` (and XDG_CONFIG_HOME,
+/// XDG_STATE_HOME, XDG_CACHE_HOME, XDG_DATA_HOME under it), the file credential store,
 /// `AMP_MCP_URL=url` and no other AMP_* settings. `env` adds variables.
-///
-/// `HOME` and both XDG variables the binary reads (config, state) are pinned under `dir` (D13), so
-/// the child never reads or writes the person's real `~/.config` or `~/.local/state`. Pinning only
-/// `HOME`/`XDG_CONFIG_HOME` was not enough (#3690): an ambient `XDG_STATE_HOME` — standard on
-/// Linux desktops, and what an isolated/disposable test env exports — sent the child's sessions
-/// and repo-trust records outside the test dir, while the in-process `Runtime::load` read them
-/// under it, so a repo agent wrote its trust record where the assertion never looked (`agents.rs`,
-/// repo-scope `amp:checker`). `env` still overrides these (`tests/keychain.rs` and
-/// `tests/repo_trust.rs` pass their own `XDG_STATE_HOME`).
 pub async fn run(dir: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_amp-harness"));
     cmd.args(args)
         .current_dir(dir.join("project"))
         .env("HOME", dir.join("home"))
         .env("XDG_CONFIG_HOME", dir.join("home/.config"))
-        .env("XDG_STATE_HOME", dir.join("home/.local/state"))
+        .envs(xdg_env(&dir.join("home")))
         .env("AMP_CREDENTIAL_STORE", "file")
         .env("AMP_MCP_URL", url)
         // The worktree's own .amp.json sits above target/; never find it.

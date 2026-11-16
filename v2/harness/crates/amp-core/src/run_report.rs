@@ -21,6 +21,15 @@
 //!     with the run's dispatch_id, so AMP records the return even though the harness started the
 //!     ticket (AMP #2909); `amp_set_task_state` backlog on an older server that refuses it, with
 //!     a "returned to ready by amp-harness" reason; #2204).
+//!   - the same hook stamps `author = <the worker's agent_id>` on the worker's
+//!     `amp_add_task_comment` **on its own ticket**, overwriting whatever the model passed
+//!     (AMP #4237): the comment watcher (#4235) skips the worker's own comments by that author,
+//!     and an author left as the server's `"agent"` default, or a person's email (recorded as
+//!     `<email> (relayed by agent)`), would be steered back into the worker in a loop. Comments
+//!     on other tickets are left alone, and a comment gets no run fields.
+//! - [`stopped_note`], [`restarted_note`] and [`resumed_note`] are the run notes for the
+//!   manager's worker-control actions (stop, restart, resume; story 582), so the audit trail
+//!   shows each one. The supervisor passes the values in (#4240).
 //! - [`SessionUsageTool`] is the native `amp_session_usage`, so the existing prompts (amp-execution
 //!   step 6) keep working: the session's own model, tokens and cost so far.
 //!
@@ -48,7 +57,7 @@ use crate::{
     events::Totals,
     supervisor::{
         BLOCK_TOOL, COMPLETE_TOOL, RETURN_TOOL, SET_STATE_TOOL, WorkerHooks, WorkerInfo,
-        WorkerOutcome, WorkerReport, task_id_arg,
+        WorkerOutcome, WorkerReport, stopped_by_manager, task_id_arg,
     },
     tools::result_text,
 };
@@ -59,6 +68,12 @@ pub const SESSION_USAGE_TOOL: &str = "amp_session_usage";
 pub const REPORT_RUN_TOOL: &str = "amp_report_run";
 /// The `amp_report_run` outcome for a worker that ended without closing its ticket.
 pub const ABANDONED: &str = "abandoned";
+/// The tool whose `author` the before-tool hook stamps on the worker's own ticket (AMP #4237).
+pub const COMMENT_TOOL: &str = "amp_add_task_comment";
+/// The run note of a worker the manager restarted (story 582).
+pub const RESTARTED: &str = "restarted";
+/// The prefix of the run note of a worker the manager resumed: `resumed:<continue|replay>`.
+pub const RESUMED: &str = "resumed";
 /// The AMP state "ready" is stored as (AMP keeps it blocked while a dependency is open).
 pub const READY_STATE: &str = "backlog";
 /// How long `on_finish` waits for AMP to take an abandoned run (shutdown waits on it).
@@ -270,6 +285,65 @@ pub fn drop_git_fields(args: &Value) -> Option<Value> {
     changed.then_some(Value::Object(out))
 }
 
+/// `args` with `author` set to `agent_id`, overwriting whatever the model passed (AMP #4237).
+/// `None` when it already says that, when `agent_id` is empty, or when `args` is not an object.
+pub fn stamp_author(args: &Value, agent_id: &str) -> Option<Value> {
+    let Value::Object(map) = args else {
+        return None;
+    };
+    if agent_id.is_empty() || map.get("author").and_then(Value::as_str) == Some(agent_id) {
+        return None;
+    }
+    let mut out = map.clone();
+    out.insert("author".into(), json!(agent_id));
+    Some(Value::Object(out))
+}
+
+/// `note` on one line (runs of whitespace become one space), cut to [`NOTE_MAX_CHARS`].
+fn clip_note(note: &str) -> String {
+    let note = note.split_whitespace().collect::<Vec<_>>().join(" ");
+    if note.chars().count() > NOTE_MAX_CHARS {
+        note.chars().take(NOTE_MAX_CHARS - 1).collect::<String>() + "…"
+    } else {
+        note
+    }
+}
+
+/// How the manager resumed a stopped worker (story 582): continue its session, or replay the
+/// ticket from the start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeMode {
+    Continue,
+    Replay,
+}
+
+impl ResumeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Replay => "replay",
+        }
+    }
+}
+
+/// The run note of a worker the manager stopped: `"stopped by manager: <reason>"` (just
+/// `"stopped by manager"` without a reason) on one line, cut to [`NOTE_MAX_CHARS`]. The same
+/// words as the stopped worker's error ([`stopped_by_manager`]), so both read alike.
+pub fn stopped_note(reason: &str) -> String {
+    clip_note(&stopped_by_manager(reason))
+}
+
+/// The run note of a worker the manager restarted: `"restarted"`.
+pub fn restarted_note() -> String {
+    RESTARTED.to_owned()
+}
+
+/// The run note of a worker the manager resumed: `"resumed:continue"` or `"resumed:replay"`.
+pub fn resumed_note(mode: ResumeMode) -> String {
+    format!("{RESUMED}:{}", mode.as_str())
+}
+
 /// `"abandoned: <outcome>[: <error>]"` on one line, cut to [`NOTE_MAX_CHARS`].
 pub fn abandoned_note(report: &WorkerReport) -> String {
     let outcome = report.outcome.as_str();
@@ -288,12 +362,9 @@ pub fn abandoned_note(report: &WorkerReport) -> String {
         .filter(|e| !e.is_empty())
     {
         note.push_str(": ");
-        note.push_str(&err.split_whitespace().collect::<Vec<_>>().join(" "));
+        note.push_str(err);
     }
-    if note.chars().count() > NOTE_MAX_CHARS {
-        note = note.chars().take(NOTE_MAX_CHARS - 1).collect::<String>() + "…";
-    }
-    note
+    clip_note(&note)
 }
 
 /// How the person at the manager's chat is told something: a line of text, above the editor. Set
@@ -633,12 +704,27 @@ impl WorkerHooks for RunReporter {
         // closeout. The worker may not know it (an old prompt, a model that forgot), so the
         // harness fills it in exactly as it fills the usage fields: only when it was left out.
         let dispatch_id = worker.dispatch_id.clone();
+        // AMP #4237: who the worker's own ticket comments are by.
+        let agent_id = worker.agent_id.clone();
         Some(Arc::new(
             move |ctx: BeforeToolCallContext<'_>, _signal: CancellationToken| -> HookFuture {
                 let name = ctx.tool_call.name.as_str();
-                if !matches!(name, COMPLETE_TOOL | BLOCK_TOOL)
-                    || task_id_arg(ctx.args) != Some(task_id)
-                {
+                if task_id_arg(ctx.args) != Some(task_id) {
+                    return Box::pin(async { None });
+                }
+                if name == COMMENT_TOOL {
+                    // Overwrite, never fill: a model-chosen author (a person's email, "agent")
+                    // would make the comment watcher steer the worker's own comment back to it.
+                    let stamped =
+                        stamp_author(ctx.args, &agent_id).map(|args| BeforeToolCallResult {
+                            block: false,
+                            reason: None,
+                            terminate: false,
+                            args: Some(args),
+                        });
+                    return Box::pin(async move { stamped });
+                }
+                if !matches!(name, COMPLETE_TOOL | BLOCK_TOOL) {
                     return Box::pin(async { None });
                 }
                 let args = ctx.args.clone();
@@ -972,6 +1058,174 @@ mod tests {
         let note = abandoned_note(&report(WorkerOutcome::Timeout, Some(&long)));
         assert_eq!(note.chars().count(), NOTE_MAX_CHARS);
         assert!(note.ends_with('…'));
+    }
+
+    #[test]
+    fn control_notes_say_what_the_manager_did() {
+        assert_eq!(
+            stopped_note("wrong approach"),
+            "stopped by manager: wrong approach"
+        );
+        assert_eq!(stopped_note("  "), "stopped by manager");
+        assert_eq!(
+            stopped_note("use the\n  other\tcrate"),
+            "stopped by manager: use the other crate",
+            "one line"
+        );
+        let note = stopped_note(&"y".repeat(1000));
+        assert_eq!(note.chars().count(), NOTE_MAX_CHARS);
+        assert!(note.starts_with("stopped by manager: y"));
+        assert!(note.ends_with('…'));
+        assert_eq!(restarted_note(), "restarted");
+        assert_eq!(resumed_note(ResumeMode::Continue), "resumed:continue");
+        assert_eq!(resumed_note(ResumeMode::Replay), "resumed:replay");
+        // Distinct from an abandoned run's note, so the audit trail tells them apart.
+        let abandoned = abandoned_note(&report(WorkerOutcome::Stopped, None));
+        for n in [
+            stopped_note("r"),
+            restarted_note(),
+            resumed_note(ResumeMode::Continue),
+        ] {
+            assert!(!n.starts_with(ABANDONED), "{n} vs {abandoned}");
+        }
+    }
+
+    #[test]
+    fn stamping_overwrites_the_comment_author() {
+        let me = "amp:amp-worker-backend";
+        assert_eq!(
+            stamp_author(
+                &json!({"task_id": 7, "body": "b", "author": "jsims@example.com"}),
+                me
+            ),
+            Some(json!({"task_id": 7, "body": "b", "author": me})),
+            "a person's email is overwritten"
+        );
+        assert_eq!(
+            stamp_author(&json!({"task_id": 7, "body": "b"}), me),
+            Some(json!({"task_id": 7, "body": "b", "author": me})),
+            "a missing author is set"
+        );
+        assert_eq!(stamp_author(&json!({"task_id": 7, "author": me}), me), None);
+        assert_eq!(stamp_author(&json!({"task_id": 7}), ""), None);
+        assert_eq!(stamp_author(&json!([1]), me), None);
+    }
+
+    fn worker_info(task_id: i64) -> WorkerInfo {
+        WorkerInfo {
+            task_id,
+            agent_id: "amp:amp-worker-backend".into(),
+            role: "amp-worker-backend".into(),
+            dispatch_id: "d_1".into(),
+            model: "wf/wf-1".into(),
+            cwd: PathBuf::from("."),
+            worktree: None,
+            branch: None,
+            worktree_start: None,
+            workspace: crate::workspace::Placement::Folder,
+            git: false,
+            edits: true,
+            manager_cwd: PathBuf::from("."),
+            totals: Arc::new(Mutex::new(totals(10, 5, 0.0))),
+        }
+    }
+
+    /// What the reporter's before-tool hook does to `name(args)` for the worker on ticket 7:
+    /// the rewritten args, or `None` when it leaves the call alone.
+    async fn hook(name: &str, args: Value) -> Option<Value> {
+        use rpi_ai::types::{Api, AssistantMessage, ToolCall};
+        let reporter = RunReporter::new(Arc::new(AmpMcpClient::offline(
+            &amp_mcp::ClientOptions::new("http://127.0.0.1:9/mcp"),
+            "test",
+        )));
+        let hook = reporter.before_tool_call(&worker_info(7)).unwrap();
+        let msg = AssistantMessage::empty(Api::Other("t".into()), "t", "m", 0);
+        let call = ToolCall {
+            kind: Default::default(),
+            id: "c1".into(),
+            name: name.into(),
+            arguments: args.clone(),
+            thought_signature: None,
+            namespace: None,
+        };
+        let context = rpi_agent::AgentContext {
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+        let ctx = BeforeToolCallContext {
+            assistant_message: &msg,
+            tool_call: &call,
+            args: &args,
+            context: &context,
+        };
+        let out = hook(ctx, CancellationToken::new()).await?;
+        assert!(!out.block && !out.terminate);
+        out.args
+    }
+
+    #[tokio::test]
+    async fn the_hook_stamps_the_workers_own_ticket_comments_only() {
+        let me = "amp:amp-worker-backend";
+        // Overwrite: whatever the model passed.
+        for author in [
+            "jsims@example.com",
+            "agent",
+            "amp-worker",
+            "amp:amp-manager",
+        ] {
+            assert_eq!(
+                hook(
+                    COMMENT_TOOL,
+                    json!({"task_id": 7, "body": "ack", "author": author})
+                )
+                .await,
+                Some(json!({"task_id": 7, "body": "ack", "author": me})),
+                "{author}"
+            );
+        }
+        // Missing author; a "#7" task id is the same ticket.
+        assert_eq!(
+            hook(COMMENT_TOOL, json!({"task_id": "#7", "body": "ack"})).await,
+            Some(json!({"task_id": "#7", "body": "ack", "author": me}))
+        );
+        // Already right: nothing to change.
+        assert_eq!(
+            hook(COMMENT_TOOL, json!({"task_id": 7, "author": me})).await,
+            None
+        );
+        // Another ticket's comment is left alone, whatever its author.
+        assert_eq!(
+            hook(
+                COMMENT_TOOL,
+                json!({"task_id": 8, "body": "b", "author": "x@y.z"})
+            )
+            .await,
+            None
+        );
+        assert_eq!(hook(COMMENT_TOOL, json!({"body": "no ticket"})).await, None);
+    }
+
+    #[tokio::test]
+    async fn the_hook_still_fills_complete_and_block_and_nothing_else() {
+        // A worker with no git of its own: usage, model and dispatch_id filled, git dropped,
+        // no author added.
+        let expected = json!({"task_id": 7, "model": "wf/wf-1", "input_tokens": 10,
+                              "output_tokens": 5, "cache_read_tokens": 3,
+                              "cache_write_tokens": 0, "dispatch_id": "d_1"});
+        for tool in [COMPLETE_TOOL, BLOCK_TOOL] {
+            let mut want = expected.clone();
+            if tool == BLOCK_TOOL {
+                want["reason"] = json!("q");
+            }
+            let mut args = json!({"task_id": 7, "branch": "__OMIT__"});
+            if tool == BLOCK_TOOL {
+                args["reason"] = json!("q");
+            }
+            assert_eq!(hook(tool, args).await, Some(want), "{tool}");
+        }
+        assert_eq!(hook(COMPLETE_TOOL, json!({"task_id": 8})).await, None);
+        assert_eq!(hook("amp_get_task", json!({"task_id": 7})).await, None);
     }
 
     #[test]

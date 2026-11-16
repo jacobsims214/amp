@@ -14,7 +14,10 @@ use rpi_ai::{
     providers::faux::{FauxProvider, FauxScript, FauxStep},
     types::Context,
 };
-use rpi_harness::{agent_harness::AgentHarness, types::AgentHarnessOptions};
+use rpi_harness::{
+    agent_harness::AgentHarness,
+    types::{AgentHarnessOptions, CompactionSettings},
+};
 use serde_json::json;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -29,19 +32,47 @@ struct Rig {
     events: UnboundedReceiver<AgentEvent>,
     done: UnboundedReceiver<amp_tui::RunDone>,
     model: Model,
+    /// The shell's clock when a test set one (AMP #4319, the confirm tests).
+    clock: Option<Arc<std::sync::Mutex<std::time::Instant>>>,
 }
 
 async fn rig(steps: Vec<FauxStep>) -> Rig {
+    rig_with(steps, None, CompactionSettings::default()).await
+}
+
+/// `window`: the model's context window (`None`: the faux default, shown as 200 000), so a
+/// small one makes rpi compact on its own (AMP #4263).
+async fn rig_with(
+    steps: Vec<FauxStep>,
+    window: Option<u64>,
+    compaction: CompactionSettings,
+) -> Rig {
+    rig_system(steps, window, compaction, None).await
+}
+
+/// [`rig_with`] with a system prompt, which the faux provider's reported usage includes, as
+/// the real manager's system prompt and tools are (AMP #4280).
+async fn rig_system(
+    steps: Vec<FauxStep>,
+    window: Option<u64>,
+    compaction: CompactionSettings,
+    system_prompt: Option<String>,
+) -> Rig {
     let script = FauxScript::new();
     script.set_responses(steps);
     let provider = FauxProvider::new(script);
-    let model = provider.default_model().clone();
+    let mut model = provider.default_model().clone();
+    if let Some(w) = window {
+        model.context_window = w;
+    }
     let (emitter, events) = ChannelEmitter::new();
     let harness = AgentHarness::create(AgentHarnessOptions {
         model: model.clone(),
         session: memory_session(),
         models: vec![provider],
         agent_emitter: Some(emitter.into_emitter()),
+        compaction,
+        system_prompt,
         ..Default::default()
     })
     .await
@@ -52,7 +83,7 @@ async fn rig(steps: Vec<FauxStep>) -> Rig {
         model_id: model.id.clone(),
         thinking: ThinkingLevel::Off,
         requested_thinking: None,
-        context_window: 200_000,
+        context_window: window.unwrap_or(200_000),
         cwd: "/work/amp".into(),
         git_branch: Some("harness-m2".into()),
         session_file: None,
@@ -79,6 +110,7 @@ async fn rig(steps: Vec<FauxStep>) -> Rig {
         events,
         done,
         model,
+        clock: None,
     }
 }
 
@@ -89,6 +121,17 @@ impl Rig {
             .drive_until_idle(&mut self.events, &mut self.done, WAIT)
             .await
             .expect("idle");
+        // `/compact` (AMP #4222) reports back through the shell's command queue.
+        self.shell.settle(WAIT).await.expect("settled");
+    }
+
+    /// Waits (bounded) for the shell's look-up of an automatic compaction's entry, which is not
+    /// counted in `settle` (AMP #4226): it takes up to ~0.5 s when no entry lands.
+    async fn settle_landed(&mut self) {
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.shell.poll();
+        }
     }
 
     fn screen(&self) -> String {
@@ -284,5 +327,769 @@ async fn narrow_terminals_still_render_a_full_frame() {
             lines.iter().all(|l| rpi_tui::visible_width(l) <= w),
             "{w}x{h}: {lines:#?}"
         );
+    }
+}
+
+/// The rendered frame as one line of words: box edges and wrapping gone.
+fn flat(rig: &Rig) -> String {
+    rig.shell
+        .view()
+        .render_plain(W, 80)
+        .iter()
+        .map(|l| l.trim().trim_matches('│').trim())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// AMP #4226 (spec E1, review #3881): `/usage` says when rpi compacts on its own (window −
+/// reserve), what it keeps, how long the summary may be, and how many compactions this session
+/// had, by reason; the trigger estimate is its own line, apart from the measured context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_shows_compaction_threshold_and_count() {
+    let mut rig = rig(vec![
+        FauxStep::text("first answer"),
+        FauxStep::text("SUMMARY-OF-EARLIER-TURNS"),
+    ])
+    .await;
+    // Before any reply: no compaction yet, and the estimate leaves out the system prompt.
+    rig.say("/usage").await;
+    let screen = flat(&rig);
+    // Defaults: reserve 16 384 of a 200 000 window; keep 20 000; summary 0.8 × reserve.
+    let window = amp_tui::footer::format_tokens(200_000);
+    let trigger = amp_tui::footer::format_tokens(200_000 - 16_384);
+    assert!(
+        screen.contains(&format!(
+            "auto-compaction: on · triggers at ~{trigger} of {window}"
+        )),
+        "{screen}"
+    );
+    assert!(
+        screen.contains(&format!(
+            "keeps ~{} recent",
+            amp_tui::footer::format_tokens(20_000)
+        )),
+        "{screen}"
+    );
+    assert!(
+        screen.contains(&format!(
+            "summary ≤ {}",
+            amp_tui::footer::format_tokens(13_107)
+        )),
+        "{screen}"
+    );
+    assert!(screen.contains("0 this session"), "{screen}");
+    assert!(
+        screen.contains("excludes system prompt and tools"),
+        "{screen}"
+    );
+
+    rig.say("hello").await;
+    rig.say("/compact").await;
+    assert!(rig.screen().contains("compacted: ~"), "{}", rig.screen());
+    rig.say("/usage").await;
+    let screen = flat(&rig);
+    assert!(
+        screen.contains("1 this session (1 manual, 0 automatic)"),
+        "{screen}"
+    );
+    assert!(screen.contains("trigger estimate: ~"), "{screen}");
+}
+
+/// AMP #4226 (spec E2/E3): right after a completed `/compact` the footer's context is the
+/// summary + kept tail estimate, below the figure before it and not the stale usage the kept
+/// tail still carries; the remote status's figure follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn footer_context_drops_after_compaction() {
+    // The faux provider reports chars/4 of the request as its usage, so long prompts make a
+    // large context. rpi keeps at least `keep_recent_tokens` (20k): the ~25k second turn and
+    // the short third are the kept tail, and the third reply still carries the large (stale)
+    // usage; the ~75k first turn becomes the summary.
+    let mut rig = rig(vec![
+        FauxStep::text("first answer"),
+        FauxStep::text("second answer"),
+        FauxStep::text("third answer"),
+        FauxStep::text("SUMMARY-OF-EARLIER-TURNS"),
+    ])
+    .await;
+    rig.say(&"lots of earlier context ".repeat(12_500)).await;
+    rig.say(&"some recent context ".repeat(5_000)).await;
+    rig.say("short follow-up").await;
+    let stale = rig.shell.view().footer().context().expect("ctx").tokens;
+    assert!(stale > 90_000, "{stale}");
+    let before_label = amp_tui::footer::context_label(stale as f64 / 2_000.0);
+    assert!(flat(&rig).contains(&before_label), "{}", flat(&rig));
+
+    rig.say("/compact").await;
+    assert!(flat(&rig).contains("compacted: ~"), "{}", flat(&rig));
+    let after = rig.shell.view().footer().context().expect("ctx").tokens;
+    assert!(
+        after < stale,
+        "after {after} before {stale}: {}",
+        flat(&rig)
+    );
+    assert_ne!(after, stale);
+    assert!(after < stale / 2, "the summary and the kept tail: {after}");
+    assert_eq!(rig.shell.totals().context_tokens, after);
+    assert!(!flat(&rig).contains(&before_label), "{}", flat(&rig));
+
+    // A declined compaction (the leaf is already one) leaves the footer as it was.
+    rig.say("/compact").await;
+    assert!(flat(&rig).contains("nothing to compact"), "{}", flat(&rig));
+    assert_eq!(rig.shell.view().footer().context().unwrap().tokens, after);
+}
+
+/// AMP #4280: `/compact` on a short chat (the whole conversation is the kept tail) shows no
+/// large drop. Before, "before" was the reported usage (system prompt + tools + messages) and
+/// "after" chars/4 of the summary and tail only, so it printed `~11k → ~21` and the footer fell
+/// below the system prompt's own size. Now both include the request overhead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_on_a_short_chat_shows_no_large_drop() {
+    let mut rig = rig_system(
+        vec![
+            FauxStep::text("Got it: 42."),
+            FauxStep::text("SUMMARY: the user asked to remember 42."),
+        ],
+        None,
+        CompactionSettings::default(),
+        // ~45k characters: about the default manager's ~11k tokens of system prompt and tools.
+        Some("You are the AMP manager; follow the protocol. ".repeat(1_000)),
+    )
+    .await;
+    rig.say("hello there, please remember the number 42").await;
+    let before = rig.shell.view().footer().context().expect("ctx").tokens;
+    assert!(
+        before > 10_000,
+        "the usage includes the system prompt: {before}"
+    );
+
+    rig.say("/compact").await;
+    let screen = flat(&rig);
+    let after = rig.shell.view().footer().context().expect("ctx").tokens;
+    // Nothing was summarized away (the tail is the whole chat) and a summary was added.
+    assert!(after >= before, "after {after} before {before}: {screen}");
+    assert!(
+        screen.contains(&format!(
+            "compacted: ~{} → ~{} tokens (estimate)",
+            amp_tui::footer::format_tokens(before),
+            amp_tui::footer::format_tokens(after)
+        )),
+        "{screen}"
+    );
+    assert_eq!(rig.shell.totals().context_tokens, after);
+}
+
+/// AMP #4263: a faux model that answers rpi's summarization requests from one queue and the
+/// chat's own turns from another, so a test controls each whatever order rpi calls them in
+/// (a split turn makes two summary calls).
+#[derive(Default)]
+struct Router {
+    /// `Err(message)`: the summary call fails. Empty: a short summary.
+    summaries: std::collections::VecDeque<Result<String, String>>,
+    turns: std::collections::VecDeque<FauxStep>,
+    summary_calls: usize,
+    turn_calls: usize,
+}
+
+fn routed(router: &Arc<std::sync::Mutex<Router>>) -> Vec<FauxStep> {
+    use rpi_ai::{providers::faux::faux_assistant_message, types::StopReason};
+    (0..40)
+        .map(|_| {
+            let router = Arc::clone(router);
+            FauxStep::factory(move |ctx: &Context| {
+                let mut r = router.lock().unwrap();
+                let summary = ctx
+                    .system_prompt
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("You are a context summarization"));
+                let failed = |msg: &str| {
+                    let mut m = faux_assistant_message("", StopReason::Error);
+                    m.error_message = Some(msg.into());
+                    m
+                };
+                if summary {
+                    r.summary_calls += 1;
+                    return match r.summaries.pop_front() {
+                        Some(Err(e)) => failed(&e),
+                        Some(Ok(text)) => faux_assistant_message(text, StopReason::Stop),
+                        None => faux_assistant_message("SUMMARY", StopReason::Stop),
+                    };
+                }
+                r.turn_calls += 1;
+                match r.turns.pop_front() {
+                    Some(FauxStep::Message(m)) => m,
+                    Some(FauxStep::Factory(f)) => f(ctx),
+                    None => failed("no more scripted turns"),
+                }
+            })
+        })
+        .collect()
+}
+
+/// A tool call whose arguments make ~15 000 tokens of output (faux usage is chars/4).
+fn big_tool_call() -> FauxStep {
+    FauxStep::tool_call("amp_whoami", json!({ "pad": "x".repeat(60_000) }))
+}
+
+/// A 30 000 window: rpi compacts above 30 000 − 16 384 = 13 616 (default reserve).
+const SMALL_WINDOW: u64 = 30_000;
+
+/// AMP #4263 G1 (spec F1, I4): a run whose pre-run compaction fails says so in its own words,
+/// the prompt is kept but never re-sent, and G2's skipped notice stays quiet for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_pre_run_compaction_has_its_own_notice_and_no_resend() {
+    let router = Arc::new(std::sync::Mutex::new(Router::default()));
+    router
+        .lock()
+        .unwrap()
+        .turns
+        .push_back(FauxStep::text("first answer"));
+    let mut rig = rig_with(
+        routed(&router),
+        Some(SMALL_WINDOW),
+        CompactionSettings::default(),
+    )
+    .await;
+    // ~12 000 tokens: below the trigger before the first call.
+    rig.say(&"earlier context ".repeat(3_000)).await;
+    assert_eq!(router.lock().unwrap().summary_calls, 0, "{}", rig.screen());
+    router
+        .lock()
+        .unwrap()
+        .summaries
+        .push_back(Err("summary model exploded".into()));
+    // ~4 000 more: the pre-run estimate crosses the trigger, and the summary call fails.
+    rig.say(&format!("SECOND-PROMPT {}", "more ".repeat(3_200)))
+        .await;
+    rig.settle_landed().await;
+    let screen = flat(&rig);
+    assert!(
+        screen.contains("automatic compaction failed (summary model exploded); context unchanged, your prompt is saved but was not answered"),
+        "{screen}"
+    );
+    assert!(
+        !screen.contains(amp_tui::shell::COMPACTION_SKIPPED),
+        "{screen}"
+    );
+    assert!(!rig.shell.is_running());
+    let r = router.lock().unwrap();
+    assert!(r.summary_calls >= 1);
+    assert_eq!(
+        r.turn_calls, 1,
+        "the prompt was never sent to the model, nor re-sent"
+    );
+}
+
+/// AMP #4263 G2 (spec F2): a between-turn compaction whose summary fails is skipped by rpi; the
+/// chat says so and the run carries on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_skipped_between_turn_compaction_is_shown() {
+    let router = Arc::new(std::sync::Mutex::new(Router::default()));
+    {
+        let mut r = router.lock().unwrap();
+        r.turns.push_back(big_tool_call());
+        r.turns.push_back(FauxStep::text("carried on"));
+        for _ in 0..4 {
+            r.summaries.push_back(Err("summary model exploded".into()));
+        }
+    }
+    let keep = CompactionSettings {
+        keep_recent_tokens: 2_000,
+        ..CompactionSettings::default()
+    };
+    let mut rig = rig_with(routed(&router), Some(SMALL_WINDOW), keep).await;
+    rig.say("go").await;
+    rig.settle_landed().await;
+    let screen = flat(&rig);
+    assert!(router.lock().unwrap().summary_calls >= 1, "{screen}");
+    assert!(screen.contains("carried on"), "{screen}");
+    assert!(
+        screen.contains(amp_tui::shell::COMPACTION_SKIPPED),
+        "{screen}"
+    );
+    assert!(!screen.contains("compaction freed nothing"), "{screen}");
+}
+
+/// AMP #4263 G3 (spec I3/S4): when one tool result alone is larger than keep_recent_tokens,
+/// automatic compaction frees nothing and fires again next turn: the chat warns, once per run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compaction_that_frees_nothing_warns_once_per_run() {
+    let router = Arc::new(std::sync::Mutex::new(Router::default()));
+    {
+        let mut r = router.lock().unwrap();
+        r.turns.push_back(big_tool_call());
+        r.turns.push_back(big_tool_call());
+        r.turns.push_back(FauxStep::text("finally done"));
+    }
+    let keep = CompactionSettings {
+        keep_recent_tokens: 2_000,
+        ..CompactionSettings::default()
+    };
+    let mut rig = rig_with(routed(&router), Some(SMALL_WINDOW), keep).await;
+    rig.say("go").await;
+    rig.settle_landed().await;
+    let screen = flat(&rig);
+    assert!(screen.contains("finally done"), "{screen}");
+    assert!(router.lock().unwrap().summary_calls >= 2, "{screen}");
+    assert_eq!(
+        screen
+            .matches(amp_tui::shell::COMPACTION_NO_PROGRESS)
+            .count(),
+        1,
+        "{screen}"
+    );
+    assert!(
+        !screen.contains(amp_tui::shell::COMPACTION_SKIPPED),
+        "{screen}"
+    );
+}
+
+// AMP #4259: self-management confirmations as a y/N question in the chat.
+
+mod confirm {
+    use super::*;
+    use amp_core::approval::{
+        ChannelConfirmer, ConfirmRequest, Confirmed, DenyReason, confirm_or_deny,
+    };
+
+    fn request(name: &str) -> ConfirmRequest {
+        ConfirmRequest::self_management(
+            "amp_manage_agent",
+            format!("/home/me/.config/amp-harness/agents/{name}.md"),
+            "user",
+            format!("create agent {name}"),
+        )
+        .detail("+ description: reviews Go code")
+    }
+
+    /// A clock the test moves by hand, for the confirmation's arm window (AMP #4319).
+    type TestClock = Arc<std::sync::Mutex<std::time::Instant>>;
+
+    fn advance(clock: &TestClock, by: Duration) {
+        *clock.lock().unwrap() += by;
+    }
+
+    /// The rig with the session's confirmer wired to its shell, as the chat does, on a clock
+    /// the test moves (AMP #4319).
+    async fn wired_clock() -> (Rig, Arc<ChannelConfirmer>, TestClock) {
+        let mut rig = rig(vec![]).await;
+        let (confirmer, confirms) = ChannelConfirmer::new();
+        rig.shell.set_confirms(confirms);
+        let clock: TestClock = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+        let read = Arc::clone(&clock);
+        rig.shell.set_clock(Arc::new(move || *read.lock().unwrap()));
+        rig.clock = Some(Arc::clone(&clock));
+        (rig, Arc::new(confirmer), clock)
+    }
+
+    async fn wired() -> (Rig, Arc<ChannelConfirmer>) {
+        let (rig, c, _) = wired_clock().await;
+        (rig, c)
+    }
+
+    /// Polls (bounded) until a question is on screen, without letting time pass on the
+    /// shell's clock: the question is not armed yet.
+    async fn until_shown_unarmed(rig: &mut Rig) {
+        for _ in 0..200 {
+            rig.shell.poll();
+            if rig.shell.confirm_pending() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no confirmation shown:\n{}", rig.screen());
+    }
+
+    /// A tool asking with `timeout`, as `confirm_or_deny` is called from a manager tool.
+    fn ask(
+        c: &Arc<ChannelConfirmer>,
+        name: &str,
+        timeout: Duration,
+    ) -> tokio::task::JoinHandle<Confirmed> {
+        let c = Arc::clone(c);
+        let req = request(name);
+        tokio::spawn(async move { confirm_or_deny(Some(c.as_ref()), req, timeout).await })
+    }
+
+    /// Polls (bounded) until a question is on screen, then lets its arm window pass with no
+    /// key (AMP #4319), so it takes the next key as its answer.
+    async fn until_shown(rig: &mut Rig) {
+        until_shown_unarmed(rig).await;
+        let clock = rig.clock.clone().expect("wired() sets the clock");
+        advance(&clock, amp_tui::shell::CONFIRM_ARM);
+        assert!(rig.shell.confirm_armed());
+    }
+
+    /// A plain key as the terminal hands it to the shell while the person types ahead into a
+    /// non-empty editor: true means the shell used it and the editor never sees it.
+    async fn typed(rig: &mut Rig, c: char) -> bool {
+        rig.shell
+            .key(&KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), false)
+            .await
+    }
+
+    // AMP #4319: a `y` typed ahead as the question appears does not answer it.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_y_inside_the_arm_window_neither_allows_nor_reaches_the_editor() {
+        let (mut rig, c, clock) = wired_clock().await;
+        let h = ask(&c, "amp-typed", WAIT);
+        until_shown_unarmed(&mut rig).await;
+        assert!(!rig.shell.confirm_armed());
+        advance(&clock, Duration::from_millis(100));
+        assert!(typed(&mut rig, 'y').await, "the editor does not get the y");
+        assert!(rig.shell.confirm_pending(), "the y answered nothing");
+        assert!(!h.is_finished(), "the tool is still waiting");
+        let screen = rig.screen();
+        assert!(
+            screen.contains(amp_tui::shell::CONFIRM_WAIT_NOTICE),
+            "{screen}"
+        );
+        assert!(!screen.contains("Allowed:"), "{screen}");
+        assert!(!screen.contains("Refused:"), "{screen}");
+        // More type-ahead: also swallowed, and the notice is not repeated.
+        assert!(typed(&mut rig, 'e').await);
+        assert!(typed(&mut rig, 's').await);
+        assert!(rig.shell.confirm_pending());
+        assert_eq!(
+            rig.screen()
+                .matches(amp_tui::shell::CONFIRM_WAIT_NOTICE)
+                .count(),
+            1,
+            "{}",
+            rig.screen()
+        );
+        // Once armed, `y` allows.
+        advance(&clock, amp_tui::shell::CONFIRM_ARM);
+        assert!(rig.shell.confirm_armed());
+        assert!(typed(&mut rig, 'y').await);
+        assert_eq!(outcome(h).await, Confirmed::Approved);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_y_after_the_arm_window_allows() {
+        let (mut rig, c, clock) = wired_clock().await;
+        let h = ask(&c, "amp-read", WAIT);
+        until_shown_unarmed(&mut rig).await;
+        advance(&clock, amp_tui::shell::CONFIRM_ARM);
+        assert!(rig.shell.confirm_armed());
+        assert!(typed(&mut rig, 'y').await);
+        assert_eq!(outcome(h).await, Confirmed::Approved);
+        assert!(!rig.screen().contains(amp_tui::shell::CONFIRM_WAIT_NOTICE));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_inside_the_arm_window_starts_it_again() {
+        let (mut rig, c, clock) = wired_clock().await;
+        let h = ask(&c, "amp-restart", WAIT);
+        until_shown_unarmed(&mut rig).await;
+        let arm = amp_tui::shell::CONFIRM_ARM;
+        // A key just before the window ends: the window starts again from it.
+        advance(&clock, arm - Duration::from_millis(10));
+        assert!(typed(&mut rig, 'x').await);
+        assert!(rig.shell.confirm_pending(), "x refused nothing");
+        // The first window's end has passed, the new one has not.
+        advance(&clock, Duration::from_millis(50));
+        assert!(!rig.shell.confirm_armed());
+        assert!(typed(&mut rig, 'y').await);
+        assert!(rig.shell.confirm_pending(), "y answered nothing");
+        assert!(!h.is_finished());
+        // A full window after the last key: armed, and any other key still refuses.
+        advance(&clock, arm);
+        assert!(rig.shell.confirm_armed());
+        assert!(typed(&mut rig, 'n').await);
+        assert_eq!(outcome(h).await, Confirmed::Denied(DenyReason::Declined));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_next_question_has_its_own_arm_window() {
+        let (mut rig, c, clock) = wired_clock().await;
+        let first = ask(&c, "amp-first", WAIT);
+        until_shown(&mut rig).await;
+        let second = ask(&c, "amp-second", WAIT);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // `n` answers the first; the second appears at once, and a `y` right after it waits.
+        assert!(typed(&mut rig, 'n').await);
+        assert_eq!(
+            outcome(first).await,
+            Confirmed::Denied(DenyReason::Declined)
+        );
+        until_shown_unarmed(&mut rig).await;
+        assert!(!rig.shell.confirm_armed());
+        assert!(typed(&mut rig, 'y').await);
+        assert!(!second.is_finished());
+        advance(&clock, amp_tui::shell::CONFIRM_ARM);
+        assert!(typed(&mut rig, 'y').await);
+        assert_eq!(outcome(second).await, Confirmed::Approved);
+    }
+
+    async fn outcome(h: tokio::task::JoinHandle<Confirmed>) -> Confirmed {
+        tokio::time::timeout(WAIT, h)
+            .await
+            .expect("the tool got an answer")
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_shows_a_y_n_question_and_y_approves() {
+        let (mut rig, c) = wired().await;
+        let h = ask(&c, "amp-foo", WAIT);
+        until_shown(&mut rig).await;
+        let screen = rig.screen();
+        assert!(
+            screen.contains("Allow amp_manage_agent to create agent amp-foo? [y/N]"),
+            "{screen}"
+        );
+        assert!(screen.contains("user scope:"), "{screen}");
+        assert!(screen.contains("agents/amp-foo.md"), "{screen}");
+        assert!(
+            screen.contains("+ description: reviews Go code"),
+            "{screen}"
+        );
+        assert!(screen.contains("Press y to allow it"), "{screen}");
+        assert!(
+            !rig.shell.input_focused(),
+            "the editor does not take the key"
+        );
+        assert!(rig.shell.press("y").await.unwrap());
+        assert_eq!(outcome(h).await, Confirmed::Approved);
+        assert!(!rig.shell.confirm_pending());
+        assert!(rig.screen().contains("Allowed: amp_manage_agent may write"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_y_approves_esc_n_and_enter_refuse() {
+        let (mut rig, c) = wired().await;
+        for key in ["n", "esc", "enter", "x"] {
+            let h = ask(&c, "amp-foo", WAIT);
+            until_shown(&mut rig).await;
+            assert!(rig.shell.press(key).await.unwrap());
+            assert_eq!(
+                outcome(h).await,
+                Confirmed::Denied(DenyReason::Declined),
+                "key {key}"
+            );
+            assert!(!rig.shell.confirm_pending());
+        }
+        assert!(
+            rig.screen()
+                .contains("Refused: amp_manage_agent did not write")
+        );
+        // A modified y (Ctrl+Y) is not a yes either.
+        let h = ask(&c, "amp-foo", WAIT);
+        until_shown(&mut rig).await;
+        let ctrl_y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL);
+        assert!(rig.shell.key(&ctrl_y, true).await);
+        assert_eq!(outcome(h).await, Confirmed::Denied(DenyReason::Declined));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_question_closes_and_a_late_y_writes_nothing() {
+        let (mut rig, c) = wired().await;
+        // On screen, then the tool gives up: the next poll closes it.
+        let h = ask(&c, "amp-slow", Duration::from_millis(200));
+        until_shown(&mut rig).await;
+        assert_eq!(outcome(h).await, Confirmed::Denied(DenyReason::TimedOut));
+        rig.shell.poll();
+        assert!(!rig.shell.confirm_pending());
+        let screen = rig.screen();
+        assert!(
+            screen.contains(
+                "The request from amp_manage_agent timed out before an answer; nothing was written."
+            ),
+            "{screen}"
+        );
+
+        // On screen, the tool gives up, and a `y` lands before the next poll: it says so.
+        let h = ask(&c, "amp-late", Duration::from_millis(200));
+        until_shown(&mut rig).await;
+        assert_eq!(outcome(h).await, Confirmed::Denied(DenyReason::TimedOut));
+        assert!(rig.shell.press("y").await.unwrap());
+        let screen = rig.screen();
+        assert!(
+            screen.contains("That request already timed out; nothing was written."),
+            "{screen}"
+        );
+        assert!(!screen.contains("Allowed:"), "{screen}");
+
+        // Stale before it was ever shown: skipped.
+        let h = ask(&c, "amp-never", Duration::from_millis(50));
+        assert_eq!(outcome(h).await, Confirmed::Denied(DenyReason::TimedOut));
+        rig.shell.poll();
+        assert!(!rig.shell.confirm_pending());
+        assert!(!rig.screen().contains("amp-never"), "{}", rig.screen());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_question_at_a_time_the_next_waits_its_turn() {
+        let (mut rig, c) = wired().await;
+        let first = ask(&c, "amp-one", WAIT);
+        until_shown(&mut rig).await;
+        let second = ask(&c, "amp-two", WAIT);
+        for _ in 0..20 {
+            rig.shell.poll();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(rig.screen().contains("create agent amp-one"));
+        assert!(
+            !rig.screen().contains("create agent amp-two"),
+            "{}",
+            rig.screen()
+        );
+        assert!(rig.shell.press("n").await.unwrap());
+        assert_eq!(
+            outcome(first).await,
+            Confirmed::Denied(DenyReason::Declined)
+        );
+        until_shown(&mut rig).await;
+        assert!(
+            rig.screen().contains("create agent amp-two"),
+            "{}",
+            rig.screen()
+        );
+        assert!(rig.shell.press("y").await.unwrap());
+        assert_eq!(outcome(second).await, Confirmed::Approved);
+    }
+
+    // AMP #4317: nothing cut from a request can be allowed unseen.
+
+    /// A request for `name` with `rows` as its detail lines.
+    fn request_with(name: &str, rows: &[String]) -> ConfirmRequest {
+        let mut req = ConfirmRequest::self_management(
+            "amp_manage_agent",
+            format!("/home/me/.config/amp-harness/agents/{name}.md"),
+            "user",
+            format!("override agent {name}"),
+        );
+        for row in rows {
+            req = req.detail(row.clone());
+        }
+        req
+    }
+
+    fn ask_with(
+        c: &Arc<ChannelConfirmer>,
+        req: ConfirmRequest,
+    ) -> tokio::task::JoinHandle<Confirmed> {
+        let c = Arc::clone(c);
+        tokio::spawn(async move { confirm_or_deny(Some(c.as_ref()), req, WAIT).await })
+    }
+
+    /// The whole transcript, unstyled, not only what fits the screen.
+    fn transcript(rig: &Rig) -> String {
+        rig.shell
+            .view()
+            .transcript_component()
+            .render(W)
+            .iter()
+            .map(|l| rpi_tui::strip_ansi(l).trim_end().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `y` on a request with unseen rows says to press `v` and leaves it open.
+    async fn y_waits_for_v(rig: &mut Rig, h: &tokio::task::JoinHandle<Confirmed>) {
+        assert!(rig.shell.press("y").await.unwrap());
+        assert!(rig.shell.confirm_pending(), "y did not allow it unseen");
+        assert!(rig.shell.confirm_has_unseen());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!h.is_finished(), "the tool got no answer yet");
+        let t = transcript(rig);
+        assert!(t.contains(amp_tui::shell::CONFIRM_VIEW_FIRST), "{t}");
+        assert!(!t.contains("Allowed:"), "{t}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_long_request_needs_v_before_y_allows_it() {
+        let (mut rig, c) = wired().await;
+        let rows: Vec<String> = (1..=60)
+            .map(|i| format!("+ row-{i:02} of the agent"))
+            .collect();
+        let h = ask_with(&c, request_with("amp-long", &rows));
+        until_shown(&mut rig).await;
+        let t = transcript(&rig);
+        assert!(t.contains("+ row-24 of the agent"), "{t}");
+        assert!(!t.contains("+ row-25 of the agent"), "{t}");
+        assert!(
+            t.contains("… 36 more lines, press v to show them all"),
+            "{t}"
+        );
+        assert!(t.contains("Press v to see the whole change, then y"), "{t}");
+
+        y_waits_for_v(&mut rig, &h).await;
+
+        assert!(rig.shell.press("v").await.unwrap());
+        assert!(rig.shell.confirm_pending(), "v does not answer");
+        assert!(!rig.shell.confirm_has_unseen());
+        let t = transcript(&rig);
+        for row in &rows {
+            assert!(t.contains(row.as_str()), "{row} missing:\n{t}");
+        }
+        assert!(
+            t.trim_end().ends_with("it is refused."),
+            "the y/N line again:\n{t}"
+        );
+        assert!(rig.shell.press("y").await.unwrap());
+        assert_eq!(outcome(h).await, Confirmed::Approved);
+        assert!(!rig.shell.confirm_pending());
+        assert!(transcript(&rig).contains("Allowed: amp_manage_agent may write"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_short_request_is_allowed_by_the_first_y() {
+        let (mut rig, c) = wired().await;
+        let rows: Vec<String> = (1..=10)
+            .map(|i| format!("+ row-{i:02} of the agent"))
+            .collect();
+        let h = ask_with(&c, request_with("amp-short", &rows));
+        until_shown(&mut rig).await;
+        assert!(!rig.shell.confirm_has_unseen());
+        let t = transcript(&rig);
+        for row in &rows {
+            assert!(t.contains(row.as_str()), "{row} missing:\n{t}");
+        }
+        assert!(!t.contains("press v"), "{t}");
+        assert!(rig.shell.press("y").await.unwrap());
+        assert_eq!(outcome(h).await, Confirmed::Approved);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wide_row_is_cut_visibly_and_shown_in_full_after_v() {
+        let (mut rig, c) = wired().await;
+        // 500 characters: 100 numbered words of five.
+        let wide: String = (0..100).map(|i| format!("w{i:03} ")).collect();
+        assert_eq!(wide.chars().count(), 500);
+        let rows = vec!["+ short row".to_owned(), wide.trim_end().to_owned()];
+        let h = ask_with(&c, request_with("amp-wide", &rows));
+        until_shown(&mut rig).await;
+        let t = transcript(&rig);
+        assert!(t.contains("w059"), "{t}");
+        assert!(!t.contains("w060"), "cut at 300 characters:\n{t}");
+        assert!(t.contains("more characters)"), "the cut is marked:\n{t}");
+        assert!(t.contains("press v to show them in full"), "{t}");
+
+        y_waits_for_v(&mut rig, &h).await;
+
+        assert!(rig.shell.press("v").await.unwrap());
+        let t = transcript(&rig);
+        for i in 0..100 {
+            assert!(t.contains(&format!("w{i:03}")), "w{i:03} missing:\n{t}");
+        }
+        // Any other key still refuses, unseen or not.
+        assert!(rig.shell.press("n").await.unwrap());
+        assert_eq!(outcome(h).await, Confirmed::Denied(DenyReason::Declined));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn any_other_key_refuses_a_request_with_unseen_rows() {
+        let (mut rig, c) = wired().await;
+        let rows: Vec<String> = (1..=30).map(|i| format!("+ row-{i:02}")).collect();
+        let h = ask_with(&c, request_with("amp-esc", &rows));
+        until_shown(&mut rig).await;
+        assert!(rig.shell.press("esc").await.unwrap());
+        assert_eq!(outcome(h).await, Confirmed::Denied(DenyReason::Declined));
+        assert!(!rig.shell.confirm_pending());
     }
 }

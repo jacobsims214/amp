@@ -21,6 +21,7 @@
    /reload                  reload agents, skills, models, MCP servers
  Chat
    /usage                   tokens and cost this session
+   /compact [instructions]  summarize older turns to free context (lossy)
    /abort                   stop the reply
    /stop                    stop the reply, or the wait for plan approval
    /close                   close the open panel
@@ -45,4 +46,4 @@
    Ctrl+W                   pick a running worker: ←/→, Enter watch
    Ctrl+X/G                 in /workers: stop the worker / open it in AMP
    click                    a worker or its #ticket: watch its session
-   Fn/⌥-drag                select text (Fn in Terminal.app, ⌥ in iTerm2)
+   drag                     select transcript text, copied on release

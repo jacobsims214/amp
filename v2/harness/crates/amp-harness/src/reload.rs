@@ -59,6 +59,8 @@ struct Live {
     /// The chat's `.amp.json` now: changed by [`ChatReload::relink`] (#2383).
     project: std::sync::Mutex<Option<ProjectMarker>>,
     supervisor: Option<Arc<Supervisor>>,
+    /// The session's confirmer, for the self-management tools /reload registers again (#4252).
+    confirmer: Option<Arc<dyn amp_core::approval::Confirmer>>,
 }
 
 impl ChatReload {
@@ -71,6 +73,7 @@ impl ChatReload {
             cwd: session.cwd.clone(),
             project: std::sync::Mutex::new(session.project.clone()),
             supervisor: session.supervisor.clone(),
+            confirmer: session.confirmer.clone(),
         }))
     }
 
@@ -124,10 +127,23 @@ impl Live {
             .reload(&SystemKeys::from_env(), &env)
             .await
             .map_err(|e| format!("{e}; nothing was changed"))?;
-        // amp_run_ticket's description lists the roster: a fresh one lists the new one.
-        let refreshed = self
-            .refresh(self.supervisor.iter().map(|s| s.tool()).collect())
-            .await?;
+        // amp_run_ticket's description lists the roster: a fresh one lists the new one. The
+        // worker-control tools (#4233) come back with it, so /reload never drops them.
+        let mut tools: Vec<_> = self
+            .supervisor
+            .iter()
+            .flat_map(crate::session::manager_tools)
+            .collect();
+        // #4252: the manager's self-management tools, with the same confirmer (only the manager
+        // has a supervisor).
+        if self.supervisor.is_some() {
+            tools.extend(crate::manage_tools::tools(
+                self.rt.paths.clone(),
+                self.cwd.clone(),
+                self.confirmer.clone(),
+            ));
+        }
+        let refreshed = self.refresh(tools).await?;
         let mut lines = report.lines();
         if lines.is_empty() && refreshed.prompt_changed {
             lines.push("the manager's prompt changed (AGENTS.md)".to_owned());

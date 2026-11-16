@@ -1203,15 +1203,47 @@ fn str_map(map: &BTreeMap<String, String>) -> toml::Value {
 /// The chat's `/mcp add <name> <url>` (#2245): an http server (or sse) with no headers or
 /// secrets, built exactly as `mcp add <name> <url>` builds it (a secret-looking URL is refused).
 pub(crate) fn http_spec(name: &str, url: &str, sse: bool) -> Result<NewServer, CliError> {
-    new_from_flags(&AddArgs {
+    let mut a = bare_args(name);
+    a.first = Some(url.to_owned());
+    a.transport = Some(if sse {
+        TransportArg::Sse
+    } else {
+        TransportArg::Http
+    });
+    new_from_flags(&a)
+}
+
+/// The manager's `amp_add_mcp_server` (#4253): a stdio server with no env, secrets or headers,
+/// built as `mcp add <name> -- <command> <args>` builds it (a secret-looking argument is refused
+/// without echoing it). A secret-looking command is refused the same way.
+pub(crate) fn stdio_spec(
+    name: &str,
+    command: &str,
+    args: &[String],
+) -> Result<NewServer, CliError> {
+    if command.trim().is_empty() {
+        return Err(CliError::usage("a stdio server needs its command"));
+    }
+    if mcp_config::looks_secret_value(command.split("${").next().unwrap_or_default()) {
+        return Err(CliError::usage(
+            "the command looks like a secret, and it would end up in config.toml; nothing was \
+             written",
+        ));
+    }
+    let mut a = bare_args(name);
+    a.first = Some(command.to_owned());
+    a.rest = args.to_vec();
+    a.transport = Some(TransportArg::Stdio);
+    new_from_flags(&a)
+}
+
+/// Flags with nothing set but the name (the chat's and the manager's builders fill in the rest).
+fn bare_args(name: &str) -> AddArgs {
+    AddArgs {
         name: name.to_owned(),
-        first: Some(url.to_owned()),
+        first: None,
         rest: Vec::new(),
-        transport: Some(if sse {
-            TransportArg::Sse
-        } else {
-            TransportArg::Http
-        }),
+        transport: None,
         url: None,
         headers: Vec::new(),
         env: Vec::new(),
@@ -1237,7 +1269,7 @@ pub(crate) fn http_spec(name: &str, url: &str, sse: bool) -> Result<NewServer, C
         no_test: true,
         scope: ScopeOpt::default(),
         json: false,
-    })
+    }
 }
 
 fn new_from_flags(a: &AddArgs) -> Result<NewServer, CliError> {
@@ -3393,6 +3425,28 @@ mod tests {
             ui.0,
             ["authd: env QA_TOKEN (kept in the OS keychain) (hidden): "]
         );
+    }
+
+    /// #4253: the manager's stdio builder keeps `mcp add`'s secret refusal and env references.
+    #[test]
+    fn stdio_spec_refuses_secrets_without_echoing_them() {
+        let planted = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let s = stdio_spec("files", "npx", &["-y".into(), "${HOME_DIR}".into()]).unwrap();
+        assert_eq!(s.table["type"].as_str(), Some("stdio"));
+        assert_eq!(s.table["command"].as_str(), Some("npx"));
+        assert_eq!(
+            s.table["args"],
+            toml::Value::Array(vec!["-y".into(), "${env:HOME_DIR}".into()])
+        );
+        assert!(s.secrets.is_empty() && !s.table.contains_key("enabled"));
+        for (command, args) in [
+            ("gh-mcp", vec!["--token".to_owned(), planted.to_owned()]),
+            (planted, Vec::new()),
+        ] {
+            let e = stdio_spec("gh", command, &args).err().expect(command);
+            assert!(!e.message.contains(planted), "{}", e.message);
+        }
+        assert!(stdio_spec("gh", "", &[]).is_err());
     }
 
     #[test]

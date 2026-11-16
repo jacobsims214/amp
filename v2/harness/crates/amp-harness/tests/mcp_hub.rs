@@ -20,7 +20,7 @@ use std::{
     process::Command,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -1427,6 +1427,134 @@ async fn reload_retries_a_server_that_needed_a_login() {
     hub.shutdown().await;
 }
 
+/// An HTTP server that connects normally but answers every `tools/call` with `code` while it is
+/// non-zero (a login revoked mid-session, or a server-side failure).
+async fn serve_call_gated(code: Arc<AtomicU16>) -> Http {
+    let service: StreamableHttpService<HubTestServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            || Ok(HubTestServer { name: "hub-http" }),
+            Default::default(),
+            StreamableHttpServerConfig::default().with_json_response(true),
+        );
+    let app = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
+            let code = Arc::clone(&code);
+            async move {
+                let (parts, body) = req.into_parts();
+                let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                let status = code.load(Ordering::SeqCst);
+                if status != 0 && bytes.windows(10).any(|w| w == b"tools/call") {
+                    let status = StatusCode::from_u16(status).unwrap();
+                    return (status, "rejected").into_response();
+                }
+                next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
+                    .await
+            }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Http {
+        url: format!("http://{addr}/mcp"),
+        task,
+    }
+}
+
+fn restarts(hub: &McpHub, name: &str) -> u32 {
+    hub.health()
+        .into_iter()
+        .find(|h| h.name == name)
+        .unwrap_or_else(|| panic!("no server {name}"))
+        .restarts
+}
+
+/// A login that dies mid-session (#4248): the connected server 401s a tool call, the call fails,
+/// and the server moves to needs-login (so `/mcp login web` is offered) instead of staying ready.
+async fn a_401_mid_session_moves_the_server_to_needs_login() {
+    let open = Arc::new(AtomicBool::new(true));
+    let web = serve_gated(Arc::clone(&open)).await;
+    let toml_text = format!("[mcp.web]\nurl = {:?}\nauth = \"none\"\n", web.url);
+    let (hub, _dir) = hub("mid-call-401", &toml_text, fast());
+    hub.start();
+    hub.wait_started(true).await;
+    assert_eq!(status(&hub, "web"), ServerStatus::Ready);
+    assert_eq!(
+        call(&hub, "mcp__web__echo", json!({"text": "hi"})).await,
+        Ok("hub-http: hi".to_owned())
+    );
+    open.store(false, Ordering::SeqCst);
+    let err = call(&hub, "mcp__web__echo", json!({"text": "again"}))
+        .await
+        .unwrap_err();
+    assert!(err.contains("login required"), "{err}");
+    let s = wait_status(&hub, "web", "needs-login", Duration::from_secs(20)).await;
+    assert_eq!(s.word(), "needs-login", "{s:?}");
+    // Not retried on its own, like a needs-login found at connect.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(status(&hub, "web").word(), "needs-login");
+    hub.shutdown().await;
+}
+
+/// A tool call that fails for any other reason (here an HTTP 500) leaves the server ready and
+/// does not reconnect it.
+async fn a_non_auth_call_error_keeps_the_server_ready() {
+    let code = Arc::new(AtomicU16::new(0));
+    let web = serve_call_gated(Arc::clone(&code)).await;
+    let toml_text = format!("[mcp.web]\nurl = {:?}\nauth = \"none\"\n", web.url);
+    let (hub, _dir) = hub("mid-call-500", &toml_text, fast());
+    hub.start();
+    hub.wait_started(true).await;
+    assert_eq!(status(&hub, "web"), ServerStatus::Ready);
+    code.store(500, Ordering::SeqCst);
+    let err = call(&hub, "mcp__web__echo", json!({"text": "x"}))
+        .await
+        .unwrap_err();
+    assert!(!err.contains("login required"), "{err}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(status(&hub, "web"), ServerStatus::Ready);
+    assert_eq!(restarts(&hub, "web"), 0);
+    code.store(0, Ordering::SeqCst);
+    assert_eq!(
+        call(&hub, "mcp__web__echo", json!({"text": "ok"})).await,
+        Ok("hub-http: ok".to_owned())
+    );
+    hub.shutdown().await;
+}
+
+/// A server that accepts connects but 401s every tool call does not loop: each failed call
+/// reconnects it at most once, and it settles back to ready in between.
+async fn a_server_that_401s_only_calls_does_not_loop() {
+    let code = Arc::new(AtomicU16::new(401));
+    let web = serve_call_gated(Arc::clone(&code)).await;
+    let toml_text = format!("[mcp.web]\nurl = {:?}\nauth = \"none\"\n", web.url);
+    let (hub, _dir) = hub("call-only-401", &toml_text, fast());
+    hub.start();
+    hub.wait_started(true).await;
+    assert_eq!(status(&hub, "web"), ServerStatus::Ready);
+    for n in 1..=2 {
+        let err = call(&hub, "mcp__web__echo", json!({"text": "x"}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("login required"), "{err}");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while restarts(&hub, "web") < n && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            wait_status(&hub, "web", "ready", Duration::from_secs(20)).await,
+            ServerStatus::Ready
+        );
+        // Settled: no further reconnects without another failed call.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(restarts(&hub, "web"), n);
+        assert_eq!(status(&hub, "web"), ServerStatus::Ready);
+    }
+    hub.shutdown().await;
+}
+
 /// `Runtime::reload` with a live session: a server added to config.toml reaches the session
 /// (tools and instructions) without rebuilding it, even though the session was built when no
 /// server was configured; removing it takes its tools away and stops it.
@@ -1571,6 +1699,9 @@ fn main() {
         reload_restarts_only_changed_servers,
         reload_restarts_a_server_after_a_secret_or_env_file_change,
         reload_retries_a_server_that_needed_a_login,
+        a_401_mid_session_moves_the_server_to_needs_login,
+        a_non_auth_call_error_keeps_the_server_ready,
+        a_server_that_401s_only_calls_does_not_loop,
         runtime_reload_adds_and_removes_servers_for_a_live_session,
     ];
     let rt = tokio::runtime::Builder::new_multi_thread()

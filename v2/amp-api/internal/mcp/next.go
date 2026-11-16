@@ -20,9 +20,12 @@ import (
 // are short, imperative, and worded for the caller the tool implies.
 
 // dispatchNext is the dispatch result's next: it names the ticket, the
-// agent, the token, and what happens if nobody claims it.
+// agent, the token, and what happens if nobody claims it. It says outright
+// that AMP runs no agents: a model reading "dispatched to <agent>" otherwise
+// takes the agent for a worker AMP started, and ends its turn.
 func dispatchNext(t *domain.Task, agentID string, returnAt *time.Time, returnMinutes int) string {
-	next := fmt.Sprintf("Ticket #%d is dispatched to %s but no worker has started it yet. Start the worker now, in this same turn, "+
+	next := fmt.Sprintf("Ticket #%d is dispatched to %s but no worker has started it yet. AMP runs no agents: nothing works on it "+
+		"until you launch one. Start the worker now, in this same turn, "+
 		"with worker_prompt as its prompt (the launch tool of your harness: Agent/Task in Claude Code, the task tool in opencode, "+
 		"amp_run_ticket in the AMP harness). It stays \"not started\" until the worker calls amp_claim_task(task_id=%d, dispatch_id=%q).",
 		t.ID, nameOr(agentID, "an agent"), t.ID, t.DispatchID)
@@ -36,10 +39,12 @@ func dispatchNext(t *domain.Task, agentID string, returnAt *time.Time, returnMin
 
 // workerPrompt is a ready-to-use prompt for the worker subagent: everything
 // it needs to claim the ticket and work it, without the manager retyping it.
+// The protocol is spelled out in full, so the amp-execution skill only helps
+// when the worker has it (it ships with the AMP plugin, not with the server).
 func workerPrompt(t *domain.Task, agentID string) string {
 	return fmt.Sprintf("Execute approved ticket #%d in project %d (dispatched to %s).\n\n"+
-		"First call amp_claim_task(task_id=%d, dispatch_id=%q) to start it, then follow the amp-execution "+
-		"protocol: read the ticket with amp_get_task(task_id=%d, include=[\"comments\",\"history\",\"runs\"]), "+
+		"First call amp_claim_task(task_id=%d, dispatch_id=%q) to start it, then work it (with the amp-execution "+
+		"skill, if you have it): read the ticket with amp_get_task(task_id=%d, include=[\"comments\",\"history\",\"runs\"]), "+
 		"post your starting comment, do the work, and finish the ticket yourself with "+
 		"amp_complete_task(task_id=%d, dispatch_id=%q, model=…, tokens…, branch=…, commit=…, pr_url=…) when every "+
 		"acceptance criterion is met, or amp_block_task(task_id=%d, dispatch_id=%q, reason=<your question>) if you need a person. "+

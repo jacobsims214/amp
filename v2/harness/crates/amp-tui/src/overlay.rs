@@ -693,6 +693,8 @@ pub enum Target {
     Item(String),
     /// A saved session in `/sessions`: Enter asks to resume that file (never resumes by itself).
     Session(PathBuf),
+    /// A chat command Enter runs, closing the panel (#4251: `/amp`'s `/mcp login amp` row).
+    Command(String),
 }
 
 /// One piece of a row.
@@ -1295,6 +1297,21 @@ fn amp_rows(data: &ChromeData) -> Vec<Row> {
     let c = colors();
     let m = &data.meta;
     let mut rows = Vec::new();
+    // #4251: an expired login is fixed from here: the first row (selected when the panel opens)
+    // runs `/mcp login amp`. A static token can't be renewed that way (it says so further down).
+    if m.health.connection == Connection::AuthRequired && !crate::chrome::uses_static_token(m) {
+        rows.push(
+            Row::new(vec![
+                label("login   "),
+                fixed(c.warning.fg(&format!("Enter runs {}", crate::chrome::AMP_LOGIN_COMMAND))),
+                flex(
+                    " · logs in to AMP in your browser; the header and the agent's AMP tools reconnect right after",
+                    c.muted,
+                ),
+            ])
+            .target(Target::Command(crate::chrome::AMP_LOGIN_COMMAND.to_owned())),
+        );
+    }
     match &m.instance {
         Some(inst) => {
             let host = link(&inst.web_base, &c.text.fg(&clean(inst.host())));
@@ -1369,10 +1386,9 @@ fn amp_rows(data: &ChromeData) -> Vec<Row> {
     ]));
     rows.push(project_line(m));
     match &m.health.connection {
-        Connection::AuthRequired => rows.push(Row::new(vec![flex(
-            "re-login needed: run `amp-harness login` in another terminal; the header and the agent's AMP tools reconnect within 15 s (with AMP_TOKEN, set a new one and restart the chat)",
-            c.warning,
-        )])),
+        Connection::AuthRequired => {
+            rows.push(Row::new(vec![flex(&relogin_text(m), c.warning)]).wrap());
+        }
         Connection::Down { .. } => rows.push(Row::new(vec![flex(
             "disconnected: the poller reconnects every 15 s",
             c.warning,
@@ -1380,6 +1396,23 @@ fn amp_rows(data: &ChromeData) -> Vec<Row> {
         _ => {}
     }
     rows
+}
+
+/// What `/amp` says about a rejected login (#4251): type or select `/mcp login amp`, or, with a
+/// static token, set a new one and restart (the command refuses a token). Before the first
+/// connection the two can't be told apart, so it names both.
+fn relogin_text(m: &AmpMeta) -> String {
+    let cmd = crate::chrome::AMP_LOGIN_COMMAND;
+    match &m.instance {
+        Some(inst) if crate::chrome::uses_static_token(m) => format!(
+            "re-login needed: AMP rejected the {}; set a new token and restart the chat ({cmd} can't renew a token)",
+            inst.auth
+        ),
+        Some(_) => format!("re-login needed: run {cmd} here (Enter on the login row above)"),
+        None => format!(
+            "re-login needed: run {cmd} here (Enter on the login row above); with AMP_TOKEN set, set a new token and restart the chat instead"
+        ),
+    }
 }
 
 fn project_line(m: &AmpMeta) -> Row {
@@ -2516,7 +2549,7 @@ pub fn target_url(meta: &AmpMeta, target: &Target) -> Option<String> {
             Some(inst.ticket_url(meta.project_id?, *id))
         }
         Target::Page(url) => Some(url.clone()),
-        Target::Model(_) | Target::Item(_) | Target::Session(_) => None,
+        Target::Model(_) | Target::Item(_) | Target::Session(_) | Target::Command(_) => None,
     }
 }
 
@@ -2579,6 +2612,79 @@ mod tests {
         let line = chrome::plain(&fit_pieces(&pieces, 24));
         assert!(line.starts_with("#2108 a long"), "{line}");
         assert!(line.ends_with("… tail") || line.ends_with("tail"), "{line}");
+    }
+
+    fn relogin_meta(auth: Option<&str>) -> ChromeData {
+        let mut m = AmpMeta::default();
+        m.health.connection = Connection::AuthRequired;
+        m.instance = auth.map(|auth| Instance {
+            mcp_url: "https://amp.example.com/mcp".into(),
+            web_base: "https://amp.example.com".into(),
+            protocol: "2026-07-28".into(),
+            server_name: None,
+            server_version: None,
+            auth: auth.into(),
+        });
+        ChromeData::new(m)
+    }
+
+    fn rows_text(rows: &[Row]) -> String {
+        rows.iter()
+            .map(|r| chrome::plain(&fit_pieces(&r.pieces, 400)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// #4251: an expired login offers `/mcp login amp` in `/amp` (its first row, selected when
+    /// the panel opens, runs it) and the header; nothing sends the person to another terminal.
+    #[test]
+    fn auth_required_offers_mcp_login_amp() {
+        for auth in [None, Some("oauth (stored login)")] {
+            let data = relogin_meta(auth);
+            let rows = amp_rows(&data);
+            let first = rows.iter().find_map(|r| r.target.clone());
+            assert_eq!(
+                first,
+                Some(Target::Command("/mcp login amp".into())),
+                "{auth:?}"
+            );
+            let text = rows_text(&rows);
+            assert!(text.contains("Enter runs /mcp login amp"), "{text}");
+            assert!(!text.contains("another terminal"), "{text}");
+            assert!(!text.contains("amp-harness login"), "{text}");
+            // Before the first connection a rejected AMP_TOKEN looks the same: both are named.
+            assert_eq!(text.contains("AMP_TOKEN"), auth.is_none(), "{text}");
+            let header = chrome::render_header(&data, &palette(), 120).join("\n");
+            let header = chrome::plain(&header);
+            assert!(
+                header.contains("re-login needed · /mcp login amp"),
+                "{header}"
+            );
+            assert_eq!(target_url(&data.meta, first.as_ref().unwrap()), None);
+        }
+    }
+
+    /// #4251: with a static token the command can't help (#4250 refuses it), so neither `/amp`
+    /// nor the header offers it; `/amp` says to set a new token and restart.
+    #[test]
+    fn auth_required_with_a_static_token_says_set_a_new_one() {
+        let data = relogin_meta(Some("static token (env AMP_TOKEN)"));
+        let rows = amp_rows(&data);
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r.target, Some(Target::Command(_)))),
+        );
+        let text = rows_text(&rows);
+        assert!(
+            text.contains("AMP rejected the static token (env AMP_TOKEN); set a new token and restart the chat"),
+            "{text}"
+        );
+        assert!(!text.contains("another terminal"), "{text}");
+        let header = chrome::render_header(&data, &palette(), 120).join("\n");
+        let header = chrome::plain(&header);
+        assert!(header.contains("re-login needed"), "{header}");
+        assert!(!header.contains("/mcp login amp"), "{header}");
     }
 
     /// A `/config`-shaped panel and an `/mcp` details-shaped one (#2351).

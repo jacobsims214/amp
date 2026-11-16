@@ -1154,6 +1154,8 @@ enum Command {
     SetTicket(Option<i64>),
     SetWorkers(Vec<i64>),
     Call(Call),
+    /// Reconnect through the connector now (`/mcp login amp`, #4250).
+    Reconnect,
 }
 
 /// A tool call asked for by the TUI (a slash command), run on the poller's connection.
@@ -1250,6 +1252,15 @@ impl MetaHandle {
         }
     }
 
+    /// Reconnects the poller's own client through its connector now, ignoring the reconnect
+    /// interval: after a fresh login (`/mcp login amp`, #4250), so "re-login needed" clears at
+    /// once instead of at the next attempt. A failed attempt changes nothing the snapshot says;
+    /// without a connector it does nothing. A [`Self::stub`] handle records it in
+    /// [`Self::stub_calls`] as `("reconnect", null)`.
+    pub fn reconnect(&self) {
+        let _ = self.0.commands.send(Command::Reconnect);
+    }
+
     /// Calls an AMP tool on the poller's own connection (a slash command's read or write; never
     /// the model's). `timeout` bounds the call itself; the whole wait, including a refresh the
     /// poller may be in the middle of, is bounded by `timeout` + [`CALL_QUEUE_GRACE`]. When a
@@ -1308,6 +1319,11 @@ impl MetaHandle {
                     }),
                     Command::SetTicket(id) => bump(&|m| m.ticket_id = id),
                     Command::SetWorkers(ids) => bump(&|m| m.worker_ids = ids.clone()),
+                    Command::Reconnect => {
+                        if let Ok(mut log) = recorded.lock() {
+                            log.push(("reconnect".to_owned(), Value::Null));
+                        }
+                    }
                     Command::Call(c) => {
                         if let Ok(mut log) = recorded.lock() {
                             log.push((c.tool.clone(), c.args.clone()));
@@ -1435,6 +1451,9 @@ pub struct MetaPoller {
     /// The last call on the client failed with 401/403 and none has been answered since; cleared
     /// by an answered call or a new client (#2156).
     auth_required: bool,
+    /// [`MetaHandle::reconnect`] asked for a reconnect: the next [`Self::ensure_client`] runs the
+    /// connector at once, whatever `next_reconnect` says.
+    reconnect_now: bool,
     /// Slash-command calls waiting to run ([`MetaHandle::call`]).
     calls: Vec<Call>,
     /// Commands other than calls that arrived during a refresh; applied after it, so a project
@@ -1511,6 +1530,7 @@ impl MetaPoller {
             tree: None,
             next_reconnect: None,
             auth_required: false,
+            reconnect_now: false,
             calls: Vec::new(),
             held: Vec::new(),
             failed: false,
@@ -1570,6 +1590,9 @@ impl MetaPoller {
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
                 }
             }
+            if self.reconnect_now && self.connector.is_some() {
+                continue;
+            }
             let now = Instant::now();
             let wake = if self.client.is_none() {
                 // Nothing to poll until a connect succeeds; pending items wait for it.
@@ -1605,6 +1628,10 @@ impl MetaPoller {
     fn apply(&mut self, cmd: Command) -> Topics {
         match cmd {
             Command::Refresh(t) => t,
+            Command::Reconnect => {
+                self.reconnect_now = true;
+                Topics::NONE
+            }
             Command::Call(call) => {
                 self.calls.push(call);
                 Topics::NONE
@@ -1672,13 +1699,18 @@ impl MetaPoller {
     /// when it is time to: when there is no client, when it is closed, or when it needs a
     /// re-login ([`Self::auth_wait`]). Returns true when a new client was connected (refetch
     /// everything).
+    /// [`MetaHandle::reconnect`] forces an attempt now, even on an open client.
     async fn ensure_client(&mut self) -> bool {
+        let forced = std::mem::take(&mut self.reconnect_now);
         let closed = self.client.as_ref().is_none_or(|c| c.is_closed());
         let auth_wait = self.auth_wait();
-        if !closed && !auth_wait {
+        if !closed && !auth_wait && !forced {
             return false;
         }
-        if !auth_wait && let Some(client) = &self.client {
+        if closed
+            && !auth_wait
+            && let Some(client) = &self.client
+        {
             let reason = match client.health() {
                 Health::Disconnected { reason } => reason,
                 _ => "connection closed".to_owned(),
@@ -1689,7 +1721,7 @@ impl MetaPoller {
             return false;
         };
         let now = Instant::now();
-        if self.next_reconnect.is_some_and(|at| now < at) {
+        if !forced && self.next_reconnect.is_some_and(|at| now < at) {
             return false;
         }
         self.next_reconnect = Some(now + self.iv.reconnect);
@@ -1707,7 +1739,8 @@ impl MetaPoller {
             }
             // The open client stays (slash commands may still use it) and so does its
             // AuthRequired: a failed attempt, for whatever reason, does not change what it says.
-            Err(_) if auth_wait => false,
+            // A forced attempt on an open, working client likewise leaves it as it was.
+            Err(_) if auth_wait || (forced && !closed) => false,
             Err(e) => {
                 let connection = if e.is_auth_required() {
                     Connection::AuthRequired

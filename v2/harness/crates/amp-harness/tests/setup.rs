@@ -50,6 +50,8 @@ impl<'a> Run<'a> {
         cmd.args(self.args)
             .current_dir(self.cwd.unwrap_or_else(|| self.dir.join("project")))
             .env("XDG_CONFIG_HOME", self.dir.join("home/.config"))
+            // Even with the real HOME (keychain cases), state, cache and data stay in the temp dir.
+            .envs(common::xdg_env(&self.dir.join("home")))
             .env("AMP_CREDENTIAL_STORE", "file")
             .env("AMP_HARNESS_CEILING_DIR", self.dir)
             // The compose UI may be running on this machine; never let the web probe find it.

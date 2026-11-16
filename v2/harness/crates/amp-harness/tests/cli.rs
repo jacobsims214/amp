@@ -430,6 +430,7 @@ async fn doctor_json_is_pinned() {
             ("fallback", "ok"),
             ("key:openrouter", "ok"),
             ("models:openrouter", "skip"),
+            ("compaction", "ok"),
             // #2246: MCP servers (none here), skills, agents and the rest of `config check`.
             ("mcp", "skip"),
             ("skills", "ok"),
@@ -460,6 +461,20 @@ async fn doctor_json_is_pinned() {
     let skills = obj.remove("skills").unwrap();
     assert!(skills["count"].as_u64().unwrap() > 0, "{skills}");
     assert_eq!(skills["custom"], json!([]));
+    // #4227: the shipped defaults: rpi's settings, the manager's window, W2 notes only.
+    let compaction = obj.remove("compaction").unwrap();
+    assert_eq!(compaction["enabled_source"], "default", "{compaction}");
+    assert_eq!(compaction["reserve_tokens"], 16384, "{compaction}");
+    assert_eq!(compaction["keep_recent_tokens"], 20000, "{compaction}");
+    assert_eq!(compaction["chat"]["role"], "amp-manager", "{compaction}");
+    assert!(
+        compaction["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| w["doctor_only"] == true),
+        "{compaction}"
+    );
     assert_eq!(
         v,
         json!({
@@ -710,6 +725,7 @@ async fn doctor_fails_cleanly_when_nothing_answers() {
             ("fallback", "ok"),
             ("key:openrouter", "fail"),
             ("models:openrouter", "skip"),
+            ("compaction", "ok"),
             // #2246: and the configuration checks.
             ("mcp", "skip"),
             ("skills", "ok"),

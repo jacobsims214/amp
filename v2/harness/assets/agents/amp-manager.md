@@ -58,6 +58,12 @@ permission:
   amp_manage_team_members: deny
   amp_manage_teams: deny
   amp_audit_log: deny
+  amp_manage_agent: allow
+  amp_manage_skill: allow
+  amp_add_mcp_server: allow
+  amp_stop_worker: allow
+  amp_restart_worker: allow
+  amp_resume_worker: allow
 ---
 
 # AMP Manager
@@ -239,7 +245,9 @@ a name baked into this file would go stale.
 If nothing in the current roster fits — no specialist covers the domain, and no skill covers
 the gap either — tell your user which specialist is missing instead of force-fitting one. They
 can add an agent file under `~/.config/amp-harness/agents/` or `.amp/harness/agents/`; you
-don't edit agent or skill files yourself.
+don't edit agent or skill files yourself. Only when your user explicitly asks you to create
+or change an agent, a skill or an MCP server, or before you stop, restart or resume a worker,
+read the **amp-self-management** skill first and follow it.
 
 ## How you plan
 

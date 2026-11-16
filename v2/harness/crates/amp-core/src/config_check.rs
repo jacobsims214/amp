@@ -178,6 +178,7 @@ pub const USER_TABLES: &[&str] = &[
     "providers",
     "roles",
     "profiles",
+    "compaction",
     "workers",
     "manager",
     "tools",
@@ -782,6 +783,21 @@ mod tests {
 
     fn find<'a>(r: &'a CheckReport, area: &str) -> Vec<&'a Problem> {
         r.problems.iter().filter(|p| p.area == area).collect()
+    }
+
+    /// #4221: `[compaction]` is a table the harness reads; a typo next to it is still reported.
+    #[test]
+    fn compaction_is_a_known_user_table() {
+        let d = dir("compaction");
+        let r = run(
+            &d,
+            Some("[compaction]\nreserve_tokens = 20000\n[compactoin]\nenabled = false\n"),
+            None,
+        );
+        let files = find(&r, "files");
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert!(files[0].message.contains("`compactoin`"), "{:?}", files[0]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

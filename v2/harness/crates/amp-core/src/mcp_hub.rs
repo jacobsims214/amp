@@ -2460,7 +2460,16 @@ impl AgentTool for ExternalTool {
             r = call => r,
         };
         drop(client);
-        let result = result.map_err(|e| AgentError::Tool(format!("{}: {e}", self.schema.name)))?;
+        let result = result.map_err(|e| {
+            // A 401 on a call to a connected server (the login expired or was revoked): wake the
+            // cell so it reconnects and the connect path classifies it again — `NeedsLogin` if the
+            // login is dead, `Ready` if rmcp could refresh it. `notify_one` keeps at most one
+            // permit, so a server that 401s every call reconnects at most once per failed call.
+            if e.is_auth_required() {
+                self.cell.wake.notify_one();
+            }
+            AgentError::Tool(format!("{}: {e}", self.schema.name))
+        })?;
         let text = cap_output(
             &model_text(&result),
             self.max_output_tokens,

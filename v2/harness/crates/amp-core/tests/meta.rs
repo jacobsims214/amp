@@ -858,6 +858,97 @@ async fn re_login_needed_heals_by_reconnecting_through_the_connector() {
     assert_eq!(meta.snapshot().health.connection, Connection::Ok);
 }
 
+/// #4250: after `/mcp login amp`, [`MetaHandle::reconnect`] reconnects at once, bypassing the
+/// reconnect interval (`next_reconnect`), so "re-login needed" clears without waiting for the
+/// next automatic attempt. The interval here is a minute: only the forced attempt can heal it.
+#[tokio::test(flavor = "multi_thread")]
+async fn reconnect_now_bypasses_the_reconnect_interval() {
+    let old = serve(Mock::new(default_board())).await;
+    let new = serve(Mock::new(default_board())).await;
+    let logged_in = Arc::new(AtomicBool::new(false));
+    let attempts = Arc::new(AtomicU64::new(0));
+    let connector: Connector = {
+        let (old_url, new_url) = (old.url.clone(), new.url.clone());
+        let (logged_in, attempts) = (logged_in.clone(), attempts.clone());
+        Arc::new(move || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let url = if logged_in.load(Ordering::SeqCst) {
+                new_url.clone()
+            } else {
+                old_url.clone()
+            };
+            Box::pin(async move {
+                AmpMcpClient::connect(
+                    ClientOptions::new(url).with_connect_timeout(Duration::from_secs(2)),
+                )
+                .await
+            })
+        })
+    };
+    let mut iv = fast(50);
+    iv.idle_ping = Duration::from_millis(50);
+    iv.reconnect = Duration::from_secs(60);
+    let meta = MetaPoller::spawn(
+        Some(client(&old.url).await),
+        MetaOptions {
+            project_marker: None,
+            project_id: Some(2),
+            ticket_id: Some(2107),
+            intervals: iv,
+            connector: Some(connector),
+            web_url: None,
+        },
+    );
+    wait_for(&meta, "loaded from the old login", loaded).await;
+
+    old.mock.unauthorized.store(true, Ordering::SeqCst);
+    wait_for(&meta, "re-login needed", |m| {
+        m.health.connection == Connection::AuthRequired
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while attempts.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no first reconnect attempt"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The first attempt failed (old login); the next automatic one is a minute away.
+    logged_in.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "rate-limited");
+    assert_eq!(meta.snapshot().health.connection, Connection::AuthRequired);
+
+    // `/mcp login amp` succeeded: reconnect now.
+    meta.reconnect();
+    let m = wait_for(&meta, "reconnected at once", |m| {
+        m.health.connection == Connection::Ok && m.user.error.is_none()
+    })
+    .await;
+    assert!(m.board.get().is_some() || m.user.get().is_some());
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "one forced attempt");
+    wait_calls(&new.mock, "refetched on the new client", |m| {
+        m.count("amp_whoami") >= 1
+    })
+    .await;
+
+    // A forced attempt that fails leaves a working client as it was.
+    logged_in.store(false, Ordering::SeqCst);
+    meta.reconnect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while attempts.load(Ordering::SeqCst) < 3 {
+        assert!(tokio::time::Instant::now() < deadline, "no forced attempt");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let calls = new.mock.total();
+    wait_calls(&new.mock, "still polling the working client", |m| {
+        m.total() > calls
+    })
+    .await;
+    assert_eq!(meta.snapshot().health.connection, Connection::Ok);
+}
+
 /// #2159: the session's own client (the model's amp_* tools, run reporting, the supervisor all
 /// share it) heals after `amp-harness login` the same way the poller does: the next tool call
 /// after the login reconnects through its reconnector and runs on the new connection.

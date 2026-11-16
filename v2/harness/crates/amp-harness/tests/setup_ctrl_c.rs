@@ -89,7 +89,7 @@ impl Pty {
             .current_dir(dir.join("project"))
             .env("HOME", dir.join("home"))
             .env("XDG_CONFIG_HOME", dir.join("home/.config"))
-            .env("XDG_STATE_HOME", dir.join("home/.local/state"))
+            .envs(common::xdg_env(&dir.join("home")))
             .env("AMP_CREDENTIAL_STORE", "file")
             .env("AMP_HARNESS_CEILING_DIR", dir)
             .env("AMP_WEB_URL", "http://ui.invalid")

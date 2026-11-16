@@ -21,9 +21,11 @@
 //! `ask` is treated as `deny`. The harness has no prompt path: a worker that waits for a human
 //! hangs, which was the "hung worker on a permission prompt" failure from the wargames.
 //!
-//! Children (subagent roles) are always denied two things, whatever their frontmatter says:
+//! Children (subagent roles) are always denied three things, whatever their frontmatter says:
 //! - the `question` tool, because nobody is there to answer;
-//! - the dispatch tool [`DISPATCH_TOOL`], so they can't recurse.
+//! - the dispatch tool [`DISPATCH_TOOL`], so they can't recurse;
+//! - the manager's worker-control tools [`WORKER_CONTROL_TOOLS`] (`amp_stop_worker`, #4233;
+//!   `amp_restart_worker`, `amp_resume_worker`, #4240).
 //!
 //! # Mapping tools to permissions
 //!
@@ -109,6 +111,21 @@ pub const MCP_PERMISSION: &str = "mcp";
 pub const DISPATCH_TOOL: &str = "amp_run_ticket";
 /// The interactive question tool. Children never get it.
 pub const QUESTION_TOOL: &str = "question";
+/// The manager's stop for one of its own workers (#4233). Children never get it.
+pub const STOP_WORKER_TOOL: &str = "amp_stop_worker";
+/// The manager's restart of one of its workers in a fresh session (#4240). Children never get it.
+pub const RESTART_WORKER_TOOL: &str = "amp_restart_worker";
+/// The manager's resume of one of its workers' last session (#4240). Children never get it.
+pub const RESUME_WORKER_TOOL: &str = "amp_resume_worker";
+/// The manager's worker-control tools (`amp-core::worker_control`): children never get any of
+/// them ([`DenialReason::ChildWorkerControl`]).
+pub const WORKER_CONTROL_TOOLS: &[&str] =
+    &[STOP_WORKER_TOOL, RESTART_WORKER_TOOL, RESUME_WORKER_TOOL];
+
+/// Whether `tool` is one of the manager's [`WORKER_CONTROL_TOOLS`].
+pub fn is_worker_control(tool: &str) -> bool {
+    WORKER_CONTROL_TOOLS.contains(&tool)
+}
 /// No role approves a plan (#2171, epic 162): a person does, in the AMP web UI (the server refuses
 /// it too). The tool stays in the list so a call shows its denial instead of "no such tool".
 pub const APPROVE_PLAN_TOOL: &str = "amp_approve_plan";
@@ -733,6 +750,8 @@ pub enum DenialReason {
     ChildQuestion,
     /// Children never get the dispatch tool.
     ChildDispatch,
+    /// Children never stop, restart or resume workers ([`WORKER_CONTROL_TOOLS`], #4233).
+    ChildWorkerControl,
     /// No role approves a plan or changes the person-only project settings ([`person_only`]).
     PersonOnly,
     /// Command substitution under a restricted bash policy.
@@ -764,6 +783,13 @@ impl fmt::Display for Denial {
             DenialReason::ChildDispatch => write!(
                 f,
                 "{who}: workers cannot dispatch other agents (`{}`). Only the manager does.",
+                self.tool
+            ),
+            DenialReason::ChildWorkerControl => write!(
+                f,
+                "{who}: workers cannot stop, restart or resume workers (`{}`). Only the \
+                 manager does. If your own work should stop, say so in a comment on your \
+                 ticket and call amp_block_task.",
                 self.tool
             ),
             DenialReason::PersonOnly => write!(
@@ -950,7 +976,8 @@ impl ToolPolicy {
     /// denials and for tools whose permission denies every subject (e.g. the manager's `edit`).
     /// The hook still checks every call; this only keeps dead tools out of the prompt.
     pub fn exposes(&self, tool: &str) -> bool {
-        if self.child && (tool == QUESTION_TOOL || tool == DISPATCH_TOOL) {
+        if self.child && (tool == QUESTION_TOOL || tool == DISPATCH_TOOL || is_worker_control(tool))
+        {
             return false;
         }
         if let Some(subject) = self.mcp_subject(tool) {
@@ -990,6 +1017,13 @@ impl ToolPolicy {
         if self.child && tool == DISPATCH_TOOL {
             let agent = str_arg(args, &["agent_id"]).unwrap_or("*").to_string();
             return Err(deny(agent, DenialReason::ChildDispatch));
+        }
+        if self.child && is_worker_control(tool) {
+            let task = args.get("task_id").filter(|v| !v.is_null()).map_or_else(
+                || "*".to_owned(),
+                |v| v.to_string().trim_matches('"').to_owned(),
+            );
+            return Err(deny(task, DenialReason::ChildWorkerControl));
         }
         if person_only(tool, args) {
             let subject = if tool == APPROVE_PLAN_TOOL {
@@ -1672,6 +1706,22 @@ mod tests {
         // An unrestricted policy runs whatever bash would.
         let tp = ToolPolicy::new("amp-x", true, Policy::default(), "/repo/wt");
         assert!(tp.check("bash", &json!({"command": "ls $'x'"})).is_ok());
+    }
+
+    #[test]
+    fn restart_and_resume_are_the_managers_only() {
+        for tool in [RESTART_WORKER_TOOL, RESUME_WORKER_TOOL] {
+            assert!(is_worker_control(tool), "{tool}");
+            let args = json!({"task_id": 9, "reason": "stuck", "mode": "continue"});
+            let child = ToolPolicy::new("amp-worker-backend", true, Policy::default(), "/repo/wt");
+            assert!(!child.exposes(tool), "{tool}");
+            let d = child.check(tool, &args).unwrap_err();
+            assert_eq!(d.reason, DenialReason::ChildWorkerControl, "{tool}");
+            assert_eq!(d.subject, "9", "{tool}");
+            let manager = ToolPolicy::new("amp-manager", false, Policy::default(), "/repo/wt");
+            assert!(manager.exposes(tool), "{tool}");
+            assert!(manager.check(tool, &args).is_ok(), "{tool}");
+        }
     }
 
     #[test]

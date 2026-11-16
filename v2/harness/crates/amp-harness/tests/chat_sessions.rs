@@ -2044,6 +2044,778 @@ async fn remote_control_on_refuses_a_switch_with_nothing_queued() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Compaction end to end (AMP #4229)
+//
+// The chat on a real session file, with a small window so rpi compacts on its own. Spec:
+// KB specs/harness-auto-compaction-policy.md (T-A1, T-A2, T-K4, T-K7) and
+// specs/harness-compact-command.md (D1-D3, E3/E4). The harness is built here, not through
+// `agent.rs`: the config -> options flow is #4225's to prove. The faux model answers rpi's
+// summary calls and the chat's turns from separate queues and records every request, so a test
+// reads what the model was actually sent.
+
+/// rpi compacts once the estimate passes 30 000 - 16 384 (default reserve) = 13 616.
+const SMALL_WINDOW: u64 = 30_000;
+
+/// A small `keep_recent_tokens`, so the earlier turns are what gets summarized (with the
+/// default 20 000 a 30 000 window keeps almost everything, see #4263's note on the spec).
+fn small_keep() -> rpi_harness::types::CompactionSettings {
+    rpi_harness::types::CompactionSettings {
+        keep_recent_tokens: 2_000,
+        ..rpi_harness::types::CompactionSettings::default()
+    }
+}
+
+/// A faux model that answers summary calls from one queue and the chat's turns from another,
+/// whatever order rpi calls them in, and records each request's messages.
+#[derive(Default)]
+struct Router {
+    /// Summary texts, in order. Empty: `SUMMARY`.
+    summaries: std::collections::VecDeque<String>,
+    turns: std::collections::VecDeque<rpi_ai::providers::faux::FauxStep>,
+    /// Every model call in order: `"summary"` or `"turn"`, and the messages it was sent.
+    calls: Vec<(&'static str, Value)>,
+}
+
+impl Router {
+    fn of(&self, kind: &str) -> Vec<&Value> {
+        self.calls
+            .iter()
+            .filter(|(k, _)| *k == kind)
+            .map(|(_, v)| v)
+            .collect()
+    }
+
+    /// The kinds of every call so far, in order (`turn`, `summary`, ...).
+    fn order(&self) -> Vec<&'static str> {
+        self.calls.iter().map(|(k, _)| *k).collect()
+    }
+}
+
+fn routed(router: &Arc<std::sync::Mutex<Router>>) -> Vec<rpi_ai::providers::faux::FauxStep> {
+    use rpi_ai::{
+        providers::faux::{FauxStep, faux_assistant_message},
+        types::{Context, StopReason},
+    };
+    (0..40)
+        .map(|_| {
+            let router = Arc::clone(router);
+            FauxStep::factory(move |ctx: &Context| {
+                let mut r = router.lock().unwrap();
+                let summary = ctx
+                    .system_prompt
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("You are a context summarization"));
+                let messages = serde_json::to_value(&ctx.messages).expect("messages serialize");
+                if summary {
+                    r.calls.push(("summary", messages));
+                    let text = r.summaries.pop_front().unwrap_or_else(|| "SUMMARY".into());
+                    return faux_assistant_message(text, StopReason::Stop);
+                }
+                r.calls.push(("turn", messages));
+                match r.turns.pop_front() {
+                    Some(FauxStep::Message(m)) => m,
+                    Some(FauxStep::Factory(f)) => f(ctx),
+                    None => {
+                        let mut m = faux_assistant_message("", StopReason::Error);
+                        m.error_message = Some("no more scripted turns".into());
+                        m
+                    }
+                }
+            })
+        })
+        .collect()
+}
+
+/// The chat shell on a harness that writes a real session file in `w`'s session directory.
+struct Compacting {
+    shell: amp_tui::Shell,
+    events: tokio::sync::mpsc::UnboundedReceiver<rpi_agent::AgentEvent>,
+    done: tokio::sync::mpsc::UnboundedReceiver<amp_tui::RunDone>,
+    harness: Arc<rpi_harness::agent_harness::AgentHarness>,
+    path: PathBuf,
+}
+
+const WAIT: Duration = Duration::from_secs(30);
+
+impl Compacting {
+    /// `tokens_per_second`: stream every reply that slowly (the footer test watches a run).
+    async fn new(
+        w: &World,
+        router: &Arc<std::sync::Mutex<Router>>,
+        tokens_per_second: Option<f64>,
+    ) -> Self {
+        use rpi_ai::providers::faux::{FauxProvider, FauxScript};
+        let mut script = FauxScript::new();
+        if let Some(tps) = tokens_per_second {
+            script = script.with_tokens_per_second(tps);
+        }
+        script.set_responses(routed(router));
+        let provider = FauxProvider::new(script);
+        let mut model = provider.default_model().clone();
+        model.context_window = SMALL_WINDOW;
+        let opened = session_store::create(&w.sessions(), &w.repo, "amp-manager")
+            .await
+            .expect("a new session file");
+        let (emitter, events) = amp_core::events::ChannelEmitter::new();
+        let harness = Arc::new(
+            rpi_harness::agent_harness::AgentHarness::create(AgentHarnessOptions {
+                model: model.clone(),
+                session: opened.session,
+                models: vec![provider],
+                agent_emitter: Some(emitter.into_emitter()),
+                compaction: small_keep(),
+                ..Default::default()
+            })
+            .await
+            .expect("harness"),
+        );
+        let info = amp_tui::ShellInfo {
+            role: "amp-manager".into(),
+            provider: model.provider.to_string(),
+            model_id: model.id.clone(),
+            thinking: rpi_ai::ThinkingLevel::Off,
+            requested_thinking: None,
+            context_window: SMALL_WINDOW,
+            cwd: w.repo.to_string_lossy().into_owned(),
+            git_branch: None,
+            session_file: Some(opened.path.to_string_lossy().into_owned()),
+            banner: vec!["AMP harness · manager".into()],
+        };
+        let (shell, done) = amp_tui::Shell::new(Arc::clone(&harness), info, Vec::new());
+        Self {
+            shell,
+            events,
+            done,
+            harness,
+            path: opened.path,
+        }
+    }
+
+    /// A prompt or a slash command, run to the end (a `/compact` included).
+    async fn say(&mut self, text: &str) {
+        assert_eq!(self.shell.submit(text).await, amp_tui::Submit::Continue);
+        self.shell
+            .drive_until_idle(&mut self.events, &mut self.done, WAIT)
+            .await
+            .expect("idle");
+        self.shell.settle(WAIT).await.expect("settled");
+        // An automatic compaction's entry is looked up off the event loop, not counted in
+        // `settle` (#4226): give it its bounded ~0.5 s.
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.shell.poll();
+        }
+    }
+
+    fn screen(&self) -> String {
+        self.shell.view().render_plain(W, 44).join("\n")
+    }
+
+    /// The compaction entries on the branch, oldest first, each with the reason rpi recorded on
+    /// its `step_attempt` record.
+    async fn compactions(
+        &self,
+    ) -> Vec<(
+        rpi_harness::session::types::CompactionEntry,
+        Option<rpi_harness::session::types::CompactionReason>,
+    )> {
+        use rpi_harness::session::types::{
+            BranchBounds, Entry, EntryOrder, EntryQuery, LaneRecord, RecordQuery,
+        };
+        let reasons: std::collections::HashMap<String, _> = self
+            .harness
+            .session()
+            .find_records(&RecordQuery {
+                record_type: Some("step_attempt"),
+                ..Default::default()
+            })
+            .await
+            .expect("records")
+            .into_iter()
+            .filter_map(|r| match r {
+                LaneRecord::StepAttempt(a) => Some((a.result_entry_id, a.compaction_reason)),
+                _ => None,
+            })
+            .collect();
+        self.harness
+            .find_entries_on_branch(
+                &EntryQuery {
+                    entry_type: Some("compaction"),
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+            .expect("branch")
+            .into_iter()
+            .filter_map(|e| match e {
+                Entry::Compaction(c) => {
+                    let reason = reasons.get(&c.base.id).copied().flatten();
+                    Some((c, reason))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Closes the chat and waits for its file to be released, as quitting does.
+    async fn close(self) -> PathBuf {
+        let path = self.path.clone();
+        drop(self);
+        assert!(
+            wait_free(&path).await,
+            "the chat released {}",
+            path.display()
+        );
+        path
+    }
+}
+
+/// Every `toolResult` in `messages` (a request's messages, as JSON) answers a tool call made by
+/// an assistant message before it in the same list (spec K2).
+fn assert_paired(messages: &Value, what: &str) {
+    let mut calls = std::collections::HashSet::new();
+    let mut results = 0;
+    for m in messages.as_array().expect("a message list") {
+        match m["role"].as_str() {
+            Some("assistant") => {
+                for b in m["content"].as_array().into_iter().flatten() {
+                    if b["type"] == "toolCall" {
+                        calls.insert(b["id"].as_str().expect("a call id").to_owned());
+                    }
+                }
+            }
+            Some("toolResult") => {
+                results += 1;
+                let id = m["toolCallId"].as_str().expect("a result's call id");
+                assert!(
+                    calls.contains(id),
+                    "{what}: the result for {id} has no tool call before it:\n{messages:#}"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        results > 0,
+        "{what}: no tool result to check:\n{messages:#}"
+    );
+}
+
+/// The `type` of each line of a session file, with the line.
+fn file_entries(path: &Path) -> Vec<(String, String)> {
+    std::fs::read_to_string(path)
+        .expect("the session file")
+        .lines()
+        .map(|l| {
+            let v: Value = serde_json::from_str(l).expect("a JSON line");
+            (
+                v["type"].as_str().unwrap_or_default().to_owned(),
+                l.to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// The index of the first `message` line of `entries` that contains `needle`.
+fn message_line(entries: &[(String, String)], needle: &str) -> usize {
+    entries
+        .iter()
+        .position(|(t, l)| t == "message" && l.contains(needle))
+        .unwrap_or_else(|| panic!("no message entry with {needle}"))
+}
+
+/// The three prompts T-A1 and the footer test use: the first two stay under the trigger, the
+/// third pushes the pre-run estimate over it (faux usage is chars/4 of the request).
+fn early() -> String {
+    format!("EARLY-TURN {}", "alpha ".repeat(3_000))
+}
+fn middle() -> String {
+    format!("MIDDLE-TURN {}", "beta ".repeat(6_000))
+}
+fn newest() -> String {
+    format!("NEW-PROMPT {}", "gamma ".repeat(2_000))
+}
+
+/// T-A1 + K3 (spec A1): a prompt that takes the chat over the trigger compacts exactly once,
+/// automatically, before its first model request; that request starts with the summary, the new
+/// prompt is kept verbatim in the retained tail, and the summarized turns are not sent.
+/// T-K7 (D1-D3, K7): the session file still has every message plus the compaction entry, and a
+/// reload — in process and by `/sessions` in the real binary — gives the summary + tail only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_automatic_compaction_keeps_the_new_prompt_the_file_and_resumes_from_the_summary() {
+    use rpi_ai::providers::faux::FauxStep;
+    let w = World::new("compaction-auto-pre-run").await;
+    let router = Arc::new(std::sync::Mutex::new(Router::default()));
+    {
+        let mut r = router.lock().unwrap();
+        r.turns.push_back(FauxStep::text("first answer"));
+        r.turns.push_back(FauxStep::text("second answer"));
+        r.turns.push_back(FauxStep::text("THIRD-ANSWER"));
+        r.summaries.push_back("SUMMARY-A1".into());
+    }
+    let mut chat = Compacting::new(&w, &router, None).await;
+
+    chat.say(&early()).await;
+    chat.say(&middle()).await;
+    assert!(chat.compactions().await.is_empty(), "under the trigger");
+    assert_eq!(router.lock().unwrap().order(), ["turn", "turn"]);
+
+    chat.say(&newest()).await;
+    assert!(chat.screen().contains("THIRD-ANSWER"), "{}", chat.screen());
+    let found = chat.compactions().await;
+    assert_eq!(found.len(), 1, "exactly one compaction:\n{}", chat.screen());
+    let (entry, reason) = &found[0];
+    assert_eq!(
+        *reason,
+        Some(rpi_harness::session::types::CompactionReason::Threshold),
+        "automatic, not manual"
+    );
+    assert!(entry.summary.contains("SUMMARY-A1"), "{}", entry.summary);
+    assert!(
+        entry.tokens_before > SMALL_WINDOW as i64 - 16_384,
+        "{}",
+        entry.tokens_before
+    );
+    // K3: the prompt that crossed the trigger is kept verbatim, never summarized.
+    let tail = serde_json::to_string(&entry.retained_tail).unwrap();
+    assert!(tail.contains("NEW-PROMPT"), "the new prompt is in the tail");
+    assert!(!tail.contains("EARLY-TURN") && !tail.contains("MIDDLE-TURN"));
+
+    {
+        let r = router.lock().unwrap();
+        // Before the run's first model request, and once.
+        assert_eq!(r.order(), ["turn", "turn", "summary", "turn"]);
+        let summarized = r.of("summary")[0].to_string();
+        assert!(summarized.contains("EARLY-TURN") && summarized.contains("MIDDLE-TURN"));
+        assert!(
+            !summarized.contains("NEW-PROMPT"),
+            "the new prompt is not summarized"
+        );
+        let asked = r.of("turn")[2];
+        let first = asked[0].to_string();
+        assert!(
+            first.contains("<summary>") && first.contains("SUMMARY-A1"),
+            "the request starts with the summary: {first}"
+        );
+        let asked = asked.to_string();
+        assert!(asked.contains("NEW-PROMPT"), "{asked}");
+        assert!(
+            !asked.contains("EARLY-TURN") && !asked.contains("MIDDLE-TURN"),
+            "the summarized turns are not sent"
+        );
+    }
+
+    // T-K7: the file keeps everything, with the compaction entry after the prompt that caused it
+    // (persisted first, spec A1) and before that prompt's reply.
+    let path = chat.close().await;
+    let entries = file_entries(&path);
+    let compaction_lines: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, (t, _))| t == "compaction")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(compaction_lines.len(), 1, "one compaction entry on disk");
+    let at = compaction_lines[0];
+    let early_at = message_line(&entries, "EARLY-TURN");
+    let middle_at = message_line(&entries, "MIDDLE-TURN");
+    let prompt_at = message_line(&entries, "NEW-PROMPT");
+    let reply_at = message_line(&entries, "THIRD-ANSWER");
+    message_line(&entries, "first answer");
+    message_line(&entries, "second answer");
+    assert!(early_at < middle_at && middle_at < prompt_at && prompt_at < at && at < reply_at);
+
+    // Reloaded in process: rpi's context builder starts at the summary.
+    {
+        use rpi_harness::session::{
+            context::{SessionContextBuildOptions, build_session_context},
+            types::{BranchBounds, EntryOrder, EntryQuery},
+        };
+        let opened = session_store::load(&path, &w.repo, "amp-manager")
+            .await
+            .expect("the file reloads");
+        let branch = opened
+            .session
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+            .expect("the branch");
+        let ctx = build_session_context(&branch, &SessionContextBuildOptions::default());
+        let text = serde_json::to_string(&ctx.messages).unwrap();
+        assert_eq!(ctx.messages[0].role().as_str(), "compactionSummary");
+        assert!(text.contains("SUMMARY-A1") && text.contains("NEW-PROMPT"));
+        assert!(text.contains("THIRD-ANSWER"));
+        assert!(!text.contains("EARLY-TURN") && !text.contains("MIDDLE-TURN"));
+    }
+    assert!(wait_free(&path).await);
+
+    // Resumed by the real binary: the next request is summary + tail + the new prompt.
+    let out = w
+        .chat(&["/sessions", "key:enter", "key:enter", "and now?", "/quit"])
+        .await;
+    let screen = World::screen(&out);
+    assert!(
+        screen.contains(&format!("✓ resumed {}", short_id(&path))),
+        "{screen}"
+    );
+    let asked = w.asked(w.provider.bodies().len() - 1);
+    assert!(asked.contains("SUMMARY-A1"), "the summary:\n{asked}");
+    assert!(asked.contains("NEW-PROMPT"), "the kept tail");
+    assert!(asked.contains("THIRD-ANSWER"), "what came after it");
+    assert!(
+        !asked.contains("EARLY-TURN") && !asked.contains("MIDDLE-TURN"),
+        "not the summarized turns"
+    );
+    assert!(
+        w.asked_no_stamp(w.provider.bodies().len() - 1)
+            .ends_with("and now?")
+    );
+    // And the file still has them after the resumed turn.
+    let entries = file_entries(&path);
+    message_line(&entries, "EARLY-TURN");
+    message_line(&entries, "MIDDLE-TURN");
+    message_line(&entries, "and now?");
+}
+
+/// T-A2 + K2 (spec A2-A4): in a tool loop, a turn whose tool call and result take the chat over
+/// the trigger compacts after that turn's tool results are in, never inside the tool call, and
+/// the next request is the summary + a tail in which every tool result has its call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_loop_compacts_between_turns_after_the_tool_results() {
+    use rpi_ai::providers::faux::FauxStep;
+    let w = World::new("compaction-auto-between-turns").await;
+    let router = Arc::new(std::sync::Mutex::new(Router::default()));
+    {
+        let mut r = router.lock().unwrap();
+        r.turns.push_back(FauxStep::text("first answer"));
+        // ~10 000 tokens of arguments (faux usage counts them as output).
+        r.turns.push_back(FauxStep::tool_call(
+            "amp_whoami",
+            json!({ "pad": "x".repeat(40_000) }),
+        ));
+        r.turns.push_back(FauxStep::text("AFTER-THE-LOOP"));
+        r.summaries.push_back("SUMMARY-A2".into());
+    }
+    let mut chat = Compacting::new(&w, &router, None).await;
+    chat.say(&format!("EARLY-TURN {}", "alpha ".repeat(4_000)))
+        .await;
+    chat.say("go").await;
+    assert!(
+        chat.screen().contains("AFTER-THE-LOOP"),
+        "{}",
+        chat.screen()
+    );
+
+    let found = chat.compactions().await;
+    assert_eq!(found.len(), 1, "one compaction:\n{}", chat.screen());
+    let (entry, reason) = &found[0];
+    assert_eq!(
+        *reason,
+        Some(rpi_harness::session::types::CompactionReason::Threshold)
+    );
+    assert!(entry.summary.contains("SUMMARY-A2"), "{}", entry.summary);
+    // K2 on the persisted tail: it holds the tool result, with its call.
+    assert_paired(
+        &serde_json::to_value(&entry.retained_tail).unwrap(),
+        "retained_tail",
+    );
+
+    {
+        let r = router.lock().unwrap();
+        // Not before the run (A1 stayed under the trigger), but between the tool-loop turns:
+        // turn (the tool call) -> its result -> summary call(s) -> the next turn.
+        let order = r.order();
+        assert_eq!(&order[..3], ["turn", "turn", "summary"], "{order:?}");
+        assert_eq!(order.last(), Some(&"turn"));
+        assert_eq!(
+            order.iter().filter(|k| **k == "turn").count(),
+            3,
+            "{order:?}"
+        );
+        let next = r.of("turn")[2];
+        let first = next[0].to_string();
+        assert!(first.contains("SUMMARY-A2"), "summary first: {first}");
+        assert_paired(next, "the next request");
+        assert!(!next.to_string().contains("EARLY-TURN"), "summarized");
+    }
+
+    // On disk: the tool call, then its result, then the compaction, then the loop's last reply.
+    let path = chat.close().await;
+    let entries = file_entries(&path);
+    let call_at = entries
+        .iter()
+        .position(|(t, l)| t == "message" && l.contains("\"toolCall\""))
+        .expect("the tool call");
+    let result_at = entries
+        .iter()
+        .position(|(t, l)| t == "message" && l.contains("\"toolResult\""))
+        .expect("its result");
+    let compaction_at = entries
+        .iter()
+        .position(|(t, _)| t == "compaction")
+        .expect("the compaction");
+    let after_at = message_line(&entries, "AFTER-THE-LOOP");
+    assert!(
+        call_at < result_at && result_at < compaction_at && compaction_at < after_at,
+        "call {call_at}, result {result_at}, compaction {compaction_at}, reply {after_at}"
+    );
+    message_line(&entries, "EARLY-TURN");
+}
+
+/// T-K4 (spec E4, K4; manager note on #4229): after a manual `/compact`, the kept tail still
+/// carries the reply's pre-compaction usage, so rpi's pre-run estimate is stale and the very next
+/// prompt compacts again automatically. Pinned: it does — and the automatic summary is asked to
+/// fold the manual one in (`<previous-summary>`), so the manual summary is not lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_prompt_after_a_manual_compact_compacts_again_folding_the_manual_summary() {
+    use rpi_ai::providers::faux::FauxStep;
+    use rpi_harness::session::types::CompactionReason;
+    let w = World::new("compaction-manual-then-auto").await;
+    let router = Arc::new(std::sync::Mutex::new(Router::default()));
+    {
+        let mut r = router.lock().unwrap();
+        r.turns.push_back(FauxStep::text("first answer"));
+        // A long reply: its usage (input + output) is over the trigger, though the estimate
+        // before its prompt was not.
+        r.turns.push_back(FauxStep::text(format!(
+            "LONG-REPLY {}",
+            "delta ".repeat(2_400)
+        )));
+        r.turns.push_back(FauxStep::text("THIRD-ANSWER"));
+    }
+    let mut chat = Compacting::new(&w, &router, None).await;
+    chat.say(&format!("EARLY-TURN {}", "alpha ".repeat(4_000)))
+        .await;
+    chat.say(&format!("MIDDLE-TURN {}", "beta ".repeat(4_000)))
+        .await;
+    assert!(chat.compactions().await.is_empty());
+
+    // Every summary call says which compaction it is for, by its position in the queue.
+    {
+        let mut r = router.lock().unwrap();
+        r.summaries.push_back("MANUAL-SUMMARY".into());
+        r.summaries.push_back("MANUAL-SUMMARY-PREFIX".into());
+    }
+    chat.say("/compact").await;
+    assert!(chat.screen().contains("compacted: ~"), "{}", chat.screen());
+    let manual = chat.compactions().await;
+    assert_eq!(manual.len(), 1);
+    assert_eq!(manual[0].1, Some(CompactionReason::Manual));
+    assert!(manual[0].0.summary.contains("MANUAL-SUMMARY"));
+    let summary_calls_after_manual = router.lock().unwrap().of("summary").len();
+    {
+        let mut r = router.lock().unwrap();
+        r.summaries.clear();
+        r.summaries.push_back("AUTO-SUMMARY".into());
+        r.summaries.push_back("AUTO-SUMMARY-PREFIX".into());
+    }
+
+    chat.say("after compacting").await;
+    assert!(chat.screen().contains("THIRD-ANSWER"), "{}", chat.screen());
+    let found = chat.compactions().await;
+    // The pinned behaviour: the stale estimate triggers a second, automatic compaction.
+    assert_eq!(
+        found.iter().map(|(_, r)| *r).collect::<Vec<_>>(),
+        [
+            Some(CompactionReason::Manual),
+            Some(CompactionReason::Threshold)
+        ],
+        "manual, then one automatic compaction before the next reply"
+    );
+    let auto = &found[1].0;
+    assert!(auto.summary.contains("AUTO-SUMMARY"), "{}", auto.summary);
+    assert!(
+        serde_json::to_string(&auto.retained_tail)
+            .unwrap()
+            .contains("after compacting"),
+        "K3: the new prompt is kept"
+    );
+
+    let r = router.lock().unwrap();
+    let summaries = r.of("summary");
+    assert!(
+        summaries.len() > summary_calls_after_manual,
+        "an automatic summary call"
+    );
+    // Loud failure if the second compaction drops the manual summary: its summary request must
+    // carry it as the previous summary.
+    let folded = summaries[summary_calls_after_manual..]
+        .iter()
+        .map(|v| v.to_string())
+        .find(|s| s.contains("<previous-summary>"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the automatic compaction did not fold the manual summary in: {:#?}",
+                &summaries[summary_calls_after_manual..]
+            )
+        });
+    assert!(
+        folded.contains("MANUAL-SUMMARY"),
+        "<previous-summary> holds the manual summary: {folded}"
+    );
+    let order = r.order();
+    assert_eq!(order.last(), Some(&"turn"), "then the reply: {order:?}");
+    let last = r.of("turn").last().unwrap().to_string();
+    assert!(last.contains("AUTO-SUMMARY") && last.contains("after compacting"));
+    assert!(!last.contains("EARLY-TURN"), "{last}");
+}
+
+/// AMP #4226's automatic path (spec E3), left untested there: when a compaction rpi started on
+/// its own lands, the footer's context drops to the summary + kept tail estimate while the reply
+/// is still streaming; the reply's own usage then replaces it, and the late look-up never puts
+/// the estimate back over the measured figure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_footer_drops_when_an_automatic_compaction_lands_then_shows_the_reply() {
+    use rpi_ai::providers::faux::FauxStep;
+    let w = World::new("compaction-auto-footer").await;
+    let router = Arc::new(std::sync::Mutex::new(Router::default()));
+    {
+        let mut r = router.lock().unwrap();
+        r.turns.push_back(FauxStep::text("first answer"));
+        r.turns.push_back(FauxStep::text("second answer"));
+        // Slow: ~1 s of streaming after the compaction lands.
+        r.turns.push_back(FauxStep::text(format!(
+            "THIRD-ANSWER {}",
+            "word ".repeat(60)
+        )));
+        r.summaries.push_back("SUMMARY-A1".into());
+    }
+    let mut chat = Compacting::new(&w, &router, Some(400.0)).await;
+    chat.say(&early()).await;
+    chat.say(&middle()).await;
+    let before = chat.shell.view().footer().context().expect("ctx").tokens;
+    assert!(before > 10_000, "{before}");
+
+    // Drive the third prompt by hand, reading the footer after every event and poll.
+    assert_eq!(
+        chat.shell.submit(&newest()).await,
+        amp_tui::Submit::Continue
+    );
+    let mut seen: Vec<i64> = Vec::new();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let mut ended = false;
+    while !ended {
+        assert!(tokio::time::Instant::now() < deadline, "the run ended");
+        tokio::select! {
+            Some(event) = chat.events.recv() => {
+                ended = matches!(event, rpi_agent::AgentEvent::AgentEnd { .. });
+                chat.shell.handle_event(&event);
+            }
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+        }
+        chat.shell.poll();
+        let now = chat.shell.view().footer().context().map(|c| c.tokens);
+        if let Some(t) = now
+            && seen.last() != Some(&t)
+        {
+            seen.push(t);
+        }
+    }
+    chat.shell
+        .drive_until_idle(&mut chat.events, &mut chat.done, WAIT)
+        .await
+        .expect("idle");
+    chat.shell.settle(WAIT).await.expect("settled");
+    // Longer than the shell's bounded look-up, so a late one would have landed by now.
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        chat.shell.poll();
+    }
+
+    let found = chat.compactions().await;
+    assert_eq!(found.len(), 1, "{}", chat.screen());
+    let entry = &found[0].0;
+    // AMP #4280: the estimate is on `tokens_before`'s basis: the summary + kept tail (chars/4)
+    // plus what `tokens_before` holds beyond chars/4 of the messages it was computed from
+    // (the system prompt and tools inside the reported usage).
+    let estimate = {
+        use rpi_harness::compaction::estimate_tokens;
+        use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery};
+        let path = chat
+            .harness
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+            .expect("branch");
+        let at = path
+            .iter()
+            .position(|e| e.id() == entry.base.id)
+            .expect("the entry is on the branch");
+        let ctx = rpi_harness::session::context::build_session_context(
+            &path[..at],
+            &rpi_harness::session::context::SessionContextBuildOptions::default(),
+        );
+        let overhead =
+            (entry.tokens_before - ctx.messages.iter().map(estimate_tokens).sum::<i64>()).max(0);
+        let summary = rpi_harness::messages::create_compaction_summary_message(
+            entry.summary.as_str(),
+            entry.tokens_before,
+            entry.base.timestamp,
+        );
+        overhead
+            + estimate_tokens(&summary)
+            + entry.retained_tail.iter().map(estimate_tokens).sum::<i64>()
+    };
+    assert!(
+        estimate < before,
+        "the estimate {estimate} is below {before}"
+    );
+    assert!(
+        seen.contains(&estimate),
+        "the footer showed the summary + tail estimate {estimate} during the run: {seen:?}"
+    );
+    // The reply's measured usage is the last word.
+    let reply = {
+        use rpi_harness::session::types::{BranchBounds, Entry, EntryOrder, EntryQuery};
+        let last = chat
+            .harness
+            .find_entries_on_branch(
+                &EntryQuery {
+                    entry_type: Some("message"),
+                    order: Some(EntryOrder::NewestFirst),
+                    limit: Some(1),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+            .expect("branch");
+        match last.first() {
+            Some(Entry::Message(m)) => match &m.message {
+                AgentMessage::Assistant(a) => {
+                    a.usage.input + a.usage.output + a.usage.cache_read + a.usage.cache_write
+                }
+                other => panic!("the last message is the reply: {other:?}"),
+            },
+            other => panic!("no reply: {other:?}"),
+        }
+    };
+    let after = chat.shell.view().footer().context().expect("ctx").tokens;
+    assert_eq!(after, reply, "measured, not the estimate: {seen:?}");
+    assert_ne!(after, estimate);
+    assert_eq!(chat.shell.totals().context_tokens, after);
+    let at = seen.iter().position(|t| *t == estimate).unwrap();
+    assert_eq!(seen.last(), Some(&reply), "{seen:?}");
+    assert!(
+        at < seen.len() - 1,
+        "the estimate came before the reply: {seen:?}"
+    );
+    chat.close().await;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Small helpers
 
 /// A user prompt as the harness stores it.

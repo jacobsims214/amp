@@ -217,6 +217,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         "reload agents, skills, models, MCP servers",
     ),
     CommandSpec::new(Group::Chat, "usage", "", "tokens and cost this session"),
+    CommandSpec::new(
+        Group::Chat,
+        "compact",
+        "[instructions]",
+        "summarize older turns to free context (lossy)",
+    ),
     CommandSpec::new(Group::Chat, "abort", "", "stop the reply"),
     CommandSpec::new(
         Group::Chat,
@@ -251,7 +257,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl+W", "pick a running worker: ←/→, Enter watch"),
     ("Ctrl+X/G", "in /workers: stop the worker / open it in AMP"),
     ("click", "a worker or its #ticket: watch its session"),
-    ("Fn/⌥-drag", "select text (Fn in Terminal.app, ⌥ in iTerm2)"),
+    SELECT_COPY_KEY,
 ];
 
 /// The Shift+Enter row where the terminal has no kitty keyboard protocol (#2349): it sends the
@@ -268,8 +274,17 @@ pub const CLICK_KEY: &str = "click";
 /// click-drag selects, so no modifier to name.
 pub const DRAG_KEY: (&str, &str) = ("drag", "select text");
 
-/// `/help`'s Keys group for the mouse-capture setting: [`KEYS`] when on; off, its last row (the
-/// modifier-drag) becomes [`DRAG_KEY`] and clicking a worker ([`CLICK_KEY`]) goes.
+/// The Keys row for select-to-copy (AMP #4217/#4218): with mouse capture and `[tui] select_copy`
+/// on, a plain drag in the transcript highlights text and copies it on release.
+pub const SELECT_COPY_KEY: (&str, &str) = ("drag", "select transcript text, copied on release");
+
+/// The Keys row with mouse capture on but `[tui] select_copy = false`: the chat takes the mouse
+/// and does not select, so the terminal's own selection needs a modifier.
+pub const MODIFIER_DRAG_KEY: (&str, &str) =
+    ("Fn/⌥-drag", "select text (Fn in Terminal.app, ⌥ in iTerm2)");
+
+/// `/help`'s Keys group for the mouse-capture setting, with select-to-copy on: [`KEYS`] when
+/// on; off, its last row becomes [`DRAG_KEY`] and clicking a worker ([`CLICK_KEY`]) goes.
 pub fn keys(mouse_capture: bool) -> Vec<(&'static str, &'static str)> {
     keys_for(mouse_capture, NewlineMode::Kitty)
 }
@@ -277,11 +292,26 @@ pub fn keys(mouse_capture: bool) -> Vec<(&'static str, &'static str)> {
 /// [`keys`] for this terminal's new-line keys ([`NewlineMode`], #2349): where Shift+Enter sends,
 /// its row says so ([`LEGACY_SHIFT_ENTER`]).
 pub fn keys_for(mouse_capture: bool, newline: NewlineMode) -> Vec<(&'static str, &'static str)> {
+    keys_with(mouse_capture, true, newline)
+}
+
+/// [`keys_for`] with the `[tui] select_copy` setting (AMP #4218). The drag row is
+/// [`SELECT_COPY_KEY`] with capture and select-to-copy on, [`MODIFIER_DRAG_KEY`] with capture on
+/// and select-to-copy off, and [`DRAG_KEY`] with capture off (which also drops [`CLICK_KEY`]).
+pub fn keys_with(
+    mouse_capture: bool,
+    select_copy: bool,
+    newline: NewlineMode,
+) -> Vec<(&'static str, &'static str)> {
     let mut rows = KEYS.to_vec();
+    rows.pop();
     if !mouse_capture {
-        rows.pop();
         rows.retain(|(k, _)| *k != CLICK_KEY);
         rows.push(DRAG_KEY);
+    } else if select_copy {
+        rows.push(SELECT_COPY_KEY);
+    } else {
+        rows.push(MODIFIER_DRAG_KEY);
     }
     if !newline.shift_enter() {
         for row in &mut rows {
@@ -513,10 +543,11 @@ impl Component for CommandMenu {
 /// `/help`: AMP, Config, Chat and Keys, each a two-column list (command and arguments, then what it
 /// does), at full contrast. Descriptions word-wrap under their column; below
 /// [`HelpBlock::TWO_COLUMNS`] cells of description room they go under the command instead.
-/// The Keys group follows the mouse-capture setting ([`keys`]).
+/// The Keys group follows the mouse-capture and select-to-copy settings ([`keys_with`]).
 #[derive(Debug, Clone, Copy)]
 pub struct HelpBlock {
     mouse_capture: bool,
+    select_copy: bool,
     newline: NewlineMode,
 }
 
@@ -534,6 +565,7 @@ impl HelpBlock {
     pub fn new() -> Self {
         Self {
             mouse_capture: true,
+            select_copy: true,
             newline: NewlineMode::Kitty,
         }
     }
@@ -550,6 +582,13 @@ impl HelpBlock {
         self
     }
 
+    /// `/help` for the `[tui] select_copy` setting (AMP #4218): off, the drag row names the
+    /// terminal's modifier-drag again.
+    pub fn select_copy(mut self, on: bool) -> Self {
+        self.select_copy = on;
+        self
+    }
+
     /// The rows of each group: (group title, [(left column, description)]).
     fn groups(&self) -> Vec<(&'static str, Vec<(String, &'static str)>)> {
         let mut groups = Vec::new();
@@ -563,7 +602,7 @@ impl HelpBlock {
         }
         groups.push((
             "Keys",
-            keys_for(self.mouse_capture, self.newline)
+            keys_with(self.mouse_capture, self.select_copy, self.newline)
                 .into_iter()
                 .map(|(k, about)| (k.to_owned(), about))
                 .collect(),

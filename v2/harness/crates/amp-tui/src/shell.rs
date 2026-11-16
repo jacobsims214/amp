@@ -59,6 +59,17 @@
 //! Esc and `/abort` still just stop the reply, with a note that the worker stops too. A stopped or abandoned worker's ticket is handed back to ready in
 //! AMP (run reporting's `on_finish`; [`Supervisor::release_unfinished`] when quitting without
 //! waiting), so it is not left in progress with nobody on it. Signals still quit at once.
+//!
+//! **Self-management confirmations (AMP #4259).** A manager tool that writes the harness's own
+//! agents, skills or MCP servers asks the person first (`amp_core::approval`, #4247). The binary
+//! hands the shell the receiver of its `ChannelConfirmer` ([`Shell::set_confirms`]); each live
+//! request is shown in the transcript as a y/N question (tool, summary, scope and path, then the
+//! diff or other details), one at a time, while the reply that asked keeps running. The next key
+//! answers it: only `y` allows; Esc, `n` or any other key refuses. A request whose tool already
+//! gave up (timed out or cancelled) is never shown, one on screen that goes stale is closed, and a
+//! `y` that arrives too late says nothing was written. Details longer than the first view
+//! ([`CONFIRM_DETAIL_ROWS`] rows of at most [`CONFIRM_ROW_CHARS`] characters) are cut visibly, and
+//! `y` does not allow until `v` has shown the rest in full (AMP #4317).
 
 use std::{
     future::Future,
@@ -73,12 +84,16 @@ use amp_core::meta::{MetaHandle, Topics};
 use amp_core::models::thinking_name;
 use amp_core::supervisor::{DispatchMode, Supervisor};
 use amp_core::tickets::Status;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use rpi_agent::AgentEvent;
 use rpi_ai::{Model, ThinkingLevel};
-use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome, RunResult};
+use rpi_harness::agent_harness::{
+    AgentHarness, AgentLane, CompactionOutcome, CompactionResult, HarnessRunOutcome, RunResult,
+};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+
+use amp_core::approval::{CONFIRM_TIMEOUT, PendingConfirm};
 
 use crate::amp_render::{self, ApprovalNotice};
 use crate::history::{PromptHistory, Recall};
@@ -164,11 +179,31 @@ enum ShellMsg {
     Compaction {
         active: bool,
         manual: bool,
+        /// When the bus reported it (ms since the epoch). AMP #4263: the shell may apply the
+        /// message after the entry already landed, so the entry lookup must not start from
+        /// the time it was applied.
+        at_ms: i64,
+    },
+    /// `/compact` finished (AMP #4222): its own message, never `done_tx`, so it writes no
+    /// `RunEnd` to the remote feed and drains nothing as a model reply would.
+    Compacted(Box<CompactDone>),
+    /// An automatic compaction's entry, looked up once its progress ended (AMP #4226, spec E3):
+    /// `None` when none landed (it failed or freed nothing to persist). `run`: the run it
+    /// happened in (`Shell::prompts` then), for AMP #4263's notices. Not counted in `in_flight`.
+    CompactionLanded {
+        run: u32,
+        landed: Option<LandedCompaction>,
     },
     /// `/sessions` scanned this directory's saved chats (AMP #3010).
     Sessions(Result<SessionList, String>),
     /// A confirmed resume finished: the harness switched to that session, or why it refused.
     Resumed(Box<ResumeRequest>, Result<Resumed, String>),
+    /// Select-to-copy (AMP #4217): a copy of `chars` characters finished (never the text).
+    /// Not counted in `in_flight`.
+    Copied {
+        chars: usize,
+        copied: crate::clipboard::Copied,
+    },
 }
 
 /// The shell's watch on its harness's event bus (#2388: compaction progress). rpi's watch
@@ -189,6 +224,7 @@ fn watch_compaction(harness: &AgentHarness, tx: UnboundedSender<ShellMsg>) -> Bu
             let _ = tx.send(ShellMsg::Compaction {
                 active: p.active,
                 manual: p.manual,
+                at_ms: now_ms(),
             });
         }
     }));
@@ -303,6 +339,9 @@ pub struct ReloadReply {
 
 pub type ReloadFuture = Pin<Box<dyn Future<Output = Result<ReloadReply, String>> + Send>>;
 
+/// A `/reload` or a panel's change asked for while the manager replies (AMP #4267).
+const RELOAD_QUEUED: &str = "reload queued until the manager's reply ends";
+
 /// Who asked for a reload: it decides what the transcript says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReloadCause {
@@ -329,6 +368,9 @@ pub struct ConfigReply {
     pub note: Option<(String, bool)>,
     /// The configuration files changed: run the `/reload` path now so the session takes it.
     pub reload: bool,
+    /// A fresh AMP login was stored (`/mcp login amp`, #4250): the metadata poller reconnects
+    /// now ([`MetaHandle::reconnect`]), so the header's "re-login needed" clears at once.
+    pub amp_relogin: bool,
 }
 
 impl ConfigReply {
@@ -532,10 +574,85 @@ pub enum QuitOutcome {
 /// The transcript line a run the person stopped ends with: dim, no error colour (#2181).
 pub const STOPPED: &str = "Stopped.";
 
+/// AMP #4263 (G2, spec F2): a between-turn compaction ended without persisting its entry; rpi
+/// skips it and the run carries on with the uncompacted context.
+pub const COMPACTION_SKIPPED: &str = "automatic compaction failed; continuing without it";
+
+/// AMP #4263 (G3, spec I3/S4): an automatic compaction left the context no smaller. Pinned rpi
+/// behaviour, nothing is truncated or retried.
+pub const COMPACTION_NO_PROGRESS: &str =
+    "compaction freed nothing — a single tool result exceeds keep_recent_tokens";
+
+/// AMP #4263 (G1, spec F1): a run whose pre-run compaction failed. rpi keeps the prompt in the
+/// session without a reply; nothing re-sends it (I4).
+pub fn compaction_failed_notice(message: &str) -> String {
+    format!(
+        "automatic compaction failed ({}); context unchanged, your prompt is saved but was not \
+         answered",
+        // rpi prefixes the summarizer's error with "Summarization failed: "; the notice already
+        // says it failed.
+        crate::chrome::clean(
+            message
+                .trim()
+                .trim_start_matches("Summarization failed:")
+                .trim()
+        )
+    )
+}
+
+/// The `Failed` code rpi gives a run whose pre-run compaction failed (spec F1).
+const COMPACTION_FAILED: &str = "compaction_failed";
+
 /// What the spinner line says, for [`ESC_HINT_FOR`], after Esc closed a panel, the `/` menu or a
 /// worker's session during a run (#2181, #2354). With this chat's workers live it names them
 /// ([`esc_hint`]).
 pub const ESC_HINT: &str = "Esc again to stop the reply";
+
+/// What a `y` to a confirmation that had already timed out says (AMP #4259, #4277).
+pub const CONFIRM_TOO_LATE: &str = "That request already timed out; nothing was written.";
+/// At most this many detail rows (a diff, a TOML block) of a confirmation are shown at first
+/// (AMP #4259); `v` shows the rest (AMP #4317).
+const CONFIRM_DETAIL_ROWS: usize = 24;
+/// At most this many characters of a confirmation row are shown at first; a longer row is cut
+/// with a visible `…` and `v` shows it in full (AMP #4317).
+const CONFIRM_ROW_CHARS: usize = 300;
+/// What `y` says while part of a confirmation has not been shown yet (AMP #4317).
+pub const CONFIRM_VIEW_FIRST: &str =
+    "Press v to see the whole change first; y allows it after that.";
+/// A confirmation takes no answer until it has been on screen this long with no key pressed
+/// (AMP #4319): a `y` typed ahead into the editor as the question appeared must not allow it.
+/// Each key inside the window is swallowed and starts the window again.
+pub const CONFIRM_ARM: Duration = Duration::from_millis(750);
+/// What a key pressed before the confirmation is armed says (AMP #4319), once per question.
+pub const CONFIRM_WAIT_NOTICE: &str = "A confirmation is waiting: read it, then press y or N.";
+/// What a key pressed before the remote pairing question is armed says (AMP #4599), once per
+/// question. The pairing question takes the same [`CONFIRM_ARM`] window as a confirmation.
+pub const PAIRING_WAIT_NOTICE: &str = "A pairing request is waiting: read it, then press y or N.";
+
+/// The arm window of a y/N question (AMP #4319, #4599): false when `armed_at` has passed (the
+/// key answers); otherwise the window starts again from `now` and the key is held (true).
+fn hold_unarmed(armed_at: &mut Option<Instant>, now: Instant) -> bool {
+    if armed_at.is_some_and(|at| now >= at) {
+        return false;
+    }
+    *armed_at = Some(now + CONFIRM_ARM);
+    true
+}
+
+/// Where the shell reads the time for the confirmation's arm window ([`CONFIRM_ARM`]): the real
+/// clock, or a test's ([`Shell::set_clock`]).
+pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// A confirmation's text as the terminal shows it: no control or escape characters, at most
+/// [`CONFIRM_ROW_CHARS`] characters (it comes from the model's tool call).
+fn confirm_text(s: &str) -> String {
+    amp_core::remote::pairing::sanitize_for_terminal(s, CONFIRM_ROW_CHARS)
+}
+
+/// A confirmation detail row in full: no control or escape characters, nothing cut (AMP #4317).
+fn confirm_row(s: &str) -> String {
+    amp_core::remote::pairing::sanitize_for_terminal(s, usize::MAX)
+}
 
 /// At most this many prompts wait for the running reply, here as on a paired device (AMP #2889).
 pub use amp_core::remote::link::QUEUE_MAX;
@@ -953,11 +1070,351 @@ pub enum Submit {
     Quit,
 }
 
+/// `/compact`'s outcome, applied by [`Shell::poll`] (AMP #4222).
+struct CompactDone {
+    result: Result<CompactionResult, CompactError>,
+    /// A decline whose branch already ends in a compaction (O2).
+    already_compacted: bool,
+    /// A completed one's [`compaction_overhead`] (AMP #4280).
+    overhead: i64,
+}
+
+/// `/compact`'s call failed before rpi gave an outcome.
+struct CompactError {
+    /// rpi refused it because the lane was busy (O5): a refusal, not a failure.
+    busy: bool,
+    message: String,
+}
+
+/// `/compact` while a reply runs (B1, O5).
+const COMPACT_WAIT_REPLY: &str = "wait for the reply to finish (Esc stops it), then try again";
+
+/// A compaction the person stopped (X2, O3).
+const COMPACT_STOPPED: &str = "compaction stopped — context unchanged";
+
+/// The model context right after a compaction, estimated (spec E2): chars/4 over the summary
+/// message plus the retained tail, plus `overhead` (see [`request_overhead`]). Not
+/// `estimate_context_tokens`: that takes the last assistant message's reported usage, and the
+/// retained tail still carries the pre-compaction figure.
+///
+/// AMP #4280: without `overhead` this is on a different basis from the entry's `tokens_before`
+/// (which comes from a reported usage, so it includes the system prompt and the tool
+/// definitions), and a short chat whose whole conversation is kept showed `~11k → ~21`.
+pub(crate) fn compacted_context_tokens(
+    entry: &rpi_harness::session::types::CompactionEntry,
+    overhead: i64,
+) -> i64 {
+    use rpi_harness::compaction::estimate_tokens;
+    let summary = rpi_harness::messages::create_compaction_summary_message(
+        entry.summary.as_str(),
+        entry.tokens_before,
+        entry.base.timestamp,
+    );
+    overhead
+        + estimate_tokens(&summary)
+        + entry.retained_tail.iter().map(estimate_tokens).sum::<i64>()
+}
+
+/// AMP #4280: what a compaction's `tokens_before` holds beyond chars/4 of the messages it was
+/// computed from: the system prompt and tool definitions (and the tokenizer's difference from
+/// chars/4) that the last reply's reported usage includes. `before` is the model context the
+/// compaction started from (`build_session_context` of the branch up to the entry). Never
+/// negative; 0 when `tokens_before` had no reported usage in it (then it is chars/4 only).
+pub(crate) fn request_overhead(tokens_before: i64, before: &[rpi_agent::AgentMessage]) -> i64 {
+    use rpi_harness::compaction::estimate_tokens;
+    (tokens_before - before.iter().map(estimate_tokens).sum::<i64>()).max(0)
+}
+
+/// [`request_overhead`] for a compaction entry on this chat's branch: the branch up to (not
+/// including) the entry is the context `tokens_before` was estimated from. 0 when the entry is
+/// not on the branch (then the estimate is messages-only, as before #4280).
+async fn compaction_overhead(
+    harness: &AgentHarness,
+    entry: &rpi_harness::session::types::CompactionEntry,
+) -> i64 {
+    use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery};
+    let query = EntryQuery {
+        order: Some(EntryOrder::OldestFirst),
+        ..Default::default()
+    };
+    let Ok(path) = harness
+        .find_entries_on_branch(&query, &BranchBounds::default())
+        .await
+    else {
+        return 0;
+    };
+    let Some(at) = path.iter().position(|e| e.id() == entry.base.id) else {
+        return 0;
+    };
+    let ctx = rpi_harness::session::context::build_session_context(
+        &path[..at],
+        &rpi_harness::session::context::SessionContextBuildOptions::default(),
+    );
+    request_overhead(entry.tokens_before, &ctx.messages)
+}
+
+/// What the shell knows about this chat's compactions (AMP #4226). The footer and `/usage`
+/// read it; #4263's notices (compaction failed / skipped / freed nothing) build on it.
+#[derive(Debug, Default)]
+struct CompactionTrack {
+    /// When the running compaction's progress started (ms since the epoch); `None` when none
+    /// is running. The entry lookup is bounded by the progress *end* (AMP #4263).
+    started_ms: Option<i64>,
+    /// The latest compaction entry whose estimate the footer was set to.
+    applied: Option<String>,
+    /// The latest completed compaction (any reason): before and after, estimated.
+    last: Option<LandedCompaction>,
+    /// The run the running compaction's progress started in (`Shell::prompts`).
+    started_run: u32,
+    /// AMP #4263 (F2/F5): the latest run that ended stopped or with `compaction_failed`. A
+    /// missing entry for an automatic compaction in that run is already explained by how the
+    /// run ended (G1 notice or "Stopped."), so G2's notice stays quiet for it.
+    quiet_run: Option<u32>,
+    /// AMP #4263 (S4): automatic compactions that landed in one run, as `(run, count)`.
+    run_auto: (u32, usize),
+    /// AMP #4263 (S4): the run whose no-progress warning was shown (once per run).
+    warned_run: Option<u32>,
+    /// AMP #4263 (S4): a landed automatic compaction waiting for the next measured usage, as
+    /// `(run, tokens_before)`.
+    measure: Option<(u32, i64)>,
+}
+
+/// A compaction entry that landed on the branch, with E2's estimate of the context after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LandedCompaction {
+    pub(crate) entry_id: String,
+    pub(crate) tokens_before: i64,
+    pub(crate) after: i64,
+    /// The footer's context tokens when the progress ended: the estimate replaces them only
+    /// if no reply reported a newer figure meanwhile.
+    pub(crate) footer_at_end: Option<i64>,
+}
+
+impl LandedCompaction {
+    /// `overhead`: [`compaction_overhead`], so `after` is on `tokens_before`'s basis (#4280).
+    fn of(
+        entry: &rpi_harness::session::types::CompactionEntry,
+        footer_at_end: Option<i64>,
+        overhead: i64,
+    ) -> Self {
+        Self {
+            entry_id: entry.base.id.clone(),
+            tokens_before: entry.tokens_before,
+            after: compacted_context_tokens(entry, overhead),
+            footer_at_end,
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// How long the lookup for an automatic compaction's entry keeps trying: rpi drops the progress
+/// guard before it persists the entry, so the entry lands shortly after `active:false`.
+const LANDED_TRIES: u32 = 20;
+const LANDED_EVERY: Duration = Duration::from_millis(25);
+
+/// The oldest compaction entry on the branch that is at least as new as `since_ms` (the first
+/// to land after it), waiting a bounded time ([`LANDED_TRIES`] x [`LANDED_EVERY`]) for it to be
+/// persisted.
+async fn landed_compaction(
+    harness: &AgentHarness,
+    since_ms: i64,
+    footer_at_end: Option<i64>,
+) -> Option<LandedCompaction> {
+    use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery};
+    let query = EntryQuery {
+        entry_type: Some("compaction"),
+        order: Some(EntryOrder::NewestFirst),
+        limit: Some(8),
+        ..Default::default()
+    };
+    for _ in 0..LANDED_TRIES {
+        if let Ok(found) = harness
+            .find_entries_on_branch(&query, &BranchBounds::default())
+            .await
+            && let Some(c) = found
+                .iter()
+                .map_while(|e| match e {
+                    rpi_harness::session::types::Entry::Compaction(c)
+                        if c.base.timestamp >= since_ms =>
+                    {
+                        Some(c)
+                    }
+                    _ => None,
+                })
+                .last()
+        {
+            let overhead = compaction_overhead(harness, c).await;
+            return Some(LandedCompaction::of(c, footer_at_end, overhead));
+        }
+        tokio::time::sleep(LANDED_EVERY).await;
+    }
+    None
+}
+
+/// The compactions on this chat's branch, by reason, and E1's trigger estimate.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BranchCompactions {
+    manual: usize,
+    automatic: usize,
+    /// rpi's own trigger figure for the branch (`estimate_context_tokens`), and whether it
+    /// includes a reported usage (without one it is chars/4 over the messages only, which
+    /// leaves out the system prompt and the tools).
+    estimate: i64,
+    measured: bool,
+}
+
+/// Counts the compaction entries on the branch (spec E1). Source: `Entry::Compaction` on the
+/// branch, not the live progress events, so the count survives `/sessions` resume and a
+/// restart, and counts only compactions that completed. The reason (manual vs automatic) is on
+/// the `step_attempt` record rpi writes after each entry; an entry without one counts as
+/// automatic.
+async fn branch_compactions(harness: &AgentHarness) -> BranchCompactions {
+    use rpi_harness::session::types::{
+        BranchBounds, CompactionReason, EntryOrder, EntryQuery, LaneRecord, RecordQuery,
+    };
+    let query = EntryQuery {
+        order: Some(EntryOrder::OldestFirst),
+        ..Default::default()
+    };
+    let path = harness
+        .find_entries_on_branch(&query, &BranchBounds::default())
+        .await
+        .unwrap_or_default();
+    let manual: std::collections::HashSet<String> = harness
+        .session()
+        .find_records(&RecordQuery {
+            record_type: Some("step_attempt"),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| match r {
+            LaneRecord::StepAttempt(a) if a.compaction_reason == Some(CompactionReason::Manual) => {
+                Some(a.result_entry_id)
+            }
+            _ => None,
+        })
+        .collect();
+    let mut out = BranchCompactions::default();
+    for e in &path {
+        if let rpi_harness::session::types::Entry::Compaction(c) = e {
+            if manual.contains(&c.base.id) {
+                out.manual += 1;
+            } else {
+                out.automatic += 1;
+            }
+        }
+    }
+    let ctx = rpi_harness::session::context::build_session_context(
+        &path,
+        &rpi_harness::session::context::SessionContextBuildOptions::default(),
+    );
+    let est = rpi_harness::compaction::estimate_context_tokens(&ctx.messages);
+    out.estimate = est.tokens;
+    out.measured = est.last_usage_index.is_some();
+    out
+}
+
+/// `/usage`'s compaction lines (spec E1, review #3881): when rpi compacts on its own, what it
+/// keeps and how long the summary may be, how many compactions this session has, and rpi's
+/// trigger estimate, apart from the measured context on the line above.
+fn compaction_lines(
+    settings: rpi_harness::types::CompactionSettings,
+    window: i64,
+    max_output: u64,
+    branch: BranchCompactions,
+) -> String {
+    use crate::footer::format_tokens as tok;
+    let n = branch.manual + branch.automatic;
+    let count = if n == 0 {
+        "0 this session".to_owned()
+    } else {
+        format!(
+            "{n} this session ({} manual, {} automatic)",
+            branch.manual, branch.automatic
+        )
+    };
+    let mut line = if !settings.enabled {
+        format!("auto-compaction: off · /compact still works · {count}")
+    } else {
+        let summary = {
+            let budget = (settings.reserve_tokens.max(0) as f64 * 0.8).floor() as u64;
+            if max_output > 0 {
+                budget.min(max_output)
+            } else {
+                budget
+            }
+        };
+        let trigger = if window > 0 {
+            format!(
+                "triggers at ~{} of {}",
+                tok(window - settings.reserve_tokens),
+                tok(window)
+            )
+        } else {
+            "triggers at window − ".to_owned() + &tok(settings.reserve_tokens) + " (window unknown)"
+        };
+        format!(
+            "auto-compaction: on · {trigger} · keeps ~{} recent · summary ≤ {} · {count}",
+            tok(settings.keep_recent_tokens),
+            tok(summary as i64),
+        )
+    };
+    line.push_str(&format!(
+        "\ntrigger estimate: ~{} tokens{}",
+        tok(branch.estimate),
+        if branch.measured {
+            ""
+        } else {
+            " (excludes system prompt and tools)"
+        }
+    ));
+    line
+}
+
+/// O1's notice. Compaction is lossy, so it never promises every detail is kept; without a
+/// session file (D1) it doesn't claim the full history is saved.
+fn compacted_notice(before: i64, after: i64, saved: bool) -> String {
+    let history = if saved {
+        "Full history stays in the session file."
+    } else {
+        "This chat is not saved (in memory): only the transcript above keeps the earlier turns."
+    };
+    format!(
+        "compacted: ~{} → ~{} tokens (estimate). Older turns are now a summary; details may be \
+         lost. {history}",
+        crate::footer::format_tokens(before),
+        crate::footer::format_tokens(after),
+    )
+}
+
+/// A left press in the transcript still held down (AMP #4217, #4315).
+#[derive(Debug, Clone, Copy)]
+struct MousePress {
+    /// The screen cell `(row, column)` pressed.
+    cell: (usize, usize),
+    /// The transcript content cell under it when pressed. The follow-end view can scroll
+    /// before release, so a click acts on this row, not on whatever the cell shows by then.
+    at: crate::selection::Pos,
+    /// The pointer has been dragged off the pressed cell: a selection, never a click.
+    moved: bool,
+}
+
 pub struct Shell {
     view: ChatView,
     harness: Arc<AgentHarness>,
     info: ShellInfo,
     models: Vec<ModelChoice>,
+    /// The chat role's `context_window` / `max_tokens` caps (#4224), applied to every model
+    /// `/model` or `/reload` switches this chat to (spec M2).
+    role_caps: amp_core::models::RoleCaps,
     totals: Totals,
     prompts: u32,
     /// A model chosen in the `/model` picker, switched to by [`Shell::key`] / [`Shell::press`]
@@ -1036,6 +1493,10 @@ pub struct Shell {
     /// Whether the terminal reports the mouse to us (wheel scrolling, the pill's click). Off,
     /// the terminal's own click-drag selection works without a modifier (`[tui] mouse`, #2185).
     mouse_capture: bool,
+    /// Whether a drag in the transcript selects and copies (AMP #4218, `[tui] select_copy`,
+    /// default on). Only matters with [`Shell::mouse_capture`] on; off, clicks act on press as
+    /// before #4217 and the terminal's modifier-drag selects.
+    select_copy: bool,
     /// How this terminal starts a new line (#2349): the empty editor's hint and `/help` name the
     /// key that works.
     newline: NewlineMode,
@@ -1045,9 +1506,33 @@ pub struct Shell {
     viewing: Option<i64>,
     /// A stop waiting for its `y` (#2252).
     stop_confirm: Option<i64>,
+    /// Self-management confirmation requests (AMP #4259) from the session's `ChannelConfirmer`,
+    /// taken one at a time.
+    confirms: Option<tokio::sync::mpsc::Receiver<PendingConfirm>>,
+    /// The confirmation on screen, waiting for its `y`/`N`.
+    confirm: Option<PendingConfirm>,
+    /// The detail rows of [`Self::confirm`] not yet shown in full (AMP #4317): `v` shows them,
+    /// and `y` does not allow while any are left.
+    confirm_unseen: Vec<String>,
+    /// When the confirmation on screen takes its first answer (AMP #4319): [`CONFIRM_ARM`]
+    /// after it was shown, pushed back by every key pressed before then.
+    confirm_armed_at: Option<Instant>,
+    /// The confirmation on screen already said [`CONFIRM_WAIT_NOTICE`].
+    confirm_wait_noted: bool,
+    /// When the remote pairing question on screen takes its first answer (AMP #4599):
+    /// [`CONFIRM_ARM`] after it was shown, pushed back by every key pressed before then.
+    pairing_armed_at: Option<Instant>,
+    /// The pairing question on screen already said [`PAIRING_WAIT_NOTICE`].
+    pairing_wait_noted: bool,
+    /// The time for the confirmation's arm window: [`Instant::now`] unless a test set its own.
+    clock: Clock,
     /// The person clicked into the editor while a panel was open (#2344): the editor has the
     /// keys (↑↓ and Enter included) until the panel closes or something is sent.
     editor_clicked: bool,
+    /// Select-to-copy (AMP #4217): a left press in the transcript still held down. It becomes
+    /// a selection once the pointer moves to another screen cell; released in place it is a
+    /// click on the content row pressed ([`Shell::mouse`], #4315).
+    mouse_press: Option<MousePress>,
     /// Who stops workers from this chat ([`Shell::set_person`]); else the AMP user's email.
     person: Option<String>,
     /// The manager's scroll position while a worker's session is shown (#2347).
@@ -1098,6 +1583,14 @@ pub struct Shell {
     end_seen_at: Option<Instant>,
     /// [`Shell::quit`] has begun: nothing new starts.
     quitting: bool,
+    /// `/compact` is running on the manager's lane (AMP #4222, spec C5). A busy state of its own,
+    /// not [`Shell::running`]: every place that starts a turn or switches the session checks it
+    /// too, because rpi holds the lane for the compaction and a prompt would fail `lane_busy`.
+    compacting: bool,
+    /// A `/sessions` resume is in flight (spec B3): `/compact` waits for it.
+    resuming: bool,
+    /// Compaction bookkeeping for the footer and `/usage` (AMP #4226).
+    compaction: CompactionTrack,
 }
 
 /// A tool call whose arguments are still streaming (#2384).
@@ -1132,6 +1625,7 @@ impl Shell {
                 harness,
                 info,
                 models,
+                role_caps: amp_core::models::RoleCaps::default(),
                 totals: Totals::default(),
                 prompts: 0,
                 pending_model: None,
@@ -1172,11 +1666,21 @@ impl Shell {
                 quit_confirm_until: None,
                 released: Vec::new(),
                 mouse_capture: true,
+                select_copy: true,
                 newline: NewlineMode::default(),
                 sessions: Default::default(),
                 viewing: None,
                 stop_confirm: None,
+                confirms: None,
+                confirm: None,
+                confirm_unseen: Vec::new(),
+                confirm_armed_at: None,
+                confirm_wait_noted: false,
+                pairing_armed_at: None,
+                pairing_wait_noted: false,
+                clock: Arc::new(Instant::now),
                 editor_clicked: false,
+                mouse_press: None,
                 person: None,
                 scroll_back: None,
                 noticed: Default::default(),
@@ -1198,6 +1702,9 @@ impl Shell {
                 wake_guard: WakeGuard::default(),
                 end_seen_at: None,
                 quitting: false,
+                compacting: false,
+                compaction: CompactionTrack::default(),
+                resuming: false,
             },
             done_rx,
         )
@@ -1209,6 +1716,20 @@ impl Shell {
     pub fn set_feed(&mut self, feed: Option<Arc<amp_core::manager_feed::ManagerFeed>>) {
         self.view.set_feed(feed);
         self.fed_workers = None;
+    }
+
+    /// The chat role's caps (#4224, `ResolvedRole::caps`): `/model` and `/reload` apply them to
+    /// the model they switch to, so the role's budget (and the footer's window) survives a switch.
+    /// Changed caps reach new sessions, not this one (spec M3).
+    pub fn set_role_caps(&mut self, caps: amp_core::models::RoleCaps) {
+        self.role_caps = caps;
+    }
+
+    /// `choice`'s model with the chat role's caps applied.
+    fn capped(&self, choice: &ModelChoice) -> Model {
+        let mut model = choice.model.clone();
+        self.role_caps.apply(&mut model);
+        model
     }
 
     /// Sends a prompt to the agent as a user turn, never as a slash command (#2370: the remote
@@ -1228,7 +1749,8 @@ impl Shell {
         prompt_id: Option<String>,
     ) -> bool {
         let text = text.trim();
-        if text.is_empty() || self.running || self.switching {
+        // AMP #4301: nor while a reload runs (its policy swap would land inside the turn).
+        if text.is_empty() || self.running || self.compacting || self.reloading || self.switching {
             return false;
         }
         // #2376: a prompt from a paired device says so above its bubble. #2391 (L2): its text
@@ -1273,7 +1795,7 @@ impl Shell {
         let ctx = self.totals.context_tokens;
         let status = amp_core::remote::HostStatus {
             model: self.info.model_ref(),
-            busy: self.running,
+            busy: self.running || self.compacting,
             context_pct: (ctx > 0).then(|| (ctx * 100 / window).clamp(0, 100)),
             cost_usd_micros: amp_core::chat_event::usd_micros(self.totals.usage.cost_usd),
             project: meta.as_ref().and_then(|m| {
@@ -1364,6 +1886,237 @@ impl Shell {
             (false, _) => format!("Refused \"{name}\": it was not paired."),
         };
         self.view.add_notice(&line);
+    }
+
+    /// The receiver of the session's `ChannelConfirmer` (AMP #4259): its requests are shown as
+    /// y/N questions, one at a time ([`Shell::poll`] takes the next).
+    pub fn set_confirms(&mut self, confirms: tokio::sync::mpsc::Receiver<PendingConfirm>) {
+        self.confirms = Some(confirms);
+    }
+
+    /// The clock the confirmation's arm window ([`CONFIRM_ARM`]) is measured with (AMP #4319):
+    /// [`Instant::now`] by default; tests pass one they move by hand.
+    pub fn set_clock(&mut self, clock: Clock) {
+        self.clock = clock;
+    }
+
+    /// The confirmation on screen takes answers now (AMP #4319): it has been shown for
+    /// [`CONFIRM_ARM`] with no key pressed in that time. False with none on screen.
+    pub fn confirm_armed(&self) -> bool {
+        self.confirm.is_some() && self.confirm_armed_at.is_some_and(|at| (self.clock)() >= at)
+    }
+
+    /// A key on a confirmation that is not armed yet (AMP #4319): it answers nothing and does
+    /// not reach the editor, the arm window starts again, and the first such key says
+    /// [`CONFIRM_WAIT_NOTICE`]. Returns false when the confirmation is armed (the key answers).
+    fn hold_unarmed_confirm(&mut self) -> bool {
+        let now = (self.clock)();
+        if !hold_unarmed(&mut self.confirm_armed_at, now) {
+            return false;
+        }
+        if !self.confirm_wait_noted {
+            self.confirm_wait_noted = true;
+            self.view.add_local_line(CONFIRM_WAIT_NOTICE, true);
+            self.view.scroll().to_end();
+        }
+        true
+    }
+
+    /// The remote pairing question on screen takes answers now (AMP #4599): it has been shown
+    /// for [`CONFIRM_ARM`] with no key pressed in that time. False with none on screen.
+    pub fn pairing_armed(&self) -> bool {
+        self.pairing_pending() && self.pairing_armed_at.is_some_and(|at| (self.clock)() >= at)
+    }
+
+    /// A key on a pairing question that is not armed yet (AMP #4599), as
+    /// [`Self::hold_unarmed_confirm`] for a confirmation: it answers nothing and does not reach
+    /// the editor, the arm window starts again, and the first such key says
+    /// [`PAIRING_WAIT_NOTICE`]. Returns false when the question is armed (the key answers).
+    fn hold_unarmed_pairing(&mut self) -> bool {
+        let now = (self.clock)();
+        if !hold_unarmed(&mut self.pairing_armed_at, now) {
+            return false;
+        }
+        if !self.pairing_wait_noted {
+            self.pairing_wait_noted = true;
+            self.view.add_local_line(PAIRING_WAIT_NOTICE, true);
+            self.view.scroll().to_end();
+        }
+        true
+    }
+
+    /// A self-management confirmation is on screen, waiting for its `y`/`N` (AMP #4259).
+    pub fn confirm_pending(&self) -> bool {
+        self.confirm.is_some()
+    }
+
+    /// Part of the confirmation on screen was cut and has not been shown with `v` yet (AMP
+    /// #4317): until it has, `y` does not allow it.
+    pub fn confirm_has_unseen(&self) -> bool {
+        self.confirm.is_some() && !self.confirm_unseen.is_empty()
+    }
+
+    /// Answers the confirmation on screen (AMP #4259): `yes` only from a `y` typed on this
+    /// keyboard. A request that had already timed out says nothing was written; then the next
+    /// waiting request, if any, is shown. A `yes` while part of the request is unseen (AMP
+    /// #4317) answers nothing: it says to press `v` first and the question stays open.
+    pub fn answer_confirm(&mut self, yes: bool) {
+        if yes && self.confirm_has_unseen() {
+            self.view.add_local_line(CONFIRM_VIEW_FIRST, true);
+            self.view.scroll().to_end();
+            return;
+        }
+        let Some(prompt) = self.confirm.take() else {
+            return;
+        };
+        self.confirm_unseen.clear();
+        let tool = confirm_text(&prompt.request.tool);
+        let path = confirm_text(&prompt.request.path.display().to_string());
+        let line = match (prompt.answer(yes), yes) {
+            (false, _) => CONFIRM_TOO_LATE.to_owned(),
+            (true, true) => format!("Allowed: {tool} may write {path}."),
+            (true, false) => format!("Refused: {tool} did not write {path}."),
+        };
+        self.view.add_notice(&line);
+        self.poll_confirms();
+    }
+
+    /// Closes the confirmation on screen once its tool has given up, and shows the next live
+    /// one (stale ones waiting in the channel are skipped: their tools already said "not
+    /// written"). Returns whether anything changed.
+    fn poll_confirms(&mut self) -> bool {
+        let mut changed = false;
+        if self.confirm.as_ref().is_some_and(PendingConfirm::is_stale) {
+            let prompt = self.confirm.take();
+            self.confirm_unseen.clear();
+            let tool = prompt
+                .map(|p| confirm_text(&p.request.tool))
+                .unwrap_or_default();
+            self.view.add_notice(&format!(
+                "The request from {tool} timed out before an answer; nothing was written."
+            ));
+            changed = true;
+        }
+        if self.confirm.is_some() {
+            return changed;
+        }
+        let Some(rx) = self.confirms.as_mut() else {
+            return changed;
+        };
+        loop {
+            match rx.try_recv() {
+                // Dropping it is a "no" nobody waits for.
+                Ok(prompt) if prompt.is_stale() => continue,
+                Ok(prompt) => {
+                    self.confirm_unseen = self.show_confirm(&prompt);
+                    self.confirm = Some(prompt);
+                    self.confirm_armed_at = Some((self.clock)() + CONFIRM_ARM);
+                    self.confirm_wait_noted = false;
+                    return true;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return changed,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    self.confirms = None;
+                    return changed;
+                }
+            }
+        }
+    }
+
+    /// The confirmation question, on this terminal only: what the tool wants, where, the
+    /// details (the first [`CONFIRM_DETAIL_ROWS`] rows, each cut at [`CONFIRM_ROW_CHARS`]), and
+    /// how to answer. Returns the rows not shown in full, from the first one that was cut: empty
+    /// when everything fit (AMP #4317).
+    fn show_confirm(&mut self, prompt: &PendingConfirm) -> Vec<String> {
+        let r = &prompt.request;
+        self.view.add_local_line(
+            &format!(
+                "Allow {} to {}? [y/N]",
+                confirm_text(&r.tool),
+                confirm_text(&r.summary)
+            ),
+            true,
+        );
+        self.view.add_local_line(
+            &format!(
+                "{} scope: {}",
+                confirm_text(&r.scope),
+                confirm_text(&r.path.display().to_string())
+            ),
+            false,
+        );
+        let rows: Vec<String> = r
+            .details
+            .iter()
+            .flat_map(|d| d.lines().map(confirm_row).collect::<Vec<_>>())
+            .collect();
+        let mut first_cut = None;
+        for (i, row) in rows.iter().take(CONFIRM_DETAIL_ROWS).enumerate() {
+            let len = row.chars().count();
+            if len > CONFIRM_ROW_CHARS {
+                first_cut.get_or_insert(i);
+                let head: String = row.chars().take(CONFIRM_ROW_CHARS).collect();
+                self.view.add_local_line(
+                    &format!("  {head} … ({} more characters)", len - CONFIRM_ROW_CHARS),
+                    false,
+                );
+            } else {
+                self.view.add_local_line(&format!("  {row}"), false);
+            }
+        }
+        if rows.len() > CONFIRM_DETAIL_ROWS {
+            first_cut.get_or_insert(CONFIRM_DETAIL_ROWS);
+            self.view.add_local_line(
+                &format!(
+                    "  … {} more lines, press v to show them all",
+                    rows.len() - CONFIRM_DETAIL_ROWS
+                ),
+                false,
+            );
+        } else if first_cut.is_some() {
+            self.view
+                .add_local_line("  … lines cut short, press v to show them in full", false);
+        }
+        let unseen = first_cut.map(|i| rows[i..].to_vec()).unwrap_or_default();
+        self.show_confirm_answer(!unseen.is_empty());
+        unseen
+    }
+
+    /// How to answer the confirmation on screen; with `unseen`, that `v` comes first.
+    fn show_confirm_answer(&mut self, unseen: bool) {
+        let minutes = CONFIRM_TIMEOUT.as_secs().div_ceil(60);
+        let first = if unseen {
+            "Press v to see the whole change, then y to allow it"
+        } else {
+            "Press y to allow it"
+        };
+        self.view.add_local_line(
+            &format!(
+                "{first}; Esc or any other key refuses. Only this keyboard can answer; with no \
+                 answer within {minutes} minute{} it is refused.",
+                if minutes == 1 { "" } else { "s" }
+            ),
+            false,
+        );
+        self.view.scroll().to_end();
+    }
+
+    /// `v` on a confirmation with unseen rows (AMP #4317): shows every one of them in full,
+    /// from the first row that was cut (a long row wraps, nothing is cut), then the y/N line
+    /// again. `y` allows from then on.
+    fn show_confirm_rest(&mut self) {
+        let rows = std::mem::take(&mut self.confirm_unseen);
+        self.view.add_local_line(
+            &format!(
+                "The whole change, from the first line that was cut ({} lines):",
+                rows.len()
+            ),
+            true,
+        );
+        for row in &rows {
+            self.view.add_local_line(&format!("  {row}"), false);
+        }
+        self.show_confirm_answer(false);
     }
 
     /// The screen's size for the QR code: the last one seen, else the terminal's, else 80x24.
@@ -1592,7 +2345,10 @@ impl Shell {
         self.view
             .add_to_transcript(Arc::new(crate::remote_ui::LinkBlock::new(url)));
         // #2423: how else to get the link out of the chat.
-        self.view.add_notice(if self.mouse_capture {
+        self.view.add_notice(if self.select_copy_on() {
+            "/remote copy copies the link again, /remote open opens it in this computer's \
+             browser, or drag to select and copy it."
+        } else if self.mouse_capture {
             "/remote copy copies the link again, /remote open opens it in this computer's \
              browser. To select it yourself: Option-drag (iTerm2) or Fn-drag (Terminal.app)."
         } else {
@@ -1738,6 +2494,9 @@ impl Shell {
         self.view.add_local_line(&question, true);
         self.view.add_local_line(&hint, false);
         self.view.scroll().to_end();
+        // AMP #4599: each question (a newer one replaces the old) gets its own arm window.
+        self.pairing_armed_at = Some((self.clock)() + CONFIRM_ARM);
+        self.pairing_wait_noted = false;
     }
 
     pub fn view(&self) -> &ChatView {
@@ -1760,6 +2519,7 @@ impl Shell {
         if self.secret.is_some()
             || self.stop_confirm.is_some()
             || self.pairing_pending()
+            || self.confirm_pending()
             || self.viewing.is_some()
             || self.view.strip().is_focused()
         {
@@ -1816,6 +2576,163 @@ impl Shell {
         true
     }
 
+    /// A mouse event from the terminal loop on a `width` x `height` screen (AMP #4217:
+    /// select-to-copy). Only the left button is handled here; the wheel and the jump-to-end
+    /// pill stay with the terminal loop. Returns whether anything may have changed (the loop
+    /// then repaints in full, which a selection change needs).
+    ///
+    /// - **Down** drops any selection. Inside the transcript it only records the press;
+    ///   anywhere else (editor, worker strip, panel) it is [`Shell::click`] at once, as before.
+    /// - **Drag** to another screen cell selects, from the press to the pointer, in content
+    ///   coordinates. Click vs. drag is decided on the screen (#4315): output arriving while the
+    ///   button is down moves the follow-end view, not the pointer, so it never starts a
+    ///   selection. Above or below the transcript it scrolls one line per event and the
+    ///   selection follows to the edge. Nothing is copied while dragging.
+    /// - **Up** with a selection copies it ([`Shell::copy_selection`]); the highlight stays.
+    ///   Up in the pressed screen cell, with no drag away from it, is [`Shell::click`] on the
+    ///   content row that was pressed, wherever it now is on screen (a thinking header, a
+    ///   `#ticket`, a worker notice); if output has pushed that row out of sight, nothing.
+    ///
+    /// With mouse capture off (`[tui] mouse = false`) the terminal sends no events; any that
+    /// come anyway are a plain click on Down and nothing else. With `[tui] select_copy = false`
+    /// (AMP #4218) it is the same: a click on Down, as before #4217, and nothing is selected.
+    pub fn mouse(&mut self, width: usize, height: usize, event: &MouseEvent) -> bool {
+        let (row, column) = (usize::from(event.row), usize::from(event.column));
+        if !self.select_copy_on() {
+            self.mouse_press = None;
+            return match event.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.click(width, height, row, column);
+                    true
+                }
+                _ => false,
+            };
+        }
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.screen = Some((width, height));
+                self.mouse_press = None;
+                self.view.clear_selection();
+                match self.view.content_pos(width, height, row, column) {
+                    Some(at) => {
+                        self.view.select_start(at);
+                        self.mouse_press = Some(MousePress {
+                            cell: (row, column),
+                            at,
+                            moved: false,
+                        });
+                    }
+                    None => {
+                        self.click(width, height, row, column);
+                    }
+                }
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(press) = self.mouse_press.as_mut() else {
+                    return false;
+                };
+                if !press.moved && press.cell == (row, column) {
+                    return false;
+                }
+                press.moved = true;
+                if let Some(rect) = self.view.scroll_rect(width, height) {
+                    if row < rect.y {
+                        self.view.scroll().scroll_by(-1);
+                    } else if row >= rect.y + rect.height {
+                        self.view.scroll().scroll_by(1);
+                    }
+                }
+                if let Some(to) = self.view.content_pos_clamped(width, height, row, column) {
+                    self.view.select_extend(to);
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(press) = self.mouse_press.take() else {
+                    return false;
+                };
+                if press.moved || press.cell != (row, column) {
+                    if let Some(to) = self.view.content_pos_clamped(width, height, row, column) {
+                        self.view.select_extend(to);
+                    }
+                    if self.view.selection().is_some() {
+                        self.copy_selection();
+                    } else {
+                        self.view.clear_selection();
+                    }
+                    return true;
+                }
+                self.view.clear_selection();
+                if let Some(now) = self.screen_row_of(width, height, press.at.row) {
+                    self.click(width, height, now, press.cell.1);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The screen row now showing transcript content row `line` (#4315), or `None` when it is
+    /// out of sight.
+    fn screen_row_of(&self, width: usize, height: usize, line: usize) -> Option<usize> {
+        let rect = self.view.scroll_rect(width, height)?;
+        let offset = line.checked_sub(self.view.scroll().top())?;
+        (offset < rect.height).then(|| rect.y + offset)
+    }
+
+    /// Copies the transcript's selection (AMP #4217) without waiting: OSC 52 goes out now, the
+    /// system tool runs in the background, and [`Shell::poll`] posts what happened
+    /// ([`crate::clipboard::copy_notice`]). An oversize selection says so and sends nothing.
+    /// Only transcript text is ever copied (never the editor, a panel or a `/connect` key), and
+    /// the text is never logged. Returns whether a copy started. Needs a tokio runtime.
+    pub fn copy_selection(&mut self) -> bool {
+        let Some(text) = self.view.select_text() else {
+            return false;
+        };
+        let chars = crate::clipboard::sanitize_for_copy(&text).chars().count();
+        match self.desktop.copy_async(text) {
+            Ok(job) => {
+                let tx = self.msgs_tx.clone();
+                tokio::spawn(async move {
+                    let copied = job.await.unwrap_or_default();
+                    let _ = tx.send(ShellMsg::Copied { chars, copied });
+                });
+                true
+            }
+            Err(crate::clipboard::CopyError::Empty) => false,
+            Err(e) => {
+                self.view.add_error(&e.to_string());
+                false
+            }
+        }
+    }
+
+    /// A key while text may be selected (AMP #4217): Esc and keys that edit drop the
+    /// selection; moving around (PageUp/PageDown, arrows, Home/End, Ctrl+U/Ctrl+D) keeps it.
+    /// The key itself still goes on to its usual handler. Returns whether a selection or a
+    /// press was dropped.
+    pub fn selection_key(&mut self, key: &KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let edits = match key.code {
+            KeyCode::Esc
+            | KeyCode::Enter
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Insert => true,
+            KeyCode::Char(c) => !ctrl || matches!(c, 'h' | 'j' | 'k' | 'y'),
+            _ => false,
+        };
+        if !edits {
+            return false;
+        }
+        let had = self.mouse_press.take().is_some() || self.view.selection().is_some();
+        self.view.clear_selection();
+        had
+    }
+
     /// Whether the terminal loop turns mouse reporting on (`[tui] mouse`, default on, #2185).
     pub fn set_mouse_capture(&mut self, on: bool) {
         self.mouse_capture = on;
@@ -1830,6 +2747,26 @@ impl Shell {
 
     pub fn mouse_capture(&self) -> bool {
         self.mouse_capture
+    }
+
+    /// Whether a drag in the transcript selects and copies (`[tui] select_copy`, default on,
+    /// AMP #4218). Off, [`Shell::mouse`] clicks on press as before #4217, `/help` and the
+    /// `/remote` hint name the terminal's modifier-drag, and any selection is dropped.
+    pub fn set_select_copy(&mut self, on: bool) {
+        self.select_copy = on;
+        if !on {
+            self.mouse_press = None;
+            self.view.clear_selection();
+        }
+    }
+
+    pub fn select_copy(&self) -> bool {
+        self.select_copy
+    }
+
+    /// Select-to-copy is live: mouse capture and `[tui] select_copy` both on.
+    fn select_copy_on(&self) -> bool {
+        self.mouse_capture && self.select_copy
     }
 
     /// This terminal's new-line keys (#2349; the terminal loop sets it once the kitty keyboard
@@ -1925,6 +2862,11 @@ impl Shell {
 
     pub fn is_running(&self) -> bool {
         self.running
+    }
+
+    /// `/compact` is running (AMP #4222): a busy state of its own, not a reply.
+    pub fn is_compacting(&self) -> bool {
+        self.compacting
     }
 
     /// Gives the shell the session's worker supervisor (the manager's; `None` for a worker role).
@@ -2250,6 +3192,13 @@ impl Shell {
     /// Nothing here cancels anything: a switch is refused, never made to fit, and no device is
     /// disconnected on the person's behalf.
     fn switch_blocker(&self) -> Option<String> {
+        if self.compacting {
+            return Some(
+                "the context is being compacted — wait for it to finish (or press Esc to stop \
+                 it), then try again."
+                    .to_owned(),
+            );
+        }
         if self.running {
             return Some(
                 "the manager is replying — wait for it to finish (or press Esc to stop it), then \
@@ -2289,6 +3238,11 @@ impl Shell {
                 "this chat is waiting to carry on when the plan is approved — press Esc to stop \
                  waiting, then try again."
                     .to_owned(),
+            );
+        }
+        if self.confirm_pending() {
+            return Some(
+                "a write is waiting for your y/N — answer it first, then try again.".to_owned(),
             );
         }
         if self.pairing_pending() {
@@ -2354,6 +3308,7 @@ impl Shell {
         self.view.add_notice(&format!("resuming {}…", request.id));
         let tx = self.msgs_tx.clone();
         self.in_flight += 1;
+        self.resuming = true;
         tokio::spawn(async move {
             let result = control.resume(request.clone()).await;
             let _ = tx.send(ShellMsg::Resumed(Box::new(request), result));
@@ -2555,6 +3510,11 @@ impl Shell {
         for line in &reply.errors {
             self.view.add_error(line);
         }
+        if reply.amp_relogin
+            && let Some(meta) = &self.meta
+        {
+            meta.reconnect();
+        }
         if reply.reload {
             self.reload_command(ReloadCause::Panel);
         }
@@ -2571,7 +3531,10 @@ impl Shell {
             }
             return;
         };
-        if self.reloading {
+        // AMP #4222 (C5): no reload under a running compaction; it follows the compaction.
+        // AMP #4267 (G3): nor under a running reply: a reload swaps the tool policy at once, so
+        // it would change inside the turn. It follows the reply (`finish_run`).
+        if self.reloading || self.compacting || self.running {
             // A panel's or a person's request outranks the watcher's (it says what changed).
             if self.reload_again != Some(ReloadCause::Command) {
                 self.reload_again = match (self.reload_again, cause) {
@@ -2579,9 +3542,18 @@ impl Shell {
                     _ => Some(cause),
                 };
             }
-            if cause == ReloadCause::Command {
-                self.view
-                    .add_notice("/reload: already reloading; once more when it is done");
+            let notice = match cause {
+                ReloadCause::Command if self.reloading => {
+                    Some("/reload: already reloading; once more when it is done")
+                }
+                ReloadCause::Command | ReloadCause::Panel if self.running => Some(RELOAD_QUEUED),
+                ReloadCause::Command => {
+                    Some("/reload: compacting the context; reloading once that is done")
+                }
+                ReloadCause::Panel | ReloadCause::Watcher => None,
+            };
+            if let Some(notice) = notice {
+                self.view.add_notice(notice);
             }
             return;
         }
@@ -2672,8 +3644,10 @@ impl Shell {
             .map_or(ABORT_GRACE, |s| s.config().abort_grace + REPORT_ALLOWANCE)
     }
 
+    /// Nothing still running: no reply, no compaction (it was asked to stop and reports back,
+    /// AMP #4226 / wave check #4223), no live worker.
     fn settled(&self) -> bool {
-        !self.running && self.live_tickets().is_empty()
+        !self.running && !self.compacting && self.live_tickets().is_empty()
     }
 
     /// Winds the session down before the process exits. With workers live: cancel them all,
@@ -2695,6 +3669,10 @@ impl Shell {
         // Quitting: nothing queued may start once the reply ends, nor any automatic turn.
         self.quitting = true;
         self.prompt_queue.clear();
+        if self.compacting {
+            // Nothing is written unless the compaction completes (spec D4): stop it.
+            let _ = self.harness.abort().await;
+        }
         if self.settled() {
             return QuitOutcome::Idle;
         }
@@ -2752,7 +3730,12 @@ impl Shell {
                     self.release_unfinished("the chat quit before its worker stopped", &mut repaint).await;
                     return QuitOutcome::TimedOut;
                 }
-                _ = ticker.tick() => {}
+                _ = ticker.tick() => {
+                    // A stopped compaction reports back through the message queue.
+                    if self.compacting {
+                        self.poll();
+                    }
+                }
             }
         }
     }
@@ -2865,6 +3848,8 @@ impl Shell {
     fn wake_on_worker_end(&mut self, now: Instant) -> bool {
         if !self.wake_on_end
             || self.running
+            || self.compacting
+            || self.reloading
             || self.switching
             || self.quitting
             || self.quit_confirm_until.is_some_and(|until| now < until)
@@ -2975,7 +3960,7 @@ impl Shell {
     /// Never while a reply runs or a server switch is going on.
     fn watch_approval(&mut self) -> bool {
         use amp_core::approval_wait::{self as aw, WaitCheck};
-        if self.running || self.switching {
+        if self.running || self.compacting || self.reloading || self.switching {
             return false;
         }
         let (Some(meta), Some(wait)) = (&self.meta, self.approval_wait.as_mut()) else {
@@ -3047,6 +4032,13 @@ impl Shell {
             meta.observe(event);
         }
         self.view.apply(event);
+        if let AgentEvent::MessageEnd {
+            message: rpi_agent::AgentMessage::Assistant(m),
+        } = event
+        {
+            let u = &m.usage;
+            self.measured_after_compaction(u.input + u.output + u.cache_read + u.cache_write);
+        }
         self.follow_streaming(event);
         // AMP #2862: the roster follows the supervisor's live status, not the dispatch tool call.
         // In Launch mode `amp_run_ticket` returns at once, while its worker is still queued or
@@ -3255,7 +4247,11 @@ impl Shell {
         // A prompt hands the keys back to the editor; a docked panel stays, unfocused.
         // #2161: a sent prompt hands the keys back to the editor; a docked panel stays.
         self.editor_clicked = self.view.panel().is_open();
-        if self.running {
+        // AMP #4222 (C5): a prompt typed during `/compact` waits for it like one typed during a
+        // reply, and runs once the compaction has ended ([`Shell::finish_compaction`]).
+        // AMP #4301: and one typed during a reload waits for it to be applied
+        // (`ShellMsg::Reloaded`), so the tool policy never changes inside its turn.
+        if self.running || self.compacting || self.reloading {
             self.queue_prompt(trimmed);
             return Submit::Continue;
         }
@@ -3304,7 +4300,9 @@ impl Shell {
             }
             return;
         }
-        if self.switching {
+        // AMP #4301: a reload in flight swaps the tool policy when it lands, so no queued prompt
+        // starts its turn before then; the `Reloaded` handler runs this again once it is applied.
+        if self.switching || self.reloading {
             return;
         }
         if let Some(next) = self.prompt_queue.pop_front() {
@@ -3417,6 +4415,10 @@ impl Shell {
     /// dispatched workers keep running and only this reply's still-queued launches end
     /// ([`reply_stop_notice`] says which). `/workers` stops one worker; quitting stops them all.
     pub async fn abort(&mut self) {
+        if self.compacting {
+            self.stop_compaction().await;
+            return;
+        }
         if self.running {
             self.warn_reply_stop();
         }
@@ -3457,6 +4459,14 @@ impl Shell {
             },
             Err(_) => stopping,
         };
+        let compaction_failed = matches!(
+            &result,
+            Ok(RunResult { outcome: HarnessRunOutcome::Failed { error, .. }, .. })
+                if error.code == COMPACTION_FAILED
+        );
+        if stopped || compaction_failed {
+            self.compaction.quiet_run = Some(self.prompts);
+        }
         if let Some(run_id) = self.run_id.take() {
             use amp_core::chat_event::{ChatEvent, RunOutcome};
             let (outcome, error) = match &result {
@@ -3464,6 +4474,10 @@ impl Shell {
                     HarnessRunOutcome::Completed { .. } => (RunOutcome::Completed, None),
                     HarnessRunOutcome::Aborted { .. } => (RunOutcome::Aborted, None),
                     HarnessRunOutcome::Failed { .. } if stopping => (RunOutcome::Aborted, None),
+                    HarnessRunOutcome::Failed { error, .. } if error.code == COMPACTION_FAILED => (
+                        RunOutcome::Failed,
+                        Some(compaction_failed_notice(&error.message)),
+                    ),
                     HarnessRunOutcome::Failed {
                         error,
                         final_message,
@@ -3497,6 +4511,11 @@ impl Shell {
                 // The provider may report a stopped request as an error ("Request was
                 // aborted"): the person asked for it, so it is not one.
                 HarnessRunOutcome::Failed { .. } if stopping => self.view.add_notice(STOPPED),
+                // G1 (spec F1): its own line, even if a reply error was drawn; the prompt stays
+                // saved and is never re-sent (I4).
+                HarnessRunOutcome::Failed { error, .. } if error.code == COMPACTION_FAILED => self
+                    .view
+                    .add_error(&format!("✗ {}", compaction_failed_notice(&error.message))),
                 HarnessRunOutcome::Failed { .. } if error_shown => {}
                 HarnessRunOutcome::Failed {
                     error,
@@ -3520,7 +4539,283 @@ impl Shell {
                 amp_core::provider_error::summarize("", &e)
             )),
         }
+        // AMP #4267: a reload asked for during the reply runs now, once, before the next queued
+        // prompt starts a turn. One still running (or a compaction) runs it when it ends.
+        // AMP #4301: while it runs, `after_run` starts no queued prompt (only a stop drops them);
+        // they start once the reload has been applied (`ShellMsg::Reloaded`).
+        if !self.reloading
+            && !self.compacting
+            && let Some(again) = self.reload_again.take()
+        {
+            self.reload_command(again);
+        }
         self.after_run(stopped);
+    }
+
+    /// Why `/compact` can't start now (spec §2, B1-B5), or `None`. Refuse, never queue, never
+    /// cancel: nothing is stopped to make room. Live workers (B6) don't block it: they are
+    /// separate harnesses, and their ends stay queued for the next turn.
+    fn compact_blocker(&self) -> Option<&'static str> {
+        if self.quitting {
+            return Some("the chat is quitting");
+        }
+        if self.compacting {
+            return Some("already compacting");
+        }
+        if self.running {
+            return Some(COMPACT_WAIT_REPLY);
+        }
+        if self.switching || self.resuming {
+            return Some("a server switch or session resume is running — try again when it's done");
+        }
+        if !self.prompt_queue.is_empty() {
+            return Some(
+                "prompts are queued and would run against whichever context exists — send or drop \
+                 the queued prompts first",
+            );
+        }
+        None
+    }
+
+    /// `/compact [instructions]` (AMP #4222, KB specs/harness-compact-command.md): asks the
+    /// manager chat's own harness (C3) to summarize its older turns, off the event loop (C6).
+    /// Everything after the name is focus instructions for the summary (C1), never a target.
+    ///
+    /// Short sessions (spec §4 correction b): there is deliberately no "too little to compact"
+    /// pre-check against `keep_recent_tokens`. rpi decides what to summarize, and the outcome
+    /// notice shows honest before/after estimates, so a compaction that saved nothing says so.
+    fn compact_command(&mut self, arg: &str) {
+        if let Some(why) = self.compact_blocker() {
+            self.view.add_notice(&format!("/compact: {why}"));
+            return;
+        }
+        self.compacting = true;
+        self.view.set_stopping(false);
+        self.in_flight += 1;
+        let instructions = (!arg.is_empty()).then(|| arg.to_owned());
+        let harness = Arc::clone(&self.harness);
+        let tx = self.msgs_tx.clone();
+        tokio::spawn(async move {
+            // Its own task, so a panic in the compaction still reports back here.
+            let job = {
+                let harness = Arc::clone(&harness);
+                tokio::spawn(async move { harness.compact(instructions.as_deref()).await })
+            };
+            let result = match job.await {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => Err(CompactError {
+                    busy: matches!(e, rpi_harness::result::HarnessError::LaneBusy { .. }),
+                    message: e.to_string(),
+                }),
+                Err(e) => Err(CompactError {
+                    busy: false,
+                    message: format!("the compaction crashed: {e}"),
+                }),
+            };
+            // O2: a decline on a branch whose last entry is already a compaction says so.
+            let already_compacted = match &result {
+                Ok(CompactionResult {
+                    outcome: CompactionOutcome::Declined { leaf_id },
+                    ..
+                }) if !leaf_id.is_empty() => matches!(
+                    harness.session().get_entry(leaf_id).await,
+                    Ok(Some(rpi_harness::session::types::Entry::Compaction(_)))
+                ),
+                _ => false,
+            };
+            // AMP #4280: the system prompt + tools inside `tokens_before`, for the "after".
+            let overhead = match &result {
+                Ok(CompactionResult {
+                    outcome:
+                        CompactionOutcome::Completed {
+                            entry: rpi_harness::session::types::Entry::Compaction(c),
+                            ..
+                        },
+                    ..
+                }) => compaction_overhead(&harness, c).await,
+                _ => 0,
+            };
+            let _ = tx.send(ShellMsg::Compacted(Box::new(CompactDone {
+                result,
+                already_compacted,
+                overhead,
+            })));
+        });
+        self.refresh_remote_status();
+    }
+
+    /// Esc, `/stop` or `/abort` while compacting (X1): cancels the compaction only. Workers,
+    /// queued prompts and the reply history are left alone (X3, N2).
+    async fn stop_compaction(&mut self) {
+        self.view.set_stopping(true);
+        self.clear_esc_hint();
+        if let Err(e) = self.harness.abort().await {
+            self.view.add_error(&format!("/compact: stop: {e}"));
+        }
+    }
+
+    /// Applies `/compact`'s outcome (spec §4): exactly one notice, then the chat is idle again
+    /// and a prompt queued meanwhile runs, as after a completed reply (C5, X3).
+    fn finish_compaction(&mut self, done: CompactDone) {
+        self.compacting = false;
+        let stopping = self.view.stopping();
+        self.view.set_stopping(false);
+        match done.result {
+            Ok(CompactionResult { outcome, .. }) => match outcome {
+                CompactionOutcome::Completed { entry, .. } => {
+                    let rpi_harness::session::types::Entry::Compaction(c) = &entry else {
+                        self.view.add_notice("compacted the context");
+                        return self.after_compaction();
+                    };
+                    let landed = LandedCompaction::of(c, None, done.overhead);
+                    let after = landed.after;
+                    self.apply_landed(landed);
+                    self.view.add_notice(&compacted_notice(
+                        c.tokens_before,
+                        after,
+                        self.info.session_file.is_some(),
+                    ));
+                }
+                CompactionOutcome::Declined { .. } if done.already_compacted => {
+                    self.view.add_notice(
+                        "/compact: nothing to compact — already compacted; send a prompt first",
+                    )
+                }
+                CompactionOutcome::Declined { .. } => {
+                    self.view.add_notice("/compact: nothing to compact")
+                }
+                // X2: rpi 0.8.0 reports a stopped compaction as `Failed`; `Aborted` is mapped
+                // the same for when it starts producing it.
+                CompactionOutcome::Aborted { .. } => self.view.add_notice(COMPACT_STOPPED),
+                CompactionOutcome::Failed { .. } if stopping => {
+                    self.view.add_notice(COMPACT_STOPPED)
+                }
+                CompactionOutcome::Failed { error, .. } => self.view.add_error(&format!(
+                    "✗ compaction failed ({}): {} — context unchanged",
+                    error.code,
+                    crate::chrome::clean(&error.message)
+                )),
+            },
+            // O5: a race with a reply rpi caught: a refusal, nothing changed.
+            Err(e) if e.busy => self
+                .view
+                .add_notice(&format!("/compact: {COMPACT_WAIT_REPLY}")),
+            Err(_) if stopping => self.view.add_notice(COMPACT_STOPPED),
+            Err(e) => self.view.add_error(&format!(
+                "✗ /compact failed: {} (rpi writes the summary only on success)",
+                crate::chrome::clean(&e.message)
+            )),
+        }
+        self.after_compaction();
+    }
+
+    /// A completed compaction (spec E3): the footer's context drops to E2's estimate at once,
+    /// and the remote `context_pct` with it; the next reply's reported usage replaces it.
+    /// Only after a *completed* one: Declined/Failed leave the footer as it was.
+    fn apply_landed(&mut self, landed: LandedCompaction) {
+        if self.compaction.applied.as_deref() == Some(landed.entry_id.as_str()) {
+            return;
+        }
+        self.compaction.applied = Some(landed.entry_id.clone());
+        self.view.footer().set_context_tokens(Some(landed.after));
+        self.totals.context_tokens = landed.after;
+        self.compaction.last = Some(landed);
+        self.refresh_remote_status();
+    }
+
+    /// An automatic compaction's progress ended: look up whether its entry landed (bounded),
+    /// off the event loop. A manual one is applied by [`Shell::finish_compaction`].
+    fn compaction_progress(&mut self, active: bool, manual: bool, at_ms: i64) {
+        if active {
+            self.compaction.started_ms = Some(at_ms);
+            self.compaction.started_run = self.prompts;
+            return;
+        }
+        if self.compaction.started_ms.take().is_none() || manual {
+            return;
+        }
+        // AMP #4263: rpi persists the entry after the progress ends, so the entry is at least as
+        // new as the end. Bounding from the end (not the start) keeps two compactions in one
+        // run apart when the shell applies both progress pairs in one poll.
+        let since = at_ms;
+        let footer_at_end = self.view.footer().context().map(|c| c.tokens);
+        let run = self.compaction.started_run;
+        let harness = Arc::clone(&self.harness);
+        let tx = self.msgs_tx.clone();
+        tokio::spawn(async move {
+            let landed = landed_compaction(&harness, since, footer_at_end).await;
+            let _ = tx.send(ShellMsg::CompactionLanded { run, landed });
+        });
+    }
+
+    /// An automatic compaction's lookup came back (AMP #4263).
+    /// - None landed (G2, spec F2): rpi skipped it and the run carries on uncompacted, so say
+    ///   so — unless the run already ended stopped (F5) or with `compaction_failed` (G1 said it).
+    /// - One landed: the footer takes its estimate (#4226, E3), and G3 (S4) checks it freed
+    ///   something: a second automatic compaction in the same run, an estimate after it no
+    ///   smaller than before, or (later) a measured usage no smaller than before ⇒ warn once.
+    fn automatic_compaction_ended(&mut self, run: u32, landed: Option<LandedCompaction>) {
+        let Some(l) = landed else {
+            if self.compaction.quiet_run != Some(run) && !self.view.stopping() {
+                self.view.add_warning(COMPACTION_SKIPPED);
+            }
+            return;
+        };
+        if self.compaction.last.as_ref().map(|x| x.entry_id.as_str()) == Some(l.entry_id.as_str()) {
+            return;
+        }
+        let (before, after) = (l.tokens_before, l.after);
+        // Only if no reply reported a newer context since the compaction ended.
+        if self.view.footer().context().map(|c| c.tokens) == l.footer_at_end {
+            self.apply_landed(l);
+        } else {
+            self.compaction.last = Some(l);
+        }
+        let count = match self.compaction.run_auto {
+            (r, n) if r == run => n + 1,
+            _ => 1,
+        };
+        self.compaction.run_auto = (run, count);
+        if count >= 2 || after >= before {
+            self.warn_no_progress(run);
+        } else {
+            self.compaction.measure = Some((run, before));
+        }
+    }
+
+    /// G3 (S4): the next measured usage after an automatic compaction is no smaller than the
+    /// context before it ⇒ it freed nothing.
+    fn measured_after_compaction(&mut self, context: i64) {
+        if context <= 0 {
+            return;
+        }
+        if let Some((run, before)) = self.compaction.measure.take()
+            && before <= context
+        {
+            self.warn_no_progress(run);
+        }
+    }
+
+    /// G3's warning, at most once per run. Nothing is truncated or retried.
+    fn warn_no_progress(&mut self, run: u32) {
+        if self.compaction.warned_run == Some(run) {
+            return;
+        }
+        self.compaction.warned_run = Some(run);
+        self.view.add_warning(COMPACTION_NO_PROGRESS);
+    }
+
+    /// After `/compact` ended, however it ended: a reload asked for meanwhile runs, then the
+    /// oldest queued prompt (its own turn, as after a completed reply) — once that reload has
+    /// been applied (AMP #4301: `after_run` waits while one is in flight).
+    fn after_compaction(&mut self) {
+        if !self.reloading
+            && let Some(again) = self.reload_again.take()
+        {
+            self.reload_command(again);
+        }
+        self.after_run(false);
+        self.refresh_remote_status();
     }
 
     /// A key the editor doesn't get first: the `/` menu's keys ([`crate::slash::CommandMenu`]),
@@ -3534,12 +4829,41 @@ impl Shell {
     /// chat's live workers ([`esc_hint`]), and the next Esc stops the reply (#2181, #2354).
     pub async fn key(&mut self, key: &KeyEvent, editor_empty: bool) -> bool {
         // #2376: a pairing question takes the next key: `y` allows, anything else refuses.
+        // AMP #4599: as for a confirmation (#4319), until it has been on screen for CONFIRM_ARM
+        // with no key, a key (a `y` typed ahead as the question popped up) answers nothing,
+        // doesn't reach the editor, and restarts that.
         if self.pairing_pending() {
+            if self.hold_unarmed_pairing() {
+                return true;
+            }
             let plain = !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
             let allow = plain && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
             self.answer_pairing(allow);
+            return true;
+        }
+        // AMP #4259: a self-management confirmation takes the next key, also while the reply
+        // that asked is running: `y` allows, anything else (Esc, `n`, Enter) refuses. AMP #4317:
+        // while part of it was cut, `v` shows the rest and `y` waits for that. AMP #4319: until
+        // it has been on screen for CONFIRM_ARM with no key, a key (a `y` typed ahead into the
+        // editor as it appeared) answers nothing, doesn't reach the editor, and restarts that.
+        if self.confirm_pending() {
+            if self.hold_unarmed_confirm() {
+                return true;
+            }
+            let plain = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            if plain
+                && self.confirm_has_unseen()
+                && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+            {
+                self.show_confirm_rest();
+                return true;
+            }
+            let yes = plain && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+            self.answer_confirm(yes);
             return true;
         }
         // #2252: a stop waiting for its answer takes the next key; a worker's session takes
@@ -3600,7 +4924,7 @@ impl Shell {
         if self.scroll_key(key, editor_empty) {
             return true;
         }
-        if is_esc && self.running {
+        if is_esc && (self.running || self.compacting) {
             self.abort().await;
             return true;
         }
@@ -3796,9 +5120,24 @@ impl Shell {
             "help" | "?" => self.view.add_to_transcript(Arc::new(
                 crate::slash::HelpBlock::new()
                     .mouse_capture(self.mouse_capture)
+                    .select_copy(self.select_copy)
                     .newline(self.newline),
             )),
-            "usage" => self.view.add_notice(&self.usage_text()),
+            "usage" => {
+                let branch = branch_compactions(&self.harness).await;
+                // The live model, role caps applied (#4276, spec S1/I9): rpi budgets the summary
+                // with this model's `max_tokens`, not the uncapped `/model` choice.
+                let max_output = AgentLane::get_model(&*self.harness)
+                    .await
+                    .map_or(0, |m| m.max_tokens);
+                let text = format!(
+                    "{}\n{}",
+                    self.usage_text(),
+                    self.compaction_text(max_output, branch)
+                );
+                self.view.add_notice(&text)
+            }
+            "compact" => self.compact_command(arg),
             "model" if arg.is_empty() => self.model_picker(),
             // `/model provider/model` switches this chat; `/model roles`, `/model <role> …` are a
             // role's model (#2245).
@@ -3813,7 +5152,7 @@ impl Shell {
             "abort" => self.abort().await,
             // #2425: stops the reply, or the wait for plan approval.
             "stop" => {
-                if self.running {
+                if self.running || self.compacting {
                     self.abort().await;
                 } else if !self.stop_approval_wait(Some(STOPPED_WAITING)) {
                     self.view.add_notice("/stop: nothing to stop");
@@ -3919,6 +5258,11 @@ impl Shell {
         if self.switching {
             self.view
                 .add_notice("/server: already switching; wait for it to finish");
+            return;
+        }
+        if self.compacting {
+            self.view
+                .add_notice("/server: compacting the context; switch once that is done");
             return;
         }
         if self.running {
@@ -4249,6 +5593,12 @@ impl Shell {
                                 self.pending_command = Some(command);
                             }
                         }
+                        // #4251: `/amp`'s login row runs `/mcp login amp`, whose browser prompt
+                        // and reply go to the transcript, so the panel closes.
+                        Some(Target::Command(command)) => {
+                            panel.close();
+                            self.pending_command = Some(command);
+                        }
                         // #2252: Enter on a worker opens its session (o still opens AMP).
                         Some(Target::Ticket { id, .. })
                             if state.kind == PanelKind::Workers && self.has_session(id) =>
@@ -4323,6 +5673,7 @@ impl Shell {
         }
         if self.stop_confirm.is_some()
             || self.pairing_pending()
+            || self.confirm_pending()
             || self.viewing.is_some()
             || self.view.strip().is_focused()
         {
@@ -4343,7 +5694,10 @@ impl Shell {
     }
 
     fn open_target(&mut self, target: &Target) {
-        if matches!(target, Target::Model(_) | Target::Item(_)) {
+        if matches!(
+            target,
+            Target::Model(_) | Target::Item(_) | Target::Command(_)
+        ) {
             return;
         }
         let Some(meta) = &self.meta else { return };
@@ -4383,6 +5737,7 @@ impl Shell {
     pub fn poll(&mut self) -> bool {
         let mut changed = self.expire_hints(Instant::now());
         changed |= self.poll_remote();
+        changed |= self.poll_confirms();
         changed |= self.build_roster();
         changed |= self.show_launch_ends();
         changed |= self.pump_sessions();
@@ -4396,8 +5751,24 @@ impl Shell {
                 }
                 continue;
             }
-            if let ShellMsg::Compaction { active, manual } = &msg {
+            if let ShellMsg::Compaction {
+                active,
+                manual,
+                at_ms,
+            } = &msg
+            {
                 self.view.set_compaction(*active, *manual);
+                self.compaction_progress(*active, *manual, *at_ms);
+                continue;
+            }
+            if let ShellMsg::CompactionLanded { run, landed } = msg {
+                self.automatic_compaction_ended(run, landed);
+                continue;
+            }
+            if let ShellMsg::Copied { chars, copied } = &msg {
+                if let Some(text) = crate::clipboard::copy_notice(*chars, copied) {
+                    self.view.add_notice(&text);
+                }
                 continue;
             }
             if let ShellMsg::ReloadRequest = &msg {
@@ -4467,15 +5838,27 @@ impl Shell {
                     if let Some(again) = self.reload_again.take() {
                         self.reload_command(again);
                     }
+                    // AMP #4301: queued prompts waited for this reload; with it applied (and no
+                    // further one started), the oldest runs now, as after a reply.
+                    if !self.reloading && !self.running && !self.compacting {
+                        self.after_run(false);
+                        self.refresh_remote_status();
+                    }
                 }
                 ShellMsg::Config { result, command } => self.apply_config(result, &command),
                 ShellMsg::RemoteDone(reply) => self.remote_done(reply),
                 ShellMsg::Sessions(listed) => self.apply_sessions(listed),
-                ShellMsg::Resumed(request, result) => self.apply_resumed(*request, result),
+                ShellMsg::Resumed(request, result) => {
+                    self.resuming = false;
+                    self.apply_resumed(*request, result)
+                }
+                ShellMsg::Compacted(done) => self.finish_compaction(*done),
                 ShellMsg::Notice { .. }
                 | ShellMsg::ReloadRequest
                 | ShellMsg::Remote(_)
                 | ShellMsg::ProjectLinked(_)
+                | ShellMsg::CompactionLanded { .. }
+                | ShellMsg::Copied { .. }
                 | ShellMsg::Compaction { .. } => {}
                 ShellMsg::Answered { ticket, result } => match result {
                     Ok(_) => {
@@ -4620,6 +6003,17 @@ impl Shell {
         )
     }
 
+    /// `/usage`'s compaction lines for this chat's harness and model ([`compaction_lines`]).
+    /// `max_output`: the live harness model's `max_tokens` (role caps applied); 0 if unknown.
+    fn compaction_text(&self, max_output: u64, branch: BranchCompactions) -> String {
+        compaction_lines(
+            self.harness.compaction_settings(),
+            self.info.context_window as i64,
+            max_output,
+            branch,
+        )
+    }
+
     /// `/usage`'s context line: what the footer's `ctx 4%` stands for, and the cache hit rate.
     fn context_text(&self) -> String {
         let footer = self.view.footer();
@@ -4739,8 +6133,9 @@ impl Shell {
             let (provider, model_id) = reference.split_once('/').unwrap_or(("", &reference));
             self.info.provider = provider.to_owned();
             self.info.model_id = model_id.to_owned();
+            let model = self.capped(&choice);
             self.info.thinking = thinking;
-            self.info.context_window = choice.model.context_window;
+            self.info.context_window = model.context_window;
             self.view.set_footer(&self.info.footer(self.footer_ticket));
             lines.push(format!(
                 "this chat now runs on {} • thinking {} (from the next reply)",
@@ -4748,7 +6143,6 @@ impl Shell {
                 thinking_name(thinking)
             ));
             let harness = Arc::clone(&self.harness);
-            let model = choice.model.clone();
             let tx = self.msgs_tx.clone();
             tokio::spawn(async move {
                 let mut failed = harness.set_model(model).await.err().map(|e| e.to_string());
@@ -4794,6 +6188,11 @@ impl Shell {
                 .add_notice("can't switch models during a run (Esc aborts it)");
             return;
         }
+        if self.compacting {
+            self.view
+                .add_notice("can't switch models while compacting the context (Esc stops it)");
+            return;
+        }
         let Some(choice) = self
             .models
             .iter()
@@ -4814,7 +6213,8 @@ impl Shell {
         } else {
             ThinkingLevel::Off
         };
-        let model = choice.model.clone();
+        let model = self.capped(&choice);
+        let window = model.context_window;
         if let Err(e) = self.harness.set_model(model).await {
             self.view.add_error(&format!("/model: {e}"));
             return;
@@ -4826,7 +6226,7 @@ impl Shell {
         self.info.provider = provider.to_owned();
         self.info.model_id = model_id.to_owned();
         self.info.thinking = thinking;
-        self.info.context_window = choice.model.context_window;
+        self.info.context_window = window;
         self.view.set_footer(&self.info.footer(self.footer_ticket));
         self.view.add_notice(&format!(
             "model: {} • thinking {} (this session only)",
@@ -5749,6 +7149,55 @@ fn count(n: u64, one: &str, many: &str) -> String {
 mod tests {
     use super::{clean_answer, parse_id, short_role, worker_summaries};
 
+    /// AMP #4280: a compaction that kept the whole short conversation is not shown as a large
+    /// drop. `tokens_before` came from a reported usage (system prompt + tools + messages);
+    /// the "after" adds the same overhead back, so it is at least `tokens_before` when the
+    /// retained tail is everything that was there before (the summary only adds to it).
+    #[test]
+    fn compaction_after_is_on_the_same_basis_as_before() {
+        use super::{compacted_context_tokens, request_overhead};
+        use rpi_harness::session::types::{CompactionEntry, EntryBase};
+        let user = |text: &str| {
+            rpi_agent::AgentMessage::User(rpi_ai::types::UserMessage::new(text.to_owned(), 1))
+        };
+        let conversation = vec![
+            user("hello there, please remember the number 42"),
+            user("Got it — I'll remember 42."),
+        ];
+        let messages: i64 = conversation
+            .iter()
+            .map(rpi_harness::compaction::estimate_tokens)
+            .sum();
+        // ~11k of system prompt and tool definitions inside the reported usage.
+        let tokens_before = 11_338;
+        let overhead = request_overhead(tokens_before, &conversation);
+        assert_eq!(overhead, tokens_before - messages);
+        let entry = CompactionEntry {
+            base: EntryBase {
+                entry_type: "compaction".into(),
+                id: "c1".into(),
+                seq: 3,
+                parent_id: None,
+                timestamp: 2,
+            },
+            summary: "The user asked to remember 42.".into(),
+            retained_tail: conversation.clone(),
+            tokens_before,
+            details: None,
+            usage: None,
+        };
+        let after = compacted_context_tokens(&entry, overhead);
+        assert!(
+            after >= tokens_before,
+            "after {after} before {tokens_before}"
+        );
+        // Messages-only (the pre-#4280 figure) is the ~11k → ~21 the smoke saw.
+        assert!(compacted_context_tokens(&entry, 0) < tokens_before / 100);
+        // Without a reported usage `tokens_before` is chars/4 only: no overhead, never negative.
+        assert_eq!(request_overhead(messages, &conversation), 0);
+        assert_eq!(request_overhead(0, &conversation), 0);
+    }
+
     /// AMP #2891's loop guard: at most WAKE_LIMIT automatic turns within WAKE_WINDOW; the next
     /// trips it once and it stays paused (silently) until the person's prompt resets it. Turns
     /// older than the window stop counting.
@@ -6519,5 +7968,248 @@ mod tests {
 
     fn get_phase(shell: &super::Shell, task_id: i64) -> Phase {
         roster_entry(shell, task_id).expect("listed").phase
+    }
+
+    /// Counts the reloads that actually start.
+    struct CountingReload(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl super::ReloadControl for CountingReload {
+        fn reload(&self) -> super::ReloadFuture {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(super::ReloadReply {
+                    lines: Vec::new(),
+                    providers: Vec::new(),
+                    models: Vec::new(),
+                    switch_to: None,
+                    stays: None,
+                    warnings: Vec::new(),
+                })
+            })
+        }
+    }
+
+    async fn reloading_shell() -> (super::Shell, Arc<std::sync::atomic::AtomicUsize>) {
+        let ends = amp_core::supervisor::LaunchEnds::default();
+        let (mut shell, _feed) = watching_shell(&ends).await;
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        shell.set_reload(Arc::new(CountingReload(Arc::clone(&count))));
+        (shell, count)
+    }
+
+    /// Polls until the running reload has been applied (bounded: 5 s).
+    async fn settle_reload(shell: &mut super::Shell) {
+        for _ in 0..500 {
+            shell.poll();
+            if !shell.reloading {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the reload never finished");
+    }
+
+    fn reloads(count: &std::sync::atomic::AtomicUsize) -> usize {
+        count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// AMP #4267 (G3): the watcher's requests during a reply start no reload (its policy swap
+    /// would land inside the turn); exactly one runs when the reply ends, and no more after.
+    #[tokio::test]
+    async fn a_watcher_reload_during_a_reply_waits_for_it_and_runs_once() {
+        let (mut shell, count) = reloading_shell().await;
+        shell.running = true;
+        shell.view.set_working(true);
+        for _ in 0..3 {
+            shell.reload_command(super::ReloadCause::Watcher);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        shell.poll();
+        assert!(!shell.reloading, "no reload starts mid-reply");
+        assert_eq!(reloads(&count), 0);
+        assert_eq!(shell.reload_again, Some(super::ReloadCause::Watcher));
+        let screen = shell.view().render_plain(160, 60).join("\n");
+        assert!(
+            !screen.contains(super::RELOAD_QUEUED),
+            "the watcher stays quiet"
+        );
+
+        shell.finish_run(Err("ended".into()));
+        assert!(shell.reloading, "the reply's end starts the pending reload");
+        assert_eq!(shell.reload_again, None);
+        settle_reload(&mut shell).await;
+        assert_eq!(reloads(&count), 1);
+
+        // Nothing is left pending: another ended reply starts nothing.
+        shell.running = true;
+        shell.finish_run(Err("ended".into()));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        shell.poll();
+        assert!(!shell.reloading);
+        assert_eq!(reloads(&count), 1);
+    }
+
+    /// AMP #4267: `/reload` during a reply says it is queued, outranks a watcher request, and
+    /// runs once after the reply; a panel's change says the same.
+    #[tokio::test]
+    async fn slash_reload_during_a_reply_is_queued_and_runs_after_it() {
+        let (mut shell, count) = reloading_shell().await;
+        shell.running = true;
+        shell.view.set_working(true);
+        shell.submit("/reload").await;
+        shell.reload_command(super::ReloadCause::Watcher);
+        assert!(!shell.reloading);
+        assert_eq!(shell.reload_again, Some(super::ReloadCause::Command));
+        let screen = shell.view().render_plain(160, 60).join("\n");
+        assert!(screen.contains(super::RELOAD_QUEUED), "{screen}");
+
+        shell.finish_run(Err("ended".into()));
+        assert!(shell.reloading);
+        settle_reload(&mut shell).await;
+        assert_eq!(reloads(&count), 1);
+        assert_eq!(shell.reload_again, None);
+
+        // A panel's change mid-reply: queued with the same notice, then run once.
+        shell.running = true;
+        shell.reload_command(super::ReloadCause::Watcher);
+        shell.reload_command(super::ReloadCause::Panel);
+        assert_eq!(shell.reload_again, Some(super::ReloadCause::Panel));
+        let queued = shell
+            .view()
+            .render_plain(160, 80)
+            .iter()
+            .filter(|l| l.contains(super::RELOAD_QUEUED))
+            .count();
+        assert_eq!(queued, 2, "one notice for /reload, one for the panel");
+        shell.finish_run(Err("ended".into()));
+        settle_reload(&mut shell).await;
+        assert_eq!(reloads(&count), 2);
+    }
+
+    /// AMP #4267: a reply that ends while a reload still runs leaves the pending one to that
+    /// reload's end; it runs once, not twice.
+    #[tokio::test]
+    async fn a_reload_pending_when_a_reply_ends_mid_reload_runs_once() {
+        let (mut shell, count) = reloading_shell().await;
+        shell.reload_command(super::ReloadCause::Command);
+        assert!(shell.reloading);
+        shell.running = true;
+        shell.reload_command(super::ReloadCause::Watcher);
+        shell.finish_run(Err("ended".into()));
+        assert_eq!(
+            shell.reload_again,
+            Some(super::ReloadCause::Watcher),
+            "still waiting on the running reload"
+        );
+        settle_reload(&mut shell).await; // the first ends and starts the pending one
+        settle_reload(&mut shell).await;
+        assert_eq!(reloads(&count), 2);
+        assert_eq!(shell.reload_again, None);
+    }
+
+    /// AMP #4301: a prompt queued during a reply, with a watcher reload asked for meanwhile,
+    /// does not start its turn when the reply ends (the reload is still in flight and would swap
+    /// the tool policy inside it); it starts exactly once after `Reloaded` has been applied.
+    #[tokio::test]
+    async fn a_queued_prompt_waits_for_the_deferred_reload_to_be_applied() {
+        let (mut shell, count) = reloading_shell().await;
+        shell.running = true;
+        shell.view.set_working(true);
+        shell.submit("after the reload").await;
+        assert_eq!(shell.queued_prompts(), vec!["after the reload".to_owned()]);
+        shell.reload_command(super::ReloadCause::Watcher);
+        let prompts = shell.prompts;
+
+        shell.finish_run(Err("ended".into()));
+        assert!(shell.reloading, "the reply's end starts the pending reload");
+        assert!(
+            !shell.running,
+            "no turn starts while the reload is in flight"
+        );
+        assert_eq!(shell.prompts, prompts);
+        assert_eq!(shell.queued_prompts(), vec!["after the reload".to_owned()]);
+
+        settle_reload(&mut shell).await;
+        assert_eq!(reloads(&count), 1);
+        assert_eq!(shell.prompts, prompts + 1, "the queued prompt starts once");
+        assert!(shell.queued_prompts().is_empty());
+
+        // Nothing else starts afterwards.
+        for _ in 0..10 {
+            shell.poll();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(shell.prompts, prompts + 1);
+        assert_eq!(reloads(&count), 1);
+    }
+
+    /// AMP #4301: a prompt submitted while a reload runs is queued, not started; it runs once
+    /// the reload has been applied.
+    #[tokio::test]
+    async fn a_prompt_submitted_during_a_reload_is_queued() {
+        let (mut shell, count) = reloading_shell().await;
+        shell.reload_command(super::ReloadCause::Command);
+        assert!(shell.reloading);
+        let prompts = shell.prompts;
+        shell.submit("typed mid-reload").await;
+        assert!(
+            !shell.running,
+            "no turn starts while the reload is in flight"
+        );
+        assert_eq!(shell.prompts, prompts);
+        assert_eq!(shell.queued_prompts(), vec!["typed mid-reload".to_owned()]);
+        // A paired device's prompt is refused meanwhile too (the remote link keeps it queued).
+        assert!(!shell.send_prompt(
+            "remote mid-reload",
+            amp_core::chat_event::PromptOrigin::Local
+        ));
+        assert_eq!(shell.prompts, prompts);
+
+        settle_reload(&mut shell).await;
+        assert_eq!(reloads(&count), 1);
+        assert_eq!(shell.prompts, prompts + 1);
+        assert!(shell.queued_prompts().is_empty());
+    }
+
+    /// AMP #4301 (compaction-end path, review #4231): when `/compact` ends with a reload
+    /// pending and a prompt queued, the reload starts and the prompt waits for it to be
+    /// applied, then starts once.
+    #[tokio::test]
+    async fn a_queued_prompt_after_compaction_waits_for_the_pending_reload() {
+        let (mut shell, count) = reloading_shell().await;
+        shell.compacting = true;
+        shell.submit("after the compaction").await;
+        assert_eq!(
+            shell.queued_prompts(),
+            vec!["after the compaction".to_owned()]
+        );
+        shell.reload_command(super::ReloadCause::Watcher);
+        assert!(!shell.reloading, "no reload under a running compaction");
+        let prompts = shell.prompts;
+
+        shell.finish_compaction(super::CompactDone {
+            result: Err(super::CompactError {
+                busy: false,
+                message: "test".into(),
+            }),
+            already_compacted: false,
+            overhead: 0,
+        });
+        assert!(!shell.compacting);
+        assert!(
+            shell.reloading,
+            "the compaction's end starts the pending reload"
+        );
+        assert!(
+            !shell.running,
+            "no turn starts while the reload is in flight"
+        );
+        assert_eq!(shell.prompts, prompts);
+        assert_eq!(shell.queued_prompts().len(), 1);
+
+        settle_reload(&mut shell).await;
+        assert_eq!(reloads(&count), 1);
+        assert_eq!(shell.prompts, prompts + 1, "the queued prompt starts once");
+        assert!(shell.queued_prompts().is_empty());
     }
 }

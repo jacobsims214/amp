@@ -412,7 +412,10 @@ fn server_auth(error: McpError, server: &str, auth: &str) -> McpError {
 /// What to tell a person whose server rejected us, given how we authenticated.
 pub(crate) fn auth_hint(server: &str, auth: &str) -> String {
     if auth.starts_with("oauth") || auth == "none" {
-        format!("login required: run `amp-harness mcp login {server}`")
+        // #4251: the chat's own command first; the same text reaches CLI and headless users.
+        format!(
+            "login required: `/mcp login {server}` in the chat, or `amp-harness mcp login {server}`"
+        )
     } else {
         format!("the server rejected the configured credentials ({auth})")
     }
