@@ -381,8 +381,15 @@ jobs:
           Each archive has a .sha256 next to it, and SHA256SUMS lists all four. \`amp-harness --version\` reports the rpi/rmcp pins, the embedded assets commit and the build commit. Not signed (v1). amp-harness.rb is the rendered Homebrew formula, for a tap.
           EOF
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "release $TAG exists: replacing its files"
+            # Made beforehand (e.g. in the GitHub UI): replace its files, then give it the title and
+            # notes a fresh release gets. Harness releases are never Latest (RELEASING.md §5), but
+            # GitHub refuses --latest=false when no other release could be Latest, so that alone
+            # only warns.
+            echo "release $TAG exists: replacing its files, title and notes"
             gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --title "amp-harness $version" --notes-file notes.md
+            gh release edit "$TAG" --latest=false ||
+              echo "::warning::could not unmark $TAG as Latest (GitHub refuses when no other release can be Latest). Check: gh release view $TAG; fix in the UI if it shows as Latest."
           else
             # shellcheck disable=SC2086 # flags is a word list
             gh release create "$TAG" dist/* --verify-tag --title "amp-harness $version" --notes-file notes.md $flags
