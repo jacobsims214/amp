@@ -1,7 +1,7 @@
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it } from 'vitest'
-import { WorkerChips } from './SessionParts'
+import { describe, expect, it, vi } from 'vitest'
+import { Composer, WorkerChips } from './SessionParts'
 import type { WorkerInfo, WorkerState } from '../../remote/types'
 
 const NOW = 1_000_000_000_000
@@ -148,5 +148,73 @@ describe('WorkerChips: the sheet holds the full roster (#4895)', () => {
     // With no start it can still say the state, just not how long it ran.
     expect(within(rows[1]).getByTestId('worker-state')).toHaveTextContent('· completed')
     expect(within(rows[2]).getByTestId('worker-state')).toHaveTextContent('· stopped')
+  })
+})
+
+describe('Composer: Send and Stop in one row, a fixed box (#4896)', () => {
+  const renderComposer = (props: Partial<Parameters<typeof Composer>[0]> = {}) => {
+    const onSend = vi.fn(), onStop = vi.fn()
+    const view = render(<Composer disabled={false} disabledReason={null} busy={false} online onSend={onSend} onStop={onStop} {...props} />)
+    return { ...view, onSend, onStop }
+  }
+  const form = () => screen.getByTestId('composer').querySelector('form')!
+
+  it('puts Stop inside the composer row, beside Send, never as a full-width bar', () => {
+    const { container } = renderComposer()
+    const row = form()
+    const stop = within(row).getByRole('button', { name: 'Stop the agent' })
+    expect(row).toContainElement(stop)
+    expect(stop).toHaveAttribute('data-testid', 'stop-inline')
+    // Not the old full-width bar, and not the same box as Send: a 42px square.
+    expect(stop).not.toHaveClass('w-full')
+    expect(stop).toHaveClass('w-[42px]', 'h-[42px]')
+    // Send comes first in the row; bar-style buttons elsewhere would have `w-full`.
+    const send = within(row).getByRole('button', { name: 'Send' })
+    expect(send.compareDocumentPosition(stop) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect([...container.querySelectorAll('button[aria-label="Stop the agent"]')].filter(b => b.className.includes('w-full'))).toEqual([])
+    // Only one Stop on the page: no second, larger copy survives below the row.
+    expect(container.querySelectorAll('button[aria-label="Stop the agent"]')).toHaveLength(1)
+  })
+
+  it('keeps Stop enabled while a run is in flight (R-M7), and only offline disables it', () => {
+    const { rerender, onStop } = renderComposer({ busy: true })
+    const stop = within(form()).getByRole('button', { name: 'Stop the agent' })
+    expect(stop).toBeEnabled()
+    stop.click()
+    expect(onStop).toHaveBeenCalledTimes(1)
+    // Offline is the one state that can reach the laptop no longer.
+    rerender(<Composer disabled={false} disabledReason={null} busy online={false} onSend={vi.fn()} onStop={onStop} />)
+    expect(within(form()).getByRole('button', { name: 'Stop the agent' })).toBeDisabled()
+  })
+
+  it('cannot be resized by the user: the only resize utility is resize-none', () => {
+    renderComposer()
+    const box = screen.getByLabelText('Message')
+    expect(box).toHaveClass('resize-none')
+    // No `resize-y`/`resize-x`/`resize` anywhere on it, whatever the width.
+    expect(box.className.split(/\s+/).filter(c => /^resize(-x|-y)?$/.test(c))).toEqual([])
+    // It grows with the text instead (`field-sizing-content`), capped rather than draggable.
+    expect(box).toHaveClass('field-sizing-content')
+  })
+
+  it('says one line above the row why a message will queue, and nothing when it will send', () => {
+    const { rerender } = renderComposer()
+    expect(screen.queryByTestId('composer-reason')).toBeNull()
+
+    rerender(<Composer disabled={false} disabledReason={null} busy queued={2} online onSend={vi.fn()} onStop={vi.fn()} />)
+    const reason = screen.getByTestId('composer-reason')
+    expect(reason).toHaveTextContent('Agent busy — your message joins the queue (2 ahead).')
+    // Above the row, not inside it.
+    expect(form()).not.toContainElement(reason)
+    expect(within(form()).getByRole('button', { name: 'Queue' })).toBeInTheDocument()
+  })
+
+  it('explains a blocked composer once, above the row (offline, ended, unpaired)', () => {
+    const why = "The laptop is offline. Messages aren't queued while it's away."
+    const { container } = renderComposer({ disabled: true, disabledReason: why })
+    expect(screen.getByTestId('composer-reason')).toHaveTextContent(why)
+    // The reason is not repeated below the row.
+    expect(within(container).getAllByText(why)).toHaveLength(1)
+    expect(screen.getByLabelText('Message')).toBeDisabled()
   })
 })

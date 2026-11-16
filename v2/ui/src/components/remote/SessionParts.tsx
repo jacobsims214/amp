@@ -10,14 +10,15 @@
  *   error on its line, and a dispatched worker's live status under its call;
  * - the shell's notices ("Stopped.", errors) as it phrases them; nothing for a completed run;
  * - the dock: the worker summary line (with a row per live worker; the sheet holds the rest), the
- *   working line with its timer (and the retry countdown), the queue, the message box, Stop, and
- *   the status line.
+ *   working line with its timer (and the retry countdown), the queue, the message box with Send
+ *   and Stop in one row, and the status line. Every dock row is `shrink-0`: the transcript is the
+ *   only region that gives and takes, so a tall dock squeezes the chat, never the other way round.
  *
  * Everything from the harness is untrusted: text is shown as text or through SafeMarkdown,
  * never as HTML.
  */
 import { useEffect, useId, useRef, useState } from 'react'
-import { Check, ChevronRight, ChevronUp, Loader2, Minus, OctagonX, ShieldAlert, Square, TriangleAlert, X } from 'lucide-react'
+import { Check, ChevronRight, ChevronUp, Loader2, Minus, ShieldAlert, Square, TriangleAlert, X } from 'lucide-react'
 import { composing, useDialogFocus } from '../../hooks/useDialogFocus'
 import { SafeMarkdown } from './SafeMarkdown'
 import { promptProblem } from '../../remote/envelope'
@@ -281,7 +282,7 @@ export function QueueStrip({ queue, myDeviceId, online, onClear }: {
   const [armed, setArmed] = useState(false)
   if (!queue.length) return null
   return (
-    <div className="border-t border-line bg-surface-2 px-3 sm:px-5 py-2 grid gap-1.5" aria-label="Queued messages">
+    <div className="shrink-0 border-t border-line bg-surface-2 px-3 sm:px-5 py-2 grid gap-1.5" aria-label="Queued messages">
       <div className="flex items-center gap-2 flex-wrap">
         <span className="amp-label">Queued ({queue.length})</span>
         <span className="text-[11.5px] text-ink-3">Runs when the agent finishes.</span>
@@ -450,7 +451,7 @@ export function WorkerChips({ workers, now }: { workers: WorkerInfo[]; now: numb
   })
   const live = ordered.filter(w => isLiveWorker(w.state))
   return (
-    <div className="border-t border-line bg-surface" aria-label="Workers">
+    <div className="shrink-0 border-t border-line bg-surface" aria-label="Workers">
       <button type="button" onClick={() => setOpen(true)} aria-expanded={open} aria-controls={sheetId}
         data-testid="roster-summary" data-worst={worst}
         className={`flex items-center gap-2 w-full min-w-0 px-3 sm:px-5 py-2 text-left hover:bg-surface-3 focus-visible:outline-2 focus-visible:outline-accent ${WORKER_STATE_INK[worst] ?? 'text-ink-2'}`}>
@@ -494,7 +495,7 @@ export function WorkingLine({ busy, runStartedAt, retry, compaction = null, now 
     ? `Retrying (${retry.attempt}/${retry.max_retries}) in ${left}s…`
     : `Working…${runStartedAt ? ` ${runningElapsed(now - runStartedAt) || ''}` : ''}`
   return (
-    <div className="flex items-center gap-2 px-3 sm:px-5 py-1.5 border-t border-line bg-surface text-[12.5px] min-w-0" role="status" data-testid="working" data-compaction={compaction ? 'true' : undefined}>
+    <div className="shrink-0 flex items-center gap-2 px-3 sm:px-5 py-1.5 border-t border-line bg-surface text-[12.5px] min-w-0" role="status" data-testid="working" data-compaction={compaction ? 'true' : undefined}>
       <Loader2 size={13} className={`shrink-0 animate-spin ${retry ? 'text-warning-ink' : 'text-st-prog'}`} aria-hidden="true" />
       <span className={retry ? 'text-warning-ink' : 'text-ink-2'}>{text.trim()}</span>
       {retry && !compaction && <span className="truncate min-w-0 text-ink-3">{clean(retry.error)}</span>}
@@ -532,7 +533,7 @@ export function StatusLine({ status, totals, startedAt, workers, now }: {
   const plan = planApprovalText(s?.plan_approval)
   const counts: [keyof NonNullable<SessionStatus['board']>, 'prog' | 'ready' | 'sched'][] = [['in_progress', 'prog'], ['ready', 'ready'], ['scheduled', 'sched']]
   return (
-    <div className="border-t border-line bg-surface-2 px-3 sm:px-5 py-1.5 grid gap-1">
+    <div className="shrink-0 border-t border-line bg-surface-2 px-3 sm:px-5 py-1.5 grid gap-1" data-testid="status-line">
       <dl className="m-0 flex flex-wrap gap-x-4 gap-y-0.5 text-[11.5px]" aria-label="Session status">
         {parts.map(([k, v, title]) => (
           <div key={k} className="flex items-baseline gap-1.5 min-w-0" title={title}>
@@ -615,8 +616,11 @@ export function PresenceBadge({ online, connection }: { online: boolean | null; 
   )
 }
 
-export function Composer({ disabled, disabledReason, busy, online, onSend, onStop }: {
-  disabled: boolean; disabledReason: string | null; busy: boolean; online: boolean; onSend: (text: string) => void; onStop: () => void
+export function Composer({ disabled, disabledReason, busy, queued = 0, online, onSend, onStop }: {
+  disabled: boolean; disabledReason: string | null; busy: boolean
+  /** Messages already waiting behind the running one, for the reason line. */
+  queued?: number
+  online: boolean; onSend: (text: string) => void; onStop: () => void
 }) {
   const [text, setText] = useState('')
   const [problem, setProblem] = useState<string | null>(null)
@@ -627,24 +631,41 @@ export function Composer({ disabled, disabledReason, busy, online, onSend, onSto
     onSend(text)
     setText('')
   }
+  // One line above the row saying what a press will do (the mockup's dock note): why this message
+  // queues, or why it cannot be sent at all. Nothing when a plain message simply sends.
+  const reason = disabled ? disabledReason
+    : busy ? `Agent busy — your message joins the queue${queued > 0 ? ` (${queued} ahead)` : ''}.`
+    : null
   return (
-    <div className="border-t border-line bg-surface px-3 sm:px-5 pt-2.5 pb-2.5 grid gap-2">
+    // `shrink-0`: the transcript is the dock's only flexible row (audit F2), so a tall dock never
+    // squeezes the chat and the chat never squeezes the rows you type and steer with.
+    <div className="shrink-0 border-t border-line bg-surface px-3 sm:px-5 pt-2 pb-2.5 grid gap-1.5" data-testid="composer">
+      {reason && <p className="m-0 px-0.5 text-[11px] text-ink-3" data-testid="composer-reason">{reason}</p>}
       <form className="flex gap-2 items-end" onSubmit={e => { e.preventDefault(); submit() }}>
         <label htmlFor="remote-message" className="sr-only">Message</label>
-        <textarea id="remote-message" rows={2} value={text} disabled={disabled}
-          placeholder={disabled ? disabledReason ?? '' : busy ? 'The agent is working. Your message will be queued.' : 'Message the agent'}
+        {/* Never user-resizable (audit F5): `resize-none` beats preflight's `textarea{resize:vertical}`
+            (it sits in the utilities layer, which is ordered after base) and `.amp-input` sets no
+            `resize` of its own, so no UA grip can appear — computed `resize` is `none` in Chromium at
+            390 and 1200 px. `field-sizing-content` grows the box with what is typed, capped at 12rem,
+            so the box no longer changes height on the first keystroke; when the composer is blocked
+            the placeholder is left empty, because the reason above the row already says why. */}
+        <textarea id="remote-message" rows={1} value={text} disabled={disabled}
+          placeholder={disabled ? '' : 'Message the agent…'}
           onChange={e => setText(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); submit() } }}
-          className="amp-input flex-1 min-w-0 resize-none text-[14px] leading-6 py-2 max-h-48" />
-        <button type="submit" className="amp-btn amp-btn-primary h-[42px]" disabled={disabled}>{busy ? 'Queue' : 'Send'}</button>
+          className="amp-input flex-1 min-w-0 resize-none field-sizing-content min-h-[42px] max-h-48 text-[14px] leading-6 py-2" />
+        <button type="submit" className="amp-btn amp-btn-primary h-[42px] shrink-0" disabled={disabled}>{busy ? 'Queue' : 'Send'}</button>
+        {/* Stop rides in the row, not as a full-width bar under it (audit F3: it was the biggest
+            target on the screen, a mis-tap away from Send). Still cheap: enabled whenever the laptop
+            is online, even mid-run (R-M7), and it is never disabled to save space. One glyph in every
+            state — the mockup's solid square — so the button never changes meaning mid-run. */}
+        <button type="button" onClick={onStop} disabled={!online}
+          className="amp-btn amp-btn-accent h-[42px] w-[42px] shrink-0 px-0" aria-label="Stop the agent"
+          title={online ? 'Stop the agent' : 'The laptop is offline, so it cannot be stopped from here'} data-testid="stop-inline">
+          <Square size={14} fill="currentColor" strokeWidth={0} aria-hidden="true" />
+        </button>
       </form>
       {problem && <p className="m-0 text-[12px] text-danger-ink" role="alert">{problem}</p>}
-      {disabled && disabledReason && <p className="m-0 text-[12px] text-ink-2">{disabledReason}</p>}
-      {/* Stop must be cheap: enabled whenever the laptop is online (R-M7). */}
-      <button type="button" onClick={onStop} disabled={!online}
-        className="amp-btn amp-btn-accent w-full justify-center h-12 text-[13px] gap-2" aria-label="Stop the agent">
-        {busy ? <OctagonX size={18} aria-hidden="true" /> : <Square size={16} aria-hidden="true" />}Stop
-      </button>
     </div>
   )
 }

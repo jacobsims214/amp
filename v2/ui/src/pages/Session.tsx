@@ -145,7 +145,9 @@ function SessionView({ sessionId }: { sessionId: string }) {
       {!ended && state.online === false && <Banner tone="warn">Laptop offline. It may be asleep or off the network; this page catches up when it's back.</Banner>}
       {!ended && state.connection === 'reconnecting' && state.online !== false && <Banner tone="info">Reconnecting to AMP… Nothing is lost: the page picks up where it left off.</Banner>}
 
-      <div ref={scroller} className="flex-1 min-h-0 overflow-y-auto" aria-label="Transcript" aria-live="polite">
+      {/* The one region that grows and shrinks: every dock row below is `shrink-0`, so the chat takes
+          whatever the dock leaves (audit #3026 F2: the transcript was the row that lost every fight). */}
+      <div ref={scroller} className="flex-1 min-h-0 overflow-y-auto" aria-label="Transcript" aria-live="polite" data-testid="transcript">
         <div className="max-w-[860px] mx-auto px-3 sm:px-5 py-4 grid grid-cols-[minmax(0,1fr)] gap-3.5">
           {state.items.length === 0 && visibleOutgoing.length === 0 && (
             <p className="m-0 text-[13px] text-ink-3 text-center py-8">{state.connection === 'live' ? 'Nothing here yet. Send a message to the agent.' : 'Connecting…'}</p>
@@ -160,8 +162,8 @@ function SessionView({ sessionId }: { sessionId: string }) {
       <WorkerChips workers={state.workers} now={now} />
       <WorkingLine busy={busy && !ended} runStartedAt={state.runStartedAt} retry={retry} compaction={ended ? null : state.compaction} now={now} />
       <QueueStrip queue={state.queue} myDeviceId={phase.deviceId} online={online} onClear={stop} />
-      <Composer disabled={composerDisabled} disabledReason={disabledReason} busy={busy} online={online && canSign}
-        onSend={sendPrompt} onStop={stop} />
+      <Composer disabled={composerDisabled} disabledReason={disabledReason} busy={busy} queued={state.queue.length}
+        online={online && canSign} onSend={sendPrompt} onStop={stop} />
       <div className="pb-[env(safe-area-inset-bottom)] bg-surface-2">
         <StatusLine status={status} totals={state.totals} startedAt={state.hello?.started_at_ms ?? detail.started_at_ms} workers={state.workers} now={now} />
       </div>

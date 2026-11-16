@@ -138,6 +138,56 @@ describe('Session page', () => {
     await waitFor(() => expect(screen.queryByLabelText('Queued messages')).toBeNull())
   })
 
+  it('the composer row holds Send and an inline Stop, and the transparent region keeps the space', async () => {
+    const user = userEvent.setup()
+    const { relay, deps } = mockSession()
+    const { container } = renderSession(deps)
+    await screen.findByText('Laptop online')
+
+    // The dock order (#4896, audit F2): the transcript is the only flexible region, and every row
+    // that holds a control is `shrink-0`, so a tall dock squeezes the chat, never the reverse.
+    const transcript = screen.getByTestId('transcript')
+    expect(transcript).toHaveClass('flex-1', 'min-h-0', 'overflow-y-auto')
+    const dockRows = [screen.getByTestId('composer'), screen.getByTestId('status-line')]
+    for (const row of dockRows) expect(row).toHaveClass('shrink-0')
+    expect(container.querySelectorAll('[data-testid="transcript"]')).toHaveLength(1)
+
+    // Send and Stop share the composer's row, and Stop is in it — not a full-width bar below.
+    const composer = screen.getByTestId('composer')
+    const form = composer.querySelector('form')!
+    const send = within(form).getByRole('button', { name: 'Send' })
+    const stop = within(form).getByRole('button', { name: 'Stop the agent' })
+    expect(form).toContainElement(stop)
+    expect(stop).toHaveAttribute('data-testid', 'stop-inline')
+    expect(stop).not.toHaveClass('w-full')
+    expect(send.compareDocumentPosition(stop) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+
+    // No full-width Stop bar survives anywhere on the page.
+    const fullWidthStops = [...container.querySelectorAll('button[aria-label="Stop the agent"]')].filter(b => b.className.includes('w-full'))
+    expect(fullWidthStops).toEqual([])
+
+    // The textarea can never be dragged: `resize-none` is the only resize utility on it.
+    const box = screen.getByLabelText('Message')
+    expect(box).toHaveClass('resize-none')
+    expect(box.className.match(/\\bresize-(x|y|both)\\b/)).toBeNull()
+
+    // Nothing to explain before a run: no reason line, and a plain placeholder.
+    expect(screen.queryByTestId('composer-reason')).toBeNull()
+    expect(box).toHaveAttribute('placeholder', 'Message the agent…')
+
+    // Mid-run Stop stays reachable (R-M7): it is enabled while the agent works, and the reason
+    // for the next message sits one line above the row. A run_start is pushed straight in, so this
+    // never races the mock harness's own timer.
+    act(() => { relay.chat({ type: 'run_start', run_id: 'run_inflight', prompt_id: 'p_inflight' }) })
+    expect(await screen.findByTestId('composer-reason')).toHaveTextContent('Agent busy — your message joins the queue.')
+    expect(within(form).getByRole('button', { name: 'Stop the agent' })).toBeEnabled()
+    expect(within(form).getByRole('button', { name: 'Queue' })).toBeInTheDocument()
+    // And it is the button that actually stops the run.
+    await user.click(screen.getByRole('button', { name: 'Stop the agent' }))
+    await waitFor(() => expect(relay.received.at(-1)?.op).toBe('stop'))
+    expect(relay.received.filter(c => c.op === 'stop')).toHaveLength(1)
+  })
+
   it('offline: badge, no sending, Stop disabled; back online re-enables', async () => {
     const { relay, deps } = mockSession()
     renderSession(deps)
