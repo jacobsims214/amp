@@ -100,6 +100,17 @@ const (
 	// Read a ticket's OWN metadata for it, never inherited metadata: a story
 	// or epic must not point every ticket under it at one PR.
 	MetaMergeFor = "merge_for"
+	// MetaRequestHandoff, on a ticket a team request's plan handoff created, is
+	// the ref→id ledger's durable half: "<request id>/<handoff key>/<batch ref>"
+	// (domain.RequestHandoffMark). It rides the ticket's own INSERT, so the row
+	// that proves a batch item exists commits when the ticket does and a retried
+	// handoff reconciles rather than duplicating (AMP #3965, D11).
+	//
+	// Read a ticket's OWN metadata for it, never inherited metadata — the
+	// merge_for rule — because a story carrying this key would claim every
+	// ticket under it for one handoff item. It is a LABEL, never the relation:
+	// which request a ticket serves is its request_links planned_as row.
+	MetaRequestHandoff = "request_handoff"
 )
 
 // IntegrationBranch is m's integration branch, or "".

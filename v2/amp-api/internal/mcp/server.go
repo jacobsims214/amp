@@ -177,14 +177,16 @@ func (s *Server) Register(mcp *server.MCPServer) {
 
 	mcp.AddTool(tool("amp_manage_invites",
 		"List, create, or revoke pending invites for people who haven't signed in yet. Requires org owner/admin "+
-			"(team leads may invite into their own team).",
+			"(team leads may invite into their own team). kind \"requester\" invites someone to send requests to a team: "+
+			"their first sign-in creates a customer account with no org or project access, and it must name a team.",
 		props{
 			"org_id":    num("REQUIRED. Org ID."),
 			"action":    str("REQUIRED. One of: list, create, revoke."),
-			"email":     str("For create: the person's email."),
-			"org_role":  str("For create: owner, admin, or member (default member)."),
-			"team_id":   num("For create: optional team to join."),
-			"team_role": str("For create: lead or member (default member)."),
+			"email":     str("For create: the person's email. A requester invite needs an email with no AMP account yet."),
+			"kind":      str("For create: member (default) or requester. requester provisions a customer identity with no membership."),
+			"org_role":  str("For create: owner, admin, or member (default member). A requester invite must leave it at member."),
+			"team_id":   num("For create: the team to join, or (requester) the team they can send requests to. Required for requester."),
+			"team_role": str("For create: lead or member (default member). A requester invite must leave it at member."),
 			"invite_id": num("For revoke: invite ID."),
 		}), wrap(ctx, s.open(s.manageInvites)))
 
@@ -718,6 +720,9 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	s.registerArtifacts(mcp)
 	s.registerReceipts(mcp)
 	s.registerDesign(mcp)
+	s.registerRequests(mcp)
+	s.registerRequestWork(mcp)
+	s.registerRequestPlanning(mcp)
 
 	mcp.AddTool(tool("amp_add_task_comment", "Post a comment to a task's log. Used by agents to report progress.",
 		props{
@@ -982,6 +987,23 @@ func (s *Server) createProject(rctx context.Context, args map[string]interface{}
 	return jsonResult(p)
 }
 
+// accountKind names the caller's account kind for whoami. The Principal knows
+// whether it is an agent; a customer is neither an agent nor a person signing
+// in to run agents, so the row's own kind is read (a user id lookup, no extra
+// state on the Principal). Before provisioning, or for a caller with no user
+// row, the Principal's own flags decide.
+func (s *Server) accountKind(ctx context.Context, p authz.Principal) string {
+	if p.HasUser() {
+		if u, err := s.repo.GetUserByID(ctx, p.UserID); err == nil && u.Kind != "" {
+			return u.Kind
+		}
+	}
+	if p.Agent {
+		return domain.UserKindAgent
+	}
+	return domain.UserKindHuman
+}
+
 func (s *Server) listProjects(rctx context.Context, _ map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	visible, err := s.svc.Authz.VisibleProjects(rctx, caller(rctx).p)
 	if err != nil {
@@ -1003,7 +1025,7 @@ func (s *Server) listProjects(rctx context.Context, _ map[string]interface{}) (*
 func (s *Server) whoami(rctx context.Context, _ map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	p := caller(rctx).p
 	out := map[string]interface{}{"user_id": p.UserID, "email": p.Email, "global_admin": p.Super,
-		"account": map[bool]string{true: domain.UserKindAgent, false: domain.UserKindHuman}[p.Agent], "via_api_token": p.ViaToken}
+		"account": s.accountKind(rctx, p), "via_api_token": p.ViaToken}
 	if p.HasUser() {
 		orgs, err := s.repo.ListOrgs(rctx, p.UserRef())
 		if err != nil {
@@ -3439,7 +3461,7 @@ func (s *Server) manageInvites(rctx context.Context, args map[string]interface{}
 		return jsonResult(map[string]interface{}{"invites": invites})
 	case "create":
 		res, err := s.svc.Invite(rctx, p, domain.Invite{
-			Email: optStr(args, "email", ""), OrgID: orgID,
+			Email: optStr(args, "email", ""), OrgID: orgID, Kind: optStr(args, "kind", ""),
 			OrgRole: optStr(args, "org_role", ""), TeamID: optIntPtr(args, "team_id"), TeamRole: optStr(args, "team_role", ""),
 		})
 		if err != nil {

@@ -46,6 +46,12 @@ Good tickets:
   step a human ticket linked to the PR it merges (`merge_for: <ticket id>`): My work folds it into
   the PR's Merge item, so there is still one action for one PR. `amp_check_plan` warns about a
   merge-looking step with no link (`unlinked_merge_step`).
+- **A plan made for a team inbox request is still a plan.** `amp_handoff_request` (or
+  `POST /api/teams/{id}/requests/{request}/handoff`) creates a batch of tickets for a request and
+  links each one to it, and nothing about that shortens the gate: every created ticket waits for a
+  person to approve it, exactly as if it had been planned by hand. The requester's own words go
+  into each description as quoted untrusted data, so they can describe the work but cannot set an
+  owner, a schedule, a performer or an approval. See `working/team-inbox.md`.
 
 ## The plan check
 

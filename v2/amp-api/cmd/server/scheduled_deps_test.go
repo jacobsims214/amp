@@ -41,27 +41,86 @@ func scheduleAt(t *testing.T, s *mcpStack, id int, at *time.Time) {
 	}
 }
 
-// waitState polls the database until the ticket reaches want, or fails.
+// stateWaitTimeout bounds waitState. A release crosses an actor message, the
+// Postgres write it makes and a polling reader, and the canonical command
+// (TEST_CLUSTER=1 go test -race) runs each test through two actor systems and
+// two cluster nodes alongside the machine's other stacks: 5 s does not always
+// carry it under that load (AMP #3688), so this matches the 30 s the other
+// bounded waits in these suites use (AMP #3680 for the same reason).
+const stateWaitTimeout = 30 * time.Second
+
+// waitState polls the database until the ticket reaches want, or fails with
+// what the row did hold: a timeout that reports only the state it wanted
+// cannot be told apart from a different one (AMP #3688).
 func waitState(t *testing.T, s *mcpStack, id int, want string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(stateWaitTimeout)
 	for {
-		got := dbState(t, s.repo, id)
-		if got == want {
+		got, err := s.repo.GetTask(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got.State) == want {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("ticket %d: state %q, want %q", id, got, want)
+			t.Fatalf("%s", missingState(id, want, stateWaitTimeout, got))
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// missingState is waitState's failure message: the state it wanted and
+// everything the row did hold. A timeout that reports only the missing state
+// cannot be told apart from a different one (AMP #3688).
+func missingState(id int, want string, timeout time.Duration, stored *domain.Task) string {
+	return fmt.Sprintf("ticket %d: state %q, want %q within %s; %s",
+		id, stored.State, want, timeout, describeTask(stored))
+}
+
+// describeTask names what a ticket's row holds, so a timeout says what was
+// observed instead of only what did not arrive. Read through the repository
+// (never the actor) so it works for a ticket whose actors are stopped.
+func describeTask(t *domain.Task) string {
+	return fmt.Sprintf("block_reason %q, start_at %s, blocked_by %v, updated_at %s",
+		t.BlockReason, describeStartAt(t.StartAt), t.DependencyIDs, t.UpdatedAt.UTC().Format(time.RFC3339Nano))
+}
+
+// describeStartAt renders a start_at for a failure message: "none" when there
+// is none, else its value and how long from now (negative = past).
+func describeStartAt(at *time.Time) string {
+	if at == nil {
+		return "none"
+	}
+	return fmt.Sprintf("%s (in %s)", at.UTC().Format(time.RFC3339Nano), time.Until(*at).Round(time.Millisecond))
+}
+
+// releaseEvent is one task.blocked / task.unblocked event seen for a ticket:
+// which one it was, and the payload the UI applies as-is.
+type releaseEvent struct {
+	Type domain.EventType
+	Task domain.Task
 }
 
 // releaseEvents records the task.blocked / task.unblocked events published
 // for one ticket from now on — what the UI's SSE stream receives.
 type releaseEvents struct {
 	mu   sync.Mutex
-	evts []domain.Task
+	evts []releaseEvent
+}
+
+func (r *releaseEvents) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.evts)
+}
+
+// all copies the events received so far, so a failure message can list them
+// without holding the lock.
+func (r *releaseEvents) all() []releaseEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]releaseEvent(nil), r.evts...)
 }
 
 func watchRelease(s *mcpStack, id int) *releaseEvents {
@@ -72,11 +131,31 @@ func watchRelease(s *mcpStack, id int) *releaseEvents {
 		}
 		if t, ok := e.Payload.(domain.Task); ok && t.ID == id {
 			r.mu.Lock()
-			r.evts = append(r.evts, t)
+			r.evts = append(r.evts, releaseEvent{Type: e.Type, Task: t})
 			r.mu.Unlock()
 		}
 	})
 	return r
+}
+
+// observed renders the two things a fired schedule either produced or did not:
+// the release events received so far, and the row's own state. A timeout that
+// reports only the missing event cannot be told apart from a different one
+// (AMP #3688: three production occurrences were byte-identical).
+func observed(evts []releaseEvent, stored *domain.Task) string {
+	got := make([]string, 0, len(evts))
+	for _, e := range evts {
+		got = append(got, fmt.Sprintf("%s(state %q, start_at %s)", e.Type, e.Task.State, describeStartAt(e.Task.StartAt)))
+	}
+	return fmt.Sprintf("received %d: [%s]; row: %s", len(evts), strings.Join(got, " "), describeTask(stored))
+}
+
+// missingRelease is the message when no release event ever arrived for a
+// schedule that fired: what did arrive instead, if anything, and what the row
+// holds (was start_at still stored?).
+func missingRelease(id int, timeout time.Duration, evts []releaseEvent, stored *domain.Task) string {
+	return fmt.Sprintf("ticket %d: no task.blocked/task.unblocked event within %s when its schedule fired; %s",
+		id, timeout, observed(evts, stored))
 }
 
 // assertScheduleConsumed checks the fired schedule is gone everywhere: the
@@ -85,28 +164,36 @@ func watchRelease(s *mcpStack, id int) *releaseEvents {
 // actor nor the database still holds one.
 func assertScheduleConsumed(t *testing.T, s *mcpStack, id int, r *releaseEvents) {
 	t.Helper()
-	r.mu.Lock()
-	evts := append([]domain.Task(nil), r.evts...)
-	r.mu.Unlock()
-	if len(evts) == 0 {
-		t.Fatalf("ticket %d: no task.blocked/task.unblocked event when its schedule fired", id)
-	}
-	for _, e := range evts {
-		if e.StartAt != nil {
-			t.Fatalf("ticket %d: release event carries start_at %v, want none", id, *e.StartAt)
-		}
-	}
-	if v, ok := planTask(t, s, id)["start_at"]; ok && v != nil {
-		t.Fatalf("ticket %d: actor still reports start_at %v after the schedule fired", id, v)
-	}
+	evts := r.all()
 	stored, err := s.repo.GetTask(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(evts) == 0 {
+		t.Fatalf("%s", missingRelease(id, scheduleWaitTimeout, evts, stored))
+	}
+	for _, e := range evts {
+		if e.Task.StartAt != nil {
+			t.Fatalf("ticket %d: release event carries start_at %v, want none; %s",
+				id, *e.Task.StartAt, observed(evts, stored))
+		}
+	}
+	if v, ok := planTask(t, s, id)["start_at"]; ok && v != nil {
+		t.Fatalf("ticket %d: actor still reports start_at %v after the schedule fired; %s",
+			id, v, observed(evts, stored))
+	}
 	if stored.StartAt != nil {
-		t.Fatalf("ticket %d: database still holds start_at %v", id, *stored.StartAt)
+		t.Fatalf("ticket %d: database still holds start_at %v; %s",
+			id, *stored.StartAt, observed(evts, stored))
 	}
 }
+
+// scheduleWaitTimeout bounds waitScheduleFired: the same actor -> Postgres path
+// as stateWaitTimeout, plus the release event's trip through the hub (in the
+// cluster suite, across a second replica). 10 s does not always carry that
+// under the canonical command's load (AMP #3688), so this matches the 30 s
+// above, and #3680's precedent.
+const scheduleWaitTimeout = 30 * time.Second
 
 // waitScheduleFired waits for a ticket's timer to have fired and its effects to
 // be visible (a release event published, start_at gone from the database),
@@ -114,16 +201,13 @@ func assertScheduleConsumed(t *testing.T, s *mcpStack, id int, r *releaseEvents)
 // start_at depends on the machine's load, so this waits on them, not on time.
 func waitScheduleFired(t *testing.T, s *mcpStack, id int, r *releaseEvents) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(scheduleWaitTimeout)
 	for time.Now().Before(deadline) {
-		r.mu.Lock()
-		n := len(r.evts)
-		r.mu.Unlock()
 		stored, err := s.repo.GetTask(context.Background(), id)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if n > 0 && stored.StartAt == nil {
+		if r.count() > 0 && stored.StartAt == nil {
 			break
 		}
 		time.Sleep(25 * time.Millisecond)
@@ -693,4 +777,78 @@ func TestScheduledDeps_AnswerKeepsFutureSchedule(t *testing.T) {
 			t.Fatalf("db: state %q, block_reason %q; want backlog, \"\"", got.State, got.BlockReason)
 		}
 	})
+}
+
+// TestScheduledDeps_WaitBoundsAndTimeoutsAreDiagnosable pins both halves of
+// AMP #3688 without a stack, like #3680's sibling check for webhook deliveries:
+// the bounds are long enough for the canonical cluster command on a loaded
+// machine, and an expiry says what WAS observed instead of only what did not
+// arrive (three production occurrences of the state wait were byte-identical,
+// so none could be diagnosed). A future shrink of a bound, or a message that
+// goes back to naming only the missing piece, fails here in milliseconds
+// instead of as the next red run of the 225 s suite.
+func TestScheduledDeps_WaitBoundsAndTimeoutsAreDiagnosable(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		got  time.Duration
+	}{
+		{"stateWaitTimeout", stateWaitTimeout},
+		{"scheduleWaitTimeout", scheduleWaitTimeout},
+	} {
+		if c.got < 30*time.Second {
+			t.Errorf("%s = %s, want at least 30s for the loaded TEST_CLUSTER run", c.name, c.got)
+		}
+	}
+
+	// A row that never reached the wanted state, still holding the schedule it
+	// was blocked on: the message must name what it found.
+	at := time.Now().Add(2 * time.Minute)
+	stored := &domain.Task{
+		ID:            7,
+		State:         domain.TaskStateBlocked,
+		BlockReason:   "scheduled:" + at.Format(time.RFC3339),
+		StartAt:       &at,
+		DependencyIDs: []int{5},
+		UpdatedAt:     time.Now(),
+	}
+	msg := missingState(7, "backlog", stateWaitTimeout, stored)
+	for _, want := range []string{
+		`state "blocked", want "backlog" within 30s`,
+		`block_reason "scheduled:`,
+		at.UTC().Format(time.RFC3339Nano), // the start_at it still held
+		"blocked_by [5]",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("state timeout message = %q, want it to contain %q", msg, want)
+		}
+	}
+
+	// No release event and start_at still stored: the message must say so, and
+	// list the events it did get (here none) rather than only the missing one.
+	noEvents := missingRelease(7, scheduleWaitTimeout, nil, stored)
+	for _, want := range []string{
+		"no task.blocked/task.unblocked event within 30s",
+		"received 0: []",
+		at.UTC().Format(time.RFC3339Nano), // start_at was still stored
+	} {
+		if !strings.Contains(noEvents, want) {
+			t.Errorf("release timeout message = %q, want it to contain %q", noEvents, want)
+		}
+	}
+
+	// Events did arrive but not the one the schedule should have produced: they
+	// are listed, with the start_at each carried.
+	released := at
+	msg = missingRelease(7, scheduleWaitTimeout, []releaseEvent{
+		{Type: domain.EventTaskUpdated, Task: domain.Task{ID: 7, State: domain.TaskStateBlocked}},
+		{Type: domain.EventTaskBlocked, Task: domain.Task{ID: 7, State: domain.TaskStateBlocked, StartAt: &released}},
+	}, stored)
+	for _, want := range []string{
+		"received 2: [task.updated(state \"blocked\", start_at none)",
+		"task.blocked(state \"blocked\", start_at " + at.UTC().Format(time.RFC3339Nano),
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("release timeout message with events = %q, want it to contain %q", msg, want)
+		}
+	}
 }

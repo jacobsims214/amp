@@ -22,6 +22,16 @@ tags: [access, orgs, teams, roles, permissions, invites, agents]
 - **Your tickets**: only you (and agents acting with your token) dispatch, work and complete
   them. Anyone on the project can read and comment.
 
+A team also has a **request inbox**, and it is a separate kind of access on purpose: submitting a
+request is a capability of its own, outside the project level ladder, because a `Member` level
+reads every ticket in the project and a customer must never get that. A team's members, its org's
+owners and admins, and the holder of a **submit grant** may submit to that inbox; the grant is a
+revocable row keyed to one team and one person and confers nothing else — no queue read, no request
+read, no org role, no project. A **requester invitation** is how a customer identity is created: it
+is bound to one team, grants no org or team role, and `AddTeamMember` refuses a customer by name
+(team membership is how a person reaches a project). See `working/team-inbox.md`. A submit-only
+API token narrows a credential to one inbox and one operation; it is not a role either.
+
 ## Managing it
 
 - UI: **Teams & orgs** (members, roles, teams, invites), and a project's **Settings → Team

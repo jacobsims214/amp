@@ -508,7 +508,7 @@ func adoptable(ix indexState, backfillStarted time.Time) bool {
 // the base name), page by page, without content. A missing collection lists
 // as empty.
 func (s *Service) listIndexState(ctx context.Context, sc Scope) (map[string]indexState, error) {
-	col := collectionName(sc)
+	col := s.CollectionName(sc)
 	const perPage = 250
 	out := map[string]indexState{}
 	for page := 1; ; page++ {

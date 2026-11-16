@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -149,6 +150,11 @@ func setupMCP(t *testing.T) *mcpStack {
 // testKB connects to the Typesense at TEST_TYPESENSE_URL (keyword search
 // only, no embeddings), or returns nil when it isn't set: KB tools then
 // still check access but report the KB as not configured.
+//
+// Every collection it touches is namespaced (kb.SetCollectionPrefix), so a
+// suite run against the Typesense a live instance uses never creates, empties
+// or drops that instance's collections — above all the global KB's, whose
+// name is fixed (kb_global_0) and whose guide is synced only at startup.
 func testKB() *kb.Service {
 	url := os.Getenv("TEST_TYPESENSE_URL")
 	if url == "" {
@@ -158,8 +164,14 @@ func testKB() *kb.Service {
 	if key == "" {
 		key = "test"
 	}
-	return kb.New(url, key, "", "")
+	svc := kb.New(url, key, "", "")
+	svc.SetCollectionPrefix(testKBNamespace())
+	return svc
 }
+
+// testKBNamespace is this run's collection namespace, made once so every
+// service in the run shares it and TestMain can sweep it at the end.
+var testKBNamespace = sync.OnceValue(kb.NewTestNamespace)
 
 // call invokes an MCP tool by name with args, asserts no JSON-RPC error,
 // and returns the parsed result map — exactly what an agent would read.

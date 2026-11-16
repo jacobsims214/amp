@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 
@@ -15,7 +14,7 @@ import (
 func TestKB_ReindexSingleFlight(t *testing.T) {
 	s := setupMCP(t)
 	ctx := context.Background()
-	key := fmt.Sprintf("kb_reindex:kb_%d", s.projectID)
+	key := s.kb.ReindexLockKey(kb.Project(s.projectID))
 
 	// The advisory lock is per session: a second taker (another replica's
 	// pool connection) is refused until the first releases it.

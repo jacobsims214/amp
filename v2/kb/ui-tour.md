@@ -45,7 +45,13 @@ tags: [ui, onboarding, navigation]
   by your org's own metadata (`visibility/reports-and-spend.md`).
 - **Agents & tokens** — API tokens for your harness, and agent accounts you manage
   (`setup/connect-your-agent.md`).
-- **Teams & orgs** — membership, roles, teams, and the team and org knowledge bases.
+- **Teams & orgs** — membership, roles, teams, the team and org knowledge bases, and each team's
+  **Inbox** button: the shared queue of work requests people and integrations sent that team
+  (`working/team-inbox.md`). Its per-team counts and your own claimed/assigned slice also appear
+  on **My work** as two panels — **Team inboxes** ("shared queues, not your tickets") and
+  **Claimed by me · team requests**; being on a team puts nothing in your personal list. Requesters
+  get their own pages (`/requests`, `/requests/new`, `/request/<reference>`), deliberately outside
+  the app shell: a customer sees no project tree, no org admin and no internal name.
 - **Your name** at the bottom of the sidebar shows your role; the arrow next to it signs you out.
 
 ## Inside a project

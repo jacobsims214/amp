@@ -74,7 +74,7 @@ func (s *Service) exportIndexed(ctx context.Context, sc Scope, skip, deleted map
 			if isNotFound(err) {
 				continue // deleted since the listing
 			}
-			return nil, fmt.Errorf("read %s/%s for export: %w", collectionName(sc), d.Path, err)
+			return nil, fmt.Errorf("read %s/%s for export: %w", s.CollectionName(sc), d.Path, err)
 		}
 		out = append(out, domain.ExportKBDoc{
 			Path: full.Path, Title: full.Title, Content: full.Content, Tags: full.Tags, Author: full.Author,

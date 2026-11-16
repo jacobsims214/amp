@@ -1,6 +1,8 @@
 package domain
 
 import (
+	"fmt"
+	"slices"
 	"strings"
 	"time"
 )
@@ -731,8 +733,11 @@ type User struct {
 	Roles       []string  `json:"roles"`
 	CreatedAt   time.Time `json:"created_at"`
 	LastSeenAt  time.Time `json:"last_seen_at"`
-	// Kind is UserKindHuman (signs in through Dex) or UserKindAgent (an
-	// account for an autonomous agent, which uses API tokens).
+	// Kind is UserKindHuman (signs in through Dex), UserKindAgent (an
+	// account for an autonomous agent, which uses API tokens) or
+	// UserKindCustomer (an authenticated requester who submits team
+	// requests: a real identity, never an org or project member by
+	// implication).
 	Kind string `json:"kind"`
 	// ManagedBy is the person responsible for an agent account.
 	ManagedBy *int `json:"managed_by,omitempty"`
@@ -869,24 +874,68 @@ func (f AuditFilter) Values() map[string]any {
 // IsAgent reports whether u is an agent account.
 func (u *User) IsAgent() bool { return u != nil && u.Kind == UserKindAgent }
 
+// IsCustomer reports whether u is a customer account: an authenticated
+// requester identity, not a member of any org or project by implication.
+func (u *User) IsCustomer() bool { return u != nil && u.Kind == UserKindCustomer }
+
 const (
-	UserKindHuman = "human"
-	UserKindAgent = "agent"
+	UserKindHuman    = "human"
+	UserKindAgent    = "agent"
+	UserKindCustomer = "customer"
 )
+
+// UserKinds is the closed set of account kinds, in the order the schema's
+// CHECK names them (`users_kind_check`, migration 057). Adding a kind means
+// widening both this list and that CHECK.
+var UserKinds = []string{UserKindHuman, UserKindAgent, UserKindCustomer}
+
+// NormalizeUserKind validates an account kind (" Customer " is customer).
+// An empty kind is a person: JIT provisioning's default (migration 009).
+func NormalizeUserKind(s string) (string, error) {
+	k := strings.ToLower(strings.TrimSpace(s))
+	if k == "" {
+		return UserKindHuman, nil
+	}
+	if !slices.Contains(UserKinds, k) {
+		return "", fmt.Errorf("account kind must be one of %s", strings.Join(UserKinds, ", "))
+	}
+	return k, nil
+}
+
+// CanHoldOrgRole reports whether an account of this kind may hold role in an
+// org. A customer is a requester identity and never its administrator: org
+// owner/admin reaches every project in the org (see levelFromAccess), which
+// is exactly what a customer must never get. Plain membership is allowed, so
+// a customer may sit in an org without gaining anything from it.
+func CanHoldOrgRole(kind, role string) bool {
+	if kind != UserKindCustomer {
+		return true
+	}
+	return role != OrgRoleOwner && role != OrgRoleAdmin
+}
 
 // APIToken is a long-lived credential for MCP (and API) access, for agent
 // accounts and for people running headless agents. Only a hash is stored;
 // the token itself is shown once, when it is created.
 type APIToken struct {
-	ID         int        `json:"id"`
-	UserID     int        `json:"user_id"`
-	Name       string     `json:"name"`
-	Prefix     string     `json:"prefix"` // first characters, to recognise it
-	CreatedBy  *int       `json:"created_by,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
-	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
-	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
-	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
+	ID     int    `json:"id"`
+	UserID int    `json:"user_id"`
+	Name   string `json:"name"`
+	Prefix string `json:"prefix"` // first characters, to recognise it
+	// Scope says how much of the account this token carries
+	// (TokenScopeFull or TokenScopeSubmit). Every token minted before
+	// scopes existed, and every token minted without asking for one, is
+	// full: its behaviour is unchanged (AMP #3772).
+	Scope string `json:"scope"`
+	// ScopeTeamID is the one team a submit-scoped token may send requests
+	// to, and nil for a full-scoped token. The scope and the team are
+	// inseparable (the schema's CHECK refuses one without the other).
+	ScopeTeamID *int       `json:"scope_team_id,omitempty"`
+	CreatedBy   *int       `json:"created_by,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
+	RevokedAt   *time.Time `json:"revoked_at,omitempty"`
 }
 
 const (
@@ -959,6 +1008,9 @@ type ProjectMember struct {
 	Disabled    bool   `json:"disabled,omitempty"`
 }
 
+// Invite is a pending invitation for an email that has not signed in yet.
+// Kind says what accepting it provisions: membership (the default, and the
+// meaning of every row written before #3767) or a requester identity.
 type Invite struct {
 	ID         int        `json:"id"`
 	Email      string     `json:"email"`
@@ -969,7 +1021,42 @@ type Invite struct {
 	InvitedBy  *int       `json:"invited_by"`
 	CreatedAt  time.Time  `json:"created_at"`
 	AcceptedAt *time.Time `json:"accepted_at,omitempty"`
+	Kind       string     `json:"kind,omitempty"`
 }
+
+const (
+	// InviteKindMember is a membership invitation: accepting it adds an org
+	// member row (and a team member row when it names a team). It is the
+	// default, and what every invite written before #3767 means.
+	InviteKindMember = "member"
+	// InviteKindRequester is a requester invitation: the invited person's
+	// first sign-in provisions a customer identity, and accepting the invite
+	// grants no org or team membership at all. Team submit access is a
+	// separate, revocable grant (#3768), never a consequence of acceptance.
+	InviteKindRequester = "requester"
+)
+
+// InviteKinds is the closed set of invitation intents, in the order the
+// schema's CHECK names them (`invites_kind_check`, migration 058).
+var InviteKinds = []string{InviteKindMember, InviteKindRequester}
+
+// NormalizeInviteKind validates an invitation intent (" Requester " is a
+// requester invite). An empty kind is a membership invite, so callers that
+// predate #3767 keep inviting members.
+func NormalizeInviteKind(s string) (string, error) {
+	k := strings.ToLower(strings.TrimSpace(s))
+	if k == "" {
+		return InviteKindMember, nil
+	}
+	if !slices.Contains(InviteKinds, k) {
+		return "", fmt.Errorf("invite kind must be one of %s", strings.Join(InviteKinds, ", "))
+	}
+	return k, nil
+}
+
+// IsRequester reports whether accepting this invite provisions a requester
+// identity rather than membership.
+func (i Invite) IsRequester() bool { return i.Kind == InviteKindRequester }
 
 // HasRole reports whether the user holds a global role.
 func (u *User) HasRole(role string) bool {

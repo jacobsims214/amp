@@ -17,6 +17,27 @@ import (
 
 const guideDir = "../../../kb"
 
+// resetGuide empties the guide's collection before a test syncs its own, so
+// "before the sync" is a real empty state, and drops it again at the end.
+//
+// The collection it empties is the test's own (kb.SetCollectionPrefix in
+// testKB), never a live instance's: the global KB's name is fixed
+// (kb_global_0), and a live instance syncs the guide only at startup, so a
+// test that dropped that name would empty the guide of every instance
+// sharing the Typesense for good (#3689). The check is a hard failure, not a
+// skip: it guards the wiring that makes this suite safe to run against a
+// live instance.
+func resetGuide(t *testing.T, svc *kb.Service) {
+	t.Helper()
+	col := svc.CollectionName(kb.Global())
+	if !kb.IsTestCollectionName(col) {
+		t.Fatalf("refusing to empty %q: the guide tests must only touch a namespaced test collection (kb.SetCollectionPrefix)", col)
+	}
+	ctx := context.Background()
+	t.Cleanup(func() { _ = svc.Drop(ctx, kb.Global()) })
+	_ = svc.Drop(ctx, kb.Global())
+}
+
 // The shipped guide parses, has its start page, and its cross-references
 // point at pages that exist.
 func TestGuide_ShippedDocs(t *testing.T) {
@@ -62,8 +83,7 @@ func TestGuide_Sync(t *testing.T) {
 		t.Skip("TEST_TYPESENSE_URL not set")
 	}
 	ctx := context.Background()
-	t.Cleanup(func() { _ = s.kb.Drop(ctx, kb.Global()) })
-	_ = s.kb.Drop(ctx, kb.Global())
+	resetGuide(t, s.kb)
 
 	dir := t.TempDir()
 	put := func(path, body string) {
@@ -129,8 +149,7 @@ func TestGuide_MCP(t *testing.T) {
 		t.Skip("TEST_TYPESENSE_URL not set")
 	}
 	ctx := context.Background()
-	t.Cleanup(func() { _ = w.s.kb.Drop(ctx, kb.Global()) })
-	_ = w.s.kb.Drop(ctx, kb.Global())
+	resetGuide(t, w.s.kb)
 
 	// Before the sync lands: a clear "not loaded yet".
 	wantErr(t, w.as(w.alice).callExpectError(t, "amp_guide", map[string]interface{}{}), "isn't loaded yet")

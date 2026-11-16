@@ -4,10 +4,18 @@ import type {
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
-  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, GitHubCredentialInfo, GitHubCredentialChange, Run, RunView, Usage, UpstreamDecision, DecisionAsk, DecisionDoc, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
+  Artifact, ArtifactVersion, APIToken, NewAPIToken, TokenScope, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, GitHubCredentialInfo, GitHubCredentialChange, Run, RunView, Usage, UpstreamDecision, DecisionAsk, DecisionDoc, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
   ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork, MyWorkCounts, PeopleWaiting,
   GettingStarted, ReceiptsMode, ReceiptMinLevel, ReceiptSummary, ReceiptView, TaskReceipt,
+  RequestQueueFilter, RequestQueue, RequestQueueSummary, RequestReadAnswer, OwnRequestFilter, OwnRequestPage,
+  SubmitRequestInput, RequestSubmissionAnswer, UpdateRequestInput, RequestMutationAnswer, RequestDiscussionInput,
+  RequestCommentAnswer, RequestPreconditionInput, RequestAssignInput, RequestLifecycleInput, RequestLifecycleAnswer,
+  RequesterAnswerInput, RequestLinkInput, RequestLinkAnswer, RequestHandoffInput, RequestHandoffAnswer,
+  RequestReadPageOpts, RequestThreadAnswer, RequestEventsAnswer, RequestLinksAnswer, RequestLinkKind,
+  RequestAttachmentPanel, RequestUploadInput, RequestUploadAnswer, RequestAttachmentKeepAnswer, RequestAttachmentDeleteAnswer,
+  RequestDownloadLink, RequestGrantList, RequestGrantAnswer, RequestInviteList, RequestInviteAnswer,
 } from '../types'
+import type { ResolvedRequestLink } from '../lib/requestControls'
 import { auditQuery, auditVerifyUrl, type AuditScope } from '../lib/audit'
 import { apiErrorMessage, NOT_SIGNED_IN } from '../lib/apiError'
 import { isSessionEnded, markSessionEnded, sessionLost } from '../lib/session'
@@ -21,42 +29,99 @@ function kbQuery(ref: KBRef): string {
   return `project_id=${ref.project_id}`
 }
 
-/** A failed request's error carries the HTTP status (404 not found, 403 no access). */
-export type HttpError = Error & { status?: number }
+/**
+ * A failed request's error carries the HTTP status (404 not found, 403 no access)
+ * and, when the server sent them, the facts a caller retries with.
+ *
+ * `code` is the refusal's stable code — `request.*` on the inbox surface, so a
+ * caller branches on the code rather than on a message that may be reworded.
+ * `rev` and `claimUserId` are a 409's facts: the revision the row is actually
+ * at (retry with it, no re-read) and who holds the claim (so the loser can be
+ * told). `retryAfterS` is a 429's wait. All are additive; a caller that reads
+ * only `message` and `status` is unaffected.
+ */
+export type HttpError = Error & {
+  status?: number
+  code?: string
+  rev?: number
+  claimUserId?: number
+  retryAfterS?: number
+}
 
 const sessionEndedError = () => Object.assign(new Error(NOT_SIGNED_IN), { status: 401, sessionEnded: true })
+
+/**
+ * A refused response as the error this client throws: the server's reason
+ * (lib/apiError.ts) as the message, plus the status and every retry fact the
+ * body and headers carry.
+ *
+ * The 429 handling reads both spellings — the `Retry-After` header, which an
+ * HTTP client honours without reading the body, and the body's
+ * `retry_after_s` — because the submission route writes the same number to
+ * both and a caller should never have to know which one it got.
+ */
+async function failure(res: Response, method: string, path: string): Promise<HttpError> {
+  const body = (await res
+    .json()
+    .catch(() => (method === 'GET' ? {} : { error: res.statusText }))) as Record<string, unknown>
+  const header = Number.parseInt(res.headers.get('retry-after') ?? '', 10)
+  const fromBody = typeof body.retry_after_s === 'number' ? body.retry_after_s : undefined
+  return Object.assign(
+    new Error(apiErrorMessage(res.status, typeof body.error === 'string' ? body.error : undefined, `${method} ${path}: ${res.status}`)),
+    {
+      status: res.status,
+      code: typeof body.code === 'string' ? body.code : undefined,
+      rev: typeof body.rev === 'number' ? body.rev : undefined,
+      claimUserId: typeof body.claim_user_id === 'number' ? body.claim_user_id : undefined,
+      retryAfterS: Number.isFinite(header) ? header : fromBody,
+    },
+  )
+}
 
 /**
  * Every AMP API call goes through here. A response from oauth2-proxy rather
  * than amp-api (the session ended: a 401, a redirect to sign-in, or the
  * sign-in page as a 200 HTML page) marks the session ended app-wide (lib/session.ts) and throws the
  * "sign in again" sentence; any other failure throws the server's reason
- * (lib/apiError.ts), with status set. Once the session has ended nothing is
- * sent at all, so the pages' pollers go quiet behind the prompt.
+ * (lib/apiError.ts) with the status and retry facts set (see HttpError). Once
+ * the session has ended nothing is sent at all, so the pages' pollers go quiet
+ * behind the prompt.
+ *
+ * `headers` carries a call's own transport facts — the inbox submission's
+ * `Idempotency-Key` is the only one today. It is never a credential: sign-in is
+ * the proxy's cookie, and nothing here stores or sends a token.
  */
-async function send(method: string, path: string, body?: unknown, base = BASE): Promise<Response> {
+async function send(
+  method: string,
+  path: string,
+  body?: unknown,
+  base = BASE,
+  headers?: Record<string, string>,
+): Promise<Response> {
   if (isSessionEnded()) throw sessionEndedError()
   const res = await fetch(`${base}${path}`, {
     method,
     // Don't follow the proxy to the sign-in page: see it as a redirect.
     redirect: 'manual',
-    headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+    headers: {
+      ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      ...headers,
+    },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   })
   if (sessionLost(res)) {
     markSessionEnded()
     throw sessionEndedError()
   }
-  if (!res.ok) {
-    const err = await res.json().catch(() => (method === 'GET' ? {} : { error: res.statusText }))
-    throw Object.assign(new Error(apiErrorMessage(res.status, err.error, `${method} ${path}: ${res.status}`)), { status: res.status })
-  }
+  if (!res.ok) throw await failure(res, method, path)
   return res
 }
 
 const get = <T>(path: string): Promise<T> => send('GET', path).then(r => r.json())
-const post = <T>(path: string, body?: unknown): Promise<T> => send('POST', path, body).then(r => r.json())
-const patch = <T>(path: string, body?: unknown): Promise<T> => send('PATCH', path, body).then(r => r.json())
+const post = <T>(path: string, body?: unknown, headers?: Record<string, string>): Promise<T> =>
+  send('POST', path, body, BASE, headers).then(r => r.json())
+const patch = <T>(path: string, body?: unknown, headers?: Record<string, string>): Promise<T> =>
+  send('PATCH', path, body, BASE, headers).then(r => r.json())
 const put = <T>(path: string, body?: unknown): Promise<T> => send('PUT', path, body).then(r => r.json())
 
 // del resolves to the parsed JSON body when there is one (several RBAC
@@ -436,8 +501,20 @@ export const api = {
   createAgent: (name: string, teamIds: number[]) =>
     post<{ agent: AmpUser }>('/agents', { name, team_ids: teamIds }).then(r => r.agent),
   listTokens: (user: number | 'me') => get<{ tokens: APIToken[] | null }>(`/users/${user}/tokens`).then(r => r.tokens ?? []),
-  createToken: (user: number | 'me', name: string, expiresInDays = 0) =>
-    post<{ token: NewAPIToken }>(`/users/${user}/tokens`, { name, expires_in_days: expiresInDays }).then(r => r.token),
+  /**
+   * Mint a token. `scope` narrows it (AMP #3772): `submit` makes a credential
+   * that may only send requests to `scopeTeamId`'s inbox. Omitting it mints a
+   * full-scope token, exactly as before.
+   *
+   * The secret is in the answer and nowhere else — there is no route that
+   * returns one (`service.ListTokens` never carries it), so a caller that drops
+   * it has to mint another.
+   */
+  createToken: (user: number | 'me', name: string, expiresInDays = 0, scope?: { scope: TokenScope; scopeTeamId?: number }) =>
+    post<{ token: NewAPIToken }>(`/users/${user}/tokens`, {
+      name, expires_in_days: expiresInDays,
+      ...(scope ? { scope: scope.scope, ...(scope.scopeTeamId != null ? { scope_team_id: scope.scopeTeamId } : {}) } : {}),
+    }).then(r => r.token),
   revokeToken: (tokenId: number) => del(`/tokens/${tokenId}`),
 
   // Audit log: global admins any; org admins pass orgId; project owners projectId
@@ -515,6 +592,388 @@ export const api = {
   setTeamMemberRole: (teamId: number, userId: number, role: TeamRole) =>
     put(`/teams/${teamId}/members/${userId}`, { role }),
   removeTeamMember: (teamId: number, userId: number) => del(`/teams/${teamId}/members/${userId}`),
+}
+
+// ---- Team inbox requests (epic 202, story 549; AMP #3977, build slice J0) ----
+//
+// Thin functions over every shipped request route — nothing here decides
+// anything. Who may read what, the tenant, the keyset cursor, the requester
+// whitelist and every 404 are the server's decisions; these functions name a
+// path, send a body and return the answer's shape. That is deliberate: the
+// server's adapters are thin over one authorized service path each, and a
+// client that re-implemented a rule would be a second place for it to drift.
+//
+// Three facts about this surface are easy to get wrong, so they are stated once
+// here instead of in each call site's comment:
+//
+//  1. **A write addresses a request by its SERIAL; a read accepts either the
+//     serial or the public reference.** The team routes are under a team
+//     (`/teams/{id}/requests/{serial}`) because the service loads the team first
+//     for the org half of the tenant; a public reference on a team write is
+//     refused by name rather than looked up, so a second definition of what a
+//     reference may name cannot appear in an adapter. The exception is the
+//     requester surface (`/requests/{ref}/…`), where the reference is the only
+//     thing a customer holds — that is why those calls take `request: number |
+//     string` and the team ones take `number`.
+//
+//  2. **A write answers the act, never the record** (see `RequestMutationFacts`).
+//     A component that shows a claim or an assignee after a write must re-read
+//     the record; the write answer does not carry them.
+//
+//  3. **A 409 carries the facts a retry needs**, and a 429 carries its wait, on
+//     the thrown `HttpError`: `code` (`request.conflict`), `rev` (the revision
+//     the row is actually at) and `claimUserId` (who holds the claim), or
+//     `retryAfterS`. Nothing here swallows them.
+
+/**
+ * The filters a queue call may carry, as a query string. Repeated `state`
+ * values are the server's own spelling (`?state=new&state=triaging`), which it
+ * also accepts comma-separated; this writes the repeated form.
+ */
+function requestQueueQuery(filter: RequestQueueFilter = {}): string {
+  const q = new URLSearchParams()
+  for (const st of filter.state ?? []) q.append('state', st)
+  if (filter.submitter !== undefined) q.set('submitter', String(filter.submitter))
+  if (filter.source_kind) q.set('source_kind', filter.source_kind)
+  if (filter.created_after) q.set('created_after', filter.created_after)
+  if (filter.created_before) q.set('created_before', filter.created_before)
+  if (filter.attached !== undefined) q.set('attached', String(filter.attached))
+  if (filter.q) q.set('q', filter.q)
+  if (filter.before_id) q.set('before_id', String(filter.before_id))
+  if (filter.limit) q.set('limit', String(filter.limit))
+  if (filter.mine) q.set('mine', 'true')
+  if (filter.mine_before_id) q.set('mine_before_id', String(filter.mine_before_id))
+  if (filter.mine_limit) q.set('mine_limit', String(filter.mine_limit))
+  const s = q.toString()
+  return s ? `?${s}` : ''
+}
+
+/** The requester's own-list query: smaller than the queue's, by the server's own rule. */
+function ownRequestQuery(filter: OwnRequestFilter = {}): string {
+  const q = new URLSearchParams()
+  for (const st of filter.state ?? []) q.append('state', st)
+  if (filter.before_id) q.set('before_id', String(filter.before_id))
+  if (filter.limit) q.set('limit', String(filter.limit))
+  const s = q.toString()
+  return s ? `?${s}` : ''
+}
+
+/**
+ * The forward cursor a discussion or history read carries (`?after_id=N&limit=N`).
+ *
+ * Forward, not `before_id`, because both tables are append-only: a thread and a
+ * history are read from where they began. The server clamps `limit` itself, so
+ * this writes whatever the caller asked for and never re-derives the bound — a
+ * second copy of the ceiling is a second thing to get out of step with it.
+ * Zero means "unset" in both spellings, as on every other query here.
+ */
+function requestReadPageQuery(opts: RequestReadPageOpts = {}): string {
+  const q = new URLSearchParams()
+  if (opts.after_id) q.set('after_id', String(opts.after_id))
+  if (opts.limit) q.set('limit', String(opts.limit))
+  const s = q.toString()
+  return s ? `?${s}` : ''
+}
+
+/**
+ * The lineage read's `kind` filter, in the repeated form the server also
+ * accepts (`?kind=planned_as&kind=delivered_by`) — the queue's `state`
+ * convention, so one spelling is written here and the comma form is the
+ * server's business. No filter writes no query at all.
+ */
+function requestLinksQuery(kind?: RequestLinkKind | readonly RequestLinkKind[]): string {
+  const kinds: readonly RequestLinkKind[] = kind == null ? [] : typeof kind === 'string' ? [kind] : kind
+  if (kinds.length === 0) return ''
+  const q = new URLSearchParams()
+  for (const k of kinds) q.append('kind', k)
+  return `?${q.toString()}`
+}
+
+/**
+ * A request write's precondition: the revision the caller read, in whichever of
+ * the two spellings the caller chose.
+ *
+ * The server accepts `If-Match: "7"` and `If-Match: 7` (both mean the same), and
+ * it refuses `If-Match: *` and weak validators — they claim a guarantee HTTP
+ * does not give a strong comparison. `expected_rev` in the body is the same
+ * precondition; sending both is allowed only when they agree. This helper
+ * prefers the header and never invents a revision, so an omitted `rev` stays
+ * omitted and the act stays replay-tolerant.
+ */
+function preconditionHeaders(rev?: number): Record<string, string> | undefined {
+  return rev !== undefined && rev > 0 ? { 'If-Match': `"${rev}"` } : undefined
+}
+
+/**
+ * The team inbox surface: the shared queue, one request's record, triage,
+ * lifecycle, lineage, attachments and the access administration.
+ *
+ * Every function names the route it calls, so a reader can match it against
+ * `internal/api/rest.go`'s registrations without opening the server. The route
+ * list is deliberately complete: a UI slice that needs a call should find it
+ * here rather than adding one beside its component, which is what keeps this
+ * file the single place the surface is described.
+ */
+export const requestApi = {
+  // ---- Submission (F1's submit half) ----
+  /**
+   * Submit a request to a team's inbox, with no project named.
+   *
+   * `idempotencyKey` is the caller's retry token and goes in the
+   * `Idempotency-Key` header, never in the body: a body field for it could be
+   * read as content, and the key's scope is `(org, team, source, submitter)`, so
+   * a browser's key and an API client's key are different keys.
+   *
+   * `created` is false when this call answered a replay with the request the key
+   * already produced (the server answers 200 rather than 201 in that case).
+   */
+  submit: (teamId: number, input: SubmitRequestInput, idempotencyKey?: string) =>
+    post<RequestSubmissionAnswer>(`/teams/${teamId}/requests`, input,
+      idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined),
+
+  // ---- Reads (F1's list half and F2's read half) ----
+  /** The team's queue: one keyset page, its per-state counts, and (when asked) the caller's own slice. */
+  queue: (teamId: number, filter?: RequestQueueFilter) =>
+    get<RequestQueue>(`/teams/${teamId}/requests${requestQueueQuery(filter)}`),
+  /** The same counts without a page — My work's inbox panels read this. */
+  queueSummary: (teamId: number, filter?: Omit<RequestQueueFilter, 'before_id' | 'limit'>) =>
+    get<RequestQueueSummary>(`/teams/${teamId}/requests/summary${requestQueueQuery(filter as RequestQueueFilter)}`),
+  /** One request's team view: the stored record plus its delivery aggregate. `ref` is a serial or a public reference. */
+  detail: (teamId: number, ref: number | string) =>
+    get<RequestReadAnswer>(`/teams/${teamId}/requests/${encodeURIComponent(String(ref))}`),
+  /** The caller's own requests, projected — never the record, and never another requester's. */
+  own: (filter?: OwnRequestFilter) => get<OwnRequestPage>(`/requests${ownRequestQuery(filter)}`),
+  /** One of the caller's own requests. Another person's reference is the same 404 as an unknown one. */
+  ownDetail: (ref: number | string) =>
+    get<RequestReadAnswer>(`/requests/${encodeURIComponent(String(ref))}`),
+
+  // ---- The record's three sub-reads (F2's discussion, F3's history, F5's lineage) ----
+  /**
+   * One request's discussion: every stored row, in append order.
+   *
+   * `ref` is a serial or the requester's public reference, as on every request
+   * read (the server decodes it with the detail read's own decoder).
+   *
+   * The answer is returned whole, not unwrapped to one array, because the two
+   * arms are two different lists: a team answer carries `comments` (the stored
+   * `RequestComment` rows, attribution included) while a requester answer carries
+   * `shared_comments` (`RequesterComment`: no id, no author, no user id) and
+   * **omits `comments` entirely**. Returning `comments ?? []` would hand a
+   * requester an empty thread where they have a real one — the bug
+   * `servedReads` in `lib/requestDetail.ts` exists to prevent — so narrow on
+   * `view` and the right list follows.
+   *
+   * `opts` is the forward cursor. The thread is an append-only table read from
+   * where it began, so there is no `before_id`; the server clamps `limit` (50
+   * default, 200 ceiling) and answers `next_after_id` only when another page
+   * really exists, so a caller never asks for an empty page to learn it is done.
+   * A requester's answer carries no cursor at all.
+   */
+  listComments: (teamId: number, ref: number | string, opts?: RequestReadPageOpts) =>
+    get<RequestThreadAnswer>(`/teams/${teamId}/requests/${encodeURIComponent(String(ref))}/comments${requestReadPageQuery(opts)}`),
+  /**
+   * One request's history: the append-only `request_events` rows, in id order.
+   *
+   * One view, one list. The history is an internal fact — a row names the acting
+   * person, the internal state names and the ids of what it touched — so the
+   * server refuses a requester here (404, the surface's one answer) rather than
+   * filtering; a page that rendered this for a requester would be inventing a
+   * whitelist nothing consumes.
+   *
+   * Returned as its page, so `next_after_id` reaches the caller and a long
+   * history is a caller's decision rather than a silent truncation at the
+   * server's 50-row default. `events` is the existing `RequestEvent`.
+   */
+  listEvents: (teamId: number, ref: number | string, opts?: RequestReadPageOpts) =>
+    get<RequestEventsAnswer>(`/teams/${teamId}/requests/${encodeURIComponent(String(ref))}/events${requestReadPageQuery(opts)}`),
+  /**
+   * One request's linked work: the `request_links` rows in attach order, so the
+   * planning rail and the deliver panel's evidence list read the lineage itself
+   * rather than reconstructing it from the outcome aggregate.
+   *
+   * `kind` narrows the answer to one kind, or to a union of them (the server
+   * takes the repeated form this writes, and also a comma list). An unknown kind
+   * is a 400 `request.invalid`.
+   *
+   * Rows, not a page: a request's lineage is bounded by what planning and
+   * delivery attached, so there is no cursor and nothing to truncate. Each row is
+   * the rail's own `ResolvedRequestLink` — `RequestLink` plus an OPTIONAL
+   * `target`, which this answer never carries: the server does not resolve a
+   * target, and an absent one is the truthful state rather than a placeholder.
+   * The page fills a title (or `gone`/`approved`/`merged`) from the target's own
+   * read.
+   */
+  listLinks: (teamId: number, ref: number | string, kind?: RequestLinkKind | readonly RequestLinkKind[]): Promise<ResolvedRequestLink[]> =>
+    get<RequestLinksAnswer>(`/teams/${teamId}/requests/${encodeURIComponent(String(ref))}/links${requestLinksQuery(kind)}`)
+      .then(r => r.links ?? []),
+
+  // ---- Triage writes (F2's write half) ----
+  /** The submitter's versioned edit, while the request is still untriaged. `expected_rev` is required. */
+  update: (teamId: number, requestId: number, input: UpdateRequestInput) =>
+    patch<RequestMutationAnswer>(`/teams/${teamId}/requests/${requestId}`, input,
+      preconditionHeaders(input.expected_rev)),
+  /** One row of discussion in the caller's own voice. 201 when it wrote, 200 when it answered a retry. */
+  comment: (teamId: number, requestId: number, input: RequestDiscussionInput) =>
+    post<RequestCommentAnswer>(`/teams/${teamId}/requests/${requestId}/comments`, input),
+  /** Take the triage claim. A lost race is a 409 carrying `claimUserId` — the winner. */
+  claim: (teamId: number, requestId: number, input?: RequestPreconditionInput) =>
+    post<RequestMutationAnswer>(`/teams/${teamId}/requests/${requestId}/claim`, input ?? {},
+      preconditionHeaders(input?.expected_rev)),
+  /** Give the claim back. Idempotent: releasing a claim nobody holds is `changed: false`. */
+  release: (teamId: number, requestId: number, input?: RequestPreconditionInput) =>
+    post<RequestMutationAnswer>(`/teams/${teamId}/requests/${requestId}/release`, input ?? {},
+      preconditionHeaders(input?.expected_rev)),
+  /** A team manager's explicit transfer to an assignee ('me', an id, an email, or 'none'). Clears any claim. */
+  assign: (teamId: number, requestId: number, input: RequestAssignInput) =>
+    post<RequestMutationAnswer>(`/teams/${teamId}/requests/${requestId}/assign`, input,
+      preconditionHeaders(input.expected_rev)),
+
+  // ---- Team lifecycle (F3) ----
+  /** The plain working step — the one generic route, to whichever state the caller names. */
+  transition: (teamId: number, requestId: number, input: RequestLifecycleInput) =>
+    post<RequestLifecycleAnswer>(`/teams/${teamId}/requests/${requestId}/transition`, input,
+      preconditionHeaders(input.expected_rev)),
+  /** Ask the requester a question; the request moves to needs_information (I5). */
+  needsInfo: (teamId: number, requestId: number, question: string, expectedRev?: number) =>
+    post<RequestLifecycleAnswer>(`/teams/${teamId}/requests/${requestId}/needs-info`, { question, expected_rev: expectedRev },
+      preconditionHeaders(expectedRev)),
+  /** Decline, with a reason (I3). */
+  reject: (teamId: number, requestId: number, rejectReason: string, expectedRev?: number) =>
+    post<RequestLifecycleAnswer>(`/teams/${teamId}/requests/${requestId}/reject`, { reject_reason: rejectReason, expected_rev: expectedRev },
+      preconditionHeaders(expectedRev)),
+  /** Fold into a canonical request (I3/D7). */
+  duplicate: (teamId: number, requestId: number, canonicalRequestId: number, expectedRev?: number) =>
+    post<RequestLifecycleAnswer>(`/teams/${teamId}/requests/${requestId}/duplicate`, { canonical_request_id: canonicalRequestId, expected_rev: expectedRev },
+      preconditionHeaders(expectedRev)),
+  /** The team reopens a closed request (D6). */
+  reopen: (teamId: number, requestId: number, input?: RequestPreconditionInput) =>
+    post<RequestLifecycleAnswer>(`/teams/${teamId}/requests/${requestId}/reopen`, input ?? {},
+      preconditionHeaders(input?.expected_rev)),
+  /**
+   * State that the outcome exists (I2).
+   *
+   * The server refuses a delivery whose evidence is missing before the lifecycle
+   * write runs, and its refusal names the request's public reference — so a
+   * Deliver panel disables its button on `outcome.delivered_eligible` (the
+   * aggregate's gate) rather than trying and translating the error.
+   */
+  deliver: (teamId: number, requestId: number, input: RequestLifecycleInput) =>
+    post<RequestLifecycleAnswer>(`/teams/${teamId}/requests/${requestId}/deliver`, input,
+      preconditionHeaders(input.expected_rev)),
+
+  // ---- The requester's own acts (F4) ----
+  /** Answer the desk's question. The destination is the state the question interrupted, never the caller's choice. */
+  answer: (ref: number | string, input: RequesterAnswerInput) =>
+    post<RequestLifecycleAnswer>(`/requests/${encodeURIComponent(String(ref))}/answer`, input,
+      preconditionHeaders(input.expected_rev)),
+  /**
+   * Accept a delivery — the one act no team member, lead, agent, token or
+   * connector may perform (I1/D5).
+   *
+   * The server refuses a non-person caller before it resolves the reference, so
+   * an agent or a service credential gets identical bytes for a real, a foreign
+   * and an unknown reference. There is no on-behalf path in v1, and this client
+   * adds none.
+   */
+  accept: (ref: number | string, input?: RequestPreconditionInput) =>
+    post<RequestLifecycleAnswer>(`/requests/${encodeURIComponent(String(ref))}/accept`, input ?? {},
+      preconditionHeaders(input?.expected_rev)),
+  /** The requester reopens after a delivery (D6). */
+  ownReopen: (ref: number | string, input?: RequestPreconditionInput) =>
+    post<RequestLifecycleAnswer>(`/requests/${encodeURIComponent(String(ref))}/reopen`, input ?? {},
+      preconditionHeaders(input?.expected_rev)),
+
+  // ---- Lineage and the planning handoff (F5) ----
+  /**
+   * Attach one durable relation. The relation is its own idempotency key: a
+   * replay answers `changed: false` and writes no row, history entry or audit.
+   *
+   * A second active `routes_to` is a 409 naming the project the request is on
+   * now; `supersede_route` moves it deliberately, appending the new routing and
+   * keeping the old one as history.
+   */
+  link: (teamId: number, requestId: number, input: RequestLinkInput) =>
+    post<RequestLinkAnswer>(`/teams/${teamId}/requests/${requestId}/links`, input),
+  /**
+   * Plan a batch of tickets for the request, durably and idempotently.
+   *
+   * The created tickets await a person's approval: nothing on this path approves
+   * or dispatches anything. A retried partial batch plans only what is missing
+   * and reports the rest as `already`.
+   */
+  handoff: (teamId: number, requestId: number, input: RequestHandoffInput) =>
+    post<RequestHandoffAnswer>(`/teams/${teamId}/requests/${requestId}/handoff`, input),
+
+  // ---- Private attachments (F5/G3) ----
+  /** The file panel: metadata only, never bytes, plus AMP's upload bounds. */
+  attachments: (teamId: number, requestId: number) =>
+    get<RequestAttachmentPanel>(`/teams/${teamId}/requests/${requestId}/attachments`),
+  /** One file onto the request. 201 always: an upload is not idempotent, so there is no replay to answer. */
+  uploadAttachment: (teamId: number, requestId: number, input: RequestUploadInput) =>
+    post<RequestUploadAnswer>(`/teams/${teamId}/requests/${requestId}/attachments`, input),
+  /** Pin a file past its retention window, or let the request's own clock apply again. */
+  keepAttachment: (teamId: number, requestId: number, attachmentId: number, keep: boolean) =>
+    post<RequestAttachmentKeepAnswer>(`/teams/${teamId}/requests/${requestId}/attachments/${attachmentId}/keep`, { keep }),
+  /** Delete a file. A second delete is a 404, not `{deleted: false}` — the row is read before it is removed. */
+  deleteAttachment: (teamId: number, requestId: number, attachmentId: number) =>
+    del<RequestAttachmentDeleteAnswer>(`/teams/${teamId}/requests/${requestId}/attachments/${attachmentId}`),
+  /**
+   * Mint a short-lived, single-use download link for one file.
+   *
+   * Minting is one thing and serving the bytes is another: the link is an
+   * additional capability, never a way around signing in, and it is the only way
+   * a private file's bytes are served.
+   */
+  downloadLink: (teamId: number, requestId: number, attachmentId: number) =>
+    post<{ download: RequestDownloadLink }>(
+      `/teams/${teamId}/requests/${requestId}/attachments/${attachmentId}/download`,
+    ).then(r => r.download),
+
+  // ---- Who may submit to this inbox (D14) and requester invitations ----
+  /** The team's submit grants: in force first, then revoked. */
+  listGrants: (teamId: number) =>
+    get<RequestGrantList>(`/teams/${teamId}/request-grants`).then(r => r.grants ?? []),
+  /** Grant submit access to 'me', a user id or an email. Idempotent, so there is no `changed`. */
+  grantSubmit: (teamId: number, user: string | number) =>
+    post<RequestGrantAnswer>(`/teams/${teamId}/request-grants`, { user: String(user) }),
+  /** Revoke it. A revoked grant fails the very next check, with no cache to clear. */
+  revokeSubmit: (teamId: number, user: string | number) =>
+    del<RequestGrantAnswer>(`/teams/${teamId}/request-grants/${encodeURIComponent(String(user))}`),
+  /** The inbox's pending requester invitations. */
+  listInvites: (teamId: number) =>
+    get<RequestInviteList>(`/teams/${teamId}/request-invites`).then(r => r.invites ?? []),
+  /** Invite someone as a requester: it provisions a customer identity and grants no role at all. */
+  inviteRequester: (teamId: number, email: string) =>
+    post<RequestInviteAnswer>(`/teams/${teamId}/request-invites`, { email }),
+  revokeInvite: (teamId: number, inviteId: number) =>
+    del<{ team_id: number; invite_id: number; revoked: boolean }>(`/teams/${teamId}/request-invites/${inviteId}`),
+}
+
+/**
+ * A 409 on this surface, as the facts a caller retries with.
+ *
+ * Every conflict the inbox answers — a stale revision, a lost claim race, a
+ * refused re-route, a duplicate that cannot be folded — is one status and one
+ * code, and what differs is which extra fact the body carries: `rev` for a
+ * stale write, `claimUserId` for a lost claim. A caller that needs to tell them
+ * apart reads the body's message; a caller that needs to *act* reads these.
+ */
+export function requestConflict(err: unknown): { rev?: number; claimUserId?: number; code?: string } | null {
+  const e = err as HttpError | undefined
+  if (!e || e.status !== 409) return null
+  return { rev: e.rev, claimUserId: e.claimUserId, code: e.code }
+}
+
+/**
+ * A 429's wait in seconds, from either spelling the server writes it in.
+ *
+ * The submission route puts the same number in `Retry-After` and in
+ * `retry_after_s`, and `send` reads both, so this is the one place a caller
+ * looks. Used by the submit form's "try again in Ns" copy.
+ */
+export function requestRetryAfterS(err: unknown): number | null {
+  const e = err as HttpError | undefined
+  return e?.status === 429 && typeof e.retryAfterS === 'number' ? e.retryAfterS : null
 }
 
 // ---- amp-authadmin — Dex credential CRUD (routed via Envoy at /authadmin/*) ----

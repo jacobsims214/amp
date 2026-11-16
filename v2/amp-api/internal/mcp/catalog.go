@@ -110,6 +110,40 @@ var toolCatalog = map[string]toolInfo{
 	"amp_list_deleted_tasks": {title: "List trash", keywords: "deleted tickets, epics and stories", readOnly: true},
 	"amp_restore_tasks":      {title: "Restore from trash", keywords: "undelete tickets, epics or stories"},
 
+	// Team inbox
+	//
+	// amp_submit_request is deliberately NOT flagged idempotent: it is idempotent
+	// only when the caller sends an idempotency_key, and a retry without one
+	// submits a second request. The flag a model reads must not promise more
+	// than the tool keeps (the condition is in the description instead), so the
+	// honest hint is "not idempotent" — the same way a write tool with no key is.
+	"amp_submit_request": {title: "Submit team request", keywords: "submit a request, intake, team inbox, send work to a team, no project needed, idempotency key replay"},
+	//
+	// The triage half (AMP #3969). The two reads are readOnly. The four writes
+	// are idempotent only where the service's own semantics make a replay a
+	// no-op — a claim you already hold, a release you already made, an assignee
+	// already set, a comment retried by the id it returned — which is what makes
+	// the hint true rather than optimistic. None is destructive: no tool here
+	// deletes anything, and none can move a request's lifecycle state.
+	"amp_list_requests":   {title: "List team requests", keywords: "team inbox queue, requests submitted to a team, triage queue, per-state counts, claim status, what has this person sent us", readOnly: true},
+	"amp_get_request":     {title: "Get team request", keywords: "read a request, a request's detail, my own request by reference, requester view, triage record, revision", readOnly: true},
+	"amp_update_request":  {title: "Edit team request", keywords: "change a request's subject or brief, fix what I submitted, versioned edit, stale revision conflict", idempotent: true},
+	"amp_comment_request": {title: "Comment on team request", keywords: "request discussion, ask the requester a question, reply in a request's thread, triage note", idempotent: true},
+	"amp_claim_request":   {title: "Claim team request", keywords: "take a request from the shared inbox, I am triaging it, claim conflict, who holds it", idempotent: true},
+	"amp_release_request": {title: "Release team request", keywords: "drop my triage claim, put a request back in the shared queue", idempotent: true},
+	"amp_assign_request":  {title: "Assign team request", keywords: "give a request to a person, own the outcome, unassign, hand over a request, transfer clears the claim", idempotent: true},
+	//
+	// The planning and attachment half (AMP #3972). Both writes are idempotent
+	// because the service makes a replay a no-op: an attach of a relation already
+	// stored writes nothing (changed=false), and a handoff retried with the same
+	// handoff_key reconciles against the ledger instead of planning the batch
+	// twice. A handoff with a NEW key is a deliberate re-plan, which is what the
+	// description says; the flag promises the retry, not the re-plan. None is
+	// destructive and none moves a lifecycle state.
+	"amp_attach_request":      {title: "Link team request", keywords: "attach a request to a project, plan items or delivery evidence, route a request, link work to a request, idempotent link", idempotent: true},
+	"amp_handoff_request":     {title: "Plan work for a team request", keywords: "plan a request, create tickets for a request, hand off a request to a project, plan items with dependencies, retry-safe planning", idempotent: true},
+	"amp_upload_request_file": {title: "Attach a file to a team request", keywords: "upload a file to a request, private attachment, requester file, base64 upload, bounded upload, no remote fetch"},
+
 	// Reports
 	"amp_day_report":          {title: "Draft day report", keywords: "end of day, wrap up today, standup draft", readOnly: true},
 	"amp_save_day_report":     {title: "Save day report", keywords: "save the end-of-day report", idempotent: true},
@@ -171,6 +205,20 @@ func presentTool(t mcpgo.Tool) mcpgo.Tool {
 // stay callable; they just aren't advertised.
 func (s *Server) listFilter(ctx context.Context, tools []mcpgo.Tool) []mcpgo.Tool {
 	p, err := authz.FromContext(ctx)
+	// A submit-scoped credential is shown the one tool it may call (AMP #3772):
+	// the list is the truth about the credential, not a broader surface it
+	// discovers by being refused. The gate in token_scope.go still refuses the
+	// others when called, since hidden tools stay callable.
+	if err == nil && p.SubmitOnly() {
+		allowed := submitScopeToolNames()
+		out := tools[:0:0]
+		for _, t := range tools {
+			if allowed[t.Name] {
+				out = append(out, t)
+			}
+		}
+		return out
+	}
 	admin := p.Super
 	if err == nil && !admin && p.HasUser() {
 		if orgs, err := s.repo.ListOrgs(ctx, p.UserRef()); err == nil {
@@ -216,7 +264,17 @@ func (s *Server) ServerOptions() []server.ServerOption {
 	return []server.ServerOption{
 		server.WithToolHandlerMiddleware(s.contactMiddleware()),
 		server.WithToolHandlerMiddleware(Middleware()),
+		// deniedMiddleware is registered BEFORE submitScopeGate because mcp-go
+		// applies middlewares in reverse (first registered = outermost), and a
+		// scope refusal must be recorded as access.denied like every other 403
+		// on this surface — the same row the REST gate's refusal gets (AMP
+		// #3772).
 		server.WithToolHandlerMiddleware(s.deniedMiddleware()),
+		// A submit-scoped credential reaches one tool. It runs outermost of
+		// the handler (after the deadline wrapper, which only sets a context),
+		// so a refused call costs no query, and it never has to remember
+		// anything: every tool call passes through it.
+		server.WithToolHandlerMiddleware(s.submitScopeGate()),
 		server.WithHooks(hooks),
 	}
 }

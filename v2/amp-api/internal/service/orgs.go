@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/kb"
+	"github.com/simstech/amp-api/internal/repository"
 )
 
 // Org and team administration, shared by the REST API (/api/orgs, /api/teams)
@@ -125,8 +127,16 @@ func (s *Service) CreateOrg(ctx context.Context, p authz.Principal, name, slug, 
 		id, err := s.Authz.ResolveUser(ctx, p, owner)
 		switch {
 		case err == nil:
+			// The owner role is a grant path like any other: a customer
+			// account can't be made the org's first owner (#3766), which
+			// the repository also refuses inside its writing transaction.
+			if err := s.requireKindCanHoldOrgRole(ctx, id, domain.OrgRoleOwner); err != nil {
+				return nil, nil, err
+			}
 			ownerID = &id
 		case strings.Contains(owner, "@"):
+			// No AMP user yet: the invite will grant the role when it is
+			// accepted, and AcceptInvitesList re-checks the kind then.
 			inviteOwner = owner
 		default:
 			return nil, nil, err
@@ -237,6 +247,14 @@ func (s *Service) AddOrgMember(ctx context.Context, p authz.Principal, orgID int
 		}
 		return nil, err
 	}
+	// A customer may be in an org as a plain member, never as its owner or
+	// admin: org owner/admin reaches every project in the org, and a
+	// requester identity must reach none (#3766). The repository refuses the
+	// same grant inside its writing transaction, so no other path slips past
+	// this clear answer.
+	if err := s.requireKindCanHoldOrgRole(ctx, userID, role); err != nil {
+		return nil, err
+	}
 	current, err := s.Repo.GetOrgRole(ctx, orgID, userID)
 	if err != nil {
 		return nil, err
@@ -281,6 +299,45 @@ func (s *Service) RemoveOrgMember(ctx context.Context, p authz.Principal, orgID 
 		Before: roleValue(current), After: roleValue("")})
 	s.endRemoteAfterAccessChange(ctx, p, userID)
 	return userID, nil
+}
+
+// requireKindCanHoldOrgRole refuses an org owner/admin role for a customer
+// account, with the same clear message as the repository's writing-transaction
+// guard (#3766). Any other account, and any other org role, is unaffected.
+func (s *Service) requireKindCanHoldOrgRole(ctx context.Context, userID int, role string) error {
+	if role != domain.OrgRoleOwner && role != domain.OrgRoleAdmin {
+		return nil
+	}
+	u, err := s.Repo.GetUserByID(ctx, userID)
+	if err != nil {
+		return authz.NotFound("user %d not found", userID)
+	}
+	if !domain.CanHoldOrgRole(u.Kind, role) {
+		return authz.BadRequest("a customer account can't be org %s: customers submit requests, they never administer an org (%s)", role, u.Email)
+	}
+	return nil
+}
+
+// requireKindCanBeTeamMember refuses team membership for a customer account,
+// with the same conflict (409) and the same shape as the invite-acceptance
+// path's refusal (Repo.AcceptInvitesList, #3861). Team membership is how a
+// person reaches every project the team is linked to, which a requester
+// identity must never get; a customer reaches a team's inbox through a submit
+// grant instead (Service.GrantSubmitAccess). Any other account kind is
+// unaffected, and so is every human path.
+//
+// The repository refuses the same grant inside its writing transaction
+// (guardCustomerTeamMember), so this is the clear answer, not the only guard.
+func (s *Service) requireKindCanBeTeamMember(ctx context.Context, userID int) error {
+	u, err := s.Repo.GetUserByID(ctx, userID)
+	if err != nil {
+		return authz.NotFound("user %d not found", userID)
+	}
+	if u.IsCustomer() {
+		return &authz.Error{Status: 409, Msg: fmt.Sprintf(
+			"a customer account can't join a team: team membership reaches projects, and customers submit requests (%s); give them submit access to the team's inbox instead", u.Email)}
+	}
+	return nil
 }
 
 // ---- Teams ----
@@ -396,6 +453,16 @@ func (s *Service) AddTeamMember(ctx context.Context, p authz.Principal, teamID i
 		}
 		return nil, err
 	}
+	// A customer is not a team member by implication (#3861): team membership
+	// reaches every project the team is linked to, which the approved contract
+	// forbids for a requester identity (see architecture/customer-accounts.md).
+	// The invite-acceptance path already refused this (AcceptInvitesList); the
+	// direct add path did not until now. The repository refuses the same grant
+	// inside its writing transaction, so no other caller slips past this clear
+	// answer.
+	if err := s.requireKindCanBeTeamMember(ctx, userID); err != nil {
+		return nil, err
+	}
 	previous, _ := s.Repo.GetTeamRole(ctx, teamID, userID)
 	if err := s.Repo.SetTeamMember(ctx, teamID, userID, role); err != nil {
 		return nil, err
@@ -442,10 +509,22 @@ func (s *Service) ListInvites(ctx context.Context, p authz.Principal, orgID int)
 	return s.Repo.ListPendingInvites(ctx, orgID)
 }
 
-// Invite records a pending membership. Org admins can invite with any role
+// Invite records a pending invitation. Org admins can invite with any role
 // (owner only by owners); team leads may invite into their own team as
 // plain org members.
+//
+// A requester invitation (kind "requester", #3767) is the customer path from
+// the approved contract §5: it must name a team (the team the person will be
+// able to submit to), grants no org or team role, and needs only that team's
+// manager — a team lead or an org owner/admin (RequireTeamManager). An existing
+// account is never turned into a customer by an invitation, so a requester
+// invite naming an email that already has one is refused rather than applied.
 func (s *Service) Invite(ctx context.Context, p authz.Principal, inv domain.Invite) (*MemberResult, error) {
+	kind, err := domain.NormalizeInviteKind(inv.Kind)
+	if err != nil {
+		return nil, authz.BadRequest("%s", err)
+	}
+	inv.Kind = kind
 	a, err := s.orgAccess(ctx, p, inv.OrgID)
 	if err != nil {
 		return nil, err
@@ -455,6 +534,9 @@ func (s *Service) Invite(ctx context.Context, p authz.Principal, inv domain.Invi
 	}
 	if inv.TeamRole == "" {
 		inv.TeamRole = domain.TeamRoleMember
+	}
+	if inv.IsRequester() {
+		return s.inviteRequester(ctx, p, a, inv)
 	}
 	if !a.admin {
 		if inv.TeamID == nil || inv.OrgRole != domain.OrgRoleMember {
@@ -474,6 +556,115 @@ func (s *Service) Invite(ctx context.Context, p authz.Principal, inv domain.Invi
 	return s.invite(ctx, p, inv)
 }
 
+// inviteRequester stores a requester invitation: the customer-targeted half of
+// the approved contract §5 (#3767). The invite is bound to one org, one team
+// and one recipient email, and only that team's manager can issue it.
+func (s *Service) inviteRequester(ctx context.Context, p authz.Principal, a orgAccess, inv domain.Invite) (*MemberResult, error) {
+	if inv.TeamID == nil {
+		return nil, authz.BadRequest("a requester invitation must name the team they can send requests to")
+	}
+	// The invitation is not a membership: it must not smuggle a role in.
+	if inv.OrgRole != domain.OrgRoleMember || inv.TeamRole != domain.TeamRoleMember {
+		return nil, authz.BadRequest("a requester invitation grants no org or team role: leave org_role and team_role at member")
+	}
+	team, err := s.Repo.GetTeam(ctx, *inv.TeamID)
+	if err != nil || team.OrgID != inv.OrgID {
+		return nil, authz.BadRequest("team is not in this org")
+	}
+	if err := s.Authz.RequireTeamManager(ctx, p, team); err != nil {
+		return nil, err
+	}
+	// An existing account keeps its kind: an explicit requester invitation
+	// provisions a new customer identity, it never converts or demotes a
+	// person, an agent or a team member.
+	if u, err := s.Repo.GetUserByEmail(ctx, inv.Email); err == nil {
+		return nil, authz.BadRequest("%s already has an AMP account, so a requester invitation would not create a customer identity; only a new email can be invited as a requester", u.Email)
+	}
+	inv.InvitedBy = p.UserRef()
+	created, err := s.Repo.CreateInvite(ctx, inv)
+	if err != nil {
+		return nil, err
+	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "invite.create", OrgID: intRef(inv.OrgID), TargetType: "invite", TargetID: idStr(created.ID),
+		Summary: "invited " + inv.Email + " to send requests to team " + team.Name, Details: map[string]any{"kind": inv.Kind, "team_id": *inv.TeamID}})
+	return &MemberResult{Invited: true, Invite: created}, nil
+}
+
+// ListRequesterInvites returns one team's pending requester invitations, for the
+// inbox's submit-access administration view (AMP #3975): who has been invited as
+// a requester and has not signed in yet. It is manager-only, the same gate as
+// grant and revoke — the listing names people who will be able to send to this
+// inbox, which is administration (contract §2), not something a plain team
+// member's inbox access includes.
+//
+// It is narrower than ListInvites on purpose: that one is an org admin's whole
+// pending set (membership and requester invitations together), while this one
+// answers the team's own question and refuses a non-manager. A team lead with no
+// org role can therefore see the requester invitations of their own inbox.
+func (s *Service) ListRequesterInvites(ctx context.Context, p authz.Principal, teamID int) ([]domain.Invite, error) {
+	if _, err := s.loadSubmitGrantTeam(ctx, p, teamID); err != nil {
+		return nil, err
+	}
+	return s.Repo.ListPendingRequesterInvites(ctx, teamID)
+}
+
+// RevokeRequesterInvite revokes one pending requester invitation of teamID, for
+// the same administration view (AMP #3975). Manager-only, like the listing.
+//
+// It is not RevokeInvite: that one is org-admin-only and takes an org id, so a
+// team lead could not revoke their own inbox's invitation with it, and a
+// manager of one inbox could revoke another inbox's invitation by naming its
+// org. Here the team is in the path and in the delete's WHERE clause, so a
+// caller who may administer team A cannot revoke a row of team B — the row
+// simply isn't the one named, and the answer is not found.
+//
+// A row that was already accepted is not revocable (the delete keeps
+// accepted_at IS NULL), which is the same rule as before: revoking deletes the
+// pending intent, and there is no second copy of it once the person has signed
+// in.
+func (s *Service) RevokeRequesterInvite(ctx context.Context, p authz.Principal, teamID, inviteID int) error {
+	team, err := s.loadSubmitGrantTeam(ctx, p, teamID)
+	if err != nil {
+		return err
+	}
+	if err := s.Repo.DeleteRequesterInvite(ctx, teamID, inviteID); err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return authz.NotFound("invite %d not found for team %d", inviteID, teamID)
+		}
+		return err
+	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "invite.revoke", OrgID: intRef(team.OrgID), TargetType: "invite", TargetID: idStr(inviteID),
+		TargetName: team.Name, Summary: "revoked a requester invitation to team " + team.Name,
+		Details: map[string]any{"kind": domain.InviteKindRequester, "team_id": teamID}})
+	return nil
+}
+
+// InviteRequesterForTeam issues a requester invitation to one team's inbox,
+// bound to that team and its org (AMP #3975). It exists so the team-addressed
+// surface needs no second way to say the same thing: Service.Invite takes a
+// whole Invite, and an adapter that fills in the org, the team and the kind from
+// a path would be deciding the invitation's shape in the transport. Here the
+// team is loaded and gated first, and its org is read from its own row.
+//
+// Everything else is inviteRequester's: the manager gate (a team lead or the
+// org's owner/admin), the refusal of an email that already has an account, and
+// the audit row naming the team and the kind. Accepting the invitation
+// provisions a customer identity and grants no membership.
+func (s *Service) InviteRequesterForTeam(ctx context.Context, p authz.Principal, teamID int, email string) (*MemberResult, error) {
+	team, a, err := s.loadTeam(ctx, p, teamID)
+	if err != nil {
+		return nil, err
+	}
+	return s.inviteRequester(ctx, p, a, domain.Invite{
+		Email:    strings.ToLower(strings.TrimSpace(email)),
+		OrgID:    team.OrgID,
+		OrgRole:  domain.OrgRoleMember,
+		TeamID:   &team.ID,
+		TeamRole: domain.TeamRoleMember,
+		Kind:     domain.InviteKindRequester,
+	})
+}
+
 // invite validates and stores an invite; if the email already belongs to
 // an AMP user the membership is applied immediately instead.
 func (s *Service) invite(ctx context.Context, p authz.Principal, inv domain.Invite) (*MemberResult, error) {
@@ -488,6 +679,16 @@ func (s *Service) invite(ctx context.Context, p authz.Principal, inv domain.Invi
 		team, err := s.Repo.GetTeam(ctx, *inv.TeamID)
 		if err != nil || team.OrgID != inv.OrgID {
 			return nil, authz.BadRequest("team is not in this org")
+		}
+	}
+	// An email that already belongs to an AMP account is granted the invite's
+	// role on the spot below, which makes this a grant path: a customer
+	// account can't be invited as a plain member never mind owner/admin, so
+	// refuse here rather than at acceptance (#3766). An email with no account
+	// yet is checked when it is accepted.
+	if u, err := s.Repo.GetUserByEmail(ctx, inv.Email); err == nil {
+		if err := s.requireKindCanHoldOrgRole(ctx, u.ID, inv.OrgRole); err != nil {
+			return nil, err
 		}
 	}
 	inv.InvitedBy = p.UserRef()

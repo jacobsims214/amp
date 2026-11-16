@@ -654,12 +654,23 @@ export interface APIToken {
   user_id: number
   name: string
   prefix: string
+  /**
+   * How much of the account this token carries: `full`, or `submit` for a
+   * credential attenuated to one team's inbox (AMP #3772). Every token minted
+   * before scopes existed is `full`. Absent on an older API — read it as full.
+   */
+  scope?: TokenScope
+  /** The one team a `submit` credential may send requests to; absent on a full-scope token. */
+  scope_team_id?: number | null
   created_by?: number
   created_at: string
   expires_at?: string
   last_used_at?: string
   revoked_at?: string
 }
+
+/** A token's reach (AMP #3772): the whole account, or submission to one inbox. */
+export type TokenScope = 'full' | 'submit'
 
 /** A token as just created: the only time `token` is shown. */
 export interface NewAPIToken extends APIToken {
@@ -1736,3 +1747,902 @@ export interface DecisionDoc {
   decided_at: string | null
   versions?: DecisionDocVersion[]
 }
+
+// ---- Team inbox requests (epic 202, story 549; AMP #3977, build slice J0) ----
+//
+// The DTOs for the team-request surface every UI slice (J1–J6) builds on. They
+// mirror the API's own answers exactly (internal/domain/request.go,
+// requester_view.go and internal/api/request_*.go), and two rules from those
+// files are carried into the types themselves rather than left to call sites:
+//
+//  1. **The two views are different types, not one type with optional fields.**
+//     `TeamRequest` is the stored record a triager works from — org, claim,
+//     assignee, contact snapshot, revision, metadata, reject reason. A requester
+//     gets `RequesterRequestView`, the whitelist projection, which has no field
+//     for any of those. Keeping them apart here is what stops a component from
+//     rendering an internal field on the requester surface: there is nothing to
+//     read. Never widen `RequesterRequestView` with an internal field — the
+//     server refuses to send one (writeRequestRead in request_reads.go), so a
+//     field added here could only ever be `undefined` at runtime.
+//
+//  2. **A write answers with the act's facts, never the record.** Every write
+//     route answers `{request: {id, public_ref, state, rev}, changed}`, or the
+//     lifecycle/discussion variants of that shape. That is deliberate on the
+//     server: the edit and requester routes are reachable by a customer, so one
+//     envelope for every caller is the safe one. A triager's UI re-reads the
+//     record it is rendering — which it must do anyway, since the claim and
+//     assignee it shows are two fields the write answer does not carry.
+//
+// Bounds are the server's real ones (domain/request.go); the UI checks them
+// before a submit so a person finds out in the form rather than after a round
+// trip, but the server is the authority.
+
+/**
+ * A request's lifecycle state. Nine values, and reopen is a *transition*, not a
+ * state: a reopened request goes back to `triaging`/`needs_information` with
+ * `reopened_count` raised, so no component has to special-case a tenth.
+ */
+export type RequestStatus =
+  | 'new'
+  | 'triaging'
+  | 'needs_information'
+  | 'accepted'
+  | 'in_progress'
+  | 'delivered'
+  | 'requester_accepted'
+  | 'rejected'
+  | 'duplicate'
+
+/** The nine states in lifecycle order (the order the queue's pills use). */
+export const REQUEST_STATUSES: readonly RequestStatus[] = [
+  'new', 'triaging', 'needs_information', 'accepted', 'in_progress',
+  'delivered', 'requester_accepted', 'rejected', 'duplicate',
+]
+
+/** How a request arrived. Only a connector carries a vendor object id. */
+export type RequestSourceKind = 'web' | 'mcp' | 'api' | 'connector'
+
+/** The four intake sources. */
+export const REQUEST_SOURCE_KINDS: readonly RequestSourceKind[] = ['web', 'mcp', 'api', 'connector']
+
+/**
+ * What one discussion row is. A `question` is the desk asking the requester
+ * something (`needs_information` obliges a preceding one) and an `answer` is
+ * what returns the request to where it was.
+ */
+export type RequestCommentKind = 'comment' | 'question' | 'answer' | 'system'
+
+/** The four discussion kinds. */
+export const REQUEST_COMMENT_KINDS: readonly RequestCommentKind[] = ['comment', 'question', 'answer', 'system']
+
+/** What one append-only history row records. */
+export type RequestEventAction =
+  | 'submit' | 'transition' | 'claim' | 'release' | 'assign'
+  | 'link' | 'unlink' | 'edit'
+
+/**
+ * The durable relation a link carries. Never metadata: `routes_to` is the one
+ * project a request is routed to, `planned_as` the plan items serving it,
+ * `delivered_by` the tasks/artifacts/receipts that prove delivery, and the last
+ * two point at another request only.
+ */
+export type RequestLinkKind = 'routes_to' | 'planned_as' | 'delivered_by' | 'duplicate_of' | 'relates_to'
+
+/** What a link may point at. No foreign key: a link outlives its target (tombstone). */
+export type RequestTargetKind = 'project' | 'epic' | 'story' | 'task' | 'artifact' | 'receipt' | 'request'
+
+/**
+ * Which target kinds each link kind may point at — the server's own matrix
+ * (requestLinkTargets), so a UI picker cannot offer a pair the API will refuse.
+ */
+export const REQUEST_LINK_TARGETS: Readonly<Record<RequestLinkKind, readonly RequestTargetKind[]>> = {
+  routes_to: ['project'],
+  planned_as: ['epic', 'story', 'task'],
+  delivered_by: ['task', 'artifact', 'receipt'],
+  duplicate_of: ['request'],
+  relates_to: ['request'],
+}
+
+/** A private upload's scan verdict. `unsupported` is *unknown*, not clean. */
+export type RequestScanState = 'pending' | 'clean' | 'infected' | 'unsupported'
+
+/**
+ * Why a file may not be downloaded right now (empty means it may). It is the
+ * server's single decision (domain.RequestAttachmentDownloadRefusal), which both
+ * the mint and the byte-serving route call, so a panel and a download cannot
+ * disagree.
+ */
+export type RequestAttachmentRefusal = '' | 'scan_infected' | 'scan_pending' | 'held_for_release' | 'purged'
+
+/** One request in a team's inbox: the stored record a triager works from. */
+export interface TeamRequest {
+  id: number
+  /** The opaque reference a requester quotes (D1) — never a guessable sequence. */
+  public_ref: string
+  org_id: number
+  team_id: number
+
+  /** The signed-in requester, `null` for a service or connector submission. */
+  requester_user_id: number | null
+  /** The contact snapshot taken at submit; survives user deletion. */
+  requester_contact: string
+
+  source_kind: RequestSourceKind
+  /** The vendor's immutable id (connector only); it, not a key, dedups a replay. */
+  source_external_id: string
+
+  subject: string
+  input_brief: string
+  /** The team's delivery note. Empty until the delivery transition writes it. */
+  outcome_brief: string
+
+  state: RequestStatus
+
+  /** The triage claim: "I am looking at it right now", one at a time, never expired. */
+  claim_user_id: number | null
+  claimed_at: string | null
+  /** The assignee who owns the outcome. A transfer clears the claim — they are never one field. */
+  owner_user_id: number | null
+
+  /** The canonical request once this one is flattened; a canonical is never a duplicate. */
+  duplicate_of: number | null
+  reject_reason: string
+
+  needs_info_since: string | null
+  planned_at: string | null
+  delivered_at: string | null
+  /** Acceptance is the requester's alone (I1/D5): nothing else may set these. */
+  accepted_at: string | null
+  accepted_by: number | null
+  closed_at: string | null
+  reopened_at: string | null
+  reopened_count: number
+
+  /** The optimistic-concurrency token every write carries as If-Match / expected_rev. */
+  rev: number
+
+  /** Connector labels and routing hints only; durable relations live in link rows. */
+  metadata: Metadata
+  created_at: string
+  updated_at: string
+}
+
+/** One row of a request's discussion: append-only, so the thread is also the record. */
+export interface RequestComment {
+  id: number
+  request_id: number
+  kind: RequestCommentKind
+  body: string
+  /** The display name at write time; `author_user_id` is the AMP user behind it, when there is one. */
+  author: string
+  author_user_id: number | null
+  created_at: string
+}
+
+/** One row of a request's history: append-only, exactly one per act. */
+export interface RequestEvent {
+  id: number
+  request_id: number
+  org_id: number
+  team_id: number
+  action: RequestEventAction
+  /** Both set for a `transition` only. */
+  from_status?: RequestStatus
+  to_status?: RequestStatus
+  actor: string
+  actor_user_id: number | null
+  /** JSON explaining the act (a transfer's previous assignee, a link's target). */
+  detail?: string
+  created_at: string
+}
+
+/** A durable relation from a request to planned or delivered work. */
+export interface RequestLink {
+  id: number
+  request_id: number
+  link_kind: RequestLinkKind
+  target_kind: RequestTargetKind
+  target_id: number
+  created_by: number | null
+  created_at: string
+}
+
+// ---- The queue and its counts ----
+
+/** How many requests a filter matches in each state, plus their sum. */
+export interface RequestStateTotals {
+  /** The sum of `states` — the filter's whole queue. */
+  total: number
+  /** One entry per lifecycle state (all nine are always present). */
+  states: Record<RequestStatus, number>
+}
+
+/** One person's slice of one filtered queue: what they are triaging and what they own. */
+export interface RequestOwnership {
+  user_id: number
+  /** Rows whose triage claim this user holds. Never expired or stolen (D4). */
+  claimed_ids: number[]
+  /** Rows this user owns the outcome of. */
+  assigned_ids: number[]
+  /** `claimed_ids` or `assigned_ids`, each id once, newest first — a personal panel renders this. */
+  ids: number[]
+  count: number
+  /** The cursor for the next page, absent on the last one. */
+  next_before_id?: number
+  /** How many distinct requests the ownership + filter match, cursor-free. */
+  total: number
+}
+
+/** The team's queue: one keyset page, the per-state counts beside it, and (when asked) the caller's own slice. */
+export interface RequestQueue {
+  /** The page, newest first. */
+  items: TeamRequest[]
+  /** How many rows this page holds (not the filtered total; `totals` carries that). */
+  count: number
+  /** The cursor for the next page, absent on the last one. */
+  next_before_id?: number
+  /** The whole filter's per-state counts — what each queue pill shows. */
+  totals: RequestStateTotals
+  /** The caller's claimed/assigned slice, absent when it was not asked for. */
+  mine?: RequestOwnership
+}
+
+/** The queue's counts without its page — My work's inbox panels read this. */
+export interface RequestQueueSummary {
+  totals: RequestStateTotals
+  mine?: RequestOwnership
+}
+
+/**
+ * The filters the team queue accepts. Every term is passed to the server, which
+ * refuses an unknown value rather than matching nothing: a typo that returned an
+ * empty queue would read as "the team has no requests", the one answer a queue
+ * must never invent.
+ */
+export interface RequestQueueFilter {
+  /** Any of these states; empty means every state. */
+  state?: RequestStatus[]
+  /** A user id, or 'me'. */
+  submitter?: number | 'me'
+  source_kind?: RequestSourceKind
+  /** RFC 3339 timestamps. */
+  created_after?: string
+  created_before?: string
+  /** Only requests that carry at least one attachment. */
+  attached?: boolean
+  q?: string
+  /** Keyset paging: the `next_before_id` of the page before. */
+  before_id?: number
+  limit?: number
+  /** Also ask for the caller's own claimed/assigned slice. */
+  mine?: boolean
+  mine_before_id?: number
+  mine_limit?: number
+}
+
+/** The filters the requester's own list accepts — deliberately smaller than the queue's. */
+export interface OwnRequestFilter {
+  state?: RequestStatus[]
+  before_id?: number
+  limit?: number
+}
+
+// ---- The requester's whitelist projection (never the record) ----
+
+/**
+ * One step of a request's public progress. Five steps and no ticket, project or
+ * phase name among them — the labels are the UI's copy, not the server's.
+ */
+export type RequesterMilestoneKey = 'received' | 'reviewing' | 'in_progress' | 'delivered' | 'accepted'
+
+/** The closed stepper vocabulary, in order. */
+export const REQUESTER_MILESTONE_KEYS: readonly RequesterMilestoneKey[] = [
+  'received', 'reviewing', 'in_progress', 'delivered', 'accepted',
+]
+
+/** One public step: whether it happened, when, and one optional sentence. */
+export interface RequesterMilestone {
+  key: RequesterMilestoneKey
+  done: boolean
+  /** Present only for a done step. */
+  at?: string
+  /** A public sentence about the step, already sanitized by the server. */
+  note?: string
+}
+
+/** Who wrote a shared comment, reduced to the only two attributions a requester may see. */
+export type RequesterAuthor = 'you' | 'desk'
+
+/** One comment the team chose to share: no id, no user id, no display name. */
+export interface RequesterComment {
+  kind: RequestCommentKind
+  from: RequesterAuthor
+  body: string
+  at: string
+}
+
+/** The desk's open question — the "needs a bit more from you" card. */
+export interface RequesterQuestion {
+  body: string
+  at: string
+}
+
+/** Whose file an output is: the requester's own upload, or something the team shared. */
+export type RequesterOutputSource = 'you' | 'desk'
+
+/** The only status word a requester sees about a file — three words, no domain state. */
+export type RequesterOutputStatus = 'ready' | 'preparing' | 'unavailable'
+
+/** One file the requester may see on their request. */
+export interface RequesterOutput {
+  source: RequesterOutputSource
+  name: string
+  size_bytes: number
+  status: RequesterOutputStatus
+  at?: string
+  /** The opaque download handle, present only for a `ready` file — never a row id. */
+  download_ref?: string
+}
+
+/**
+ * One request as its own requester sees it. The whitelist is a *type*, not a
+ * filter: there is no field here for a project, a claim, an assignee, a
+ * revision, a metadata key, an agent identity or an audit row, so a component
+ * built on it cannot leak one even by accident.
+ */
+export interface RequesterRequestView {
+  public_ref: string
+  state: RequestStatus
+  /** The word the approved requester mockup shows for `state` — render this, branch on `state`. */
+  state_word: string
+  subject: string
+  input_brief: string
+  /** Present only once the request is delivered; a brief written mid-flight stays hidden. */
+  outcome_brief?: string
+  reject_reason?: string
+  /** The desk's display name — the one team fact the mockup shows. */
+  team_name?: string
+  created_at: string
+  needs_reply_since?: string
+  delivered_at?: string
+  accepted_at?: string
+  closed_at?: string
+  milestones: RequesterMilestone[]
+  comments: RequesterComment[]
+  outputs: RequesterOutput[]
+  /** The open question, absent when the team shared none. */
+  question?: RequesterQuestion
+}
+
+/** One requester's list: their own requests only, by construction. */
+export interface OwnRequestPage {
+  items: RequesterRequestView[]
+  count: number
+  next_before_id?: number
+  /** How many requests the caller has in total, cursor-free. */
+  total: number
+}
+
+// ---- The delivery aggregate (team view only) ----
+
+/** What one piece of delivery evidence is. */
+export type RequestOutcomeItemKind = 'task' | 'artifact' | 'receipt'
+
+/** One piece of evidence's honest state, in order of "how far from delivered". */
+export type RequestOutcomeItemState =
+  | 'open' | 'blocked' | 'done' | 'merge_gated' | 'held' | 'deleted' | 'unverified'
+
+/** The one word for the team rail. `delivered` is the only phase that says the outcome exists. */
+export type RequestPhase = 'unlinked' | 'not_started' | 'in_progress' | 'blocked' | 'delivered' | 'closed'
+
+/** One piece of linked evidence. */
+export interface RequestOutcomeItem {
+  kind: RequestOutcomeItemKind
+  id: number
+  state: RequestOutcomeItemState
+  /** Set only for a merge-gated task, so a rail can say which gate it is. */
+  merge_state?: string
+  /** The tombstone date when the target is gone and the trash still remembers it. */
+  deleted_at?: string
+  /** A receipt's derived status; set only for a receipt. */
+  verification_status?: string
+  /** How many of the piece's runs died or were stopped. */
+  rework?: number
+}
+
+/**
+ * What a request's linked work actually amounts to, plus the delivery gate.
+ *
+ * `delivered_eligible` is the one decision that is not a count, and it is
+ * deliberately NOT `done === total`: a request whose tickets are all complete is
+ * reported as such and is explicitly not delivered (I8). Nothing about ticket
+ * state can make it true.
+ */
+export interface RequestOutcome {
+  phase: RequestPhase
+  /**
+   * The evidence items. `null`, not `[]`, when the request has no
+   * `delivered_by` links: the server appends onto a nil Go slice, and Go
+   * marshals a nil slice as `null`. Read it as `outcome.items ?? []`.
+   */
+  items: RequestOutcomeItem[] | null
+  total: number
+  done: number
+  open: number
+  blocked: number
+  gated: number
+  held: number
+  deleted: number
+  unverified: number
+  /** The sum of the items' abandoned runs — "5 of 5 done" is not the same delivery with 3 of them. */
+  rework: number
+  /** `planned_as` epics/stories/tickets plus the one `routes_to` project: "is this planned at all". */
+  linked: number
+  /** The active routes_to target, absent for none. */
+  routed_project_id?: number
+  /** Whether the delivery note is set (I2's first half) — kept apart from its text. */
+  outcome_brief_set: boolean
+  /** Whether the delivery was the explicit "there is nothing to link" record (I2's second half). */
+  no_artifact: boolean
+  /** The delivery gate for these facts. What a Deliver panel disables its button on. */
+  delivered_eligible: boolean
+  /** What is missing before a delivery could be made; absent when eligible or already delivered. */
+  blocked_reason?: string
+}
+
+// ---- Write answers (the act's facts, never the record) ----
+
+/**
+ * What every write answers with: which request, where it now stands, at what
+ * revision. No org, no claim, no assignee, no contact, no metadata.
+ *
+ * `rev` is here for both views and it is the one internal-looking number a
+ * requester gets: an edit is a compare-and-set, so a form saved twice needs the
+ * revision the first save produced.
+ */
+export interface RequestMutationFacts {
+  id: number
+  public_ref: string
+  state: RequestStatus
+  rev: number
+}
+
+/** One write's answer. `changed` is false for a replay ("already was", not "done"). */
+export interface RequestMutationAnswer {
+  request: RequestMutationFacts
+  changed: boolean
+}
+
+/** One discussion row as a write answers it. There is deliberately no author. */
+export interface RequestCommentFacts {
+  id: number
+  kind: RequestCommentKind
+  body: string
+  created_at: string
+}
+
+/** One discussion write's answer. `wrote` distinguishes a new row (201) from a retried one (200). */
+export interface RequestCommentAnswer {
+  comment: RequestCommentFacts
+  wrote: boolean
+}
+
+/** One lifecycle act's answer: the request's facts, the row the move appended (if any) and whether it wrote. */
+export interface RequestLifecycleAnswer {
+  request: RequestMutationFacts
+  /** The question or answer the move appended; absent when the act carried none. Never an author. */
+  comment?: RequestCommentFacts
+  changed: boolean
+}
+
+// ---- The two read answers ----
+
+/**
+ * One request's answer on either surface. `view` says which of the two objects
+ * is set, and exactly one ever is: a team answer carries `request` (plus
+ * `outcome`), a requester answer carries `projection` and nothing else.
+ */
+export type RequestReadAnswer =
+  | { view: 'team'; request: TeamRequest; outcome: RequestOutcome }
+  | { view: 'requester'; projection: RequesterRequestView }
+
+// ---- The three sub-read answers: discussion, history and lineage ----
+
+/**
+ * The forward cursor a discussion or history read accepts
+ * (`GET …/comments` and `GET …/events`): read from where the last page ended.
+ *
+ * Both are forward-only because both tables are append-only — a thread is read
+ * from where it began — and `limit` is clamped by the server (50 default, 200
+ * ceiling), so a client never owns the bound.
+ */
+export interface RequestReadPageOpts {
+  /** The `next_after_id` of the page before; omitted reads from the beginning. */
+  after_id?: number
+  /** How many rows to ask for; the server clamps it. */
+  limit?: number
+}
+
+/**
+ * One request's discussion.
+ *
+ * `view` says which of the two lists is set, and exactly one ever is — the same
+ * rule as `RequestReadAnswer`: a team answer carries `comments` (every stored
+ * row, `RequestComment`), a requester answer carries `shared_comments` (the
+ * projection's shared kinds, `RequesterComment`, which has no id, author or user
+ * id at all). The other list is omitted, so a client reads `view` first rather
+ * than asking whether one of the keys is an array.
+ *
+ * A requester's answer also omits `request_id` and `next_after_id`: their rows
+ * carry no id, so there is no cursor they could use.
+ */
+export type RequestThreadAnswer =
+  | { view: 'team'; request_id: number; count: number; next_after_id?: number; comments: RequestComment[] }
+  | { view: 'requester'; count: number; shared_comments: RequesterComment[] }
+
+/**
+ * One request's history page: `RequestEvent` rows in append order, plus the
+ * forward cursor when another page exists.
+ *
+ * One view, one list. The history is an internal fact (it names the acting
+ * person, the internal state names and ids of what it touched), so the server
+ * refuses a requester rather than filtering — their milestones come from the
+ * detail read's projection instead.
+ */
+export interface RequestEventsAnswer {
+  view: 'team'
+  request_id: number
+  count: number
+  /** The cursor for the next page, absent on the last one. */
+  next_after_id?: number
+  events: RequestEvent[]
+}
+
+/**
+ * One request's linked work: `RequestLink` rows in attach order, tombstones
+ * included.
+ *
+ * There is no cursor: a request's lineage is bounded by what planning and
+ * delivery attached. The rows are the planning rail's type minus what only a
+ * client can know — `ResolvedRequestLink` is `RequestLink` plus an OPTIONAL
+ * `target` (its title, project, approval and tombstone facts), which the page
+ * fills from the target's own read. This answer never invents one.
+ */
+export interface RequestLinksAnswer {
+  view: 'team'
+  request_id: number
+  count: number
+  links: RequestLink[]
+}
+
+/** What a submission answers with — a whitelist, not the record. */
+export interface SubmittedRequest {
+  /** The opaque reference the requester will quote. */
+  public_ref: string
+  state: RequestStatus
+  subject: string
+  team_id: number
+  source_kind: RequestSourceKind
+  created_at: string
+}
+
+/** A submission's answer. `created` is false for a replay of the same `Idempotency-Key`. */
+export interface RequestSubmissionAnswer {
+  request: SubmittedRequest
+  created: boolean
+}
+
+// ---- Request bodies ----
+
+/** `POST /api/teams/:id/requests`. The caller's retry token goes in the `Idempotency-Key` header. */
+export interface SubmitRequestInput {
+  subject: string
+  input_brief: string
+  /** Connector labels and routing hints only — never an authorization decision. */
+  metadata?: Metadata
+}
+
+/** `PATCH /api/teams/:id/requests/:request`. The fields a submitter may move, and its precondition. */
+export interface UpdateRequestInput {
+  subject?: string
+  input_brief?: string
+  /** Answered by name (refused): the delivery note is the delivery transition's. */
+  outcome_brief?: string
+  /** Answered by name (refused): metadata is the team's and its integrations'. */
+  metadata?: MetadataPatch
+  /** Required by the server: an edit is a compare-and-set. */
+  expected_rev?: number
+}
+
+/** `POST …/comments`. */
+export interface RequestDiscussionInput {
+  kind: RequestCommentKind
+  body: string
+  /** The id a retried post is answering, so the retry returns the row the first attempt wrote. */
+  retry_of_comment_id?: number
+}
+
+/** `POST …/assign`. */
+export interface RequestAssignInput {
+  /** A user id, an email, 'me', or 'none'/'unassigned'. */
+  assignee: string
+  expected_rev?: number
+}
+
+/**
+ * The evidence fields a lifecycle route may send. Every one is present so the
+ * *policy* refuses a field the destination does not read (an outcome brief on a
+ * reject, a question on a plain step) rather than the decoder dropping it.
+ */
+export interface RequestLifecycleInput {
+  /** The generic `transition` route's destination. */
+  to?: RequestStatus
+  /** What the desk asks (needs-info, I5). */
+  question?: string
+  /** Why the request is declined (reject, I3). */
+  reject_reason?: string
+  /** The request a duplicate folds into (duplicate, I3/D7). */
+  canonical_request_id?: number
+  /** What is and is not included (deliver, I2). */
+  outcome_brief?: string
+  /** The explicit "there is nothing to link" record (deliver, I2). */
+  no_artifact?: boolean
+  /** The revision the caller read; omitted means "the revision this call reads". */
+  expected_rev?: number
+}
+
+/** `POST /api/requests/:ref/answer`. There is no field for a state or an actor. */
+export interface RequesterAnswerInput {
+  answer: string
+  /** The question comment being answered; 0 answers the question currently open. */
+  answer_to?: number
+  expected_rev?: number
+}
+
+/** `…/claim`, `…/release`, `…/accept` and `…/reopen` take only a precondition. */
+export interface RequestPreconditionInput {
+  /** The revision the caller read; omitted means "whatever the row is now". */
+  expected_rev?: number
+}
+
+// ---- Lineage: links and the planning handoff ----
+
+/** `POST …/links`: one relation, and nothing else. */
+export interface RequestLinkInput {
+  link_kind: RequestLinkKind
+  target_kind: RequestTargetKind
+  target_id: number
+  /** Allows a `routes_to` attach to move the request to a different project (D9), keeping the old route as history. */
+  supersede_route?: boolean
+}
+
+/** What a link's target resolved to, read from the target's own row. Absent on a replay of a deleted target. */
+export interface RequestLinkTargetFacts {
+  kind: RequestTargetKind
+  id: number
+  project_id: number
+}
+
+/** One attach's answer. `changed: false` is a replay: nothing was written at all. */
+export interface RequestLinkAnswer {
+  link: RequestLink
+  changed: boolean
+  target?: RequestLinkTargetFacts
+}
+
+/**
+ * One ticket the caller wants planned. Every field is a *plan* decision; the
+ * ones a caller may not make (assignee, owner, start_at, performer, metadata,
+ * approval) have no field at all — request text decides nothing.
+ */
+export interface RequestHandoffItem {
+  /** This item's key within the batch, stable across attempts of the same handoff. */
+  ref: string
+  /** Where the ticket goes; it must be in the request's routed project. */
+  story_id: number
+  name: string
+  /** The plan author's instruction, written outside the untrusted fence. */
+  plan: string
+  acceptance_criteria: string
+  /** 0 low, 1 normal, 2 high, 3 critical. */
+  priority?: Priority
+  /** Refs in this batch, or existing ticket ids — as a string or a number. */
+  depends_on?: (string | number)[]
+}
+
+/** `POST …/handoff`: the caller's retry token and the batch. */
+export interface RequestHandoffInput {
+  /** Idempotency token for THIS batch: the same key retries, a new key is a deliberate re-plan. */
+  handoff_key: string
+  items: RequestHandoffItem[]
+}
+
+/** One ref's outcome in a handoff. */
+export interface RequestHandoffItemResult {
+  ref: string
+  /** The ticket serving this ref — created by this call, or by an earlier attempt of the same handoff. */
+  task_id: number
+  /** True when THIS call created the ticket; false is "it already existed". */
+  created: boolean
+  /** True when this call wrote the `planned_as` relation; false is a replay. */
+  linked: boolean
+}
+
+/** One handoff attempt: where the batch was planned, what each ref became, and the counts a retry reads. */
+export interface RequestHandoffAnswer {
+  project_id: number
+  items: RequestHandoffItemResult[]
+  created: number
+  already: number
+  warnings?: string[]
+}
+
+// ---- Attachments ----
+
+/** What the download gate would say about one file right now. */
+export interface RequestAttachmentDownloadState {
+  /** True exactly when the file may be served. Says nothing about the caller. */
+  ready: boolean
+  /** Why not, when it is not ready. */
+  refusal?: RequestAttachmentRefusal
+  /** The derived restricted-file hold — shown as such even while "held" is the reason. */
+  held: boolean
+}
+
+/** One file as a listing answers it: the metadata a panel shows, never the bytes. */
+export interface RequestAttachmentFacts {
+  id: number
+  request_id: number
+  file_name: string
+  /** What AMP sniffed from the bytes, never the client's header. */
+  content_type: string
+  size_bytes: number
+  sha256: string
+  scan_state: RequestScanState
+  uploaded_by: number | null
+  created_at: string
+  /** Whether a keep pins the file past the retention window. */
+  keep: boolean
+  kept_by: number | null
+  kept_at: string | null
+  expires_at: string | null
+  released_at: string | null
+  released_by: number | null
+  /** The restricted-file hold: waiting for a team lead to release it. */
+  held: boolean
+  state: RequestAttachmentDownloadState
+}
+
+/** AMP's upload bounds, travelling with a listing so a caller can say why a sixth upload would fail. */
+export interface RequestAttachmentLimits {
+  max_file_bytes: number
+  max_files: number
+  max_total_bytes: number
+  retention_days: number
+}
+
+/** The file panel: one request's identity and its files. */
+export interface RequestAttachmentPanel {
+  request_id: number
+  public_ref: string
+  items: RequestAttachmentFacts[]
+  count: number
+  limits: RequestAttachmentLimits
+}
+
+/** One upload's answer. `held` is at the top level too: it is the fact a UI branches on first. */
+export interface RequestUploadAnswer {
+  attachment: RequestAttachmentFacts
+  held: boolean
+  /** One sentence about what the caller can and cannot do next. */
+  next: string
+}
+
+/** One keep or unkeep's answer: the file's retention columns as they now stand. */
+export interface RequestAttachmentKeepAnswer {
+  attachment: RequestAttachmentFacts
+  keep: boolean
+}
+
+/** One delete's answer. A retry of a delete that already happened is the surface's 404, not a false. */
+export interface RequestAttachmentDeleteAnswer {
+  deleted: boolean
+  attachment_id: number
+}
+
+/** `POST …/attachments`: the file's display name and its bytes. No content type, no scan state, no location. */
+export interface RequestUploadInput {
+  file_name: string
+  /** The bytes, base64-encoded. AMP never fetches a location a caller names. */
+  content_base64: string
+}
+
+/** One minted download link. */
+export interface RequestDownloadLink {
+  url: string
+  expires_at: string
+  attachment_id: number
+  request_id: number
+  file_name: string
+  size_bytes: number
+}
+
+// ---- Who may submit to an inbox (D14), and requester invitations ----
+
+/**
+ * A revocable grant of submit access on one team's inbox. Never membership: it
+ * reaches no project, so the holder can submit and nothing else.
+ */
+export interface TeamSubmitGrant {
+  team_id: number
+  org_id: number
+  user_id: number
+  granted_by?: number
+  granted_at: string
+  /** Set once revoked; a revoked grant fails the very next check with no cache to clear. */
+  revoked_by?: number
+  revoked_at?: string
+}
+
+/** A grant with the recipient's identity, for the administration listing. */
+export interface TeamSubmitGrantee extends TeamSubmitGrant {
+  email: string
+  display_name?: string
+  kind?: string
+}
+
+/** One grant as the administration view gets it. Granting is idempotent, so there is no `changed`. */
+export interface RequestGrantAnswer {
+  team_id: number
+  grant: TeamSubmitGrant
+  active: boolean
+}
+
+/** A team's grants: in force first, then revoked. */
+export interface RequestGrantList {
+  team_id: number
+  grants: TeamSubmitGrantee[]
+}
+
+/** One pending requester invitation. Its kind is always 'requester' and it grants no role. */
+export interface RequestInviteAnswer {
+  team_id: number
+  invite: Invite
+}
+
+/** An inbox's pending requester invitations. */
+export interface RequestInviteList {
+  team_id: number
+  invites: Invite[]
+}
+
+// ---- The stable codes a client branches on ----
+
+/**
+ * The four `request.*` codes every refusal on this surface carries, so a client
+ * branches on a code rather than on a message that may be reworded. `not_found`
+ * is deliberately indistinguishable between "no such request" and "not yours":
+ * existence never leaks.
+ */
+export type RequestErrorCode =
+  | 'request.not_found'
+  | 'request.conflict'
+  | 'request.invalid'
+  | 'request.rate_limited'
+
+/**
+ * What a 429 submission answer carries: the same wait in the body as in
+ * `Retry-After`, so a client that reads only one still honours it.
+ */
+export interface RequestRateLimitedBody {
+  error: string
+  code: 'request.rate_limited'
+  retry_after_s: number
+}
+
+/** The bound on a one-line subject, in characters (the server's own limit). */
+export const MAX_REQUEST_SUBJECT_LEN = 200
+/** The bound on a brief (`input_brief` / `outcome_brief`), in characters. */
+export const MAX_REQUEST_BRIEF_LEN = 20000
+/** The bound on a reject reason, in characters. */
+export const MAX_REQUEST_REJECT_REASON_LEN = 2000

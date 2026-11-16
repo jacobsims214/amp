@@ -11,6 +11,7 @@ import { RemoteProvider } from '../remote/RemoteProvider'
 import { httpTransport } from '../remote/transport'
 import { unpairedCrypto } from '../remote/crypto'
 import type { GettingStarted, Me, MyWork as MyWorkData, WaitCounts, WaitItem, WorkTask } from '../types'
+import { queue, request, totals } from '../test/requestFixture'
 import userEvent from '@testing-library/user-event'
 
 const hourAgo = new Date(Date.now() - 3_600_000).toISOString()
@@ -476,5 +477,100 @@ describe('find box (#155)', () => {
     await user.keyboard('/')
     expect(box).toHaveFocus()
     expect(box).toHaveValue('')
+  })
+})
+
+// The two team-inbox panels (AMP #3983, build slice J3; approved mockup 37 v1
+// view 3). The components have their own suite; what is proved here is the
+// composition — that My work reads each team's queue exactly once, that the two
+// panels sit beside Waiting-on-you without disturbing it, and that a person on
+// no team sees neither panel.
+describe('top-level My work: team inbox panels (#3983)', () => {
+  interface Call { path: string; search: string }
+  let calls: Call[] = []
+  afterEach(() => { server.resetHandlers(); calls = [] })
+
+  const meWithTeams: Me = {
+    subject: 's', email: 'jo@example.com', name: 'Jo', roles: [], user_id: 7,
+    teams: [
+      { id: 4, name: 'Platform engineering', org_id: 2, role: 'member' },
+      { id: 9, name: 'Field ops', org_id: 2, role: 'member' },
+    ],
+  }
+
+  const claimedAt = new Date(Date.now() - 26 * 3_600_000).toISOString()
+  const claimedRow = request({ id: 21, team_id: 4, public_ref: 'refclaimedaaaaaaaaaa1', subject: 'SSO group mapping for Berlin', state: 'triaging', claim_user_id: 7, claimed_at: claimedAt })
+  const nobodysRow = request({ id: 19, team_id: 4, public_ref: 'refnobodysaaaaaaaaaa3', subject: 'Nobody owns this one', state: 'new' })
+  const otherTeamRow = request({ id: 30, team_id: 9, public_ref: 'refnotmineaaaaaaaaaa4', subject: 'A field ops request', state: 'new' })
+
+  /** One handler per team, recording the read. Counts deliberately exceed the rows. */
+  function inboxRoutes() {
+    server.use(
+      http.get('*/api/teams/4/requests', ({ request: req }) => {
+        calls.push({ path: new URL(req.url).pathname, search: new URL(req.url).search })
+        return HttpResponse.json(queue([claimedRow, nobodysRow], {
+          totals: totals({ new: 4, triaging: 3, needs_information: 2 }),
+          mine: { user_id: 7, claimed_ids: [21], assigned_ids: [], ids: [21], count: 1, total: 1 },
+        }))
+      }),
+      http.get('*/api/teams/9/requests', ({ request: req }) => {
+        calls.push({ path: new URL(req.url).pathname, search: new URL(req.url).search })
+        return HttpResponse.json(queue([otherTeamRow], {
+          totals: totals({ new: 1 }),
+          mine: { user_id: 7, claimed_ids: [], assigned_ids: [], ids: [], count: 0, total: 0 },
+        }))
+      }),
+    )
+  }
+
+  it('reads each team\'s queue exactly once, and shows both panels', async () => {
+    inboxRoutes()
+    renderMyWork(meWithTeams)
+    const teamPanel = await screen.findByRole('region', { name: 'Team inboxes' })
+    await within(teamPanel).findByRole('heading', { name: 'Field ops' })
+
+    // One read per team, and each asks for the caller's own slice.
+    expect(calls.map(c => c.path).sort()).toEqual(['/api/teams/4/requests', '/api/teams/9/requests'])
+    expect(calls.every(c => new URLSearchParams(c.search).get('mine') === 'true')).toBe(true)
+
+    const claimed = screen.getByRole('region', { name: 'Claimed by me, team requests' })
+    expect(within(claimed).getByText(/SSO group mapping for Berlin/)).toBeInTheDocument()
+    expect(within(claimed).queryByText('Nobody owns this one')).toBeNull()
+    expect(within(claimed).queryByText('A field ops request')).toBeNull()
+    // The server's whole-queue count, not the page's two rows.
+    expect(within(teamPanel).getByText(/9 requests in the shared queue|4\s*new/)).toBeInTheDocument()
+  })
+
+  it('leaves Waiting-on-you exactly as it was', async () => {
+    inboxRoutes()
+    renderMyWork(meWithTeams)
+    await within(await screen.findByRole('region', { name: 'Team inboxes' })).findByRole('heading', { name: 'Field ops' })
+    // The summary readouts and the project cards are untouched by the panels.
+    const ro = screen.getByLabelText('Waiting on you, across your projects')
+    expect(ro.textContent).toMatch(/Waiting on you8/)
+    expect(ro.textContent).toMatch(/in 2 of 13 projects/)
+    expect(screen.getByRole('heading', { name: 'AMP v2', level: 2 })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Core API', level: 2 })).toBeInTheDocument()
+  })
+
+  it('shows neither panel to a person on no team', async () => {
+    renderMyWork() // the default `me` has no teams
+    await screen.findByRole('heading', { name: 'AMP v2' })
+    expect(screen.queryByRole('region', { name: 'Team inboxes' })).toBeNull()
+    expect(screen.queryByRole('region', { name: 'Claimed by me, team requests' })).toBeNull()
+  })
+
+  it('a team whose read fails does not take My work down with it', async () => {
+    server.use(
+      http.get('*/api/teams/4/requests', () => HttpResponse.json({ error: 'boom' }, { status: 500 })),
+      http.get('*/api/teams/9/requests', () => HttpResponse.json(queue([], { totals: totals({ new: 1 }) }))),
+    )
+    renderMyWork(meWithTeams)
+    const teamPanel = await screen.findByRole('region', { name: 'Team inboxes' })
+    const platform = await within(teamPanel).findByRole('heading', { name: 'Platform engineering' })
+    expect(platform.closest('li')!.textContent).toMatch(/no counts are shown/)
+    // The rest of the page is unaffected.
+    expect(screen.getByLabelText('Waiting on you, across your projects')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'AMP v2', level: 2 })).toBeInTheDocument()
   })
 })

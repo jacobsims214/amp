@@ -400,7 +400,7 @@ func (s *Service) waitReindexLock(ctx context.Context, sc Scope) (func(), error)
 // reindex built them from Postgres rows, so they hold nothing Postgres
 // lacks, and an old one could hold a doc purged since.
 func (s *Service) backfillSources(ctx context.Context, sc Scope) (sources []string, kc kbCollections, err error) {
-	kc, err = s.kbCollections(ctx, collectionName(sc))
+	kc, err = s.kbCollections(ctx, s.CollectionName(sc))
 	if err != nil {
 		return nil, kc, err
 	}
@@ -707,7 +707,7 @@ func (s *Service) backfillDone(ctx context.Context, sc Scope) (bool, error) {
 		s.log.Info("kb backfill: not marking a KB with no collection complete; typesense is not healthy", "kb", sc.String(), "err", err)
 		return false, nil
 	}
-	kc, err := s.kbCollections(ctx, collectionName(sc))
+	kc, err := s.kbCollections(ctx, s.CollectionName(sc))
 	if err != nil || kc.real || kc.alias != "" {
 		return false, nil
 	}

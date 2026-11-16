@@ -33,6 +33,27 @@ type Service struct {
 	// Denied rate-limits refusal rows (nil: the limiter shared by every
 	// Service, which main uses).
 	Denied *DeniedLimiter
+	// RequestLimits rate-limits team-request submissions (nil: the limiter
+	// shared by every Service, which main uses). Same-process burst guard only;
+	// see request_limits.go.
+	RequestLimits *RequestLimiter
+	// RequestDownloads mints the opaque reference a requester's ready file is
+	// downloaded with (nil: not configured, so a ready file degrades to
+	// "unavailable" — see request_views.go). The signed-grant implementation is
+	// slice G3's; the read path only asks it for a file the download rules
+	// already allow.
+	RequestDownloads RequestDownloadLinker
+	// RequestEvidence resolves what a request delivery is evidenced by (nil: the
+	// request_links table, verified at write time by LinkRequest). It exists so a
+	// test can state a request's delivered_by relations without writing four
+	// tables, and so the service's only source of delivery evidence is one named
+	// dependency; see request_lifecycle.go.
+	RequestEvidence RequestDeliveryEvidence
+	// Now is the clock the request-submission path reads (nil: time.Now), so a
+	// test can drive the submission limiter's window and its refund from one
+	// instant. It is deliberately narrow: this is the only clock the submit path
+	// needs, and every other duration in the service keeps using time.Now.
+	Now func() time.Time
 	// Remote is the instance's remote control configuration (off unless
 	// RELAY_ENABLED and auth are on).
 	Remote RemoteConfig
@@ -732,6 +753,14 @@ func (s *Service) ResolveOwnerRefs(ctx context.Context, p authz.Principal, proje
 // at most every 2s when an event arrives for an unknown project (e.g. one
 // just created or newly linked to one of p's teams).
 func (s *Service) EventFilter(p authz.Principal) hub.Allow {
+	// A submit-scoped credential sees no project's events, so its stream is
+	// empty rather than every project's: nil means "allow all" here, and a
+	// narrowed credential must never inherit that through `p.Super` (AMP
+	// #3772). The REST gate already refuses the SSE route outright; this keeps
+	// the capability honest for any other caller of EventFilter.
+	if p.SubmitOnly() {
+		return func(int) bool { return false }
+	}
 	if p.Super {
 		return nil
 	}

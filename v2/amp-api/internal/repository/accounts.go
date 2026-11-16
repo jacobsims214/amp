@@ -111,18 +111,56 @@ func (r *Repo) SetUserDisabled(ctx context.Context, userID int, disabled bool) (
 	return revoked, tx.Commit(ctx)
 }
 
-const tokenCols = `id, user_id, name, prefix, created_by, created_at, expires_at, last_used_at, revoked_at`
+const tokenCols = `id, user_id, name, prefix, scope, scope_team_id, created_by, created_at, expires_at, last_used_at, revoked_at`
 
 func scanToken(row rowScanner, t *domain.APIToken) error {
-	return row.Scan(&t.ID, &t.UserID, &t.Name, &t.Prefix, &t.CreatedBy, &t.CreatedAt, &t.ExpiresAt, &t.LastUsedAt, &t.RevokedAt)
+	return row.Scan(&t.ID, &t.UserID, &t.Name, &t.Prefix, &t.Scope, &t.ScopeTeamID, &t.CreatedBy, &t.CreatedAt, &t.ExpiresAt, &t.LastUsedAt, &t.RevokedAt)
 }
 
-// CreateAPIToken stores a token's hash.
+// APITokenSpec is what a caller asks for when minting a token. The zero value
+// is a full-scope token that never expires — exactly what every caller minted
+// before scopes existed (AMP #3772).
+//
+// ScopeTeamID is required with Scope "submit" and refused with "full": the
+// scope and its team are inseparable (migration 060's CHECK), so the schema and
+// this struct agree about what a scope means rather than one inferring it from
+// the other.
+type APITokenSpec struct {
+	Name        string
+	Hash        string
+	Prefix      string
+	CreatedBy   *int
+	ExpiresAt   *time.Time
+	Scope       string // "" means full, like domain.NormalizeTokenScope
+	ScopeTeamID *int
+}
+
+// CreateAPIToken stores a token's hash. A scope other than the submit one is
+// stored as full; a submit scope without a team is refused by the schema's
+// CHECK (there is nothing a submit-only credential could do without one).
 func (r *Repo) CreateAPIToken(ctx context.Context, userID int, name, hash, prefix string, createdBy *int, expiresAt *time.Time) (*domain.APIToken, error) {
+	return r.CreateScopedAPIToken(ctx, userID, APITokenSpec{Name: name, Hash: hash, Prefix: prefix,
+		CreatedBy: createdBy, ExpiresAt: expiresAt})
+}
+
+// CreateScopedAPIToken is CreateAPIToken with an explicit scope (AMP #3772).
+//
+// The scope is written once, here, and never updated: api_tokens has no other
+// write path to these columns, so a token cannot be widened after minting and
+// a scope cannot be escalated through any update path — the property build
+// slice B5's third criterion asks for, held structurally rather than by every
+// handler remembering not to.
+func (r *Repo) CreateScopedAPIToken(ctx context.Context, userID int, spec APITokenSpec) (*domain.APIToken, error) {
+	scope := spec.Scope
+	if scope == "" {
+		scope = domain.TokenScopeFull
+	}
 	t := &domain.APIToken{}
 	err := scanToken(r.db.QueryRow(ctx,
-		`INSERT INTO api_tokens (user_id, name, token_hash, prefix, created_by, expires_at) VALUES ($1, $2, $3, $4, $5, $6)
-		 RETURNING `+tokenCols, userID, name, hash, prefix, createdBy, expiresAt), t)
+		`INSERT INTO api_tokens (user_id, name, token_hash, prefix, scope, scope_team_id, created_by, expires_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		 RETURNING `+tokenCols,
+		userID, spec.Name, spec.Hash, spec.Prefix, scope, spec.ScopeTeamID, spec.CreatedBy, spec.ExpiresAt), t)
 	return t, err
 }
 
@@ -161,39 +199,45 @@ func (r *Repo) UserForAPIToken(ctx context.Context, hash string) (*domain.User, 
 	return u, err
 }
 
-// UserAndTokenForAPIToken is UserForAPIToken that also returns the token's
-// api_tokens.id (for the audit log's token_id; never the token itself).
-func (r *Repo) UserAndTokenForAPIToken(ctx context.Context, hash string) (*domain.User, int64, error) {
-	var tokenID int64
+// UserAndTokenForAPIToken is UserForAPIToken that also returns the token row
+// itself (never the token string): its id for the audit log's token_id, and
+// its scope (AMP #3772) so the request's identity knows how much of the
+// account this credential carries. The scope comes back with the same row read
+// that already validated the token, so there is no second lookup and nothing
+// that could disagree with api_tokens about what the token may do.
+func (r *Repo) UserAndTokenForAPIToken(ctx context.Context, hash string) (*domain.User, *domain.APIToken, error) {
+	tok := &domain.APIToken{}
 	u := &domain.User{}
 	err := r.db.QueryRow(ctx, `
-		SELECT t.id, `+prefixed("u", userCols)+`
+		SELECT t.id, t.user_id, t.name, t.prefix, t.scope, t.scope_team_id, t.created_by, t.created_at,
+		       t.expires_at, t.last_used_at, t.revoked_at, `+prefixed("u", userCols)+`
 		FROM api_tokens t JOIN users u ON u.id = t.user_id
 		WHERE t.token_hash = $1 AND (u.disabled_at IS NOT NULL
 		      OR (t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > NOW())))`, hash,
-	).Scan(append([]any{&tokenID}, userDest(u)...)...)
+	).Scan(append([]any{&tok.ID, &tok.UserID, &tok.Name, &tok.Prefix, &tok.Scope, &tok.ScopeTeamID, &tok.CreatedBy,
+		&tok.CreatedAt, &tok.ExpiresAt, &tok.LastUsedAt, &tok.RevokedAt}, userDest(u)...)...)
 	if err == pgx.ErrNoRows {
-		return nil, 0, ErrNotFound
+		return nil, nil, ErrNotFound
 	}
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, err
 	}
 	if u.DisabledAt != nil {
-		return u, tokenID, nil
+		return u, tok, nil
 	}
 	// At most one write a minute per token, however busy the agent is.
 	if _, err := r.db.Exec(ctx, `UPDATE api_tokens SET last_used_at = NOW()
-		WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < NOW() - interval '1 minute')`, tokenID); err != nil {
-		return nil, 0, err
+		WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < NOW() - interval '1 minute')`, tok.ID); err != nil {
+		return nil, nil, err
 	}
 	if _, err := r.db.Exec(ctx, `UPDATE users SET last_seen_at = NOW()
 		WHERE id = $1 AND last_seen_at < NOW() - interval '1 minute'`, u.ID); err != nil {
-		return nil, 0, err
+		return nil, nil, err
 	}
 	if u.Roles, err = r.getUserRoles(ctx, u.ID); err != nil {
-		return nil, 0, err
+		return nil, nil, err
 	}
-	return u, tokenID, nil
+	return u, tok, nil
 }
 
 // prefixed qualifies a comma-separated column list with a table alias.

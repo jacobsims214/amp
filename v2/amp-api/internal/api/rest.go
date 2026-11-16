@@ -139,9 +139,127 @@ func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("/api/tasks/", h.taskSub)
 	mux.HandleFunc("/api/runs/", h.runSub)
 	mux.HandleFunc("/api/kb/", h.kbDoc)
-	mux.mux.HandleFunc("/api/events", h.events) // SSE: streams, never a 403 after it starts
+	// SSE: goes through denied() like every other route, so a refusal is
+	// audited as access.denied (AMP #3862). The ordering is what makes it
+	// safe: submitScopeGate refuses before h.events runs, so a refused request
+	// writes its 403 and returns without a stream, while a stream that does
+	// open has already written 200 by the time denied() looks (statusRecorder
+	// forwards Flush, so streaming is unaffected — AMP #3772 pinning it here).
+	mux.HandleFunc("/api/events", h.events)
 	mux.HandleFunc("/api/orgs", h.orgs)
 	mux.HandleFunc("/api/orgs/", h.orgSub)
+	// The inbox submission (request_submit.go): the one POST that is not the
+	// team's own sub-path router. It is registered as a method+path pattern so
+	// net/http gives it the team id as a path value and so the other methods on
+	// the same path still reach teamSub, which answers them. Registering it
+	// here, through deniedMux, is what puts the submit-scope gate and the
+	// access.denied audit in front of it (AMP #3772, #3862, #3919).
+	mux.HandleFunc("POST /api/teams/{id}/requests", h.teamRequestSubmit)
+	// Team request reads (request_reads.go, AMP #3968): the queue with its pill
+	// counts and the caller's own claimed/assigned slice, the same counts without
+	// a page (My work's inbox panels), and one request by serial or public
+	// reference. All through deniedMux, so the submit-scope gate refuses a
+	// read-only credential and a 403 is audited like every other refusal.
+	mux.HandleFunc("GET /api/teams/{id}/requests", h.teamRequestQueue)
+	mux.HandleFunc("GET /api/teams/{id}/requests/summary", h.teamRequestSummary)
+	mux.HandleFunc("GET /api/teams/{id}/requests/{request}", h.teamRequestDetail)
+	// The request's discussion (request_reads.go, AMP #4270): the read the POST
+	// beside it never had. Registered here, in the reads block, rather than next
+	// to its write, so the read routes stay one list a reviewer can compare
+	// against the view matrix above — and through deniedMux, so the submit-scope
+	// gate refuses a submit-only credential before the handler runs.
+	mux.HandleFunc("GET /api/teams/{id}/requests/{request}/comments", h.teamRequestComments)
+	// The request's history (request_reads.go, AMP #4271): the same missing-read
+	// shape one route further along — `request_events` is written by every act
+	// and had no read at all until this route. Registered in the reads block for
+	// the same reason, and through deniedMux, so the submit-scope gate refuses a
+	// submit-only credential before the handler runs.
+	mux.HandleFunc("GET /api/teams/{id}/requests/{request}/events", h.teamRequestEvents)
+	// The request's linked work (request_reads.go, AMP #4272): the read `POST
+	// …/links` never had. The planning rail and the deliver panel's evidence list
+	// are drawn from these rows. Registered in the reads block for the same reason
+	// as its two siblings, and through deniedMux, so the submit-scope gate refuses
+	// a submit-only credential before the handler runs.
+	mux.HandleFunc("GET /api/teams/{id}/requests/{request}/links", h.teamRequestLinks)
+	// Team request writes (request_mutations.go, AMP #3971): the submitter's
+	// versioned edit and the four triage acts, each on its own sub-path so a
+	// method+path pair names exactly one act. All through deniedMux, so the
+	// submit-scope gate refuses a submit-only credential before any handler runs
+	// (its allow-list is the submission POST and nothing else) and a 403 is
+	// audited. No lifecycle, delivery, acceptance or attachment route is here:
+	// those are F3/F4/F5 and each has its own gate.
+	mux.HandleFunc("PATCH /api/teams/{id}/requests/{request}", h.teamRequestEdit)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/comments", h.teamRequestComment)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/claim", h.teamRequestClaim)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/release", h.teamRequestRelease)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/assign", h.teamRequestAssign)
+	// Team request lifecycle (request_lifecycle.go, AMP #3973): the working steps,
+	// the two closes that carry a reason, the question, the reopen and the
+	// delivery — each on its own sub-path, each a thin adapter over the one
+	// reviewed transition service. All through deniedMux, so a submit-only
+	// credential is refused before any handler runs and a 403 is audited. No route
+	// here accepts a requester's acceptance: that is the requester surface below.
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/transition", h.teamRequestTransition)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/needs-info", h.teamRequestNeedsInfo)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/reject", h.teamRequestReject)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/duplicate", h.teamRequestDuplicate)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/reopen", h.teamRequestReopen)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/deliver", h.teamRequestDeliver)
+	// The requester surface (same file): a person's own requests, projected, and
+	// one of them by serial or by the opaque reference their submission answered
+	// with. Never the record, never another requester's request.
+	mux.HandleFunc("GET /api/requests", h.ownRequests)
+	mux.HandleFunc("GET /api/requests/{request}", h.ownRequestDetail)
+	// The requester's own acts (request_lifecycle.go, AMP #3973): answering a
+	// question, accepting a delivery and reopening after delivery. Acceptance is
+	// a person's act alone and the service refuses a credential before it resolves
+	// the reference, so these three routes are the only path to `accept` and it
+	// reaches no agent, token or connector.
+	mux.HandleFunc("POST /api/requests/{request}/answer", h.ownRequestAnswer)
+	mux.HandleFunc("POST /api/requests/{request}/accept", h.ownRequestAccept)
+	mux.HandleFunc("POST /api/requests/{request}/reopen", h.ownRequestReopen)
+	// Private attachment downloads (request_download.go, AMP #3963): the mint on a
+	// request's own team-scoped sub-path, and the short-lived URL it produces. Both go
+	// through deniedMux like every other route, so the auth verifier, the auth proxy,
+	// the submit-only scope gate and the access.denied audit all apply — a download URL
+	// is an additional capability, never a way around signing in.
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/attachments/{attachment}/download", h.requestTeamDownloadMint)
+	mux.HandleFunc("/api/request-downloads/", h.requestDownloadServe)
+	// Request lineage and attachments (request_links.go and request_uploads.go, AMP
+	// #3974): the attach, the planning handoff, the file panel, the upload, and a
+	// file's keep and delete. Each is a thin adapter over one reviewed service —
+	// AttachRequest, HandoffRequest, ListRequestAttachmentsForDownload,
+	// AddRequestAttachment, KeepRequestAttachment, DeleteRequestAttachment — which
+	// are the same methods the MCP tools call, so a refusal is the same code on
+	// either surface. All through deniedMux, so a submit-only credential is refused
+	// before any handler runs and a 403 is audited. No route here approves, dispatches
+	// or fetches anything a caller names: a handoff creates tickets that await a
+	// person's approval, and an upload's bytes arrive in its body.
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/links", h.teamRequestLink)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/handoff", h.teamRequestHandoff)
+	mux.HandleFunc("GET /api/teams/{id}/requests/{request}/attachments", h.teamRequestAttachmentPanel)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/attachments", h.teamRequestAttachmentUpload)
+	mux.HandleFunc("POST /api/teams/{id}/requests/{request}/attachments/{attachment}/keep", h.teamRequestAttachmentKeep)
+	mux.HandleFunc("DELETE /api/teams/{id}/requests/{request}/attachments/{attachment}", h.teamRequestAttachmentDelete)
+	// Team requester access administration (request_grants.go, AMP #3975): who may
+	// submit to this inbox, and who has been invited as a requester. Six routes, all
+	// thin over the reviewed administration services — GrantSubmitAccess,
+	// RevokeSubmitAccess, ListSubmitGrants, InviteRequesterForTeam,
+	// ListRequesterInvites and RevokeRequesterInvite — so a refusal is the same code
+	// the service answers every other caller with. They are team-addressed and
+	// deliberately separate from /api/teams/{id}/members and /api/orgs/{id}/invites:
+	// submit access is a revocable grant that reaches no project, and a requester
+	// invitation provisions a customer identity and grants no membership. All through
+	// deniedMux, so a submit-only credential cannot administer the inbox it may submit
+	// to (token.scope_denied) and a 403 is audited. No route here mints a credential: a
+	// submit-scoped token is POST /api/users/{id}/tokens with scope "submit" (rest.go),
+	// which returns its secret once.
+	mux.HandleFunc("GET /api/teams/{id}/request-grants", h.teamRequestGrants)
+	mux.HandleFunc("POST /api/teams/{id}/request-grants", h.teamRequestGrants)
+	mux.HandleFunc("DELETE /api/teams/{id}/request-grants/{user}", h.teamRequestGrantRevoke)
+	mux.HandleFunc("GET /api/teams/{id}/request-invites", h.teamRequestInvites)
+	mux.HandleFunc("POST /api/teams/{id}/request-invites", h.teamRequestInvites)
+	mux.HandleFunc("DELETE /api/teams/{id}/request-invites/{invite}", h.teamRequestInviteRevoke)
 	mux.HandleFunc("/api/teams/", h.teamSub)
 	mux.HandleFunc("/api/me", h.me)
 	mux.HandleFunc("/api/users", h.users)
@@ -330,12 +448,18 @@ func (h *RestHandler) userSub(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Name          string `json:"name"`
 			ExpiresInDays int    `json:"expires_in_days"`
+			// Scope mints a narrowed credential (AMP #3772): "submit" makes
+			// a token that may only submit requests to ScopeTeamID's inbox.
+			// Absent means full, exactly as before.
+			Scope       string `json:"scope"`
+			ScopeTeamID int    `json:"scope_team_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			jsonErr(w, err, 400)
 			return
 		}
-		tok, err := h.svc.CreateToken(r.Context(), pr, userID, body.Name, body.ExpiresInDays)
+		tok, err := h.svc.CreateScopedToken(r.Context(), pr, userID, body.Name, body.ExpiresInDays,
+			service.TokenScopeRequest{Scope: body.Scope, TeamID: body.ScopeTeamID})
 		if err != nil {
 			fail(w, err, 500)
 			return

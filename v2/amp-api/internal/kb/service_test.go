@@ -47,6 +47,40 @@ func TestScopeNaming(t *testing.T) {
 	}
 }
 
+// A test service's collections all live under its own namespace, so a suite
+// run against the Typesense a live instance uses never creates, empties or
+// drops that instance's collections — above all kb_global_0, the fixed name
+// of the global KB, which a live instance syncs only at startup (#3689).
+func TestCollectionPrefix(t *testing.T) {
+	s := New("http://127.0.0.1:1", "k", "", "")
+	s.SetCollectionPrefix("kbtest_123_")
+	for _, sc := range []Scope{Project(5), Team(5), Org(5), Global()} {
+		got := s.CollectionName(sc)
+		want := "kbtest_123_" + collectionName(sc)
+		if got != want {
+			t.Errorf("%s collection = %q, want %q", sc, got, want)
+		}
+		if !IsTestCollectionName(got) {
+			t.Errorf("%s: %q not recognised as a test collection", sc, got)
+		}
+	}
+	// The live names are untouched by the prefix, and never read as test ones.
+	for _, sc := range []Scope{Project(5), Team(5), Org(5), Global()} {
+		name := New("http://127.0.0.1:1", "k", "", "").CollectionName(sc)
+		if name != collectionName(sc) {
+			t.Errorf("without a prefix, %s collection = %q, want %q", sc, name, collectionName(sc))
+		}
+		if IsTestCollectionName(name) {
+			t.Errorf("live collection %q read as a test collection", name)
+		}
+	}
+	// And a test-created collection is not a KB name, so the reconciler of the
+	// instance that owns the Typesense never adopts it as a live KB's index.
+	if _, ok := scopeOfBase(s.CollectionName(Project(5))); ok {
+		t.Errorf("reconciler would adopt test collection %q", s.CollectionName(Project(5)))
+	}
+}
+
 // Tasks queued before scopes existed carry only a project id.
 func TestPayloadScope(t *testing.T) {
 	if got := payloadScope("", 0, 7); got != Project(7) {
