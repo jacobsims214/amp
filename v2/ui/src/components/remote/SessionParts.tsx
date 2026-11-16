@@ -9,14 +9,16 @@
  *   long groups folding their earliest successful calls into `✓ 4 calls · …`, a failed call's
  *   error on its line, and a dispatched worker's live status under its call;
  * - the shell's notices ("Stopped.", errors) as it phrases them; nothing for a completed run;
- * - the dock: worker chips, the working line with its timer (and the retry countdown), the
- *   queue, the message box, Stop, and the status line.
+ * - the dock: the worker summary line (with a row per live worker; the sheet holds the rest), the
+ *   working line with its timer (and the retry countdown), the queue, the message box, Stop, and
+ *   the status line.
  *
  * Everything from the harness is untrusted: text is shown as text or through SafeMarkdown,
  * never as HTML.
  */
-import { useState } from 'react'
-import { Check, ChevronRight, Loader2, Minus, OctagonX, ShieldAlert, Square, TriangleAlert, X } from 'lucide-react'
+import { useEffect, useId, useRef, useState } from 'react'
+import { Check, ChevronRight, ChevronUp, Loader2, Minus, OctagonX, ShieldAlert, Square, TriangleAlert, X } from 'lucide-react'
+import { composing, useDialogFocus } from '../../hooks/useDialogFocus'
 import { SafeMarkdown } from './SafeMarkdown'
 import { promptProblem } from '../../remote/envelope'
 import { formatCost, sessionTokens, type Block, type Outgoing, type Totals, type TranscriptItem } from '../../remote/session'
@@ -28,7 +30,7 @@ import {
   ampConnectionWord, compactionLabel, displayStateOf, epicStory, errorDetail, errorLine, planApprovalText, thinkingLabel,
   workerLine, workerState, workerUsage,
 } from '../../remote/transcriptView'
-import type { QueueItem, SessionStatus, WorkerInfo } from '../../remote/types'
+import type { QueueItem, SessionStatus, WorkerInfo, WorkerState } from '../../remote/types'
 import { StateDot, StateTag } from '../ui/StateTag'
 import { STATE_LABEL } from '../../lib/ticketState'
 
@@ -310,37 +312,170 @@ const WORKER_STATE_INK: Record<string, string> = {
   running: 'text-st-prog', done: 'text-ink-2', failed: 'text-danger-ink', stopped: 'text-ink-3', blocked: 'text-st-flag',
 }
 
+/** A worker's state in the roster's words: the TUI says `completed` for done (roster.rs). */
+const WORKER_STATE_WORD: Record<WorkerState, string> = {
+  running: 'running', blocked: 'blocked', failed: 'failed', stopped: 'stopped', done: 'done',
+}
+/** Worst first, for the summary line's colour: `blocked` waits on a person, so it outranks a
+ *  `failed` worker whose run is already over; `running` beats a finished one; done is quietest. */
+const WORKER_SEVERITY: WorkerState[] = ['blocked', 'failed', 'running', 'stopped', 'done']
+/** The summary line's order, as the mockup reads it (#3062): the live states first, then the
+ *  finished ones — a sentence that says what is happening before what has happened. */
+const WORKER_ORDER: WorkerState[] = ['running', 'blocked', 'failed', 'stopped', 'done']
+/** A live worker keeps a row in the default roster. `blocked` is live: it is a question a person answers.
+ *  `done`, `failed` and `stopped` runs are over — they are counted on the line, and only the
+ *  sheet lists them, so a session with many finished workers stays one line tall. */
+const isLiveWorker = (s: WorkerState) => s === 'running' || s === 'blocked'
+
 /** A chip's context colour, as roster.rs `ctx_color`: calm, amber from 80%, red from 95%. */
 const chipCtxTone = (p: number) => p >= 95 ? 'text-danger-ink' : p >= 80 ? 'text-warning-ink' : 'text-ink-3'
 
-/** The chat's workers, read-only (watching and stopping one from here is M2): the TUI's roster chips,
- *  `#2142 Name · Epic › Story · worker-backend (model) · running 3m12s · 48.0k tok · ctx 31% · $0.04`. */
-export function WorkerChips({ workers, now }: { workers: WorkerInfo[]; now: number }) {
-  if (!workers.length) return null
-  const running = workers.filter(w => w.state === 'running').length
+/** One worker's row: the TUI's roster chip,
+ *  `#2142 Name · Epic › Story · worker-backend (model) · running 3m12s · 48.0k tok · ctx 31% · $0.04`.
+ *  The default row is one line and gives the usage pieces up on a phone, so the name stays readable;
+ *  the sheet's row (`full`) puts them on a second line instead, where nothing has to be cut. */
+function WorkerRow({ w, now, full = false }: { w: WorkerInfo; now: number; full?: boolean }) {
+  const role = shortRole(w.role)
+  const es = epicStory(w.epic, w.story)
+  const u = workerUsage(w)
+  const ticket = displayStateOf(w.ticket_state)
+  const tone = WORKER_TONE[w.state] ?? 'border-line'
+  const dot = ticket && <span title={`Ticket: ${STATE_LABEL[ticket]}`} className="inline-flex shrink-0"><StateDot state={ticket} size={7} /></span>
+  const id = <span className="amp-num font-semibold text-accent shrink-0">#{w.task_id}</span>
+  const state = <span className={`amp-num shrink-0 ${WORKER_STATE_INK[w.state] ?? 'text-ink-2'}`} data-testid="worker-state">· {workerState(w, now)}</span>
+  if (full) return (
+    <div data-testid="roster-row" data-state={w.state} data-ticket={w.task_id} title={workerLine(w, now, true)}
+      className={`grid gap-y-0.5 min-w-0 border-l-2 pl-2 py-1 text-[12px] ${tone}`}>
+      <div className="flex items-baseline gap-1.5 min-w-0">
+        {dot}{id}<span className="truncate min-w-0 text-ink">{clean(w.name)}</span>
+        <span className="ml-auto pl-2 shrink-0 whitespace-nowrap">{state}</span>
+      </div>
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0 pl-[19px] text-[11px] text-ink-3 min-w-0">
+        {es && <span className="truncate min-w-0 max-w-full" data-testid="worker-epic">{es}</span>}
+        {role && <span className="shrink-0">{role}{w.model ? ` (${shortModel(w.model)})` : ''}</span>}
+        {u.tokens && <span className="amp-num shrink-0" data-testid="worker-tokens">{u.tokens}</span>}
+        {u.ctx && <span className={`amp-num shrink-0 ${chipCtxTone(u.ctxPercent ?? 0)}`} data-testid="worker-ctx">{u.ctx}</span>}
+        {u.cost && <span className="amp-num shrink-0" data-testid="worker-cost">{u.cost}</span>}
+      </div>
+    </div>
+  )
   return (
-    <div className="grid gap-1 px-3 sm:px-5 py-2 border-t border-line bg-surface" aria-label="Workers">
-      {workers.map(w => {
-        const role = shortRole(w.role)
-        const es = epicStory(w.epic, w.story)
-        const u = workerUsage(w)
-        const ticket = displayStateOf(w.ticket_state)
-        return (
-          <div key={w.task_id} className={`flex items-center gap-1.5 min-w-0 border-l-2 pl-2 text-[12px] ${WORKER_TONE[w.state] ?? 'border-line'}`} data-testid="worker-chip"
-            title={workerLine(w, now, true)}>
-            {ticket && <span title={`Ticket: ${STATE_LABEL[ticket]}`} className="inline-flex shrink-0"><StateDot state={ticket} size={7} /></span>}
-            <span className="amp-num font-semibold text-accent shrink-0">#{w.task_id}</span>
-            <span className="truncate min-w-0 text-ink">{clean(w.name)}</span>
-            {es && <span className="text-ink-3 shrink-[2] truncate min-w-0 hidden md:inline" data-testid="worker-epic">· {es}</span>}
-            {role && <span className="text-ink-3 shrink-0 hidden sm:inline">· {role}{w.model ? <span className="text-ink-3"> ({shortModel(w.model)})</span> : null}</span>}
-            <span className={`amp-num shrink-0 ${WORKER_STATE_INK[w.state] ?? 'text-ink-2'}`} data-testid="worker-state">· {workerState(w, now)}</span>
-            {u.tokens && <span className="amp-num shrink-0 text-ink-3" data-testid="worker-tokens">· {u.tokens}</span>}
-            {u.ctx && <span className={`amp-num shrink-0 ${chipCtxTone(u.ctxPercent ?? 0)}`} data-testid="worker-ctx">· {u.ctx}</span>}
-            {u.cost && <span className="amp-num shrink-0 text-ink-3 hidden sm:inline" data-testid="worker-cost">· {u.cost}</span>}
-          </div>
-        )
-      })}
-      <p className="m-0 text-[11px] text-ink-3">{running ? `${running} running` : 'none running'} · watch or stop them on the laptop</p>
+    <div data-testid="worker-chip" data-state={w.state} data-ticket={w.task_id} title={workerLine(w, now, true)}
+      className={`flex items-baseline gap-1.5 min-w-0 border-l-2 pl-2 text-[12px] ${tone}`}>
+      {dot}{id}<span className="truncate min-w-0 text-ink">{clean(w.name)}</span>
+      {es && <span className="text-ink-3 truncate min-w-0 shrink-[2] hidden md:inline" data-testid="worker-epic">· {es}</span>}
+      {role && <span className="text-ink-3 shrink-0 hidden lg:inline">· {role}{w.model ? <span className="text-ink-3"> ({shortModel(w.model)})</span> : null}</span>}
+      <span className="ml-auto pl-2 shrink-0">{state}</span>
+      {u.tokens && <span className="amp-num shrink-0 text-ink-3 hidden sm:inline" data-testid="worker-tokens">· {u.tokens}</span>}
+      {u.ctx && <span className={`amp-num shrink-0 hidden sm:inline ${chipCtxTone(u.ctxPercent ?? 0)}`} data-testid="worker-ctx">· {u.ctx}</span>}
+      {u.cost && <span className="amp-num shrink-0 text-ink-3 hidden lg:inline" data-testid="worker-cost">· {u.cost}</span>}
+    </div>
+  )
+}
+
+/** The full roster, on demand: every worker including the finished ones, with its state and how
+ *  long it ran. A bottom sheet, closed by its scrim, Escape or the close control. */
+function RosterSheet({ id, workers, now, counts, onClose }: {
+  id: string; workers: WorkerInfo[]; now: number; counts: { state: WorkerState; n: number }[]; onClose: () => void
+}) {
+  const panel = useRef<HTMLDivElement>(null)
+  const close = useRef<HTMLButtonElement>(null)
+  useDialogFocus(panel, close)
+  // Escape closes the sheet. A stable listener, so a clock tick never re-registers it.
+  const closeRef = useRef(onClose)
+  useEffect(() => { closeRef.current = onClose })
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.defaultPrevented || composing(e)) return
+      e.preventDefault()
+      closeRef.current()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [])
+  return (
+    <>
+      <div data-testid="roster-scrim" aria-hidden="true" className="fixed inset-0 z-40" style={{ background: 'var(--scrim)' }} onClick={onClose} />
+      <div id={id} ref={panel} role="dialog" aria-modal="true" aria-label="All workers" data-testid="roster-sheet"
+        className="fixed inset-x-0 bottom-0 z-50 mx-auto flex max-h-[72vh] w-full max-w-[560px] flex-col border-t border-line bg-surface pb-[env(safe-area-inset-bottom)] shadow-[0_-12px_32px_rgba(22,24,27,0.22)]">
+        {/* The mockup's grip: it says “a sheet, pushed back down” even before the close control is read. */}
+        <div className="flex justify-center pt-2 pb-0.5" aria-hidden="true">
+          <span className="w-9 h-1 bg-line-str" style={{ borderRadius: 2 }} />
+        </div>
+        <div className="flex items-center gap-2 border-b border-line-sub px-3 sm:px-4 pt-1.5 pb-2 min-w-0">
+          <span className="amp-label shrink-0">Workers ({workers.length})</span>
+          <span className="truncate min-w-0 text-[11px] text-ink-3" data-testid="roster-sheet-counts">
+            {counts.map(c => `${c.n} ${WORKER_STATE_WORD[c.state]}`).join(' · ')}
+          </span>
+          <button ref={close} type="button" onClick={onClose} aria-label="Close roster"
+            className="ml-auto shrink-0 inline-flex items-center justify-center w-8 h-8 border border-transparent text-ink-2 hover:bg-surface-3 hover:text-ink">
+            <X size={15} aria-hidden="true" />
+          </button>
+        </div>
+        <div className="min-h-0 overflow-y-auto overflow-x-hidden px-3 sm:px-4 py-2 grid gap-2">
+          {workers.map(w => <WorkerRow key={w.task_id} w={w} now={now} full />)}
+        </div>
+        <p className="m-0 border-t border-line-sub px-3 sm:px-4 py-2 text-[11px] text-ink-3">Watch or stop a worker on the laptop — per-worker actions land in M2.</p>
+      </div>
+    </>
+  )
+}
+
+/**
+ * The chat's workers, read-only (watching and stopping one from here is M2).
+ *
+ * The default view is one summary line — `3 running · 1 blocked · 2 done` — plus a row for each
+ * live worker (running, or blocked on a question). Workers whose run is over (done, failed,
+ * stopped) are counted on the line and never listed here: with many finished workers the roster
+ * stays one line tall instead of pushing the chat off the screen (audit #3026 F1). Tapping the
+ * line opens the sheet with the full roster, finished workers included.
+ */
+export function WorkerChips({ workers, now }: { workers: WorkerInfo[]; now: number }) {
+  const [open, setOpen] = useState(false)
+  const sheetId = useId()
+  if (!workers.length) return null
+  // Counts by state, in the mockup's order; only the states that have a worker.
+  const counts = WORKER_ORDER
+    .map(state => ({ state, n: workers.filter(w => w.state === state).length }))
+    .filter(c => c.n > 0)
+  const worst = counts.map(c => c.state).sort((a, b) => WORKER_SEVERITY.indexOf(a) - WORKER_SEVERITY.indexOf(b))[0] ?? 'done'
+  // Live workers first — blocked before running, since a blocked worker needs an answer —
+  // then the most recently finished. An older harness sends no ended_at_ms (and may send no
+  // started_at_ms), so both fall back to 0, never undefined.
+  const ordered = [...workers].sort((a, b) => {
+    const live = Number(isLiveWorker(b.state)) - Number(isLiveWorker(a.state))
+    if (live) return live
+    if (isLiveWorker(a.state) || isLiveWorker(b.state)) return WORKER_SEVERITY.indexOf(a.state) - WORKER_SEVERITY.indexOf(b.state)
+    return (b.ended_at_ms ?? b.started_at_ms ?? 0) - (a.ended_at_ms ?? a.started_at_ms ?? 0)
+  })
+  const live = ordered.filter(w => isLiveWorker(w.state))
+  return (
+    <div className="border-t border-line bg-surface" aria-label="Workers">
+      <button type="button" onClick={() => setOpen(true)} aria-expanded={open} aria-controls={sheetId}
+        data-testid="roster-summary" data-worst={worst}
+        className={`flex items-center gap-2 w-full min-w-0 px-3 sm:px-5 py-2 text-left hover:bg-surface-3 focus-visible:outline-2 focus-visible:outline-accent ${WORKER_STATE_INK[worst] ?? 'text-ink-2'}`}>
+        {/* The worst state present colours the line: a blocked or failed worker is never hidden
+            behind a running one. Each count then keeps its own state's ink, as the mockup's do, so
+            `3 running · 1 blocked` shows both at a glance while the line as a whole is alarm-red. */}
+        <span className="inline-flex items-center gap-1.5 flex-wrap min-w-0 flex-1" data-testid="roster-counts">
+          <i className="w-1.5 h-1.5 shrink-0 bg-current" style={{ borderRadius: 1 }} aria-hidden="true" />
+          {counts.map((c, i) => (
+            <span key={c.state} className={`whitespace-nowrap text-[11.5px] ${WORKER_STATE_INK[c.state] ?? 'text-ink-2'}`} data-testid="roster-count" data-state={c.state}>
+              {i > 0 && <span className="whitespace-pre text-line-str" aria-hidden="true">{' · '}</span>}
+              <b className="amp-num font-semibold">{c.n}</b> {WORKER_STATE_WORD[c.state]}
+            </span>
+          ))}
+        </span>
+        <span className="ml-auto shrink-0 inline-flex items-center gap-1 text-[11px] text-ink-3">
+          <span className="hidden sm:inline">All workers</span><ChevronUp size={14} aria-hidden="true" />
+        </span>
+      </button>
+      {live.length > 0 && (
+        <div className="grid gap-1 px-3 sm:px-5 pb-2">
+          {live.map(w => <WorkerRow key={w.task_id} w={w} now={now} />)}
+        </div>
+      )}
+      {open && <RosterSheet id={sheetId} workers={ordered} now={now} counts={counts} onClose={() => setOpen(false)} />}
     </div>
   )
 }

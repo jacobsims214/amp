@@ -425,13 +425,22 @@ describe('Session page shows what the TUI shows besides (#2388)', () => {
     expect(within(board).getByTestId('plan-approval')).toHaveTextContent('plan: 2 waiting for your approval')
     // Gap 6: the harness's own AMP connection.
     expect(screen.getByTestId('amp-connection')).toHaveTextContent('slow 812 ms')
-    // Gap 1: worker chips with epic › story, tokens, context and cost.
-    const chips = screen.getAllByTestId('worker-chip')
+    // Gap 1: worker chips with epic › story, tokens, context and cost. Only the running worker
+    // gets a default row; the finished one is counted on the summary line and listed in the
+    // sheet (#4895).
+    const roster = screen.getByLabelText('Workers')
+    const chips = within(roster).getAllByTestId('worker-chip')
+    expect(chips).toHaveLength(1)
+    expect(chips[0]).toHaveTextContent('#2390')
+    expect(within(roster).getByTestId('roster-counts')).toHaveTextContent('1 running · 1 done')
     expect(within(chips[0]).getByTestId('worker-epic')).toHaveTextContent('QA3d epic › Watch workers')
     expect(within(chips[0]).getByTestId('worker-tokens')).toHaveTextContent('7.8k tok')
     expect(within(chips[0]).getByTestId('worker-ctx')).toHaveTextContent('ctx 8%')
     expect(within(chips[0]).getByTestId('worker-cost')).toHaveTextContent('$0.04')
-    expect(within(chips[1]).getByTestId('worker-state')).toHaveTextContent('completed after 3m10s')
+    await userEvent.setup().click(within(roster).getByTestId('roster-summary'))
+    const rows = within(screen.getByTestId('roster-sheet')).getAllByTestId('roster-row')
+    expect(rows).toHaveLength(2)
+    expect(within(rows[1]).getByTestId('worker-state')).toHaveTextContent('completed after 3m10s')
     // Gap 3: compaction in the working line.
     expect(screen.getByTestId('working')).toHaveTextContent('Auto-compacting…')
     // Gap 4: the TUI's one sentence, the raw provider text one click away.
