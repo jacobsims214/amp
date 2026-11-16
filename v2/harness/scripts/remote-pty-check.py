@@ -250,7 +250,23 @@ class Chat:
         self.pump(0.4)
 
     def link(self):
-        """The pairing link on screen (wrapped lines joined)."""
+        """The pairing link on screen (wrapped lines joined).
+
+        #4901: the QR code is drawn at every window size now, so in a short window the link can
+        be scrolled above it: page up until it is on screen, then back to the end so new output
+        still follows.
+        """
+        for _ in range(10):
+            found = self._link_on_screen()
+            if found:
+                self.child.send("\x1b[F")  # End: follow new output again
+                self.pump(0.3)
+                return found
+            self.child.send("\x1b[5~")  # PageUp
+            self.pump(0.3)
+        raise SystemExit(f"no pairing link on screen:\n{self.text()}")
+
+    def _link_on_screen(self):
         lines = [l.strip() for l in self.screen.display]
         found = None
         for i, l in enumerate(lines):
@@ -261,7 +277,6 @@ class Chat:
                         break
                     parts.append(nxt)
                 found = "".join(parts)
-        assert found, self.text()
         return found
 
 
@@ -373,7 +388,7 @@ def flow(cols, rows):
 
 def copy():
     """#2423: the link is copied as it is shown; /remote copy, /remote open; a selection."""
-    cols, rows = 80, 30  # no room for the QR code: the link stays on screen
+    cols, rows = 80, 30  # #4901: the code is drawn here too; the link above it stays selectable
     d = workdir("copy")
     rig = Rig(dict(os.environ, AMP_REMOTE_RIG="1"))
     env = home_env(d, rig.url)
