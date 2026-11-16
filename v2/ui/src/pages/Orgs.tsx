@@ -1,16 +1,18 @@
 import { PageHeader } from '../components/ui/PageHeader'
 import { useState, useEffect, useCallback } from 'react'
 import { Link } from 'react-router-dom'
-import { Loader2, Plus, Trash2, Pencil, UserPlus, Users, Mail, ChevronDown, ChevronRight, X, Check, BookOpen, Inbox } from 'lucide-react'
+import { Loader2, Plus, Trash2, Pencil, UserPlus, Users, Mail, ChevronDown, ChevronRight, X, Check, BookOpen, Inbox, ShieldCheck, ArrowUpRight } from 'lucide-react'
 import { api } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal'
 import { AccountBadges } from '../components/admin'
 import { AuditLogPanel } from '../components/AuditLogPanel'
+import { RequestAccessPanel } from '../components/requests/RequestAccessPanel'
 import { WebhooksPanel } from '../components/WebhooksPanel'
 import { OrgRemoteControlSetting } from '../components/remote/OrgRemoteControlSetting'
 import { OrgReceiptsSetting } from '../components/receipt/OrgReceiptsSetting'
 import { personName } from '../lib/people'
+import { canManageSubmitAccess } from '../lib/requestAccess'
 import { teamInboxPath } from '../lib/requestRoutes'
 import type { AddMemberResult, Invite, Member, Org, OrgRole, Team, TeamRole } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
@@ -537,11 +539,41 @@ function TeamRow({ team, first, canManageOrg, meId, expanded, onToggle, onChange
   onToggle: () => void
   onChanged: () => Promise<void>
 }) {
+  const { me, isAdmin } = useAuth()
   const [renaming, setRenaming] = useState(false)
   const [name, setName] = useState(team.name)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  /**
+   * Whether this team's inbox-access section is open (AMP #4877).
+   *
+   * A team's own state, not the org's: two teams can be expanded at different
+   * times, and closing this section is how the panel's `onClose` collapses it —
+   * the page's expanded team, its scroll and its other rows are untouched.
+   */
+  const [accessOpen, setAccessOpen] = useState(false)
+  /**
+   * Whether to offer the action at all.
+   *
+   * The panel's own hint (`canManageSubmitAccess`), not a second rule: the entry
+   * point and the panel it opens must not be able to disagree about who is a
+   * manager. Deliberately optimistic — the server's `RequireTeamManager` is the
+   * gate on every write (see lib/requestAccess).
+   */
+  const canAdministerAccess = canManageSubmitAccess(me, team, isAdmin)
+  const accessId = `team-access-${team.id}`
+  /**
+   * Open the section, expanding the row first when it is collapsed.
+   *
+   * The section only exists inside an expanded row, so an action that merely
+   * flipped a hidden flag would be a control that visibly does nothing. Expanding
+   * is the row's own `onToggle`; nothing else on the page changes.
+   */
+  const toggleAccess = () => {
+    if (!expanded) { onToggle(); setAccessOpen(true); return }
+    setAccessOpen(open => !open)
+  }
 
   const rename = async () => {
     setBusy(true); setError(null)
@@ -559,8 +591,12 @@ function TeamRow({ team, first, canManageOrg, meId, expanded, onToggle, onChange
 
   return (
     <div className={first ? '' : 'border-t border-line'}>
-      <div className="flex items-center gap-2 px-4 py-2.5">
-        <button onClick={onToggle} className="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer">
+      {/* The row wraps at phone width and the toggle takes the first line
+          (artifact 112 v1's `.teamrow` / `.teamtoggle` rules, which use 720 px):
+          the actions — Inbox, KB, Inbox access, rename, delete — then sit on
+          their own line instead of pushing the last of them off the screen. */}
+      <div className="flex flex-wrap items-center gap-2 px-4 py-2.5">
+        <button onClick={onToggle} className="flex items-center gap-2 flex-1 min-w-0 max-[720px]:basis-full text-left cursor-pointer">
           <span className="text-ink-3">{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</span>
           <Users size={13} className="text-ink-3 flex-shrink-0" />
           {!renaming && <span className="text-sm text-ink truncate">{team.name}</span>}
@@ -578,6 +614,20 @@ function TeamRow({ team, first, canManageOrg, meId, expanded, onToggle, onChange
               className="amp-btn amp-btn-ghost amp-btn-sm">
               <BookOpen size={12} />KB
             </Link>
+            {/* Who may send requests to this team's inbox (AMP #4877, approved
+                mockup artifact 112 v1). An outlined button rather than a ghost
+                one: it opens a section of this row, where Inbox and KB are page
+                links. Managers only — a viewer with neither standing gets no
+                action, and no dead end. */}
+            {canAdministerAccess && (
+              <button type="button" onClick={toggleAccess}
+                aria-expanded={expanded && accessOpen} aria-controls={expanded && accessOpen ? accessId : undefined}
+                aria-label={`Inbox access for ${team.name}`}
+                title="Who may send requests to this team's inbox"
+                className="amp-btn amp-btn-sm">
+                <ShieldCheck size={12} />Inbox access
+              </button>
+            )}
           </>
         )}
         {renaming ? (
@@ -595,6 +645,40 @@ function TeamRow({ team, first, canManageOrg, meId, expanded, onToggle, onChange
       </div>
       {error && !confirmDelete && <p className="text-xs text-danger-ink px-4 pb-2">{error}</p>}
       {expanded && <TeamMembers teamId={team.id} canManageOrg={canManageOrg} meId={meId} />}
+      {/* The inbox-access section: inside the expanded row, beneath the members,
+          on the same surface and at the same left indent (artifact 112 v1). It is
+          the panel itself, unmoved — no field, control or sentence is restated
+          here, and `onClose` collapses the section rather than the row. */}
+      {expanded && accessOpen && canAdministerAccess && (
+        <section id={accessId} aria-labelledby={`${accessId}-h`}
+          className="mr-4 mb-4 ml-4 border border-line sm:ml-10"
+          style={{ background: 'var(--surface)', borderRadius: 'var(--radius)' }}>
+          <div className="flex flex-col gap-2 px-3.5 py-3 border-b border-line sm:flex-row sm:flex-wrap sm:items-center sm:gap-2.5">
+            <ShieldCheck size={14} className="hidden flex-shrink-0 text-ink-3 sm:block" aria-hidden="true" />
+            <div className="min-w-0 flex-1">
+              <span id={`${accessId}-h`} className="amp-label">Team inbox · submit access</span>
+              <p className="m-0 mt-1 text-[12.5px] leading-snug text-ink-2">
+                Who may send requests to {team.name}’s inbox. This is part of the team’s access — nothing here is a
+                separate admin page.
+              </p>
+            </div>
+            <Link to={teamInboxPath(team.id)} className="amp-btn amp-btn-ghost amp-btn-sm self-start"
+              title="Open the inbox queue">
+              Open inbox<ArrowUpRight size={11} />
+            </Link>
+          </div>
+          <div className="grid gap-4 px-3.5 py-3.5">
+            <RequestAccessPanel
+              teamId={team.id}
+              team={team}
+              me={me}
+              isAdmin={isAdmin}
+              meId={meId}
+              onClose={() => setAccessOpen(false)}
+            />
+          </div>
+        </section>
+      )}
       {confirmDelete && (
         <ConfirmDeleteModal
           title={`Delete team "${team.name}"`}
