@@ -70,6 +70,7 @@ pub mod remote;
 pub mod remote_ui;
 pub mod roster;
 pub mod scroll;
+pub mod selection;
 pub mod shell;
 pub mod slash;
 pub mod table;
@@ -106,7 +107,7 @@ pub use shell::{
 };
 pub use slash::{
     COMMANDS, CommandMenu, CommandSpec, DRAG_KEY, Group, HelpBlock, KEYS, LEGACY_SHIFT_ENTER,
-    MenuKey, keys, keys_for,
+    MODIFIER_DRAG_KEY, MenuKey, SELECT_COPY_KEY, keys, keys_for, keys_with,
 };
 pub use theme::{AmpPalette, AmpTheme, ColorDepth, ThemeSettings, Variant};
 pub use transcript::ThinkingDisplay;

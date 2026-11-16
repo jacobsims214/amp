@@ -528,3 +528,139 @@ async fn a_refusal_in_a_mixed_batch_blocks_the_retry_and_ends_the_run() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// #4247: person confirmation for self-management writes. Only a person's "yes" through a
+// confirmer approves; no confirmer, a timeout or a vanished responder all deny.
+// ---------------------------------------------------------------------------------------------
+
+mod confirm {
+    use std::time::Duration;
+
+    use amp_core::approval::{
+        CONFIRM_TIMEOUT, ChannelConfirmer, ConfirmKind, ConfirmRequest, Confirmed, Confirmer,
+        DenyReason, confirm_or_deny,
+    };
+
+    fn request() -> ConfirmRequest {
+        ConfirmRequest::self_management(
+            "amp_manage_agent",
+            "/home/me/.config/amp-harness/agents/amp-foo.md",
+            "user",
+            "create agent amp-foo",
+        )
+        .detail("+ permission: bash allow (widens the template)")
+    }
+
+    /// A confirmer that never answers, like a TUI nobody is looking at.
+    struct Silent;
+    #[async_trait::async_trait]
+    impl Confirmer for Silent {
+        async fn confirm(&self, _: ConfirmRequest) -> Confirmed {
+            std::future::pending().await
+        }
+    }
+
+    #[test]
+    fn the_self_management_kind_is_never_auto_approvable() {
+        let r = request();
+        assert_eq!(r.kind, ConfirmKind::SelfManagementWrite);
+        assert!(!r.kind.auto_approvable());
+        assert!(CONFIRM_TIMEOUT > Duration::ZERO);
+        let lines = r.prompt_lines();
+        assert_eq!(lines[0], "amp_manage_agent wants to: create agent amp-foo");
+        assert!(lines[1].starts_with("user scope: ") && lines[1].ends_with("amp-foo.md"));
+        assert_eq!(lines[2], "+ permission: bash allow (widens the template)");
+    }
+
+    #[tokio::test]
+    async fn no_confirmer_denies() {
+        let got = confirm_or_deny(None, request(), CONFIRM_TIMEOUT).await;
+        assert_eq!(got, Confirmed::Denied(DenyReason::NoResponder));
+        assert!(!got.is_approved());
+        assert!(got.denial_message().unwrap().starts_with("not written: "));
+    }
+
+    #[tokio::test]
+    async fn a_person_who_does_not_answer_in_time_is_a_no() {
+        let got = confirm_or_deny(Some(&Silent), request(), Duration::from_millis(30)).await;
+        assert_eq!(got, Confirmed::Denied(DenyReason::TimedOut));
+
+        // Same through the channel: the prompt reached the front end but nobody answered.
+        let (c, mut rx) = ChannelConfirmer::new();
+        let got = confirm_or_deny(Some(&c), request(), Duration::from_millis(30)).await;
+        assert_eq!(got, Confirmed::Denied(DenyReason::TimedOut));
+        assert!(rx.try_recv().is_ok(), "the prompt was delivered");
+    }
+
+    #[tokio::test]
+    async fn a_prompt_whose_requester_timed_out_is_stale_and_its_yes_is_not_delivered() {
+        let (c, mut rx) = ChannelConfirmer::new();
+        let got = confirm_or_deny(Some(&c), request(), Duration::from_millis(30)).await;
+        assert_eq!(got, Confirmed::Denied(DenyReason::TimedOut));
+
+        // The prompt is still in the channel, but the tool has already reported "not written".
+        let p = rx.try_recv().expect("the prompt was delivered");
+        assert!(
+            p.is_stale(),
+            "the requester gave up, so the prompt is stale"
+        );
+        assert!(
+            !p.answer(true),
+            "a yes to a timed-out request reaches nobody"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_tool_call_leaves_a_stale_prompt() {
+        let (c, mut rx) = ChannelConfirmer::new();
+        let asking =
+            tokio::spawn(
+                async move { confirm_or_deny(Some(&c), request(), CONFIRM_TIMEOUT).await },
+            );
+        let p = rx.recv().await.expect("a prompt");
+        assert!(!p.is_stale(), "the tool is still waiting");
+
+        asking.abort();
+        assert!(asking.await.unwrap_err().is_cancelled());
+        assert!(p.is_stale(), "the cancelled tool call dropped its receiver");
+        assert!(!p.answer(true));
+    }
+
+    #[tokio::test]
+    async fn no_tui_listening_or_a_dropped_prompt_denies() {
+        // The front end's receiver is gone (no TUI attached).
+        let (c, rx) = ChannelConfirmer::new();
+        drop(rx);
+        let got = confirm_or_deny(Some(&c), request(), CONFIRM_TIMEOUT).await;
+        assert_eq!(got, Confirmed::Denied(DenyReason::ResponderGone));
+
+        // The front end got the prompt and dropped it unanswered (closed, cancelled).
+        let (c, mut rx) = ChannelConfirmer::new();
+        let front = tokio::spawn(async move { drop(rx.recv().await) });
+        let got = confirm_or_deny(Some(&c), request(), CONFIRM_TIMEOUT).await;
+        front.await.unwrap();
+        assert_eq!(got, Confirmed::Denied(DenyReason::ResponderGone));
+    }
+
+    #[tokio::test]
+    async fn only_the_persons_yes_approves() {
+        for (yes, want) in [
+            (false, Confirmed::Denied(DenyReason::Declined)),
+            (true, Confirmed::Approved),
+        ] {
+            let (c, mut rx) = ChannelConfirmer::new();
+            let front = tokio::spawn(async move {
+                let p = rx.recv().await.expect("a prompt");
+                assert_eq!(p.request.summary, "create agent amp-foo");
+                assert_eq!(p.request.scope, "user");
+                assert!(!p.is_stale(), "the tool is still waiting");
+                assert!(p.answer(yes), "the waiting tool received the answer");
+            });
+            let got = confirm_or_deny(Some(&c), request(), CONFIRM_TIMEOUT).await;
+            front.await.unwrap();
+            assert_eq!(got, want);
+            assert_eq!(got.denial_message().is_none(), yes);
+        }
+    }
+}

@@ -736,6 +736,7 @@ fn header_line1(style: &Style, data: &ChromeData, p: &AmpPalette, width: usize) 
         Seg::new(dot.fg("●"), Lead::Space, 1),
         Seg::new(c.muted.fg(&health_word(health)), Lead::Space, 1),
     ];
+    right.extend(relogin_seg(style, meta));
     if let Some(inst) = &meta.instance {
         let protocol = clean(&inst.protocol);
         if !protocol.is_empty() {
@@ -822,6 +823,7 @@ pub fn header_title(data: &ChromeData, p: &AmpPalette, width: usize) -> (String,
         Seg::new(dot.fg("●"), Lead::Space, 1),
         Seg::new(c.muted.fg(&health_word(health)), Lead::Space, 1),
     ];
+    right.extend(relogin_seg(&style, meta));
     if let Some(inst) = &meta.instance {
         let protocol = clean(&inst.protocol);
         if !protocol.is_empty() {
@@ -868,6 +870,32 @@ fn project_seg(style: &Style, meta: &AmpMeta) -> Option<Seg> {
     };
     Some(Seg::new(
         format!("{text} {}", c.dim.fg(&format!("#{pid}"))),
+        Lead::Dot,
+        2,
+    ))
+}
+
+/// The chat command that logs in to AMP again from inside the chat (#4250, #4251).
+pub const AMP_LOGIN_COMMAND: &str = "/mcp login amp";
+
+/// The session authenticates to AMP with a static token (`AMP_TOKEN`, or the env a server's
+/// settings name), which `/mcp login amp` refuses: only a new token and a restart help. Known only
+/// once the poller has connected once ([`Instance::auth`] reads `static token (env …)`); before
+/// that a rejected token and an expired login look the same.
+pub fn uses_static_token(meta: &AmpMeta) -> bool {
+    meta.instance
+        .as_ref()
+        .is_some_and(|i| i.auth.starts_with("static token"))
+}
+
+/// After "re-login needed", the command that fixes it (#4251), unless the session uses a static
+/// token, which that command can't renew.
+fn relogin_seg(style: &Style, meta: &AmpMeta) -> Option<Seg> {
+    if meta.health.connection != Connection::AuthRequired || uses_static_token(meta) {
+        return None;
+    }
+    Some(Seg::new(
+        style.colors.warning.fg(AMP_LOGIN_COMMAND),
         Lead::Dot,
         2,
     ))

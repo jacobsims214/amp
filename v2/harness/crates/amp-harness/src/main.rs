@@ -33,6 +33,7 @@ mod conn;
 mod connect;
 mod debug;
 mod doctor;
+mod manage_tools;
 mod mcp_cmd;
 mod mcp_crud;
 mod mcp_import;

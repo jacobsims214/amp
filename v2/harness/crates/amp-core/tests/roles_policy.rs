@@ -13,8 +13,8 @@ use amp_core::{
     assets::{Assets, OverrideDirs},
     models::{ModelsConfig, ModelsFile},
     policy::{
-        DISPATCH_TOOL, DenialReason, Policy, QUESTION_TOOL, ToolPolicy, resolve_read_tool_path,
-        resolve_symlinks, resolve_tool_path,
+        DISPATCH_TOOL, DenialReason, Policy, QUESTION_TOOL, STOP_WORKER_TOOL, ToolPolicy,
+        WORKER_CONTROL_TOOLS, resolve_read_tool_path, resolve_symlinks, resolve_tool_path,
     },
     roles::{RoleError, RoleRegistry},
 };
@@ -418,6 +418,14 @@ fn manager_policy() {
         DenialReason::BadArguments
     );
 
+    // #4233: the manager stops its own workers, without a prompt (no rule asks or denies it).
+    assert!(p.exposes(STOP_WORKER_TOOL));
+    assert!(allowed(
+        &p,
+        STOP_WORKER_TOOL,
+        json!({"task_id": 1, "reason": "wrong approach"})
+    ));
+
     // Reads and AMP tools: allowed.
     assert!(allowed(&p, "read", json!({"path": "README.md"})));
     assert!(allowed(&p, "grep", json!({"pattern": "x"})));
@@ -730,6 +738,17 @@ fn every_worker_policy_matches_its_frontmatter() {
             !p.exposes(QUESTION_TOOL) && !p.exposes(DISPATCH_TOOL),
             "{id}"
         );
+
+        // Never: the manager's worker-control tools (#4233), with their own denial.
+        for tool in WORKER_CONTROL_TOOLS {
+            let d = p
+                .check(tool, &json!({"task_id": 7, "reason": "x"}))
+                .unwrap_err();
+            assert_eq!(d.reason, DenialReason::ChildWorkerControl, "{id} {tool}");
+            assert_eq!(d.subject, "7", "{id} {tool}");
+            assert!(d.to_string().contains("Only the manager"), "{id} {tool}");
+            assert!(!p.exposes(tool), "{id} {tool}");
+        }
 
         // AMP tools and reads: allowed.
         assert!(
@@ -1576,4 +1595,362 @@ fn symlinks_are_followed_before_the_rules_see_the_path() {
             "{tool}"
         );
     }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Context budget (#4225): what `Runtime::build` hands rpi.
+// ------------------------------------------------------------------------------------------------
+
+/// The manager and worker-backend on a faux provider whose model sets its own window and output
+/// budget, plus `extra` (a `[compaction]` table).
+fn budget_config(extra: &str) -> String {
+    format!(
+        r#"
+[providers.wf]
+api = "faux"
+[providers.wf.models."wf-1"]
+context_window = 64000
+max_tokens = 4096
+
+[roles.manager]
+model = "wf/wf-1"
+[roles.worker-backend]
+model = "wf/wf-1"
+{extra}
+"#
+    )
+}
+
+/// A runtime over `config` (the user layer), offline (no AMP tools), with its state under this
+/// crate's target dir. Returns it with the repo dir sessions are built in.
+fn budget_runtime(name: &str, config: &str) -> (amp_core::agent::Runtime, PathBuf) {
+    let dir = path_scratch(&format!("budget-{name}"));
+    let home = dir.join("home");
+    let repo = dir.join("repo");
+    fs::create_dir_all(home.join(".config/amp-harness")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    let user = ModelsFile::parse(config, "test config").unwrap();
+    let models =
+        ModelsConfig::from_files(ModelsFile::defaults(), Some(user), "test config", &|_| None)
+            .unwrap();
+    let env = move |k: &str| match k {
+        "HOME" => Some(home.to_string_lossy().into_owned()),
+        "XDG_CONFIG_HOME" => Some(home.join(".config").to_string_lossy().into_owned()),
+        "XDG_STATE_HOME" => Some(home.join(".local/state").to_string_lossy().into_owned()),
+        _ => None,
+    };
+    let client = amp_mcp::AmpMcpClient::offline(
+        &amp_mcp::ClientOptions::new("http://127.0.0.1:9/mcp".to_owned()),
+        "test: no AMP",
+    );
+    let rt = amp_core::agent::Runtime::load(
+        Arc::new(client),
+        amp_core::agent::RuntimeOptions {
+            repo_root: Some(repo.clone()),
+            models: Some(models),
+            keys: &amp_core::providers::StaticKeys::default(),
+            env: &env,
+            state_dir: Some(dir.join("state")),
+        },
+    )
+    .expect("load the runtime");
+    (rt, repo)
+}
+
+/// T12: a non-default `[compaction]` reaches every harness `Runtime::build` makes, the manager's
+/// (the chat) and a worker's; T13: the model's configured window and output budget are what the
+/// harness compacts against (role caps, #4224, clamp the same `ResolvedRole.model`).
+#[tokio::test]
+async fn configured_compaction_and_budget_reach_every_harness() {
+    let (rt, repo) = budget_runtime(
+        "custom",
+        &budget_config(
+            "[compaction]\nenabled = true\nreserve_tokens = 8000\nkeep_recent_tokens = 12000\n",
+        ),
+    );
+    let want = rpi_harness::types::CompactionSettings {
+        enabled: true,
+        reserve_tokens: 8000,
+        keep_recent_tokens: 12000,
+    };
+    assert_ne!(
+        want,
+        rpi_harness::types::DEFAULT_COMPACTION_SETTINGS,
+        "the test needs non-default values"
+    );
+    for role in ["amp-manager", "worker-backend"] {
+        let built = rt
+            .build(amp_core::agent::AgentSpec::new(role, repo.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("build {role}: {e}"));
+        assert_eq!(built.harness.compaction_settings(), want, "{role}");
+        let model = rpi_harness::agent_harness::AgentLane::get_model(&*built.harness)
+            .await
+            .unwrap();
+        assert_eq!(model.context_window, 64000, "{role}");
+        assert_eq!(model.max_tokens, 4096, "{role}");
+    }
+    rt.mcp_hub.shutdown().await;
+}
+
+/// T-A5: `enabled = false` is what rpi gets, so neither automatic trigger (before a run, between
+/// tool-loop turns) compacts; without `[compaction]` the harness has rpi's defaults.
+#[tokio::test]
+async fn compaction_disabled_and_absent_reach_the_harness() {
+    let (rt, repo) = budget_runtime("off", &budget_config("[compaction]\nenabled = false\n"));
+    let built = rt
+        .build(amp_core::agent::AgentSpec::new("worker-backend", repo))
+        .await
+        .unwrap();
+    let got = built.harness.compaction_settings();
+    assert!(!got.enabled, "{got:?}");
+    assert_eq!(
+        got.reserve_tokens,
+        rpi_harness::types::DEFAULT_COMPACTION_SETTINGS.reserve_tokens
+    );
+    rt.mcp_hub.shutdown().await;
+
+    let (rt, repo) = budget_runtime("absent", &budget_config(""));
+    let built = rt
+        .build(amp_core::agent::AgentSpec::new("worker-backend", repo))
+        .await
+        .unwrap();
+    assert_eq!(
+        built.harness.compaction_settings(),
+        rpi_harness::types::DEFAULT_COMPACTION_SETTINGS
+    );
+    rt.mcp_hub.shutdown().await;
+}
+
+// ------------------------------------------------------------------------------------------------
+// Self-management guard (#4246): permission_widens, refuse_primary, dispatch_effect.
+// ------------------------------------------------------------------------------------------------
+
+fn perm(v: Value) -> Policy {
+    Policy::parse(Some(&v)).unwrap()
+}
+
+#[test]
+fn permission_widens_flags_every_widening_change() {
+    use amp_core::roles::{new_agent_baseline, permission_widens};
+    let base = new_agent_baseline();
+    let old = perm(json!({
+        "bash": { "*": "deny", "git status*": "allow" },
+        "edit": "deny",
+        "webfetch": "deny",
+        "mcp": { "*": "allow", "github/delete_*": "deny" },
+    }));
+    let cases: &[(&str, Value, &str)] = &[
+        (
+            "new allow",
+            json!({ "bash": { "*": "deny", "git status*": "allow", "cargo test*": "allow" },
+                    "edit": "deny", "webfetch": "deny",
+                    "mcp": { "*": "allow", "github/delete_*": "deny" } }),
+            "adds bash \"cargo test*\": allow",
+        ),
+        (
+            "removed deny",
+            json!({ "bash": { "*": "deny", "git status*": "allow" },
+                    "edit": "deny", "webfetch": "deny", "mcp": { "*": "allow" } }),
+            "removes mcp \"github/delete_*\": deny (now allow)",
+        ),
+        (
+            "removed key falls back to allow",
+            json!({ "bash": { "*": "deny", "git status*": "allow" },
+                    "webfetch": "deny", "mcp": { "*": "allow", "github/delete_*": "deny" } }),
+            "removes edit \"*\": deny (now allow)",
+        ),
+        (
+            "broader glob",
+            json!({ "bash": { "*": "deny", "git *": "allow" },
+                    "edit": "deny", "webfetch": "deny",
+                    "mcp": { "*": "allow", "github/delete_*": "deny" } }),
+            "adds bash \"git *\": allow",
+        ),
+        (
+            "deny flipped to allow",
+            json!({ "bash": { "*": "deny", "git status*": "allow" },
+                    "edit": "allow", "webfetch": "deny",
+                    "mcp": { "*": "allow", "github/delete_*": "deny" } }),
+            "edit \"*\": deny -> allow",
+        ),
+        (
+            "deny moved before the allow it overrode",
+            json!({ "bash": { "*": "deny", "git status*": "allow" },
+                    "edit": "deny", "webfetch": "deny",
+                    "mcp": { "github/delete_*": "deny", "*": "allow" } }),
+            // Either alignment is right: the deny is gone, or the catch-all allow now wins.
+            "mcp ",
+        ),
+        (
+            "whole block removed",
+            Value::Null,
+            "removes bash \"*\": deny (now allow)",
+        ),
+    ];
+    for (name, new, reason) in cases {
+        let new = Policy::parse(Some(new)).unwrap();
+        let w = permission_widens(Some(&old), &new, &base);
+        assert!(w.widens, "{name}: not flagged");
+        assert!(
+            w.reasons.iter().any(|r| r.contains(reason)),
+            "{name}: {:?} lacks {reason:?}",
+            w.reasons
+        );
+    }
+}
+
+#[test]
+fn permission_widens_allows_narrowing_and_no_ops() {
+    use amp_core::roles::{new_agent_baseline, permission_widens};
+    let base = new_agent_baseline();
+    let old = perm(json!({
+        "bash": { "*": "deny", "git status*": "allow", "git log*": "allow" },
+        "edit": { "*": "allow", "secrets/**": "deny" },
+        "webfetch": "deny",
+    }));
+    let cases: &[(&str, Value)] = &[
+        (
+            "identical",
+            json!({ "bash": { "*": "deny", "git status*": "allow", "git log*": "allow" },
+                    "edit": { "*": "allow", "secrets/**": "deny" }, "webfetch": "deny" }),
+        ),
+        (
+            "added deny",
+            json!({ "bash": { "*": "deny", "git status*": "allow", "git log*": "allow" },
+                    "edit": { "*": "allow", "secrets/**": "deny", ".env": "deny" },
+                    "webfetch": "deny", "mcp": { "db/*": "deny" } }),
+        ),
+        (
+            "removed allow",
+            json!({ "bash": { "*": "deny", "git status*": "allow" },
+                    "edit": { "*": "allow", "secrets/**": "deny" }, "webfetch": "deny" }),
+        ),
+        (
+            "allow flipped to deny",
+            json!({ "bash": { "*": "deny", "git status*": "allow", "git log*": "deny" },
+                    "edit": { "*": "allow", "secrets/**": "deny" }, "webfetch": "deny" }),
+        ),
+        (
+            "deny written as ask",
+            json!({ "bash": { "*": "ask", "git status*": "allow", "git log*": "allow" },
+                    "edit": { "*": "allow", "secrets/**": "deny" }, "webfetch": "ask" }),
+        ),
+        (
+            "allow for a permission that already allowed everything",
+            json!({ "bash": { "*": "deny", "git status*": "allow", "git log*": "allow" },
+                    "edit": { "*": "allow", "secrets/**": "deny" }, "webfetch": "deny",
+                    "websearch": "allow" }),
+        ),
+    ];
+    for (name, new) in cases {
+        let new = Policy::parse(Some(new)).unwrap();
+        let w = permission_widens(Some(&old), &new, &base);
+        assert!(!w.widens, "{name}: flagged {:?}", w.reasons);
+        assert!(w.reasons.is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn a_new_agent_is_judged_against_the_restrictive_baseline() {
+    use amp_core::roles::{new_agent_baseline, permission_widens};
+    let base = new_agent_baseline();
+    // No permission block: bash, edit and webfetch all fall back to allow.
+    let w = permission_widens(None, &Policy::default(), &base);
+    assert!(w.widens);
+    for p in ["bash", "edit", "webfetch"] {
+        assert!(
+            w.reasons
+                .iter()
+                .any(|r| r.starts_with(&format!("removes {p} "))),
+            "{p}: {:?}",
+            w.reasons
+        );
+    }
+    // The baseline itself, plus more denies, is fine.
+    let ok = perm(json!({ "bash": "deny", "edit": "deny", "webfetch": "deny", "task": "deny" }));
+    assert!(!permission_widens(None, &ok, &base).widens);
+    // Granting one command is a widening the person must confirm.
+    let grant = perm(json!({ "bash": { "*": "deny", "cargo test*": "allow" },
+                             "edit": "deny", "webfetch": "deny" }));
+    let w = permission_widens(None, &grant, &base);
+    assert!(w.widens);
+    assert_eq!(
+        w.reasons,
+        vec!["adds bash \"cargo test*\": allow".to_string()]
+    );
+    // external_directory defaults to ask, so an allow there widens even with no old rule.
+    let ext = perm(json!({ "bash": "deny", "edit": "deny", "webfetch": "deny",
+                           "external_directory": "allow" }));
+    assert!(permission_widens(None, &ext, &base).widens);
+}
+
+#[test]
+fn tool_edits_of_primary_agents_are_refused() {
+    use amp_core::roles::refuse_primary;
+    let reg = registry();
+    for name in ["amp-manager", "amp:amp-manager", "manager"] {
+        let e = refuse_primary(&reg, name, false).unwrap_err();
+        assert!(e.to_string().contains("is the manager"), "{name}: {e}");
+    }
+    assert!(refuse_primary(&reg, "amp-worker-backend", false).is_ok());
+    assert!(refuse_primary(&reg, "sql-expert", false).is_ok());
+    // Making a subagent primary, or creating a primary, is refused too.
+    let e = refuse_primary(&reg, "amp-worker-backend", true).unwrap_err();
+    assert!(e.to_string().contains("would become a primary"), "{e}");
+    assert!(refuse_primary(&reg, "new-lead", true).is_err());
+
+    // Judged on the role, not the name: a second primary under any id is refused.
+    let base = scratch("refuse-primary");
+    let agents = base.join("user/agents");
+    fs::create_dir_all(&agents).unwrap();
+    fs::write(
+        agents.join("lead.md"),
+        "---\ndescription: lead\nmode: primary\n---\nLead.\n",
+    )
+    .unwrap();
+    let assets = Assets::load(&OverrideDirs {
+        user: Some(base.join("user")),
+        repo: None,
+    })
+    .unwrap();
+    let reg = RoleRegistry::from_assets(&assets).unwrap();
+    assert!(reg.get("lead").unwrap().primary);
+    let e = refuse_primary(&reg, "lead", false).unwrap_err();
+    assert!(
+        e.to_string().contains("primary agent") || e.to_string().contains("is the manager"),
+        "{e}"
+    );
+    assert!(refuse_primary(&reg, "amp-manager", false).is_err());
+}
+
+#[test]
+fn dispatch_effect_reports_agents_the_manager_can_dispatch_at_once() {
+    use amp_core::roles::dispatch_effect;
+    let base = scratch("dispatch-effect");
+    let agents = base.join("user/agents");
+    fs::create_dir_all(&agents).unwrap();
+    let agent = |id: &str, extra: &str| {
+        fs::write(
+            agents.join(format!("{id}.md")),
+            format!("---\ndescription: {id}\nmode: subagent\n{extra}---\nDo {id}.\n"),
+        )
+        .unwrap();
+    };
+    agent("amp-sql", "");
+    agent("opted-in", "dispatch: true\n");
+    agent("helper", "");
+    let assets = Assets::load(&OverrideDirs {
+        user: Some(base.join("user")),
+        repo: None,
+    })
+    .unwrap();
+    let reg = RoleRegistry::from_assets(&assets).unwrap();
+    let manager = reg.manager();
+    let note = dispatch_effect(manager, reg.get("amp-sql").unwrap()).unwrap();
+    assert!(note.contains("amp-*"), "{note}");
+    let note = dispatch_effect(manager, reg.get("opted-in").unwrap()).unwrap();
+    assert!(note.contains("dispatch"), "{note}");
+    assert_eq!(dispatch_effect(manager, reg.get("helper").unwrap()), None);
+    assert_eq!(dispatch_effect(manager, manager), None);
 }

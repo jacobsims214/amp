@@ -68,7 +68,10 @@ use rpi_harness::{
     },
     skills::format_skill_invocation,
     system_prompt::compose_system_prompt,
-    types::{AgentHarnessOptions, AgentHarnessResources, HarnessTool, Skill},
+    types::{
+        AgentHarnessOptions, AgentHarnessResources, CompactionSettings, HarnessTool, Skill,
+        ToolReplay,
+    },
 };
 use rpi_tools::{
     BashExecution, BashPrepare, BashToolOptions, ExecutionEnv, ExecutionToolContext,
@@ -773,7 +776,28 @@ impl Runtime {
                     from,
                     to,
                 });
+            } else if let (Ok(old), Ok(new)) = (
+                old_role.resolve_model(&old_models),
+                role.resolve_model(&models),
+            ) {
+                // #4225: same model, different window or output budget (its `context_window` /
+                // `max_tokens`, or a role cap). The live chat keeps the model it was switched to.
+                let budget = |r: &ResolvedRole| (r.model.context_window, r.model.max_tokens);
+                if budget(&old) != budget(&new) {
+                    report.budgets.push(BudgetChange {
+                        role: role.id.clone(),
+                        from: budget(&old),
+                        to: budget(&new),
+                    });
+                }
             }
+        }
+        let (old_compaction, new_compaction) = (
+            old_models.compaction_settings(),
+            models.compaction_settings(),
+        );
+        if old_compaction != new_compaction {
+            report.compaction = Some((old_compaction, new_compaction));
         }
 
         *self.catalog.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(catalog);
@@ -997,6 +1021,19 @@ impl Runtime {
                 let (s, path) = jsonl_session(dir, &cwd, &role.id).await?;
                 (s, Some(path))
             }
+            SessionKind::Existing { path, .. } => {
+                // AMP #4239: the saved file itself, claimed and validated (same cwd, not Busy)
+                // before it is read. Its unconsumed queued prompts are dropped, as on any resume.
+                let opened = session_store::load(path, &cwd, &role.id).await?;
+                discard_persisted_queues(&opened.session)
+                    .await
+                    .map_err(AgentError::Harness)?;
+                (opened.session, Some(opened.path))
+            }
+        };
+        let existing = match &spec.session {
+            SessionKind::Existing { replay, .. } => Some(*replay),
+            _ => None,
         };
 
         let repeat = crate::repeat::RepeatGuard::default();
@@ -1036,12 +1073,18 @@ impl Runtime {
                 repeat
                     .after_tool_call_then(role.primary.then(crate::approval::end_turn_on_refusal)),
             ),
+            // #4225: `[compaction]` as configured (global, already checked against every built
+            // model's window). rpi takes it at construction only: a change reaches the sessions
+            // built after it (workers, a new chat), never a live one (see `Reloaded::budgets`).
+            compaction: models.compaction_settings(),
             ..Default::default()
         };
         let harness = Arc::new(
-            AgentHarness::create(options)
-                .await
-                .map_err(|e| AgentError::Harness(format!("{e}")))?,
+            match existing {
+                Some(replay) => create_on_existing(options, replay).await,
+                None => AgentHarness::create(options).await,
+            }
+            .map_err(|e| AgentError::Harness(format!("{e}")))?,
         );
         // Attached even with no server configured yet: a reload may add one (#2242).
         {
@@ -1274,6 +1317,21 @@ pub struct ModelChange {
     pub to: Option<String>,
 }
 
+/// A role whose model stayed the same but whose context window or output budget (`max_tokens`)
+/// a reload changed (#4225): `(context_window, max_tokens)` before and after.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BudgetChange {
+    pub role: String,
+    pub from: (u64, u64),
+    pub to: (u64, u64),
+}
+
+/// What a running session cannot take from a reload (#4225): rpi fixes the compaction settings
+/// when it builds a harness, and the live chat keeps the model it runs on unless its model ref
+/// changed. Workers are built per ticket, so they take it on their next dispatch.
+pub const BUDGET_APPLIES_LATER: &str = "context budget / compaction changes apply to new sessions \
+     and workers; this chat keeps its current budget until a new session";
+
 fn harness_error(e: impl std::fmt::Display) -> AgentError {
     AgentError::Harness(e.to_string())
 }
@@ -1302,6 +1360,11 @@ pub struct Reloaded {
     pub providers: Changes,
     /// Roles (that existed before) whose resolved model or thinking changed.
     pub models: Vec<ModelChange>,
+    /// Roles whose model stayed but whose window or output budget changed (#4225).
+    pub budgets: Vec<BudgetChange>,
+    /// `[compaction]` before and after, when it changed (#4225).
+    #[serde(skip)]
+    pub compaction: Option<(CompactionSettings, CompactionSettings)>,
     pub mcp: McpReload,
     /// Repo agents, skills and settings that are new or changed on disk but not trusted as they
     /// are now (#2310), so this reload left them out. Each is reported once.
@@ -1315,6 +1378,8 @@ impl Reloaded {
             && self.skills.is_empty()
             && self.providers.is_empty()
             && self.models.is_empty()
+            && self.budgets.is_empty()
+            && self.compaction.is_none()
             && self.mcp.is_empty()
             && self.untrusted.is_empty()
     }
@@ -1344,6 +1409,24 @@ impl Reloaded {
                 show(&m.from),
                 show(&m.to)
             ));
+        }
+        for b in &self.budgets {
+            out.push(format!(
+                "budget {}: context_window {} → {}, max_tokens {} → {}",
+                b.role, b.from.0, b.to.0, b.from.1, b.to.1
+            ));
+        }
+        if let Some((from, to)) = &self.compaction {
+            let show = |c: &CompactionSettings| {
+                format!(
+                    "enabled {}, reserve_tokens {}, keep_recent_tokens {}",
+                    c.enabled, c.reserve_tokens, c.keep_recent_tokens
+                )
+            };
+            out.push(format!("compaction: {} → {}", show(from), show(to)));
+        }
+        if !self.budgets.is_empty() || self.compaction.is_some() {
+            out.push(BUDGET_APPLIES_LATER.to_owned());
         }
         let mcp = Changes {
             added: self.mcp.added.clone(),
@@ -1595,6 +1678,17 @@ pub enum SessionKind {
     Jsonl {
         dir: PathBuf,
     },
+    /// The saved JSONL session at `path`, continued in place (AMP #4239: resuming a stopped or
+    /// crashed worker). Built with `allow_existing_session`, so rpi's crash recovery runs: an
+    /// operation the old process left open is closed, and every tool call it left without a
+    /// result gets one. With `replay`, a tool declared `ToolReplay::Safe` is re-run and the run is
+    /// left resumable ([`AgentHarness::pending_resume`]); without it no tool is re-run at all (every
+    /// open call gets the unknown-outcome stand-in) and the caller continues with a prompt of its
+    /// own. Refused like [`resume_session`]: another cwd, a live writer (`Busy`), a damaged header.
+    Existing {
+        path: PathBuf,
+        replay: bool,
+    },
 }
 
 /// One session to build.
@@ -1674,6 +1768,37 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// `AgentHarness::create` on a session that already has records (AMP #4239,
+/// [`SessionKind::Existing`]): `allow_existing_session`, so rpi's crash recovery runs on whatever
+/// operation the old process left open.
+///
+/// With `replay`, the tools keep their own replay flags: recovery re-runs a call only when it was
+/// recorded `ToolReplay::Safe` and the tool still declares it, gives every other open call the
+/// unknown-outcome stand-in, and leaves the run resumable ([`AgentHarness::pending_resume`]).
+///
+/// Without it (continue), nothing is re-run at all: recovery sees every tool as `Never`, so every
+/// open call gets the stand-in, and the real flags are put back right after `create` so the next
+/// run's own frames record them. The caller ignores any `pending_resume` and prompts instead.
+pub async fn create_on_existing(
+    mut options: AgentHarnessOptions,
+    replay: bool,
+) -> rpi_harness::result::HarnessResult<AgentHarness> {
+    options.allow_existing_session = true;
+    if replay {
+        return AgentHarness::create(options).await;
+    }
+    let tools = options.tools.clone();
+    let active = options.active_tool_names.clone();
+    options.tools = tools
+        .iter()
+        .cloned()
+        .map(|t| t.with_replay(ToolReplay::Never))
+        .collect();
+    let harness = AgentHarness::create(options).await?;
+    harness.set_tools(tools, Some(active)).await?;
+    Ok(harness)
 }
 
 /// A fresh in-memory session.

@@ -8,7 +8,10 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
 use amp_core::{agent::memory_session, events::ChannelEmitter};
-use amp_tui::{COMMANDS, DRAG_KEY, HelpBlock, KEYS, PLACEHOLDER, Shell, ShellInfo, Submit, keys};
+use amp_tui::{
+    COMMANDS, DRAG_KEY, HelpBlock, KEYS, MODIFIER_DRAG_KEY, NewlineMode, PLACEHOLDER,
+    SELECT_COPY_KEY, Shell, ShellInfo, Submit, keys, keys_with,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rpi_agent::AgentEvent;
 use rpi_ai::{
@@ -370,7 +373,8 @@ async fn help_is_grouped_with_descriptions_and_fits_80_columns() {
 }
 
 /// With mouse capture off (`[tui] mouse = false`, #2185) plain drag selects: /help names no
-/// modifier and no terminal (#2210). On, it keeps the Fn/Option row.
+/// modifier and no terminal (#2210). On, the drag row is select-to-copy (AMP #4218): the old
+/// Fn/Option row would be wrong, since a plain drag now selects and copies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn help_keys_follow_mouse_capture() {
     let _lock = LOCK.lock().await;
@@ -411,9 +415,15 @@ async fn help_keys_follow_mouse_capture() {
             .map(|l| rpi_tui::strip_ansi(l).trim_end().to_owned())
             .collect::<Vec<_>>()
     );
-    assert!(on.iter().any(|r| r.contains("Fn/⌥-drag")), "{on:?}");
+    assert!(!on.iter().any(|r| r.contains("Fn/⌥-drag")), "{on:?}");
+    assert!(
+        on.iter()
+            .any(|r| r.contains("select transcript text, copied on release")),
+        "{on:?}"
+    );
     assert!(!off.iter().any(|r| r.contains("Fn/⌥-drag")), "{off:?}");
     assert_eq!(keys(true), KEYS.to_vec());
+    assert_eq!(keys(true).last(), Some(&SELECT_COPY_KEY));
     assert_eq!(keys(false).last(), Some(&DRAG_KEY));
     // #2347: clicking a worker needs mouse reporting, so its row goes too.
     assert_eq!(keys(false).len(), KEYS.len() - 1);
@@ -459,4 +469,44 @@ async fn every_listed_command_is_one_the_shell_runs() {
             );
         }
     }
+}
+
+/// AMP #4218: with mouse capture on and `[tui] select_copy = false` the chat does not select,
+/// so `/help` names the terminal's modifier-drag again; with capture off the select setting
+/// changes nothing (plain drag is the terminal's own).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn help_keys_follow_select_copy() {
+    let _lock = LOCK.lock().await;
+    let mut rig = rig().await;
+    rig.shell.set_select_copy(false);
+    assert!(!rig.shell.select_copy());
+    rig.shell.submit("/help").await;
+    let screen = unboxed(&rig.shell.view().render_plain(W, 80));
+    assert!(
+        screen.iter().any(|l| l.contains("Fn/⌥-drag")),
+        "{}",
+        screen.join("\n")
+    );
+    assert!(
+        !screen.iter().any(|l| l.contains("copied on release")),
+        "{}",
+        screen.join("\n")
+    );
+
+    let kitty = NewlineMode::Kitty;
+    assert_eq!(keys_with(true, true, kitty), KEYS.to_vec());
+    assert_eq!(
+        keys_with(true, false, kitty).last(),
+        Some(&MODIFIER_DRAG_KEY)
+    );
+    assert_eq!(keys_with(true, false, kitty).len(), KEYS.len());
+    assert_eq!(keys_with(false, false, kitty), keys(false));
+    assert_eq!(keys_with(false, true, kitty), keys(false));
+    let rows: Vec<String> = HelpBlock::new()
+        .select_copy(false)
+        .render(HELP_80)
+        .iter()
+        .map(|l| rpi_tui::strip_ansi(l).trim_end().to_owned())
+        .collect();
+    snapshot("help-80-select-copy-off", &rows);
 }

@@ -8,7 +8,7 @@
 //! [`Session::fanout`], or reads the numbered chat from [`Session::feed`].
 //!
 //! A primary role (the manager) also gets a worker [`Supervisor`] and its `amp_run_ticket` tool
-//! (D7, M2-5), limited by config.toml `[workers]` and `AMP_HARNESS_MAX_WORKERS` /
+//! (D7, M2-5) with its worker-control tools ([`manager_tools`]: `amp_stop_worker`, #4233), limited by config.toml `[workers]` and `AMP_HARNESS_MAX_WORKERS` /
 //! `AMP_HARNESS_WORKER_TIMEOUT_SECS` / `AMP_HARNESS_WORKER_MAX_TURNS`. Aborting the manager's run
 //! cancels the workers its tool calls started; [`Supervisor::cancel_all`] cancels every worker.
 //!
@@ -64,6 +64,10 @@ pub struct SessionRequest<'a> {
     /// How `amp_run_ticket` picks its [`DispatchMode`]: [`HEADLESS_DISPATCH`] for `run -p`,
     /// [`CHAT_DISPATCH`] for the interactive chat.
     pub dispatch: Dispatch,
+    /// Who confirms the manager's self-management writes (AMP #4247, #4259): the chat's y/N
+    /// prompt. `None` (headless `run -p`) denies every such write ("no person can confirm it
+    /// here").
+    pub confirmer: Option<Arc<dyn amp_core::approval::Confirmer>>,
 }
 
 /// How a front end chooses the manager's [`DispatchMode`] against `[workers] dispatch` and
@@ -111,6 +115,17 @@ pub struct Session {
     pub mcp_events: tokio::sync::broadcast::Receiver<amp_core::mcp_hub::HubEvent>,
     /// MCP servers still on their first attempt when the session was built.
     pub mcp_starting: Vec<String>,
+    /// [`SessionRequest::confirmer`], for the self-management tools (#4252) and `/reload`.
+    pub confirmer: Option<Arc<dyn amp_core::approval::Confirmer>>,
+}
+
+/// The manager's tools that come with its [`Supervisor`]: `amp_run_ticket` and the worker-control
+/// tools (`amp_stop_worker`, #4233; restart/resume join [`amp_core::worker_control::tools`] without
+/// touching this). The session and `/reload` both register exactly this list.
+pub(crate) fn manager_tools(sup: &Arc<Supervisor>) -> Vec<rpi_harness::types::HarnessTool> {
+    let mut tools = vec![sup.tool()];
+    tools.extend(amp_core::worker_control::tools(sup));
+    tools
 }
 
 /// The manager's `[workers]` settings for this front end: `dispatch` decides the mode (see
@@ -251,6 +266,11 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
     } else {
         None
     };
+    // #4235: a comment added to a running worker's ticket reaches that worker. The watcher holds
+    // the supervisor weakly and ends with it.
+    if let Some(sup) = &supervisor {
+        amp_core::comment_watch::spawn(sup, Arc::clone(&rt.mcp));
+    }
     let (emitter, events) = ChannelEmitter::new();
     let fanout = FanOutEmitter::new();
     fanout.add_sink(emitter.into_emitter());
@@ -265,12 +285,22 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
     spec.project = project.clone();
     // #2364: where its workers work (git worktrees, a folder each, or this folder shared).
     spec.extra_context = supervisor.as_ref().map(|s| s.workspace_context());
-    spec.extra_tools = supervisor.iter().map(|s| s.tool()).collect();
+    // #4233: amp_run_ticket, then the manager's worker-control tools (amp_stop_worker, ...).
+    spec.extra_tools = supervisor.iter().flat_map(manager_tools).collect();
     spec.extra_tools.push(SessionUsageTool::harness_tool(
         model,
         Arc::clone(&totals),
         false,
     ));
+    // #4252: amp_manage_agent / amp_manage_skill, for the manager only. Headless `run -p` has no
+    // confirmer, so every call there is refused.
+    if role.primary {
+        spec.extra_tools.extend(crate::manage_tools::tools(
+            rt.paths.clone(),
+            cwd.clone(),
+            req.confirmer.clone(),
+        ));
+    }
     spec.emitter = Some(
         TotalsEmitter::new(Arc::clone(&totals), Some(fanout.clone().into_emitter())).into_emitter(),
     );
@@ -306,6 +336,7 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         offline,
         mcp_events,
         mcp_starting,
+        confirmer: req.confirmer,
     })
 }
 

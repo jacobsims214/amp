@@ -266,3 +266,222 @@ impl RoleRegistry {
             .collect()
     }
 }
+
+// ------------------------------------------------------------------------------------------------
+// Self-management guard (#4246): what a tool-driven agent edit may change without widening.
+// ------------------------------------------------------------------------------------------------
+
+/// The outcome of [`permission_widens`]: whether the new `permission:` block lets the agent do
+/// anything the old one (or the baseline) did not, and why, in words a person confirms.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Widening {
+    pub widens: bool,
+    /// One line per widening change (empty when `widens` is false).
+    pub reasons: Vec<String>,
+}
+
+/// The policy a newly created agent is compared with (there is no old one): bash, edit and
+/// webfetch denied. A new agent with no `permission:` block gets the defaults (allow for all
+/// but `external_directory`), so it widens on all three.
+pub fn new_agent_baseline() -> Policy {
+    let mut baseline = Policy::default();
+    for permission in ["bash", "edit", "webfetch"] {
+        baseline.push(Rule {
+            permission: permission.into(),
+            pattern: "*".into(),
+            action: Action::Deny,
+        });
+    }
+    baseline
+}
+
+/// Whether going from `old` (or `baseline` for a new agent, `old == None`) to `new` widens the
+/// agent's permissions, with the reasons.
+///
+/// Glob containment can't be decided in general, so the rule is conservative (#3139, #3144):
+/// the only changes that don't widen are **adding deny/ask rules** and **removing allow rules**
+/// (`ask` counts as deny, as the harness enforces it). Everything else widens:
+/// - a new `allow` rule, including one with a broader glob than the rule it replaces;
+/// - a removed `deny`/`ask` rule, or a removed key or block, because a missing key falls back to
+///   the default (allow for every permission but `external_directory`, which is ask);
+/// - moving a deny before an allow it used to override.
+///
+/// One exception keeps no-ops quiet: an added `allow` for a literal permission the old policy
+/// already allowed everywhere (no rule but allow, default allow) changes nothing.
+///
+/// Computed as the cheapest alignment of the two rule lists, where matching an equal rule,
+/// dropping an old allow and inserting a new deny are free, and dropping an old deny or inserting
+/// a new allow cost one each. It widens when every alignment costs something.
+pub fn permission_widens(old: Option<&Policy>, new: &Policy, baseline: &Policy) -> Widening {
+    let from = old.unwrap_or(baseline);
+    let (a, b) = (from.rules(), new.rules());
+    let (n, m) = (a.len(), b.len());
+    let same = |x: &Rule, y: &Rule| {
+        x.permission == y.permission
+            && x.pattern == y.pattern
+            && x.action.allows() == y.action.allows()
+    };
+    let drop_cost = |r: &Rule| usize::from(!r.action.allows());
+    let add_cost = |r: &Rule| {
+        let harmless = !r.action.allows()
+            || (!has_wildcard(&r.permission) && from.allows_everything(&r.permission));
+        usize::from(!harmless)
+    };
+    // cost[i][j]: the cheapest way to turn a[i..] into b[j..].
+    let mut cost = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..=n).rev() {
+        for j in (0..=m).rev() {
+            if i == n && j == m {
+                continue;
+            }
+            let mut best = usize::MAX;
+            if i < n {
+                best = best.min(drop_cost(&a[i]) + cost[i + 1][j]);
+            }
+            if j < m {
+                best = best.min(add_cost(&b[j]) + cost[i][j + 1]);
+            }
+            if i < n && j < m && same(&a[i], &b[j]) {
+                best = best.min(cost[i + 1][j + 1]);
+            }
+            cost[i][j] = best;
+        }
+    }
+    if cost[0][0] == 0 {
+        return Widening::default();
+    }
+    // Walk one cheapest alignment back and name what it charged for.
+    let (mut removed, mut added) = (Vec::new(), Vec::new());
+    let (mut i, mut j) = (0, 0);
+    while i < n || j < m {
+        if i < n && j < m && same(&a[i], &b[j]) && cost[i][j] == cost[i + 1][j + 1] {
+            i += 1;
+            j += 1;
+        } else if i < n && cost[i][j] == drop_cost(&a[i]) + cost[i + 1][j] {
+            if drop_cost(&a[i]) > 0 {
+                removed.push(&a[i]);
+            }
+            i += 1;
+        } else {
+            if add_cost(&b[j]) > 0 {
+                added.push(&b[j]);
+            }
+            j += 1;
+        }
+    }
+    let mut reasons = Vec::new();
+    for r in &removed {
+        let now = new.evaluate(&r.permission, &r.pattern);
+        let changed = added
+            .iter()
+            .any(|x| x.permission == r.permission && x.pattern == r.pattern);
+        if changed {
+            reasons.push(format!(
+                "{} {:?}: {} -> allow",
+                r.permission,
+                r.pattern,
+                r.action.as_str()
+            ));
+        } else {
+            reasons.push(format!(
+                "removes {} {:?}: {} (now {})",
+                r.permission,
+                r.pattern,
+                r.action.as_str(),
+                now.as_str()
+            ));
+        }
+    }
+    for x in &added {
+        let changed = removed
+            .iter()
+            .any(|r| x.permission == r.permission && x.pattern == r.pattern);
+        if !changed {
+            reasons.push(format!("adds {} {:?}: allow", x.permission, x.pattern));
+        }
+    }
+    Widening {
+        widens: true,
+        reasons,
+    }
+}
+
+fn has_wildcard(text: &str) -> bool {
+    text.contains(['*', '?'])
+}
+
+/// A tool-driven edit of an agent that no confirmation can allow.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("agent {id}: {reason}")]
+pub struct AgentEditRefused {
+    pub id: String,
+    pub reason: String,
+}
+
+/// Refuse a tool-driven create/edit/remove of a primary agent (#4246): the role `id` names in
+/// `registry` is primary or is [`RoleRegistry::manager`], or the edit makes it primary
+/// (`new_primary`, the new file's `mode: primary`). Judged on the role, never on the name
+/// `amp-manager`. A person edits primaries with `amp-harness agents edit`.
+pub fn refuse_primary(
+    registry: &RoleRegistry,
+    id: &str,
+    new_primary: bool,
+) -> Result<(), AgentEditRefused> {
+    let refused = |reason: &str| AgentEditRefused {
+        id: id.to_owned(),
+        reason: reason.to_owned(),
+    };
+    if let Some(role) = registry.get(id) {
+        if role.id == registry.manager().id {
+            return Err(refused(
+                "is the manager; tools can't change it (a person can, with `amp-harness agents edit`)",
+            ));
+        }
+        if role.primary {
+            return Err(refused(
+                "is a primary agent; tools can't change it (a person can, with `amp-harness agents edit`)",
+            ));
+        }
+    }
+    if new_primary {
+        return Err(refused(
+            "would become a primary agent (mode: primary); tools may only write subagents",
+        ));
+    }
+    Ok(())
+}
+
+/// What saving `role` means for dispatch (#4246): `Some(note)` when the `manager` may dispatch it
+/// as soon as it is loaded (live reload picks the file up within seconds), because the manager's
+/// `task` rules allow its id (the shipped `"amp-*": allow`) or it says `dispatch: true` and no
+/// manager rule names it denied. `None` for primaries and agents the manager can't dispatch.
+pub fn dispatch_effect(manager: &Role, role: &Role) -> Option<String> {
+    if role.primary {
+        return None;
+    }
+    let explicit_deny = manager
+        .policy
+        .matching_rule("task", &role.id)
+        .is_some_and(|r| !r.action.allows() && r.pattern != "*" && r.pattern != "**");
+    if role.dispatch && !explicit_deny {
+        return Some(format!(
+            "{} becomes dispatchable by {} immediately: it says dispatch: true",
+            role.id, manager.id
+        ));
+    }
+    match manager.policy.matching_rule("task", &role.id) {
+        Some(rule) if rule.action.allows() => Some(format!(
+            "{} becomes dispatchable by {} immediately: its task rule {:?} allows it",
+            role.id, manager.id, rule.pattern
+        )),
+        None if default_task_allows() => Some(format!(
+            "{} becomes dispatchable by {} immediately: no task rule names it and task defaults to allow",
+            role.id, manager.id
+        )),
+        _ => None,
+    }
+}
+
+fn default_task_allows() -> bool {
+    Policy::default().evaluate("task", "x").allows()
+}

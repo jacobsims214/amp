@@ -595,6 +595,88 @@ async fn skills_crud_at_user_and_repo_scope() {
 }
 
 // ------------------------------------------------------------------------------------------------
+// #4245: `skills new` / `skills edit` through the non-interactive writer (`write_skill_in`), which
+// backs up the layer's SKILL.md before an edit.
+// ------------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn skills_edit_backs_up_the_layer_skill_md_4245() {
+    let dir = setup("skills-write-4245");
+    let skill_md = user_dir(&dir).join("skills/my-skill/SKILL.md");
+    let backups = || -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = std::fs::read_dir(user_dir(&dir).join(".edit/backup/skills"))
+            .map(|r| r.filter_map(|e| e.ok().map(|e| e.path())).collect())
+            .unwrap_or_default();
+        out.sort();
+        out
+    };
+
+    let out = cli(
+        &dir,
+        &["skills", "new", "my-skill", "--description", "Does things"],
+    )
+    .await;
+    ok(&out, "skills new");
+    assert!(
+        out.stdout.contains("Created skill my-skill (user)"),
+        "{}",
+        out.stdout
+    );
+    assert!(backups().is_empty(), "a new skill has nothing to back up");
+    let original = std::fs::read_to_string(&skill_md).unwrap();
+
+    let good = editor(&dir, "good", "s/^description: .*/description: Edited/");
+    let out = cli_env(&dir, &["skills", "edit", "my-skill"], &[("EDITOR", &good)]).await;
+    ok(&out, "edit");
+    assert!(out.stdout.contains("Saved my-skill: "), "{}", out.stdout);
+    assert!(
+        std::fs::read_to_string(&skill_md)
+            .unwrap()
+            .contains("description: Edited")
+    );
+    let saved = backups();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert!(
+        saved[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("my-skill."),
+        "{saved:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(saved[0].join("SKILL.md")).unwrap(),
+        original
+    );
+
+    // An invalid edit writes nothing and backs nothing up.
+    let edited = std::fs::read_to_string(&skill_md).unwrap();
+    let bad = editor(&dir, "bad", "s/^name: .*/name: other-name/");
+    let out = cli_env(&dir, &["skills", "edit", "my-skill"], &[("EDITOR", &bad)]).await;
+    assert!(
+        out.code == 1 && out.stderr.contains("must match its directory"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(std::fs::read_to_string(&skill_md).unwrap(), edited);
+    assert_eq!(backups().len(), 1);
+
+    // Backups are not skills: everything still loads.
+    let out = cli(&dir, &["skills", "validate", "--json"]).await;
+    ok(&out, "validate");
+    assert_eq!(out.json()["ok"], true);
+    let list = cli(&dir, &["skills", "list", "--json"]).await.json();
+    assert!(
+        list["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| !s["name"].as_str().unwrap().starts_with('.')),
+        "{list:#}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
 // A new agent, dispatched by the manager on faux models.
 // ------------------------------------------------------------------------------------------------
 
@@ -1055,4 +1137,139 @@ async fn untrusted_repo_agents_and_skills_are_not_listed_as_in_use() {
     .await;
     ok(&out, "trust");
     check_trusted(&[]).await;
+}
+
+// ------------------------------------------------------------------------------------------------
+// #4244: the non-interactive agent writer (`agents_cmd::write_agent_in`) behind `new` / `edit`.
+// Validates before writing and keeps the previous file in `<layer>/.edit/backup/agents/`.
+// (Skill-writer tests from #4245 go in their own section.)
+// ------------------------------------------------------------------------------------------------
+
+/// The agent backups in `<layer>/.edit/backup/agents/` (`<id>.<unix ms>/<id>.md`), sorted.
+fn agent_backups(layer: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(layer.join(".edit/backup/agents")) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flat_map(|e| std::fs::read_dir(e.unwrap().path()).unwrap())
+        .map(|e| e.unwrap().path())
+        .collect();
+    files.sort();
+    files
+}
+
+#[tokio::test]
+async fn write_agent_in_backs_up_before_overwriting_and_refuses_invalid_text() {
+    let dir = setup("write-agent-in");
+    let user = user_dir(&dir);
+    let file = user.join("agents/sql-expert.md");
+
+    // new: nothing to back up.
+    let out = cli(
+        &dir,
+        &["agents", "new", "sql-expert", "--description", "Writes SQL"],
+    )
+    .await;
+    ok(&out, "new");
+    assert!(agent_backups(&user).is_empty());
+    let original = std::fs::read_to_string(&file).unwrap();
+
+    // An invalid edit is refused before anything is written or backed up.
+    let bad = editor(&dir, "bad", "s/^description: .*/description:/");
+    let out = cli_env(&dir, &["agents", "edit", "sql-expert"], &[("EDITOR", &bad)]).await;
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+    assert!(
+        agent_backups(&user).is_empty(),
+        "no backup for a refused edit"
+    );
+
+    // A valid edit keeps the previous version in the hidden backup dir and says where.
+    let good = editor(&dir, "good", "s/^description: .*/description: SQL, edited/");
+    let out = cli_env(
+        &dir,
+        &["agents", "edit", "sql-expert"],
+        &[("EDITOR", &good)],
+    )
+    .await;
+    ok(&out, "edit");
+    let backups = agent_backups(&user);
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    let backup = &backups[0];
+    assert_eq!(backup.file_name().unwrap(), "sql-expert.md");
+    let stamp_dir = backup
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy();
+    assert!(stamp_dir.starts_with("sql-expert."), "{stamp_dir}");
+    assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+    assert!(
+        out.stdout
+            .contains(&format!("previous version: {}", backup.display())),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("description: SQL, edited")
+    );
+
+    // A second edit adds a backup and never overwrites the first.
+    let again = editor(&dir, "again", "s/^description: .*/description: SQL, again/");
+    let out = cli_env(
+        &dir,
+        &["agents", "edit", "sql-expert"],
+        &[("EDITOR", &again)],
+    )
+    .await;
+    ok(&out, "edit again");
+    let backups = agent_backups(&user);
+    assert_eq!(backups.len(), 2, "{backups:?}");
+    assert!(
+        backups.contains(backup),
+        "the first backup is kept: {backups:?}"
+    );
+    assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+
+    // The backups are never loaded as agents: the roster is unchanged and still valid.
+    let list = cli(&dir, &["agents", "list", "--json"]).await.json();
+    let ids: Vec<&str> = list["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a["id"].as_str())
+        .filter(|id| id.contains("sql-expert"))
+        .collect();
+    assert_eq!(ids, ["sql-expert"]);
+    assert_eq!(agent(&list, "sql-expert")["description"], "SQL, again");
+    let out = cli(&dir, &["agents", "validate", "--json"]).await;
+    ok(&out, "validate");
+    assert_eq!(out.json()["ok"], true);
+
+    // The first override of a built-in agent has no previous layer file: no backup.
+    let docs = editor(
+        &dir,
+        "docs",
+        "s/^description: .*/description: Docs, edited/",
+    );
+    let out = cli_env(
+        &dir,
+        &["agents", "edit", "amp-worker-docs", "--repo"],
+        &[("EDITOR", &docs)],
+    )
+    .await;
+    ok(&out, "edit built-in");
+    assert!(!out.stdout.contains("previous version"), "{}", out.stdout);
+    assert!(agent_backups(&repo_dir(&dir)).is_empty());
+
+    // `new` on an id with a file is refused before writing: no backup, file untouched.
+    let before = std::fs::read_to_string(&file).unwrap();
+    let out = cli(&dir, &["agents", "new", "sql-expert"]).await;
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(out.stderr.contains("already exists"), "{}", out.stderr);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+    assert_eq!(agent_backups(&user).len(), 2);
 }

@@ -6,7 +6,7 @@ mod common;
 
 use std::{path::Path, process::Stdio, time::Duration};
 
-use common::{MockAmp, Output, run, spawn, workdir};
+use common::{MockAmp, Output, flat, run, spawn, workdir};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
@@ -40,6 +40,7 @@ async fn server_answering(dir: &Path, args: &[&str], stdin: &str) -> Output {
         .current_dir(dir.join("project"))
         .env("HOME", dir.join("home"))
         .env("XDG_CONFIG_HOME", dir.join("home/.config"))
+        .envs(common::xdg_env(&dir.join("home")))
         .env("AMP_CREDENTIAL_STORE", "file")
         .env("AMP_HARNESS_CEILING_DIR", dir)
         .env("AMP_HARNESS_PROMPTS", "stdin")
@@ -546,10 +547,11 @@ async fn a_switched_session_only_has_the_new_servers_tools() {
     )
     .await;
     ok(&out);
-    // The unnamed first server was kept under a name when `two` became active.
-    // (the notice wraps at this width)
+    // The unnamed first server was kept under a name when `two` became active. The notice
+    // names the config path, which sits under CARGO_TARGET_DIR, so where it wraps at this
+    // width depends on that path's length: match it on the flattened screen (#4275).
     assert!(
-        out.stdout.contains("server is kept as `local`)"),
+        flat(&out.stdout).contains("(your previous server is kept as `local`)"),
         "{}",
         out.stdout
     );

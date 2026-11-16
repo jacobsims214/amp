@@ -1091,7 +1091,8 @@ impl Switcher {
             .clone()
     }
 
-    fn current(&self) -> Settings {
+    /// The AMP server settings the session uses now (after any `/server` switch).
+    pub(crate) fn current(&self) -> Settings {
         self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

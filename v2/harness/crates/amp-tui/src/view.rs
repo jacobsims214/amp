@@ -68,7 +68,8 @@ use crate::frame::{BorderRow, Edge, Framed, Gutter, Spacer, Titles, TitlesFn};
 use crate::inset::{Gap, Inset, Padding};
 use crate::overlay::{Panel, PanelKind};
 use crate::roster::{NoticeKind, Roster, WorkerNotice, WorkerStrip};
-use crate::scroll::{TranscriptScroll, paint_pill};
+use crate::scroll::{SelectionLayer, TranscriptScroll, paint_pill};
+use crate::selection::{Pos, Selection};
 use crate::slash::CommandMenu;
 use crate::transcript::{
     AssistantBlock, Block, THINKING_HINT, THINKING_HINT_KEY, ThinkingDisplay, ToolBlock,
@@ -147,6 +148,8 @@ pub struct ChatView {
     root: Arc<dyn Component>,
     /// The transcript's scroll position and the "↓ new output" pill (#2185).
     scroll: TranscriptScroll,
+    /// Select-to-copy's highlight and selected text (#4215), inside the scroll view.
+    selection: Arc<SelectionLayer>,
     /// The assistant message being streamed, if any.
     assistant: Option<Arc<AssistantBlock>>,
     /// Running tool calls by id.
@@ -233,10 +236,13 @@ impl ChatView {
         // the box has no sides and the transcript is inset as before the boxes.
         let flush = Arc::new(AtomicBool::new(false));
         let inner_padding = Padding::new(0);
-        let scroll = TranscriptScroll::new(Arc::new(ScrollView::primary(Arc::new(Inset::new(
-            transcript_slot.clone(),
+        // #4215: the selection layer between the scroll view and the inset takes the row
+        // markers off and paints the select-to-copy highlight, for every chat the slot shows.
+        let selection = Arc::new(SelectionLayer::new(
+            Arc::new(Inset::new(transcript_slot.clone(), inner_padding.clone())),
             inner_padding.clone(),
-        )))));
+        ));
+        let scroll = TranscriptScroll::new(Arc::new(ScrollView::primary(selection.clone())));
         let session_slot = Arc::new(Container::new());
         let status = Arc::new(Container::new());
         let panel = Panel::new(chrome.clone());
@@ -420,6 +426,7 @@ impl ChatView {
             menu,
             root: Arc::new(root),
             scroll,
+            selection,
             assistant: None,
             tools: HashMap::new(),
             group: Mutex::new(None),
@@ -549,6 +556,7 @@ impl ChatView {
     /// Shows a worker's session in place of the manager's transcript and editor (#2252), or
     /// (`None`) the manager again. The transcript jumps to its latest output either way.
     pub fn show_session(&self, session: Option<SessionParts>) {
+        self.clear_selection();
         self.transcript_slot.clear();
         self.session_slot.clear();
         self.editor_slot.clear();
@@ -593,6 +601,7 @@ impl ChatView {
     /// line was already said). What was restored after it renders through [`Self::apply`] like
     /// any replayed transcript — display only, no tool runs, no model call.
     pub fn clear_transcript(&mut self) {
+        self.clear_selection();
         let banner = self.banner.lock().ok().and_then(|b| b.clone());
         self.transcript.clear();
         if let Some(banner) = banner {
@@ -656,6 +665,7 @@ impl ChatView {
     /// Columns of space left and right of every area (`[tui] padding`, #2251; at most
     /// [`crate::MAX_PADDING`]). Narrow terminals get less ([`Padding::at`]).
     pub fn set_padding(&self, columns: usize) {
+        self.clear_selection();
         self.padding.set(columns);
         if self.flush.load(Ordering::Relaxed) {
             self.inner_padding.set(columns);
@@ -672,6 +682,7 @@ impl ChatView {
     /// #2345) those already in the transcript, which open for `full` and close otherwise.
     pub fn set_show_thinking(&mut self, display: ThinkingDisplay) {
         self.show_thinking = display;
+        self.clear_selection();
         for child in self.transcript.get_children() {
             if let Some(a) = child.as_any().downcast_ref::<AssistantBlock>() {
                 a.set_display(display);
@@ -703,7 +714,11 @@ impl ChatView {
     /// Expands or collapses the last thinking section (Ctrl+T). `None` when there is none yet,
     /// else whether it is now expanded.
     pub fn toggle_thinking(&self) -> Option<bool> {
-        self.last_thinking.as_ref()?.toggle_thinking()
+        let expanded = self.last_thinking.as_ref()?.toggle_thinking();
+        if expanded.is_some() {
+            self.clear_selection();
+        }
+        expanded
     }
 
     /// Ctrl+T on a `width` x `height` screen (#2345): expands or collapses the lowest thinking
@@ -774,6 +789,7 @@ impl ChatView {
             .as_any()
             .downcast_ref::<AssistantBlock>()?
             .toggle_section(section)?;
+        self.clear_selection();
         if expanded && following {
             // A layout first, so the scroll view knows the new height (it stays at the end).
             self.layout(screen.0, screen.1);
@@ -788,6 +804,7 @@ impl ChatView {
     /// now expanded.
     pub fn toggle_tools(&self) -> bool {
         let expanded = self.tool_display.toggle();
+        self.clear_selection();
         self.transcript.invalidate();
         expanded
     }
@@ -869,6 +886,85 @@ impl ChatView {
         &self.scroll
     }
 
+    /// The transcript content cell under screen cell `(row, column)` (0-based) on a `width` x
+    /// `height` screen (#4215): `line = scroll.top() + row - rect.y`, `col = column - rect.x`,
+    /// where `rect` is the transcript's scroll view. `None` outside the scroll view.
+    pub fn content_pos(
+        &self,
+        width: usize,
+        height: usize,
+        row: usize,
+        column: usize,
+    ) -> Option<Pos> {
+        let rect = self.scroll_rect(width, height)?;
+        if row < rect.y
+            || row >= rect.y + rect.height
+            || column < rect.x
+            || column >= rect.x + rect.width
+        {
+            return None;
+        }
+        Some(Pos::new(
+            self.scroll.top() + (row - rect.y),
+            column - rect.x,
+        ))
+    }
+
+    /// [`Self::content_pos`] for a drag that may leave the transcript: the cell is clamped into
+    /// the scroll view first (above it: its first shown row; below: its last; left or right:
+    /// its edge columns). `None` before the transcript has a place on screen.
+    pub fn content_pos_clamped(
+        &self,
+        width: usize,
+        height: usize,
+        row: usize,
+        column: usize,
+    ) -> Option<Pos> {
+        let rect = self.scroll_rect(width, height)?;
+        if rect.width == 0 || rect.height == 0 {
+            return None;
+        }
+        let row = row.clamp(rect.y, rect.y + rect.height - 1);
+        let column = column.clamp(rect.x, rect.x + rect.width - 1);
+        self.content_pos(width, height, row, column)
+    }
+
+    /// The transcript's scroll view on screen (select-to-copy's autoscroll, AMP #4217).
+    pub(crate) fn scroll_rect(&self, width: usize, height: usize) -> Option<rpi_tui::LayoutRect> {
+        let frame = self.layout(width, height);
+        let view: Arc<dyn Component> = self.scroll.view().clone();
+        find_box(&frame.root, &view)
+    }
+
+    /// Select-to-copy (#4215): a press at transcript content cell `at`. Nothing is selected
+    /// until [`Self::select_extend`] moves to another cell; a new press drops the old selection.
+    /// Like every selection change, the terminal needs a full repaint to show it.
+    pub fn select_start(&self, at: Pos) {
+        self.selection.start(at);
+    }
+
+    /// The pointer dragged to content cell `to`: selects from the press to `to` (both cells
+    /// included, either direction), painted in reverse video.
+    pub fn select_extend(&self, to: Pos) {
+        self.selection.extend(to);
+    }
+
+    /// The selected text, as shown ([`crate::selection::extract`]): soft-wrapped rows rejoined,
+    /// decoration and padding left out. `None` for no selection or an empty one.
+    pub fn select_text(&self) -> Option<String> {
+        self.selection.text()
+    }
+
+    /// The current selection in content coordinates, if any.
+    pub fn selection(&self) -> Option<Selection> {
+        self.selection.selection()
+    }
+
+    /// Drops the selection and any press. Called for anything that reflows the transcript.
+    pub fn clear_selection(&self) {
+        self.selection.clear();
+    }
+
     /// Adds a component to the transcript (the ticket marker).
     pub fn add_to_transcript(&self, component: Arc<dyn Component>) {
         // #2423: the pairing link's rows start at the screen's edge, so a selection of them is
@@ -876,6 +972,7 @@ impl ChatView {
         if component.as_any().is::<crate::remote_ui::LinkBlock>()
             && !self.flush.swap(true, Ordering::Relaxed)
         {
+            self.clear_selection();
             self.inner_padding.set(self.padding.columns());
             self.root.invalidate();
         }

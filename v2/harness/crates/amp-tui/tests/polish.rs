@@ -23,7 +23,7 @@ use amp_core::{agent::memory_session, events::ChannelEmitter};
 use amp_tui::{
     AmpTheme, ColorDepth, Shell, ShellInfo, Submit, Variant, install_theme,
     transcript::{AssistantBlock, MarkdownStyle, WrapMarkdown},
-    wrap::plain,
+    wrap::{plain, take_row_meta},
 };
 use rpi_ai::{
     ThinkingLevel,
@@ -109,7 +109,11 @@ fn code_blocks_carry_truecolor_whole_in_the_light_theme() {
     let _g = themed(Variant::Light, ColorDepth::TrueColor);
     let colors = theme().colors;
     let md = WrapMarkdown::new(code_md(), 1, MarkdownStyle::Plain);
-    let rows = md.render(W);
+    let marked = md.render(W);
+    // Code rows carry select-to-copy's in-band row marker (#4214); the terminal gets them
+    // stripped, and that must be byte-identical to what was drawn before.
+    assert!(marked.iter().any(|r| take_row_meta(r).1.is_some()));
+    let rows: Vec<String> = marked.iter().map(|r| take_row_meta(r).0).collect();
     check_snapshot("codeblock-amp-light-truecolor", &visible(&rows));
 
     let surface = colors.md_code_block_bg.to_bg();

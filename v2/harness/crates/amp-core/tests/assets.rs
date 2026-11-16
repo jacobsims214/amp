@@ -52,6 +52,58 @@ fn embedded_roster_is_the_eleven_roles() {
     assert_eq!(assets.manifest().source_sha256.len(), 64);
 }
 
+/// The manager's self-management tools (amp-harness `manage_tools`, #4252/#4253) and its
+/// worker-control tools (`policy::WORKER_CONTROL_TOOLS`, #4233/#4240): the generated manager
+/// allows all six, every worker role denies all six (#4255).
+#[test]
+fn manager_only_tools_are_allowed_for_the_manager_and_denied_for_every_worker() {
+    let mut tools = vec!["amp_manage_agent", "amp_manage_skill", "amp_add_mcp_server"];
+    tools.extend_from_slice(amp_core::policy::WORKER_CONTROL_TOOLS);
+    assert_eq!(tools.len(), 6);
+    let assets = Assets::embedded().unwrap();
+    let manager = assets.agent("amp-manager").unwrap();
+    for tool in &tools {
+        assert_eq!(
+            manager.frontmatter["permission"][tool], "allow",
+            "amp-manager {tool}"
+        );
+    }
+    for id in WORKERS {
+        let a = assets.agent(id).unwrap();
+        for tool in &tools {
+            assert_eq!(a.frontmatter["permission"][tool], "deny", "{id} {tool}");
+        }
+    }
+}
+
+/// The harness-only amp-self-management skill (#4256) ships, says when the manager may use each
+/// of those six tools, and the manager's prompt points at it.
+#[test]
+fn self_management_skill_ships_and_the_manager_prompt_names_it() {
+    let assets = Assets::embedded().unwrap();
+    let skill = assets
+        .skill("amp-self-management")
+        .expect("amp-self-management skill");
+    assert!(skill.description.contains("Manager only"));
+    let mut tools = vec!["amp_manage_agent", "amp_manage_skill", "amp_add_mcp_server"];
+    tools.extend_from_slice(amp_core::policy::WORKER_CONTROL_TOOLS);
+    for needle in tools.iter().copied().chain([
+        "explicitly asks",
+        "Never widen permissions",
+        "amp-harness mcp secret <name>",
+        "`roles` is required",
+        "/mcp enable",
+        "/mcp login",
+        "next turn",
+        "nothing_to_replay",
+        "**after** any",
+    ]) {
+        assert!(skill.content.contains(needle), "skill lacks {needle:?}");
+    }
+    let manager = assets.agent("amp-manager").unwrap();
+    assert!(manager.prompt.contains("**amp-self-management** skill"));
+}
+
 #[test]
 fn embedded_skills_exclude_agent_builder_and_keep_files() {
     let assets = Assets::embedded().unwrap();
@@ -258,15 +310,238 @@ fn materialized_skills_are_readable_rpi_skills() {
     let skills = assets.materialize_skills(&dest).unwrap();
     assert_eq!(skills.len(), assets.skills().count());
     let exec = skills.iter().find(|s| s.name == "amp-execution").unwrap();
+    let root = materialized_root(&dest, &skills);
     assert_eq!(
         Path::new(&exec.file_path),
-        dest.join("amp-execution/SKILL.md")
+        root.join("amp-execution/SKILL.md")
     );
     let on_disk = fs::read_to_string(&exec.file_path).unwrap();
     assert!(on_disk.starts_with("---\nname: amp-execution"));
     assert!(on_disk.contains(&exec.content));
     assert!(
-        dest.join("amp-design-tools/scripts/publish_file.py")
+        root.join("amp-design-tools/scripts/publish_file.py")
             .is_file()
+    );
+}
+
+/// The content-addressed directory a materialize returned: `dest/<12 hex>/`.
+fn materialized_root(dest: &Path, skills: &[rpi_harness::types::Skill]) -> PathBuf {
+    let first = Path::new(&skills[0].file_path);
+    let root = first.parent().unwrap().parent().unwrap().to_path_buf();
+    assert_eq!(root.parent().unwrap(), dest);
+    let hash = root.file_name().unwrap().to_str().unwrap();
+    assert!(
+        hash.len() == 12 && hash.chars().all(|c| c.is_ascii_hexdigit()),
+        "{hash}"
+    );
+    for s in skills {
+        assert!(
+            Path::new(&s.file_path).starts_with(&root),
+            "{}",
+            s.file_path
+        );
+    }
+    root
+}
+
+/// Every file under `dir`, keyed by its path relative to `dir`, with its bytes and mtime.
+fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        out: &mut std::collections::BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)>,
+    ) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+                out.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    (fs::read(&path).unwrap(), mtime),
+                );
+            }
+        }
+    }
+    let mut out = Default::default();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// The entries directly under `dest`.
+fn entries(dest: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dest)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn materializing_identical_skills_reuses_the_directory_and_writes_nothing() {
+    let dest = scratch("materialize-same");
+    let assets = Assets::embedded().unwrap();
+    let first = assets.materialize_skills(&dest).unwrap();
+    let root = materialized_root(&dest, &first);
+    let before = snapshot(&root);
+    assert!(!before.is_empty());
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let again = Assets::embedded()
+        .unwrap()
+        .materialize_skills(&dest)
+        .unwrap();
+    assert_eq!(again, first, "same skills must give the same paths");
+    assert_eq!(
+        snapshot(&root),
+        before,
+        "no file rewritten (bytes and mtime)"
+    );
+    assert_eq!(
+        entries(&dest),
+        [root.file_name().unwrap().to_string_lossy().into_owned()],
+        "no new directory and no leftover temp dir"
+    );
+}
+
+#[test]
+fn changing_a_skill_materializes_a_new_directory_and_leaves_the_old_one_alone() {
+    let dest = scratch("materialize-change");
+    let mut assets = Assets::embedded().unwrap();
+    let first = assets.materialize_skills(&dest).unwrap();
+    let old_root = materialized_root(&dest, &first);
+    let before = snapshot(&old_root);
+
+    let exec = assets.skill("amp-execution").unwrap();
+    let mut md = exec.files["SKILL.md"].bytes.clone();
+    md.extend_from_slice(b"\nChanged body for #4266.\n");
+    let origin = Origin::User(dest.join("override/SKILL.md"));
+    assets
+        .put_skill_file("amp-execution", "SKILL.md", md.clone(), origin)
+        .unwrap();
+    let second = assets.materialize_skills(&dest).unwrap();
+    let new_root = materialized_root(&dest, &second);
+
+    assert_ne!(new_root, old_root, "changed skills need a new directory");
+    let new_exec = second.iter().find(|s| s.name == "amp-execution").unwrap();
+    assert_eq!(fs::read(&new_exec.file_path).unwrap(), md);
+    assert_eq!(
+        snapshot(&old_root),
+        before,
+        "every file under the first directory is untouched"
+    );
+    let mut want = vec![
+        old_root.file_name().unwrap().to_string_lossy().into_owned(),
+        new_root.file_name().unwrap().to_string_lossy().into_owned(),
+    ];
+    want.sort();
+    assert_eq!(entries(&dest), want, "no leftover temp dir");
+}
+
+/// Set `dir`'s mtime to `age` ago (AMP #4278's pruning reads directory mtimes).
+fn backdate(dir: &Path, age: std::time::Duration) {
+    fs::File::open(dir)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - age)
+        .unwrap();
+}
+
+/// A directory under `dest` holding one file, with its mtime set to `age` ago.
+fn aged_dir(dest: &Path, name: &str, age: std::time::Duration) -> PathBuf {
+    let dir = dest.join(name);
+    write(&dir.join("amp-execution/SKILL.md"), "stale");
+    backdate(&dir, age);
+    dir
+}
+
+const HOUR: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+#[test]
+fn materialize_prunes_old_skill_dirs_and_stale_temp_dirs_but_keeps_current_and_recent_ones() {
+    use amp_core::assets::{SKILL_DIR_GRACE, SKILL_TMP_GRACE};
+    assert_eq!(SKILL_DIR_GRACE, 7 * DAY);
+    assert_eq!(SKILL_TMP_GRACE, HOUR);
+
+    let dest = scratch("materialize-prune");
+    let mut assets = Assets::embedded().unwrap();
+    let first = assets.materialize_skills(&dest).unwrap();
+    let previous = materialized_root(&dest, &first);
+    let previous_files = snapshot(&previous);
+
+    // Removed: another skill set untouched past the grace period, and a crash-left temp dir.
+    let old = aged_dir(&dest, "0123456789ab", 8 * DAY);
+    let stale_tmp = aged_dir(&dest, ".tmp-deadbeefdeadbeef", 2 * HOUR);
+    // Kept: a set still inside the grace period, a temp dir a live materialize may be writing,
+    // and entries that aren't ours (a non-hash name, a hash-named file, uppercase hex).
+    let recent = aged_dir(&dest, "ba9876543210", 6 * DAY);
+    let live_tmp = aged_dir(
+        &dest,
+        ".tmp-0000000000000001",
+        10 * 60 * std::time::Duration::from_secs(1),
+    );
+    let foreign = aged_dir(&dest, "notes", 30 * DAY);
+    let upper = aged_dir(&dest, "ABCDEF012345", 30 * DAY);
+    let hash_file = dest.join("fedcba987654");
+    write(&hash_file, "not a dir");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&hash_file)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - 30 * DAY)
+        .unwrap();
+
+    let exec = assets.skill("amp-execution").unwrap();
+    let mut md = exec.files["SKILL.md"].bytes.clone();
+    md.extend_from_slice(b"\nChanged body for #4278.\n");
+    let origin = Origin::User(dest.join("override/SKILL.md"));
+    assets
+        .put_skill_file("amp-execution", "SKILL.md", md, origin)
+        .unwrap();
+    let second = assets.materialize_skills(&dest).unwrap();
+    let current = materialized_root(&dest, &second);
+    assert_ne!(current, previous);
+
+    assert!(
+        !old.exists(),
+        "a skill dir past the grace period is removed"
+    );
+    assert!(!stale_tmp.exists(), "a stale .tmp-* dir is removed");
+    for kept in [
+        &current, &previous, &recent, &live_tmp, &foreign, &upper, &hash_file,
+    ] {
+        assert!(kept.exists(), "{} must be kept", kept.display());
+    }
+    assert_eq!(
+        snapshot(&previous),
+        previous_files,
+        "a recent skill dir is untouched"
+    );
+    for s in &second {
+        assert!(Path::new(&s.file_path).is_file(), "{}", s.file_path);
+    }
+}
+
+#[test]
+fn reusing_an_aged_skill_dir_refreshes_its_mtime_and_never_prunes_it() {
+    let dest = scratch("materialize-reuse-aged");
+    let assets = Assets::embedded().unwrap();
+    let first = assets.materialize_skills(&dest).unwrap();
+    let root = materialized_root(&dest, &first);
+    let files = snapshot(&root);
+    backdate(&root, 30 * DAY);
+
+    let again = assets.materialize_skills(&dest).unwrap();
+    assert_eq!(again, first);
+    assert!(root.is_dir(), "the returned dir is never pruned");
+    assert_eq!(snapshot(&root), files, "reuse rewrites no file");
+    let age = std::time::SystemTime::now()
+        .duration_since(fs::metadata(&root).unwrap().modified().unwrap())
+        .unwrap_or_default();
+    assert!(
+        age < HOUR,
+        "reuse refreshes the dir's mtime, got age {age:?}"
     );
 }

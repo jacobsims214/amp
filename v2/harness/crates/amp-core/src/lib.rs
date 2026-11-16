@@ -36,6 +36,10 @@
 //!   AMP, a git worktree per ticket, an independent harness per worker on its own model, a cap on
 //!   parallel workers, a wall-clock timeout, a turn budget and cancellation, ending in a
 //!   [`supervisor::WorkerReport`] with a [`supervisor::WorkerOutcome`].
+//! - [`worker_control`]: the manager's worker-control tools (#4233: `amp_stop_worker`), registered
+//!   next to `amp_run_ticket` through [`worker_control::tools`].
+//! - [`comment_watch`] (#4235): polls live workers' tickets and steers each new comment into its
+//!   worker in a fixed envelope, through [`supervisor::Supervisor::steer_worker`].
 //!
 //! M2-6 (#2098):
 //! - [`run_report`]: automatic run reporting (D8). [`run_report::RunReporter`] fills the model,
@@ -110,6 +114,7 @@ pub mod approval;
 pub mod approval_wait;
 pub mod assets;
 pub mod chat_event;
+pub mod comment_watch;
 pub mod config_check;
 pub mod dispatch_ledger;
 pub mod events;
@@ -146,5 +151,6 @@ pub mod text_tool_calls;
 pub mod tickets;
 pub mod tool_guide;
 pub mod tools;
+pub mod worker_control;
 pub mod worker_session;
 pub mod workspace;

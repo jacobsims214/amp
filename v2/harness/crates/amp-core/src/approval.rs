@@ -443,6 +443,241 @@ pub fn dispatched(messages: &[AgentMessage]) -> BTreeSet<i64> {
     out
 }
 
+// ---------------------------------------------------------------------------------------------
+// Person confirmation for self-management writes (#4247, story 583).
+// ---------------------------------------------------------------------------------------------
+//
+// A manager tool that writes the harness's own agents, skills or MCP servers (#4252, #4253) must
+// first get a "yes" from the person at the keyboard. This is the contract between those tools and
+// whatever asks the person (the chat/TUI y/N prompt, #4259):
+//
+// - [`ConfirmRequest`] says what would be written: the tool, the target path, the scope, a one-line
+//   summary and detail lines (a diff, a widening note, a TOML block, a stdio command).
+// - [`Confirmer`] is the person's side. Only a front end with a person behind it implements it;
+//   [`ChannelConfirmer`] is the ready-made bridge: the tool side sends a [`PendingConfirm`] down a
+//   channel and the TUI answers it with [`PendingConfirm::answer`].
+// - [`confirm_or_deny`] is the only way a tool asks. It denies when there is no confirmer
+//   (headless `run -p`, a worker, a remote viewer), when the person does not answer in time, and
+//   when the responder goes away. Nothing approves by default.
+//
+// There is no auto-approve: [`ConfirmKind::auto_approvable`] is false for every kind, the role
+// policy's `ask` is already a deny (`policy.rs`), and the model's own words never reach
+// [`Confirmed::Approved`] (an answer comes only through a [`Confirmer`], which the model has no
+// handle on).
+
+/// How long a tool waits for the person before [`confirm_or_deny`] denies.
+pub const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What a confirmation asks the person to allow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfirmKind {
+    /// A write to the harness's own configuration: an agent, a skill, an MCP server (story 583).
+    SelfManagementWrite,
+}
+
+impl ConfirmKind {
+    /// Whether anything but a person's answer may approve this kind. Always false: no setting,
+    /// role policy or model output stands in for the person.
+    pub const fn auto_approvable(self) -> bool {
+        match self {
+            ConfirmKind::SelfManagementWrite => false,
+        }
+    }
+}
+
+/// A write that waits for the person's "yes".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmRequest {
+    pub kind: ConfirmKind,
+    /// The tool asking (`amp_manage_agent`, `amp_add_mcp_server`, …).
+    pub tool: String,
+    /// The file or directory that would be written.
+    pub path: std::path::PathBuf,
+    /// Where it lands: `user` or `repo` (the CLI's `--user`/`--repo`).
+    pub scope: String,
+    /// One line: what changes ("create agent amp-foo", "edit skill bar").
+    pub summary: String,
+    /// Shown under the summary, in order: a diff, a permission-widening note (#4246), "this agent
+    /// becomes dispatchable", a TOML block or a stdio command (#4253).
+    pub details: Vec<String>,
+}
+
+impl ConfirmRequest {
+    /// A self-management write with no detail lines yet.
+    pub fn self_management(
+        tool: impl Into<String>,
+        path: impl Into<std::path::PathBuf>,
+        scope: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: ConfirmKind::SelfManagementWrite,
+            tool: tool.into(),
+            path: path.into(),
+            scope: scope.into(),
+            summary: summary.into(),
+            details: Vec::new(),
+        }
+    }
+
+    /// Adds a detail line (builder style).
+    pub fn detail(mut self, line: impl Into<String>) -> Self {
+        self.details.push(line.into());
+        self
+    }
+
+    /// The prompt as plain lines, for a front end without its own layout: summary, target, then
+    /// the details.
+    pub fn prompt_lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            format!("{} wants to: {}", self.tool, self.summary),
+            format!("{} scope: {}", self.scope, self.path.display()),
+        ];
+        lines.extend(self.details.iter().cloned());
+        lines
+    }
+}
+
+/// Why a confirmation did not approve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyReason {
+    /// The person said no.
+    Declined,
+    /// Nobody can answer: headless, a worker, no TUI attached.
+    NoResponder,
+    /// The person did not answer in time.
+    TimedOut,
+    /// The responder went away before answering (the TUI closed, the request was dropped).
+    ResponderGone,
+}
+
+impl std::fmt::Display for DenyReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            DenyReason::Declined => "the person declined it",
+            DenyReason::NoResponder => {
+                "no person can confirm it here (headless or no TUI); run it from the chat"
+            }
+            DenyReason::TimedOut => "the person did not confirm it in time",
+            DenyReason::ResponderGone => "the confirmation prompt closed before an answer",
+        })
+    }
+}
+
+/// A confirmation's outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirmed {
+    Approved,
+    Denied(DenyReason),
+}
+
+impl Confirmed {
+    pub fn is_approved(self) -> bool {
+        matches!(self, Confirmed::Approved)
+    }
+
+    /// The tool error to return when denied ("not written: …"), `None` when approved.
+    pub fn denial_message(self) -> Option<String> {
+        match self {
+            Confirmed::Approved => None,
+            Confirmed::Denied(why) => Some(format!("not written: {why}")),
+        }
+    }
+}
+
+/// The person's side of a confirmation. Implemented only by a front end with a person behind it.
+#[async_trait::async_trait]
+pub trait Confirmer: Send + Sync {
+    /// Shows the request and waits for the person's answer. May wait forever:
+    /// [`confirm_or_deny`] bounds it.
+    async fn confirm(&self, request: ConfirmRequest) -> Confirmed;
+}
+
+/// Asks the person through `confirmer` and waits at most `timeout`. Denies without a confirmer,
+/// on timeout, and when the responder goes away. The only way a tool should ask.
+pub async fn confirm_or_deny(
+    confirmer: Option<&dyn Confirmer>,
+    request: ConfirmRequest,
+    timeout: std::time::Duration,
+) -> Confirmed {
+    let Some(confirmer) = confirmer else {
+        return Confirmed::Denied(DenyReason::NoResponder);
+    };
+    debug_assert!(!request.kind.auto_approvable());
+    match tokio::time::timeout(timeout, confirmer.confirm(request)).await {
+        Ok(answer) => answer,
+        Err(_) => Confirmed::Denied(DenyReason::TimedOut),
+    }
+}
+
+/// A request waiting for the person, as the front end receives it from a [`ChannelConfirmer`].
+#[derive(Debug)]
+pub struct PendingConfirm {
+    pub request: ConfirmRequest,
+    reply: tokio::sync::oneshot::Sender<bool>,
+}
+
+impl PendingConfirm {
+    /// Whether the tool that asked has already given up: [`confirm_or_deny`] timed out or the tool
+    /// call was cancelled, and it has already reported the write as not done. A stale prompt must
+    /// not be shown (or must be closed if it is on screen): any answer to it is ignored.
+    pub fn is_stale(&self) -> bool {
+        self.reply.is_closed()
+    }
+
+    /// The person's answer: `true` for yes. Returns whether the tool that asked received it;
+    /// `false` means the prompt was stale and nothing happened, so the front end should say so
+    /// (e.g. "that request already timed out; nothing was written") rather than imply a yes took
+    /// effect. Dropping a `PendingConfirm` unanswered denies it.
+    #[must_use = "a false return means the request had already timed out and the answer was dropped"]
+    pub fn answer(self, yes: bool) -> bool {
+        self.reply.send(yes).is_ok()
+    }
+}
+
+/// A [`Confirmer`] that hands each request to the front end over a channel and waits for its
+/// answer. The front end (#4259) keeps the receiver from [`ChannelConfirmer::new`], shows each
+/// [`PendingConfirm`] as a y/N prompt and calls [`PendingConfirm::answer`].
+///
+/// A prompt can go stale while it waits in the channel or on screen: [`confirm_or_deny`] stops
+/// waiting after its timeout (and a cancelled tool call stops too), and the tool reports the write
+/// as not done. The front end must skip a received prompt whose [`PendingConfirm::is_stale`] is
+/// true, close one on screen when it becomes stale, and treat a `false` from
+/// [`PendingConfirm::answer`] as "that request already timed out; nothing was written". The person
+/// must only ever see live prompts, and a yes must never seem to approve a denied write.
+#[derive(Debug, Clone)]
+pub struct ChannelConfirmer {
+    tx: tokio::sync::mpsc::Sender<PendingConfirm>,
+}
+
+impl ChannelConfirmer {
+    /// The confirmer and the receiver the front end reads prompts from.
+    pub fn new() -> (Self, tokio::sync::mpsc::Receiver<PendingConfirm>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        (Self { tx }, rx)
+    }
+}
+
+#[async_trait::async_trait]
+impl Confirmer for ChannelConfirmer {
+    async fn confirm(&self, request: ConfirmRequest) -> Confirmed {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        if self
+            .tx
+            .send(PendingConfirm { request, reply })
+            .await
+            .is_err()
+        {
+            return Confirmed::Denied(DenyReason::ResponderGone);
+        }
+        match answer.await {
+            Ok(true) => Confirmed::Approved,
+            Ok(false) => Confirmed::Denied(DenyReason::Declined),
+            Err(_) => Confirmed::Denied(DenyReason::ResponderGone),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

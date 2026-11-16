@@ -1,7 +1,7 @@
 {
  "generated_by": "v2/scripts/build-harness-assets.sh — do not edit; edit v2/.opencode or v2/scripts/lib/harness_overrides.yaml",
  "source": "v2/.opencode",
- "source_sha256": "28273bb8cbf53b85bc2bfc3b40a67efda689fc6365d9e69ec256e1d8d32b0228",
+ "source_sha256": "c092063521ec229358ff5bc1fa0dd025ff7517b5a5ab55082b24ff78354de5be",
  "default_agent": "amp-manager",
  "excluded_skills": [
   "amp-agent-builder"
@@ -257,6 +257,14 @@
     "scripts/design_system.py",
     "scripts/search.py"
    ]
+  },
+  {
+   "name": "amp-self-management",
+   "description": "Manager only, amp-harness. When and how to use amp_manage_agent, amp_manage_skill, amp_add_mcp_server, amp_stop_worker, amp_restart_worker and amp_resume_worker. Agents, skills and MCP servers only when the person explicitly asks, never to widen permissions, never with secrets in chat; stop, restart and resume only with a stated reason. Read it before calling any of them.",
+   "files": [
+    "SKILL.md"
+   ],
+   "harness_only": true
   }
  ]
 }

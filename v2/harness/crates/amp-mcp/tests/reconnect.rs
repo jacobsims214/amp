@@ -324,6 +324,59 @@ async fn reconnect_now_switches_to_another_server() {
         .expect("still on b");
 }
 
+/// #4250: `/mcp login amp` reconnects with Drop semantics. A call whose 401 is still on its way
+/// back when the post-login reconnect swaps the connection is sent again on the new connection
+/// instead of failing as Replaced, and the explicit reconnect is the only attempt made.
+#[tokio::test(flavor = "multi_thread")]
+async fn reconnect_after_login_heals_an_in_flight_call() {
+    let (old, new) = pair().await;
+    let client = Arc::new(connect(&old.running.url).await);
+    let (logged_in, attempts) = (
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    client.set_reconnector(Some(reconnector(
+        &old.running.url,
+        &new.running.url,
+        &logged_in,
+        &attempts,
+    )));
+    // Hold every 401 until released, so the call is in flight across the swap.
+    old.release.send_replace(0);
+    old.unauthorized.store(true, Ordering::SeqCst);
+    let call = {
+        let client = client.clone();
+        tokio::spawn(async move { client.call_tool("amp_whoami", None).await })
+    };
+    wait_until("the call is rejected and held", || {
+        old.rejected.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    client.reconnect_after_login().await.expect("reconnect");
+    assert_eq!(client.generation(), 1);
+    old.release.send_replace(usize::MAX);
+    tokio::time::timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the in-flight call must not hang")
+        .unwrap()
+        .expect("the in-flight call heals on the new connection, not Replaced");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "only the explicit reconnect"
+    );
+    assert_eq!(client.generation(), 1);
+    assert_eq!(new.running.counters.call_tool.load(Ordering::SeqCst), 1);
+    assert_eq!(client.health(), Health::Connected);
+
+    // Without a reconnector (AMP_TOKEN) it refuses and keeps the connection.
+    client.set_reconnector(None);
+    let err = client.reconnect_after_login().await.unwrap_err();
+    assert!(err.to_string().contains("no reconnector"), "{err}");
+    assert_eq!(client.generation(), 1);
+}
+
 /// AMP_TOKEN: no reconnector, so a rejected token stays rejected and nothing reconnects.
 #[tokio::test(flavor = "multi_thread")]
 async fn without_a_reconnector_login_required_stays() {

@@ -23,6 +23,10 @@ crossterm.workspace = true
 toml.workspace = true
 rpi-agent.workspace = true
 rpi-harness.workspace = true
+# The manager's self-management tools (#4252) implement rpi-agent's AgentTool.
+async-trait.workspace = true
+rpi-ai.workspace = true
+tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
