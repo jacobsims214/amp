@@ -30,7 +30,9 @@ func (s *Server) registerArtifacts(mcp *server.MCPServer) {
 		"Publish something for people to look at in AMP: a UI mockup or clickable prototype (html), a diagram or icon (svg), "+
 			"an image, a document (markdown or pdf), or plain text. AMP stores it, versions it, and shows it sandboxed to everyone on "+
 			"the project, whatever harness they use; the result has its url. Make html a single self-contained file (inline CSS and JS; "+
-			"CDN scripts and fonts are fine, other files aren't reachable). Pass artifact_id to publish a new version of one you "+
+			"CDN scripts and fonts are fine, other files aren't reachable). To publish a file on disk without pasting it (any size up to "+
+			"10 MB, e.g. HTML with embedded screenshots), pass bytes and sha256 instead of content: you get a one-time upload URL, and "+
+			"`curl -fsS -T <file> <url>` publishes it. Never substitute a screenshot for the file. Pass artifact_id to publish a new version of one you "+
 			"published before: it goes back into review. Each publish is noted on the ticket. To have a person review it, block the "+
 			"ticket (amp_block_task) asking them to review the artifact at its url; their approval or requested changes answer the "+
 			"question and come back as a comment on the ticket.",
@@ -42,6 +44,8 @@ func (s *Server) registerArtifacts(mcp *server.MCPServer) {
 			"kind":           str("REQUIRED for a new artifact: html, svg, image, markdown, pdf or text."),
 			"content":        str("The content as text (html, svg, markdown, text)."),
 			"content_base64": str("The content base64-encoded, for binary files (image, pdf). Use content or content_base64."),
+			"bytes":          num("Instead of content: the size of the file you will upload (wc -c < file). With sha256, returns an upload URL."),
+			"sha256":         str("Instead of content: the file's sha256 in hex (shasum -a 256 file)."),
 			"note":           str("Optional. What this version is or changed, shown with it."),
 		}), wrap(ctx, s.open(s.publishArtifact)))
 
@@ -92,6 +96,11 @@ func (s *Server) publishArtifact(ctx context.Context, args map[string]interface{
 		Kind:       strings.ToLower(strings.TrimSpace(optStr(args, "kind", ""))),
 		Note:       optStr(args, "note", ""),
 	}
+	size, sum := optInt(args, "bytes", 0), strings.TrimSpace(optStr(args, "sha256", ""))
+	upload := size != 0 || sum != ""
+	if upload && (optStr(args, "content", "") != "" || optStr(args, "content_base64", "") != "") {
+		return nil, fmt.Errorf("pass content (or content_base64), or bytes and sha256 for an upload URL, not both")
+	}
 	if b64 := optStr(args, "content_base64", ""); b64 != "" {
 		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
 		if err != nil {
@@ -108,6 +117,19 @@ func (s *Server) publishArtifact(ctx context.Context, args map[string]interface{
 		if err := s.checkProjectNotArchived(ctx, pid); err != nil {
 			return nil, err
 		}
+	}
+	if upload {
+		if size == 0 || sum == "" {
+			return nil, fmt.Errorf("an upload URL needs both bytes and sha256")
+		}
+		u, err := s.svc.BeginArtifactUpload(ctx, caller(ctx).p, req, int64(size), sum)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"upload": u,
+			"next": fmt.Sprintf("Nothing is published yet. Upload the file now (one use, until %s): curl -fsS -T <file> '%s' "+
+				"(Bash; no auth header). Its response is the published artifact with its url. A 422 means the file isn't the "+
+				"size or sha256 you declared: the URL still works for the right file.", u.ExpiresAt.Format(time.RFC3339), u.URL)})
 	}
 	a, err := s.svc.PublishArtifact(ctx, caller(ctx).p, req)
 	if err != nil {
