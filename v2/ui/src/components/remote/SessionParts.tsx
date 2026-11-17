@@ -630,13 +630,24 @@ export function TicketChip({ status }: { status: SessionStatus | null }) {
  * A phone gets the dot alone, the mockup's own `narrow` rule for this badge: the full word is the
  * widest thing in a one-row header (`slow 812 ms`, `disconnected · retrying…`) and the row has to
  * hold back, host, facts, this, presence and the ⋯ menu. The dot keeps the tone colour, so a slow
- * or lost connection is never invisible, and the word stays in the title and the accessible label. */
+ * or lost connection is never invisible, and the word stays in the title and the accessible name.
+ *
+ * On a phone the dot is the *only* thing left, so the colour cannot be the whole message (#4960):
+ * an `aria-label` on a bare `<span>` is prohibited on a generic role and drops out of the
+ * accessibility tree, which left a screen reader with nothing at all. `role="img"` gives the badge
+ * a role that carries its name — the same shape the project's other drawn-status widgets use
+ * (`StateBar`, `BarChart`) — and makes the dot and the CSS-hidden words presentational, so the
+ * phone form is one announced name rather than a silent dot. Not `role="status"`: `PresenceBadge`
+ * beside it is already the polite live region for the connection, and a second one driven by every
+ * `status` poll would announce the AMP link on top of it. The name is always exposed, so a reader
+ * that explores the header still hears it on a phone; the words stay in the DOM on desktop, where
+ * they are visible as before. */
 export function AmpConnectionBadge({ status }: { status: SessionStatus | null }) {
   const c = ampConnectionWord(status?.amp_connection)
   if (!c) return null
   const cls = c.tone === 'ok' ? 'text-success-ink' : c.tone === 'warn' ? 'text-warning-ink' : 'text-danger-ink'
   return (
-    <span className="inline-flex items-center gap-1.5 text-[11.5px] whitespace-nowrap text-ink-2" data-testid="amp-connection"
+    <span className="inline-flex items-center gap-1.5 text-[11.5px] whitespace-nowrap text-ink-2" data-testid="amp-connection" role="img"
       title="The laptop's own connection to AMP (its AMP tools), as the harness header shows it" aria-label={`AMP tools ${c.word}`}>
       <span className="amp-label !text-[9.5px] hidden sm:inline">AMP</span>
       <span className={`w-1.5 h-1.5 rounded-full bg-current ${cls}`} aria-hidden="true" />
