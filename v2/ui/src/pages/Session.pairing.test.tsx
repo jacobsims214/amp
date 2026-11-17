@@ -99,6 +99,11 @@ function freshLink(h = harnessKey.fingerprint) {
   setPairingLinkForTest({ session_id: SESSION, secret: b64uDecode(vec.pairing_secret_b64u), h })
 }
 
+/** The whole link the laptop prints, as a person would paste it (#4902). */
+function pastedLink(h = harnessKey.fingerprint) {
+  return `${window.location.origin}/sessions/${SESSION}#p=${vec.pairing_secret_b64u}&h=${h}`
+}
+
 function renderPage(transport: RelayTransport, crypto = webRemoteCrypto(memoryStore())) {
   render(
     <AuthContext.Provider value={{ me, loading: false, error: null, isAdmin: false }}>
@@ -201,6 +206,60 @@ describe('pairing from the link (protocol 7)', () => {
     // The real laptop's answer still decides.
     expect(await screen.findByText(/declined on the laptop/)).toBeInTheDocument()
     expect(await crypto.harnessPin(harnessKey.fingerprint)).toBeNull()
+  })
+
+  // #4902: the installed app is never handed the pairing URL as its page load, so the unpaired
+  // screen has to be able to take the link by hand. This is that page load's absence: no fragment,
+  // nothing held, and the person pastes the link instead.
+  it('pairs from a link pasted on the unpaired screen of a cold page load with no fragment', async () => {
+    const user = userEvent.setup()
+    const laptop = fakeLaptop()
+    expect(window.location.hash).toBe('') // nothing was captured at load: this is the installed app's case
+    expect(pairingLinkFor(SESSION)).toBeNull()
+    const crypto = renderPage(laptop.transport)
+
+    // The unpaired screen, with a way in.
+    expect(await screen.findByText('Pair this device from the laptop')).toBeInTheDocument()
+    const field = screen.getByLabelText('Pairing link')
+    await user.type(field, pastedLink())
+    await user.click(screen.getByRole('button', { name: 'Pair this device' }))
+
+    // Exactly what a scanned link does: the code on both ends, the laptop's check, then the session.
+    const code = await screen.findByTestId('pairing-code')
+    await waitFor(() => expect(laptop.pairs).toHaveLength(1))
+    expect(laptop.pairs[0].macOk).toBe(true)
+    expect(laptop.pairs[0].sigOk).toBe(true)
+    expect(code.textContent).toBe(laptop.pairs[0].code)
+    await screen.findByText('Laptop online')
+    expect(await crypto.harnessPin(harnessKey.fingerprint)).toMatchObject({ harness_id: harnessKey.fingerprint })
+
+    // The secret is memory-only: it is gone from the field and never reached any storage.
+    expect((field as HTMLInputElement).value).toBe('')
+    expect(pairingLinkFor(SESSION)).toBeNull()
+    expect(JSON.stringify({ ...localStorage })).not.toContain(vec.pairing_secret_b64u)
+    expect(JSON.stringify({ ...sessionStorage })).not.toContain(vec.pairing_secret_b64u)
+  })
+
+  it('refuses a stale or malformed link pasted on the unpaired screen, in words that say what to fix', async () => {
+    const user = userEvent.setup()
+    const laptop = fakeLaptop()
+    renderPage(laptop.transport)
+    expect(await screen.findByText('Pair this device from the laptop')).toBeInTheDocument()
+
+    // The laptop key is the part a 5-minute link still carries when the link is stale; a bad secret
+    // is what a truncated paste looks like. Both must say so rather than do nothing.
+    for (const [pasted, says] of [
+      [`${window.location.origin}/sessions/${SESSION}#p=short&h=${harnessKey.fingerprint}`, /secret in that link isn't valid/],
+      [`${window.location.origin}/sessions/${SESSION}#p=${vec.pairing_secret_b64u}`, /is missing the laptop key/],
+      ['not a link', /doesn't look like a pairing link/],
+    ] as const) {
+      await user.clear(screen.getByLabelText('Pairing link'))
+      await user.type(screen.getByLabelText('Pairing link'), pasted)
+      await user.click(screen.getByRole('button', { name: 'Pair this device' }))
+      expect(await screen.findByRole('alert')).toHaveTextContent(says)
+    }
+    expect(laptop.pairs).toHaveLength(0) // nothing was sent on a refused link
+    expect(pairingLinkFor(SESSION)).toBeNull()
   })
 
   it('opens directly when this browser is already paired, without using the link', async () => {

@@ -6,14 +6,15 @@
  * Served with a strict CSP (src/remote/csp.ts). Links into this page are
  * full page loads so the header applies.
  */
-import { useEffect, useLayoutEffect, useRef } from 'react'
+import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
-import { ArrowLeft, MonitorSmartphone, Unplug } from 'lucide-react'
+import { ArrowLeft, MonitorSmartphone, ScanLine, Unplug } from 'lucide-react'
 import { useAuth } from '../hooks/useAuth'
 import { remoteAvailable, useRemote } from '../remote/remote-context'
+import { acceptPairingLink } from '../remote/pairingLink'
 import { useRemoteSession } from '../remote/useRemoteSession'
 import { endReasonText, isBusy } from '../remote/session'
-import type { SessionStatus } from '../remote/types'
+import type { SessionDetail, SessionStatus } from '../remote/types'
 import { BandLoader } from '../components/brand/BandLoader'
 import { PairingPanel } from '../components/remote/PairingPanel'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
@@ -108,9 +109,11 @@ function SessionView({ sessionId }: { sessionId: string }) {
     return <Frame title="Remote session"><PairingPanel detail={phase.detail} link={phase.link} onPaired={paired} /></Frame>
   }
   if (phase.kind === 'unpaired') {
+    // `relink` re-reads the session with the link now held in memory: the same `pairing` phase a
+    // page load from the laptop's link reaches (`useRemoteSession`), so both entries pair identically.
     return <Message title="Pair this device from the laptop">
       <p className="m-0">This browser isn't paired with <b className="text-ink">{phase.detail.host}</b> yet, so it can't show or send anything for this session.</p>
-      <p className="m-0">On the laptop, run <code className="font-mono">/remote</code> in the harness and open the link it prints (or scan its QR code) on this device. Then press <b>y</b> on the laptop when the codes match.</p>
+      <LinkEntry detail={phase.detail} onAccepted={retryLoad} />
       <p className="m-0 amp-num text-[12px] text-ink-3">Laptop key {phase.detail.harness_fp_display}</p>
     </Message>
   }
@@ -172,4 +175,119 @@ function SessionView({ sessionId }: { sessionId: string }) {
 const emptyStatus: SessionStatus = {
   model: null, busy: false, context_pct: null, cost_usd_micros: null, project: null, ticket_id: null, branch: null,
   queue_len: 0, workers_running: 0, devices: [],
+}
+
+/**
+ * Getting the pairing link into this page by hand (#4902).
+ *
+ * Pairing normally starts from the fragment of the page load that runs this screen (protocol 7.1),
+ * which is what a QR scan by the phone's camera gives you in a browser. An installed app is never
+ * handed that page load — no https link can be routed into a home-screen web app on iOS, and this
+ * build ships no manifest for Android to verify (discoveries/remote-pairing-pwa-divergence.md) — so
+ * the same link can be pasted or scanned here instead. `acceptPairingLink` runs the identical checks
+ * and keeps the secret in module memory only; nothing about it is stored.
+ */
+function LinkEntry({ detail, onAccepted }: { detail: SessionDetail; onAccepted: () => void }) {
+  const [text, setText] = useState('')
+  const [problem, setProblem] = useState<string | null>(null)
+  const [elsewhere, setElsewhere] = useState<{ href: string } | null>(null)
+  const inputId = useId()
+
+  const take = (raw: string) => {
+    const result = acceptPairingLink(raw, detail.session_id)
+    if (result.kind === 'refused') { setProblem(result.message); return }
+    // Another session on this AMP: its own URL is a fresh page load, which captures the link there
+    // exactly as the laptop's link does in a browser (protocol 7.1).
+    if (result.kind === 'other_session') { setProblem(null); setElsewhere(result); return }
+    setProblem(null)
+    setElsewhere(null)
+    setText('') // held in memory now: don't leave the secret sitting in a form field
+    onAccepted()
+  }
+
+  return (
+    <div className="grid gap-2 mt-1">
+      <p className="m-0">On the laptop, run <code className="font-mono">/remote</code> in the harness. Then paste the link it prints here — in an installed app the link can't open by itself.</p>
+      <form className="grid gap-1.5" onSubmit={e => { e.preventDefault(); take(text) }}>
+        <label htmlFor={inputId} className="amp-label">Pairing link</label>
+        <input id={inputId} className="amp-input amp-num !text-[12.5px]" value={text} onChange={e => setText(e.target.value)}
+          placeholder="https://…/sessions/rs_…#p=…&h=…" autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} inputMode="url" />
+        {problem && <p role="alert" className="m-0 text-[12.5px] text-danger-ink leading-snug">{problem}</p>}
+        {elsewhere && <p className="m-0 text-[12.5px] text-ink-2 leading-snug">That link is for another session. <a className="underline" href={elsewhere.href}>Open that session</a> to pair it.</p>}
+        <div className="flex items-center gap-2 flex-wrap">
+          <button type="submit" className="amp-btn amp-btn-primary amp-btn-sm" disabled={!text.trim()}>Pair this device</button>
+          <ScanForLink onText={take} />
+        </div>
+      </form>
+      <p className="m-0">Then press <b>y</b> on the laptop when the codes match.</p>
+    </div>
+  )
+}
+
+/** The `BarcodeDetector` shape this build uses, where the platform has it (Chrome on Android does; Safari doesn't). */
+interface DetectedBarcode { rawValue: string }
+interface BarcodeDetectorLike { detect(source: CanvasImageSource): Promise<DetectedBarcode[]> }
+type BarcodeDetectorCtor = new (opts?: { formats?: string[] }) => BarcodeDetectorLike
+const barcodeDetector = (): BarcodeDetectorCtor | undefined => (window as unknown as { BarcodeDetector?: BarcodeDetectorCtor }).BarcodeDetector
+
+/**
+ * Scanning the QR code with this device's camera, offered only where the platform can decode it —
+ * the paste field above is the entry that works everywhere. Nothing is captured anywhere: each frame
+ * is read for a QR code and dropped.
+ */
+function ScanForLink({ onText }: { onText: (text: string) => void }) {
+  const [scanning, setScanning] = useState(false)
+  const [problem, setProblem] = useState<string | null>(null)
+  const video = useRef<HTMLVideoElement>(null)
+  // Held in a ref: the parent's handler is a new function each render, and the camera must not
+  // restart (or stop) because of that.
+  const onTextRef = useRef(onText)
+  useEffect(() => { onTextRef.current = onText })
+  const supported = !!barcodeDetector() && !!navigator.mediaDevices?.getUserMedia
+
+  useEffect(() => {
+    if (!scanning) return
+    const Ctor = barcodeDetector()
+    let stream: MediaStream | undefined
+    let timer: ReturnType<typeof setInterval> | undefined
+    let stopped = false
+    const stop = () => {
+      stopped = true
+      clearInterval(timer)
+      stream?.getTracks().forEach(t => t.stop())
+    }
+    const started = navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false }).then(s => {
+      if (stopped) { s.getTracks().forEach(t => t.stop()); return }
+      stream = s
+      if (video.current) { video.current.srcObject = s; void video.current.play().catch(() => {}) }
+      if (!Ctor) return
+      const detector = new Ctor({ formats: ['qr_code'] })
+      timer = setInterval(() => {
+        const el = video.current
+        if (!el || !el.videoWidth) return
+        detector.detect(el).then(codes => {
+          const found = codes[0]?.rawValue
+          if (!found || stopped) return
+          stop()
+          setScanning(false)
+          onTextRef.current(found)
+        }).catch(() => { /* a frame that can't be read: try the next one */ })
+      }, 250)
+    }, () => {
+      if (stopped) return
+      setScanning(false)
+      setProblem('This browser wouldn\'t open the camera. Allow camera access for AMP, or paste the link above.')
+    })
+    return () => { stopped = true; clearInterval(timer); void started.finally(() => stream?.getTracks().forEach(t => t.stop())) }
+  }, [scanning])
+
+  if (!supported) return null
+  return (
+    <>
+      {!scanning && <button type="button" className="amp-btn amp-btn-sm" onClick={() => { setProblem(null); setScanning(true) }}><ScanLine size={13} aria-hidden="true" />Scan the QR code</button>}
+      {scanning && <button type="button" className="amp-btn amp-btn-sm" onClick={() => setScanning(false)}>Stop the camera</button>}
+      <video ref={video} className={scanning ? 'w-full max-w-[320px] border border-line bg-surface' : 'hidden'} muted playsInline aria-label="Camera, looking for the QR code" />
+      {problem && <p role="alert" className="m-0 text-[12.5px] text-danger-ink leading-snug">{problem}</p>}
+    </>
+  )
 }
