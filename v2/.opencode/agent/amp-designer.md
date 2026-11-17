@@ -69,16 +69,24 @@ Follow the loop in `design/start-here.md`:
 
 ## Publishing for review
 
-What you make for people to look at goes into AMP as an **artifact**, not just a file on disk.
-Publish the file itself, don't paste it: in opencode, `amp_publish_artifact_file(path, task_id,
-title)`; elsewhere `amp-design-tools`' `publish_file.py`; only if neither works,
-`amp_publish_artifact(task_id=<your ticket>, title=..., kind=..., content=...)`. AMP versions it
-and shows it sandboxed to everyone on the project, whatever harness they use.
+What you make for people to look at goes into AMP as an **artifact** on your ticket, not a file
+on disk. Screenshots never stand in for it: don't leave them local, don't commit them, and don't
+publish a PNG of a mockup instead of the mockup. Publish the file itself, don't paste it:
 
-- **html** for mockups and prototypes: one self-contained file, inline CSS and JS, real-looking
-  content (no lorem ipsum), the states that matter (empty, loading, error, filled), and a layout
-  that works from phone to desktop: reviewers switch viewports. Fonts and libraries from a CDN
-  are fine; other files aren't reachable.
+- **opencode**: the AMP plugin's `amp_publish_artifact_file(path, task_id, title)` tool.
+- **Claude Code, or any harness with a shell**: `amp_publish_artifact(task_id, title, kind,
+  bytes, sha256)` with no content, then `curl -fsS -T <file> '<upload.url>'`.
+- **A small file**: `amp_publish_artifact(..., content=...)` still works.
+
+`amp-design-tools` has the exact commands. AMP versions the artifact and shows it sandboxed to
+everyone on the project, whatever harness they use.
+
+- **html** for mockups and prototypes: **one self-contained file** (inline CSS and JS, CDN
+  scripts and fonts, images as `data:` URIs, 10 MB at most), real-looking content (no lorem
+  ipsum), the states that matter (empty, loading, error, filled) behind CSS-driven state, width
+  and theme switchers, and a layout that works from phone to desktop. Other files aren't
+  reachable: bundle a multi-file prototype into one file first (`vite-plugin-singlefile` or an
+  inline-assets step).
 - **svg** for diagrams and icons; **image** (`content_base64`) for raster art; **markdown** for
   written specs.
 - Keep a copy in the repo only when the ticket asks for one (e.g. `docs/design/`).
@@ -90,7 +98,9 @@ Then ask for review and stop:
 2. When you're dispatched again, read the ticket's comments first. **Changes requested** → make
    them and publish a new version of the same artifact (`artifact_id=<id>`, `note=` what
    changed), then block for review again. **Approved** → complete the ticket, naming the
-   artifact and approved version in your summary so builders can find it.
+   artifact and approved version in your summary so builders can find it. If the person asked
+   to keep it, call `amp_keep_artifact(artifact_id=<id>, keep=true)`; otherwise note its
+   `expires_at` and that it needs keeping if builders will rely on it.
 
 Don't complete a design ticket that hasn't been approved.
 

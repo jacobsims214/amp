@@ -254,8 +254,10 @@ files:
             - '  amp_restart_worker: deny'
             - '  amp_resume_worker: deny'
     body:
-      - find: "Publish the file itself, don't paste it: in opencode, `amp_publish_artifact_file(path, task_id,\ntitle)`; elsewhere `amp-design-tools`' `publish_file.py`; only if neither works,"
-        replace: "Publish the file itself, don't paste it: with `amp-design-tools`' `publish_file.py`; only if that\ndoesn't work,"
+      - find: "- **opencode**: the AMP plugin's `amp_publish_artifact_file(path, task_id, title)` tool.\n"
+        replace: ""
+      - find: "**Claude Code, or any harness with a shell**"
+        replace: "**With your `bash` tool**"
 
   agent/amp-github-researcher.md:
     frontmatter: *worker_denies
@@ -384,10 +386,14 @@ files:
         replace: "← if your harness has it (amp-harness does): your model,"
       - find: "← opencode plugin: your own model/tokens/cost"
         replace: "← your own model/tokens/cost"
+      - find: "- **opencode**: the AMP plugin's `amp_publish_artifact_file(path, task_id, title)` tool.\n"
+        replace: ""
+      - find: "**Claude Code, or any harness with a shell**"
+        replace: "**With your `bash` tool**"
 
   skills/amp-mcp/SKILL.md:
     body:
-      - find: "the harness plugin provides it (Claude Code with the AMP plugin, opencode)"
+      - find: "the harness plugin provides it (opencode with the AMP plugin)"
         replace: "the harness provides it (amp-harness, and the AMP plugin for other hosts)"
 
   skills/amp-init/SKILL.md:
@@ -413,8 +419,10 @@ files:
 
   skills/amp-design-tools/SKILL.md:
     body:
-      - find: "In opencode with AMP's plugin, use the `amp_publish_artifact_file` tool instead\n(it knows AMP's address and your token). If neither is available, publish with"
-        replace: "If they aren't set, publish with"
+      - find: "- **opencode**: the AMP plugin's `amp_publish_artifact_file(path, task_id, title)` tool.\n"
+        replace: ""
+      - find: "**Claude Code, or any harness with a shell**"
+        replace: "**With your `bash` tool**"
 
   skills/amp-image-gen/SKILL.md:
     body:

@@ -1,7 +1,7 @@
 {
  "generated_by": "v2/scripts/build-harness-assets.sh — do not edit; edit v2/.opencode or v2/scripts/lib/harness_overrides.yaml",
  "source": "v2/.opencode",
- "source_sha256": "c092063521ec229358ff5bc1fa0dd025ff7517b5a5ab55082b24ff78354de5be",
+ "source_sha256": "8a246cebc1732cb9f19f85e81ee25499138698806b8af17510fb39fba28c9db9",
  "default_agent": "amp-manager",
  "excluded_skills": [
   "amp-agent-builder"
@@ -73,7 +73,7 @@
   },
   {
    "name": "amp-design-tools",
-   "description": "Fast tools for design work. Screenshot every state of a mockup in one call (capture.mjs), and publish a file as an AMP artifact without re-typing it (publish_file.py). Use them instead of screenshotting state by state with chrome-devtools, and instead of pasting a whole file into amp_publish_artifact.",
+   "description": "Fast tools for design work, and the rule for where screenshots go. Screenshot every state of a mockup in one call (capture.mjs), publish a file as an AMP artifact without re-typing it (an upload URL, or publish_file.py), and put screenshots and visual evidence on the ticket as one self-contained HTML artifact. Use them instead of screenshotting state by state with chrome-devtools, and instead of pasting a whole file into amp_publish_artifact.",
    "files": [
     "SKILL.md",
     "scripts/capture.mjs",

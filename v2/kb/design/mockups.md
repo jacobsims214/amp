@@ -19,7 +19,8 @@ How to build a mockup that people can judge, and that a builder can implement. R
 - **Covers the states** with a small switcher bar at the top (Filled, Empty, Errors, Loading,
   …) so reviewers can flip through without you publishing several files. Its buttons carry
   `data-setstate="filled"` (and `data-settheme="light"` for theme toggles): that's how
-  screenshot tools find every state.
+  screenshot tools find every state. A page of screenshots also gets a width switcher
+  (`data-setwidth="390"`), since its images don't reflow.
 - **Responsive**: reviewers switch Desktop / Tablet / Phone in AMP. It must hold up at 390 px.
 - **Interactive where it matters**: tabs switch, toggles toggle, a dialog opens. Not a full app.
 
@@ -57,9 +58,10 @@ How to build a mockup that people can judge, and that a builder can implement. R
 4. Critique with `design/critique.md`; fix; screenshot again. Then the other states.
 5. Write the file in parts if it's long (skeleton first, then sections) rather than one
    enormous write: long single outputs can stall.
-6. Publish the file (opencode: `amp_publish_artifact_file`; elsewhere `publish_file.py` from
-   `amp-design-tools`; else `amp_publish_artifact` with the content). The note says what's in
-   it and how to use the state switcher.
+6. Publish the file (opencode: `amp_publish_artifact_file`; Claude Code or any harness with a
+   shell: `amp_publish_artifact` with `bytes` and `sha256`, then `curl -fsS -T` the file to the
+   upload URL it returns; a small file can go inline as `content`). See `amp-design-tools`.
+   The note says what's in it and how to use the state switcher.
 7. Ask for review with `amp_block_task`: the url and one or two concrete decisions.
 8. New version for each round of feedback (`artifact_id`), note says what changed.
 
