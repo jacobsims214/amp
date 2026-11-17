@@ -11,11 +11,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -202,5 +205,128 @@ func TestArtifactUpload_Refusals(t *testing.T) {
 	}
 	if _, err := f.svc.StoreArtifactUpload(f.ctx, token, bytes.NewReader(html)); authz.StatusOf(err, 0) != 410 {
 		t.Errorf("expired: %v, want 410", err)
+	}
+}
+
+// stallingReader hands out its first chunk, signals started, then holds the
+// rest until release is closed: an upload on a slow link.
+type stallingReader struct {
+	data    []byte
+	off     int
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *stallingReader) Read(p []byte) (int, error) {
+	if r.off >= len(r.data) {
+		return 0, io.EOF
+	}
+	if r.off > 0 {
+		select {
+		case <-r.release:
+		case <-time.After(30 * time.Second):
+			return 0, errors.New("stallingReader: never released")
+		}
+	} else {
+		defer close(r.started)
+	}
+	n := copy(p[:min(len(p), 4096)], r.data[r.off:])
+	r.off += n
+	return n, nil
+}
+
+func TestArtifactUpload_SlowUploadRacingAStaleTakeoverPublishesOnce(t *testing.T) {
+	f := newArtUploadFixture(t)
+	html := screenshotHTML("race")
+	_, token := f.begin(f.worker, PublishArtifactRequest{TaskID: &f.task, Title: "Mockup", Kind: "html"}, html)
+
+	slow := &stallingReader{data: html, started: make(chan struct{}), release: make(chan struct{})}
+	type result struct {
+		a   *domain.Artifact
+		err error
+	}
+	slowDone := make(chan result, 1)
+	go func() {
+		a, err := f.svc.StoreArtifactUpload(f.ctx, token, slow)
+		slowDone <- result{a, err}
+	}()
+	select {
+	case <-slow.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the slow upload never started reading")
+	}
+
+	// Whatever claim the row holds now has gone stale, as it would after two
+	// minutes of streaming, so a second PUT may take it over.
+	if _, err := f.db.Exec(f.ctx, `UPDATE artifact_uploads SET claimed_at = NOW() - INTERVAL '3 minutes' WHERE token_hash = $1`,
+		sumOf([]byte(token))); err != nil {
+		t.Fatal(err)
+	}
+	fast, err := f.svc.StoreArtifactUpload(f.ctx, token, bytes.NewReader(html))
+	if err != nil {
+		t.Fatalf("the second PUT: %v", err)
+	}
+	close(slow.release)
+	var got result
+	select {
+	case got = <-slowDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the slow upload never returned")
+	}
+	if got.err != nil || got.a.ID != fast.ID || got.a.CurrentVersion != 1 {
+		t.Fatalf("the slow upload = %+v, %v; want artifact %d at v1", got.a, got.err, fast.ID)
+	}
+	var versions int
+	if err := f.db.QueryRow(f.ctx, `SELECT COUNT(*) FROM artifact_versions WHERE artifact_id = $1`, fast.ID).Scan(&versions); err != nil {
+		t.Fatal(err)
+	}
+	if versions != 1 {
+		t.Fatalf("artifact %d has %d versions, want 1", fast.ID, versions)
+	}
+}
+
+func TestArtifactUpload_ReleaseAndFinishActOnlyOnTheirOwnClaim(t *testing.T) {
+	f := newArtUploadFixture(t)
+	html := screenshotHTML("claim")
+	_, token := f.begin(f.worker, PublishArtifactRequest{TaskID: &f.task, Title: "Mockup", Kind: "html"}, html)
+	hash := sumOf([]byte(token))
+	repo := f.svc.Repo
+
+	first, err := repo.ClaimArtifactUpload(f.ctx, hash, artifactUploadStaleClaim)
+	if err != nil || first == nil || first.ClaimedAt == nil {
+		t.Fatalf("first claim = %+v, %v", first, err)
+	}
+	if _, err := f.db.Exec(f.ctx, `UPDATE artifact_uploads SET claimed_at = NOW() - INTERVAL '3 minutes' WHERE id = $1`, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := repo.ArtifactUploadByToken(f.ctx, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := repo.ClaimArtifactUpload(f.ctx, hash, artifactUploadStaleClaim)
+	if err != nil || second == nil || second.ClaimedAt == nil {
+		t.Fatalf("takeover = %+v, %v", second, err)
+	}
+
+	if err := repo.ReleaseArtifactUpload(f.ctx, stale.ID, *stale.ClaimedAt); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := repo.FinishArtifactUpload(f.ctx, stale.ID, *stale.ClaimedAt, 1, 1); err != nil || ok {
+		t.Fatalf("finish under a taken-over claim = %v, %v; want false", ok, err)
+	}
+	now, err := repo.ArtifactUploadByToken(f.ctx, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if now.ClaimedAt == nil || !now.ClaimedAt.Equal(*second.ClaimedAt) || now.DoneAt != nil {
+		t.Fatalf("after the stale request's release and finish, row = claimed %v done %v; want the takeover's claim %v, not done",
+			now.ClaimedAt, now.DoneAt, *second.ClaimedAt)
+	}
+
+	if ok, err := repo.FinishArtifactUpload(f.ctx, second.ID, *second.ClaimedAt, 1, 1); err != nil || !ok {
+		t.Fatalf("finish under its own claim = %v, %v; want true", ok, err)
+	}
+	if ok, err := repo.FinishArtifactUpload(f.ctx, second.ID, *second.ClaimedAt, 1, 2); err != nil || ok {
+		t.Fatalf("a second finish = %v, %v; want false", ok, err)
 	}
 }

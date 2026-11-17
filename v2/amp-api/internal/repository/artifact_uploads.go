@@ -64,15 +64,22 @@ func (r *Repo) ClaimArtifactUpload(ctx context.Context, hash string, staleAfter 
 }
 
 // ReleaseArtifactUpload un-claims row id after a failed upload, so the URL
-// can be retried until it expires.
-func (r *Repo) ReleaseArtifactUpload(ctx context.Context, id int64) error {
-	_, err := r.db.Exec(ctx, `UPDATE artifact_uploads SET claimed_at = NULL WHERE id = $1 AND done_at IS NULL`, id)
+// can be retried until it expires. claimedAt is the caller's own claim: one
+// taken over since is left alone.
+func (r *Repo) ReleaseArtifactUpload(ctx context.Context, id int64, claimedAt time.Time) error {
+	_, err := r.db.Exec(ctx, `UPDATE artifact_uploads SET claimed_at = NULL
+		WHERE id = $1 AND claimed_at = $2 AND done_at IS NULL`, id, claimedAt)
 	return err
 }
 
-// FinishArtifactUpload marks row id used by the version it published.
-func (r *Repo) FinishArtifactUpload(ctx context.Context, id int64, artifactID, version int) error {
-	_, err := r.db.Exec(ctx, `UPDATE artifact_uploads SET done_at = NOW(), artifact_id = $2, version = $3 WHERE id = $1`,
-		id, artifactID, version)
-	return err
+// FinishArtifactUpload marks row id used by the version it published, if
+// the claim made at claimedAt still holds; false when it was taken over or
+// the row is already used.
+func (r *Repo) FinishArtifactUpload(ctx context.Context, id int64, claimedAt time.Time, artifactID, version int) (bool, error) {
+	tag, err := r.db.Exec(ctx, `UPDATE artifact_uploads SET done_at = NOW(), artifact_id = $3, version = $4
+		WHERE id = $1 AND claimed_at = $2 AND done_at IS NULL`, id, claimedAt, artifactID, version)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }

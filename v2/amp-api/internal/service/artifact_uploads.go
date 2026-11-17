@@ -14,6 +14,7 @@ import (
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/receipts"
+	"github.com/simstech/amp-api/internal/repository"
 )
 
 // ArtifactUploadPath is the artifact upload route's prefix; the token follows it.
@@ -115,7 +116,7 @@ func (s *Service) BeginArtifactUpload(ctx context.Context, p authz.Principal, re
 // StoreArtifactUpload publishes the file PUT to a one-time artifact upload
 // URL (no session: the token is the credential, and the publish is
 // re-authorized as the caller who minted it). Unknown token: 404. Expired:
-// 410. Another upload running with it: 409. Length or sha256 not as
+// 410. Another upload publishing with it: 409. Length or sha256 not as
 // declared: 422 and the URL stays usable. Already used: the artifact it
 // published, so a retry after a lost response doesn't add a version.
 func (s *Service) StoreArtifactUpload(ctx context.Context, token string, body io.Reader) (*domain.Artifact, error) {
@@ -123,51 +124,51 @@ func (s *Service) StoreArtifactUpload(ctx context.Context, token string, body io
 		return nil, authz.NotFound("upload URL not found")
 	}
 	hash := receipts.HashToken(token)
+	cur, err := s.Repo.ArtifactUploadByToken(ctx, hash)
+	if err != nil {
+		return nil, err
+	}
+	if cur == nil || cur.DoneAt != nil || time.Now().After(cur.ExpiresAt) ||
+		(cur.ClaimedAt != nil && time.Since(*cur.ClaimedAt) < artifactUploadStaleClaim) {
+		return s.unclaimableUpload(ctx, cur)
+	}
+
+	// The body is read before claiming: a slow upload could otherwise
+	// outlive its claim, letting a second PUT take it over and publish too.
+	content, err := io.ReadAll(io.LimitReader(body, cur.Bytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(content)) != cur.Bytes {
+		return nil, &authz.Error{Status: 422, Msg: fmt.Sprintf("the upload is %s bytes, but %d were declared; nothing was published",
+			sizeOf(len(content), cur.Bytes), cur.Bytes)}
+	}
+	got := sha256.Sum256(content)
+	if hex.EncodeToString(got[:]) != cur.SHA256 {
+		return nil, &authz.Error{Status: 422, Msg: "the upload's sha256 doesn't match the one declared; nothing was published"}
+	}
+
 	row, err := s.Repo.ClaimArtifactUpload(ctx, hash, artifactUploadStaleClaim)
 	if err != nil {
 		return nil, err
 	}
 	if row == nil {
 		cur, err := s.Repo.ArtifactUploadByToken(ctx, hash)
-		switch {
-		case err != nil:
+		if err != nil {
 			return nil, err
-		case cur == nil:
-			return nil, authz.NotFound("upload URL not found: call amp_publish_artifact again for a new one")
-		case cur.DoneAt != nil && cur.ArtifactID != nil:
-			a, err := s.Repo.GetArtifact(ctx, *cur.ArtifactID)
-			if err != nil {
-				return nil, authz.NotFound("upload URL already used, and its artifact %d is gone", *cur.ArtifactID)
-			}
-			return s.withURL(a), nil
-		case time.Now().After(cur.ExpiresAt):
-			return nil, &authz.Error{Status: 410, Msg: "upload URL expired: call amp_publish_artifact again for a new one"}
-		default:
-			return nil, &authz.Error{Status: 409, Msg: "another request is uploading to this URL"}
 		}
+		return s.unclaimableUpload(ctx, cur)
 	}
 	done := false
 	defer func() {
 		if done {
 			return
 		}
-		if err := s.Repo.ReleaseArtifactUpload(context.WithoutCancel(ctx), row.ID); err != nil {
+		if err := s.Repo.ReleaseArtifactUpload(context.WithoutCancel(ctx), row.ID, *row.ClaimedAt); err != nil {
 			slog.Warn("artifact upload: release the claim", "id", row.ID, "err", err)
 		}
 	}()
 
-	content, err := io.ReadAll(io.LimitReader(body, row.Bytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(content)) != row.Bytes {
-		return nil, &authz.Error{Status: 422, Msg: fmt.Sprintf("the upload is %s bytes, but %d were declared; nothing was published",
-			sizeOf(len(content), row.Bytes), row.Bytes)}
-	}
-	got := sha256.Sum256(content)
-	if hex.EncodeToString(got[:]) != row.SHA256 {
-		return nil, &authz.Error{Status: 422, Msg: "the upload's sha256 doesn't match the one declared; nothing was published"}
-	}
 	var c uploadCaller
 	var r uploadRequest
 	if err := json.Unmarshal(row.Caller, &c); err != nil {
@@ -181,13 +182,32 @@ func (s *Service) StoreArtifactUpload(ctx context.Context, token string, body io
 	if err != nil {
 		return nil, err
 	}
-	if err := s.Repo.FinishArtifactUpload(ctx, row.ID, a.ID, a.CurrentVersion); err != nil {
-		// Published already; a retry would add a second version, so the
-		// claim is kept rather than released.
-		slog.Warn("artifact upload: mark it used", "id", row.ID, "artifact", a.ID, "err", err)
-	}
+	// Published already; a retry would add a second version, so the claim is
+	// kept rather than released even when marking it used fails.
 	done = true
+	if ok, err := s.Repo.FinishArtifactUpload(ctx, row.ID, *row.ClaimedAt, a.ID, a.CurrentVersion); err != nil || !ok {
+		slog.Warn("artifact upload: mark it used", "id", row.ID, "artifact", a.ID, "claim_held", ok, "err", err)
+	}
 	return a, nil
+}
+
+// unclaimableUpload answers a PUT to an upload URL that can't be claimed now,
+// from its row (nil when the token is unknown).
+func (s *Service) unclaimableUpload(ctx context.Context, cur *repository.ArtifactUploadRow) (*domain.Artifact, error) {
+	switch {
+	case cur == nil:
+		return nil, authz.NotFound("upload URL not found: call amp_publish_artifact again for a new one")
+	case cur.DoneAt != nil && cur.ArtifactID != nil:
+		a, err := s.Repo.GetArtifact(ctx, *cur.ArtifactID)
+		if err != nil {
+			return nil, authz.NotFound("upload URL already used, and its artifact %d is gone", *cur.ArtifactID)
+		}
+		return s.withURL(a), nil
+	case time.Now().After(cur.ExpiresAt):
+		return nil, &authz.Error{Status: 410, Msg: "upload URL expired: call amp_publish_artifact again for a new one"}
+	default:
+		return nil, &authz.Error{Status: 409, Msg: "another request is uploading to this URL"}
+	}
 }
 
 func sizeOf(n int, declared int64) string {
