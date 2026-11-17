@@ -69,6 +69,44 @@ describe('baseline CSP for every other page (#2381 M6)', () => {
 })
 
 /**
+ * AMP #5162: the Cloudflare Web Analytics beacon is switched off at the zone rather than
+ * allowed in either policy. Cloudflare injects
+ * https://static.cloudflareinsights.com/beacon.min.js at the edge, and that script reports
+ * to https://cloudflareinsights.com/cdn-cgi/rum, so allowing it would take exactly those two
+ * origins. The decision doc says why that trade was refused
+ * (decisions/ui-cloudflare-beacon-csp.md in the project KB): the remote-control device key
+ * lives in this origin's IndexedDB, so any script that runs on the origin can sign prompts
+ * (T-UI-4, R-M10), and because Cloudflare terminates TLS for the zone, the CSP is the
+ * control that keeps the edge from running script here. Disabling Web Analytics removes the
+ * violation on every page, `/sessions/` included, which a baseline-only allow would not.
+ *
+ * This describe block is the executable half of that decision: if either policy (or what
+ * nginx serves) grows a beacon origin, this fails on purpose — revisit the decision doc
+ * before changing it, don't just update the expectation.
+ */
+describe('no Cloudflare beacon origin in either policy (#5162)', () => {
+  const BEACON_SCRIPT = 'https://static.cloudflareinsights.com'
+  const BEACON_CONNECT = 'https://cloudflareinsights.com'
+
+  it.each([
+    { name: 'BASELINE_CSP', policy: BASELINE_CSP },
+    { name: 'SESSION_CSP', policy: SESSION_CSP },
+  ])('$name carries neither the beacon script origin nor its report origin', ({ policy }) => {
+    const directives = parse(policy)
+    expect(directives['script-src']).not.toContain(BEACON_SCRIPT)
+    expect(directives['connect-src']).not.toContain(BEACON_CONNECT)
+    // And nothing wider in its place: the beacon needs no wildcard, inline or eval.
+    expect(policy).not.toMatch(/unsafe-(inline|eval)|\*/)
+    expect(policy).not.toMatch(/cloudflareinsights/i)
+  })
+
+  it('is absent from what nginx serves too (both locations)', () => {
+    const conf = readFileSync(resolve(process.cwd(), 'nginx.conf'), 'utf8')
+    expect(conf).not.toMatch(/cloudflareinsights/i)
+  })
+})
+
+/**
  * The strict CSP only covers a full page load of /sessions/…, so the app must never
  * navigate there client-side (a router <Link>/navigate keeps the baseline page's
  * policy). Links to a session page are plain <a href>.
