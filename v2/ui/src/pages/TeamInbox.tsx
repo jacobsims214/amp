@@ -105,10 +105,10 @@ const PAGE_SIZE = 25
  * that module's rule is about **request** paths, and this is not one: it is the
  * admin surface the shell already links to by name (`AppShell`'s "Teams & orgs"
  * nav item). The `?team=` value is the mockup's contract for what the
- * destination should open; Orgs reads nothing off its URL today, so a person who
- * follows this link still picks the team's row there. Sending the id anyway
- * costs nothing and means the destination can honour it without this page
- * changing.
+ * destination opens, and `Orgs` honours it (#4910): it selects the team's org,
+ * activates its Teams tab, expands the team's row and — for a viewer who may
+ * manage it — opens its Inbox access section. So this page needs no change to
+ * make the journey land; it only has to keep sending the id.
  */
 const TEAMS_AND_ORGS_PATH = '/admin/orgs'
 const teamAccessPath = (teamId: number) => `${TEAMS_AND_ORGS_PATH}?team=${teamId}`
