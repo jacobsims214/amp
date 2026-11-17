@@ -885,7 +885,7 @@ appears, global admins and org owners included.
 {"sessions": [{
   "session_id": "rs_…", "harness_id": "…", "harness_fp_display": "29CA-E6B5-00C2-66CB",
   "host": "jacobs-mbp", "os": "macos", "harness_version": "0.4.0",
-  "project": {"id": 2, "name": "AMP"}, "online": true, "viewers": 1,
+  "project": {"id": 2, "name": "AMP"}, "online": true, "viewers": 1, "workers_running": 2,
   "started_at_ms": …, "expires_at_ms": null, "last_activity_at_ms": …, "protocol_version": 1,
   "state": "active", "end_reason": null, "ended_at_ms": null,
   "model": "anthropic/claude-opus-5-5",
@@ -906,6 +906,13 @@ The members after `protocol_version` were added by #2389 (additive; a client tha
 - `devices` lists the browsers paired with this **harness install** (pins are per harness, section 7.7) that are
   neither revoked nor expired: `device_id`, `name`, `paired_at_ms`, `expires_at_ms`. For an ended session it is
   that harness's current pins.
+
+`workers_running` was added by #4898 (additive, in the same spirit as the block above, though it sits beside
+`viewers` because it is presence, not stored metadata): the worker count from the harness's last `status`, or 0
+for a harness that predates the member or has sent no status yet. The relay keeps it in memory, not on the
+session row, so an ended session reports 0 even if it ended with workers running; when the session's holder is
+another replica, the presence control call carries it too (section 11). The UI treats 0 as "no workers" and
+shows it as a fact on each live row.
 
 `GET /api/sessions/:id/...` on an ended session stays `410 session_ended`; the list is the only place ended
 sessions show.

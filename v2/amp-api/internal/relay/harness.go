@@ -469,8 +469,14 @@ func (rl *Relay) publish(w http.ResponseWriter, r *http.Request, sess *domain.Re
 		switch env.Op {
 		case "hello":
 			live.hello = data
+			// The hello carries the first status: its worker count is where the
+			// sessions list starts from (#4898).
+			if st, ok := env.Body["status"].(map[string]any); ok {
+				live.setWorkers(st)
+			}
 		case "status":
 			live.status = data
+			live.setWorkers(env.Body)
 		}
 		live.broadcast(frame{id: env.Seq, event: "envelope", data: data})
 		live.mu.Unlock()
@@ -566,6 +572,9 @@ func (rl *Relay) reconcileDevices(ctx context.Context, sess *domain.RemoteSessio
 const (
 	maxModelBytes      = 200
 	maxTicketNameBytes = 200
+	// maxWorkersRunning bounds the worker count the sessions list reports, so a
+	// hostile or broken status can't put an absurd number on it (#4898).
+	maxWorkersRunning = 9999
 )
 
 // statusMeta picks the members of a status the relay stores (#2389): model,

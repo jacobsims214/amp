@@ -28,7 +28,7 @@ const me = (available: boolean): Me => ({
 
 const other: SessionSummary = {
   session_id: 'rs_OtherSessionBBBBBBBBBB', harness_id: 'h2', harness_fp_display: '8F1D-02AA-71C3-9E40', host: 'build-box',
-  os: 'linux', harness_version: '0.4.0', project: { id: 158, name: 'QA 2365 plan' }, online: false, viewers: 0,
+  os: 'linux', harness_version: '0.4.0', project: { id: 158, name: 'QA 2365 plan' }, online: false, viewers: 0, workers_running: 0,
   started_at_ms: Date.now() - 5 * 3_600_000, expires_at_ms: Date.now() + 7 * 3_600_000 + 10 * 60_000,
   last_activity_at_ms: Date.now() - 42 * 60_000, protocol_version: 1,
   state: 'active', end_reason: null, ended_at_ms: null, model: 'openai/gpt-5.5', ticket: { id: 2389, name: 'Sessions list' },
@@ -37,7 +37,7 @@ const other: SessionSummary = {
 
 const old: SessionSummary = {
   session_id: 'rs_EndedSessionCCCCCCCCCC', harness_id: 'h3', harness_fp_display: '41B0-77E2-0C5A-D913', host: 'old-laptop',
-  os: 'macos', harness_version: '0.3.9', project: { id: 2, name: 'AMP' }, online: false, viewers: 0,
+  os: 'macos', harness_version: '0.3.9', project: { id: 2, name: 'AMP' }, online: false, viewers: 0, workers_running: 0,
   started_at_ms: Date.now() - 30 * 3_600_000, expires_at_ms: Date.now() - 18 * 3_600_000, last_activity_at_ms: Date.now() - 26 * 3_600_000,
   protocol_version: 1, state: 'ended', end_reason: 'idle', ended_at_ms: Date.now() - 25 * 3_600_000, model: 'anthropic/claude-opus-5-5',
   ticket: { id: 77, name: null }, devices: [],
@@ -107,13 +107,20 @@ describe('Sessions page', () => {
     expect(within(box).getByText('Paired device').closest('div')).toHaveAttribute('title', expect.stringMatching(/^Chrome on Pixel 9: paired .*, trusted until /))
   })
 
-  it('lists ended sessions of the last 7 days below the live ones, with why they ended', async () => {
+  it('lists ended sessions of the last 7 days behind a collapsed section, with why they ended', async () => {
+    const user = userEvent.setup()
     setup(true, [{ ...other }, { ...old }])
     await screen.findAllByTestId('session-row')
+    // The ended ones are not in the default view: a week of history can't bury the live session.
+    expect(screen.queryByRole('list', { name: 'Ended sessions' })).toBeNull()
+    expect(screen.queryByTestId('ended-session-row')).toBeNull()
+    expect(screen.getByRole('button', { name: /Show 1 ended session/ })).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.getAllByTestId('session-row')).toHaveLength(2)
+    expect(screen.getByText('1 session in the last 7 days')).toBeInTheDocument()
+
+    await user.click(screen.getByTestId('ended-toggle'))
     const endedList = screen.getByRole('list', { name: 'Ended sessions' })
     const [row] = within(endedList).getAllByTestId('ended-session-row')
-    expect(screen.getAllByTestId('session-row')).toHaveLength(2)
-    expect(screen.getByText('1 in the last 7 days')).toBeInTheDocument()
     expect(within(row).getByText('old-laptop')).toBeInTheDocument()
     expect(within(row).getByText(/Ended · Idle timeout/)).toBeInTheDocument()
     expect(within(row).getByText(/ended after its idle time without remote activity/)).toBeInTheDocument()
@@ -125,6 +132,10 @@ describe('Sessions page', () => {
     expect(within(row).queryByRole('button', { name: /Disconnect/ })).toBeNull()
     expect(within(row).queryByRole('link', { name: /Open/ })).toBeNull()
     expect(within(row).queryByRole('link', { name: 'old-laptop' })).toBeNull()
+
+    // And it folds away again.
+    await user.click(screen.getByTestId('ended-toggle'))
+    expect(screen.queryByRole('list', { name: 'Ended sessions' })).toBeNull()
   })
 
   it('reads a list from a relay that predates ended sessions', async () => {
@@ -134,11 +145,14 @@ describe('Sessions page', () => {
     const row = rows[1]
     expect(within(row).getByText('legacy-box')).toBeInTheDocument()
     expect(within(row).getByText('Laptop online')).toBeInTheDocument()
-    expect(within(row).getAllByText('—')).toHaveLength(3) // model, ticket, devices
+    // model, ticket and devices: the relay sends none of them.
+    expect(within(row).getAllByText('—')).toHaveLength(3)
     expect(screen.queryByRole('list', { name: 'Ended sessions' })).toBeNull()
+    // ...and no worker count either (#4898): "—", not a made-up 0.
+    expect(within(row).getByTestId('live-counts')).toHaveTextContent('— workers')
   })
 
-  it('disconnects one session after a confirm', async () => {
+  it('disconnects one session after a confirm, and it moves into the folded ended list', async () => {
     const user = userEvent.setup()
     setup()
     const rows = await screen.findAllByTestId('session-row')
@@ -146,7 +160,8 @@ describe('Sessions page', () => {
     await user.click(within(rows[1]).getByRole('button', { name: 'Disconnect now' }))
     await waitFor(() => expect(screen.getAllByTestId('session-row')).toHaveLength(1))
     expect(screen.getByRole('status')).toHaveTextContent(/keeps running locally/)
-    // It moves to the ended list.
+    // It moves to the ended list, which is folded: open it to see the row.
+    await user.click(screen.getByRole('button', { name: /Show 1 ended session/ }))
     const [ended] = within(screen.getByRole('list', { name: 'Ended sessions' })).getAllByTestId('ended-session-row')
     expect(within(ended).getByText('build-box')).toBeInTheDocument()
     expect(within(ended).getByText(/Ended · Disconnected/)).toBeInTheDocument()
@@ -161,9 +176,43 @@ describe('Sessions page', () => {
     await screen.findByText('No live sessions')
     expect(relay.ended).toBe('revoked')
     expect(screen.getByRole('status')).toHaveTextContent('Ended 2 sessions and forgot 1 paired device.')
+    // Both are counted in the folded ended section, not listed in the default view.
+    expect(screen.getByRole('button', { name: /Show 2 ended sessions/ })).toBeInTheDocument()
+    expect(screen.queryAllByTestId('ended-session-row')).toHaveLength(0)
+    await user.click(screen.getByTestId('ended-toggle'))
     expect(screen.getAllByTestId('ended-session-row')).toHaveLength(2)
     expect(screen.getAllByText(/Ended · Revoked/)).toHaveLength(2)
     expect(screen.queryByRole('button', { name: /Revoke all/ })).toBeNull()
+  })
+
+  it('shows a live session\'s worker count and viewer count at a glance', async () => {
+    setup(true, [{ ...other, workers_running: 3, viewers: 2 }])
+    const [mine, box] = await screen.findAllByTestId('session-row')
+    // Both halves are on one line under the host, as words a person reads rather than "w:1 v:0".
+    const mineCounts = within(mine).getByTestId('live-counts')
+    expect(mineCounts).toHaveTextContent('1 worker')
+    expect(mineCounts).toHaveTextContent('0 watching')
+    expect(within(box).getByTestId('live-counts')).toHaveTextContent('3 workers')
+    expect(within(box).getByTestId('live-counts')).toHaveTextContent('2 watching')
+  })
+
+  it('keeps Open and Disconnect on the row itself, with no hover and no overflow menu', async () => {
+    setup()
+    const [mine] = await screen.findAllByTestId('session-row')
+    const open = within(mine).getByRole('link', { name: /Open/ })
+    const disconnect = within(mine).getByRole('button', { name: /Disconnect/ })
+    // Rendered, and on screen: `hidden`/`group-hover` classes would keep it out of reach on a
+    // touch device, where there is no hover state at all.
+    for (const el of [open, disconnect]) {
+      expect(el).toBeVisible()
+      expect(el.className).not.toMatch(/hidden|group-hover|peer-hover|opacity-0/)
+    }
+    // Disconnect still asks once more in place — a destructive action is never a bare tap.
+    expect(disconnect).toHaveTextContent('Disconnect')
+    const user = userEvent.setup()
+    await user.click(disconnect)
+    expect(within(mine).getByRole('button', { name: 'Disconnect now' })).toBeInTheDocument()
+    expect(within(mine).getByRole('button', { name: 'Cancel' })).toBeInTheDocument()
   })
 
   it('has no nav entry and no list when remote control is unavailable', async () => {
