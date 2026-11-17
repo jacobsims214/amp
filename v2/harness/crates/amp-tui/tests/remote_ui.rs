@@ -511,17 +511,72 @@ async fn a_y_after_the_pairing_arm_window_pairs() {
     );
 }
 
+/// #4901: an 80x24 window gets the code too (the owner wants it always available: a phone can
+/// pair from the QR), with the link printed beside it; `/remote off` still ends it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_80x24_window_gets_the_link_alone_and_off_says_so() {
+async fn an_80x24_window_gets_the_qr_and_the_link() {
     let mut r = rig("small", MockOptions::default(), (80, 24)).await;
     r.shell.submit("/remote").await;
-    let screen = r.until("No QR code").await;
+    let screen = r.until("████").await;
+    // The link is still there to copy, and no "no QR code" line.
     assert!(screen.contains("https://amp.local/sessions/"), "{screen}");
-    assert!(!screen.contains("████"), "{screen}");
+    assert!(!screen.contains("No QR code"), "{screen}");
+    assert!(!screen.contains("needs a wider window"), "{screen}");
+    // The window is shorter than the code plus the room around it: it says how to see it all.
+    assert!(screen.contains("scroll up to see all of it"), "{screen}");
+    // The criterion: at any width, nothing the chat draws runs past the terminal's width. The
+    // window shrinks from one too narrow for the code (the link, and the sentence saying why)
+    // through 80 to a wide one: the code's own rows, and that sentence drawn in its place where
+    // the code is too wide, both stay inside it.
+    for width in 12..=170 {
+        let rows = r.shell.view().render_frame(width, 24);
+        for row in rows {
+            let w = rpi_tui::visible_width(&row);
+            assert!(w <= width, "{w} columns in a {width}-wide window: {row:?}");
+        }
+        if [20, 40, 54, 80, 160].contains(&width) {
+            let code = r
+                .shell
+                .view()
+                .render_frame(width, 24)
+                .iter()
+                .filter(|l| l.contains('█'))
+                .count();
+            assert_eq!(
+                code > 1,
+                width >= 54,
+                "the code at {width} columns: {code} rows"
+            );
+        }
+    }
     r.shell.submit("/remote off").await;
     let screen = r.until("Remote control is off.").await;
     assert!(r.mock.ended().is_some());
     assert!(!screen.contains("REMOTE ON"), "{screen}");
+}
+
+/// #4901: a window genuinely too narrow for the code still degrades to the link, and the line
+/// that says why is the one that was always there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_too_narrow_for_the_code_gets_the_link_and_says_why() {
+    let mut r = rig("narrow", MockOptions::default(), (40, 24)).await;
+    r.shell.submit("/remote").await;
+    let screen = r.until("No QR code").await;
+    assert!(screen.contains("https://amp.local/sessions/"), "{screen}");
+    assert!(!screen.contains("████"), "{screen}");
+    assert!(screen.contains("Use the link"), "{screen}");
+}
+
+/// #4901: a window wide enough but shorter than the code gets the code (the transcript scrolls)
+/// and a line saying it is taller than the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tall_window_shows_the_whole_code_with_no_hint() {
+    let mut r = rig("tall", MockOptions::default(), (120, 40)).await;
+    r.shell.submit("/remote").await;
+    let screen = r.until("████").await;
+    assert!(screen.contains("https://amp.local/sessions/"), "{screen}");
+    assert!(!screen.contains("No QR code"), "{screen}");
+    assert!(!screen.contains("scroll up to see all of it"), "{screen}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
