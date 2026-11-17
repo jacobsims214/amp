@@ -202,7 +202,10 @@ describe('Session page', () => {
     // The textarea can never be dragged: `resize-none` is the only resize utility on it.
     const box = screen.getByLabelText('Message')
     expect(box).toHaveClass('resize-none')
-    expect(box.className.match(/\\bresize-(x|y|both)\\b/)).toBeNull()
+    // No `resize`/`resize-x`/`resize-y` class on it, whatever the width (same guard as
+    // SessionParts.test.tsx). Split into class names and test each one: a double-escaped
+    // `\\b` inside the regex literal would match a literal backslash and could never fail.
+    expect(box.className.split(/\s+/).filter(c => /^resize(-x|-y)?$/.test(c))).toEqual([])
 
     // Nothing to explain before a run: no reason line, and a plain placeholder.
     expect(screen.queryByTestId('composer-reason')).toBeNull()
