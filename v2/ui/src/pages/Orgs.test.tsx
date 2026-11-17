@@ -1,6 +1,6 @@
 // Teams & orgs — the page's own behaviour, and its one inbox-action entry point.
 //
-// Two concerns live here:
+// Three concerns live here:
 //
 //  * **Members (#124)**: the current user is listed, and inviting has a visible,
 //    labelled Invite button next to the email and role fields.
@@ -21,6 +21,13 @@
 //        under the reader.
 //     3. `npx vitest run src/pages/Orgs.test.tsx` and `npx tsc -b` pass, with a
 //        non-manager case — that is the last two tests here.
+//
+//  * **The `?team=` deep link (#4910)**: the team inbox's "Manage submit access"
+//    sends `/admin/orgs?team=<id>` (#4879), and the approved mockup's promise is
+//    that it lands on "the Teams tab with this team expanded to its access
+//    section". The cases at the bottom are this ticket's three criteria: the
+//    manager journey, the same link for a viewer who may not manage it, and a
+//    URL that names no team behaving exactly as the page did before.
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
@@ -37,6 +44,16 @@ let invited: unknown = null
 const ORG: Org = { id: 1, name: 'Default', slug: 'default', created_by: null, created_at: '2026-01-01T00:00:00Z', my_role: 'admin' }
 const PLATFORM: Team = { id: 4, org_id: 1, name: 'Platform', created_by: null, created_at: '2026-01-01T00:00:00Z' }
 const SUPPORT: Team = { id: 5, org_id: 1, name: 'Support', created_by: null, created_at: '2026-01-01T00:00:00Z' }
+
+/**
+ * A second org, and a team in it (#4910).
+ *
+ * The page's default is the *first* org, so a deep link that names a team in the
+ * second one can only land correctly by resolving the team first — which is the
+ * part of the journey that used to be missing.
+ */
+const NORTHWIND: Org = { id: 2, name: 'Northwind Traders', slug: 'northwind', created_by: null, created_at: '2026-01-01T00:00:00Z', my_role: 'admin' }
+const FIELD: Team = { id: 6, org_id: 2, name: 'Field service', created_by: null, created_at: '2026-01-01T00:00:00Z' }
 
 const grant = (team: number, over: Partial<TeamSubmitGrantee> = {}): TeamSubmitGrantee => ({
   team_id: team, org_id: 1, user_id: 31, granted_by: 1, granted_at: '2026-11-13T10:00:00Z',
@@ -65,6 +82,8 @@ const server = setupServer(
   }),
   http.get('*/api/teams/4/request-invites', () => HttpResponse.json({ team_id: 4, invites: [] })),
   http.get('*/api/teams/5/request-invites', () => HttpResponse.json({ team_id: 5, invites: [] })),
+  // An id no team has, so "unknown id" is a 404 like the server's, not an MSW gap.
+  http.get('*/api/teams/999', () => HttpResponse.json({ error: 'team 999 not found' }, { status: 404 })),
   http.get('*/api/users/me/tokens', () => HttpResponse.json({ tokens: [] })),
 )
 beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }))
@@ -84,16 +103,22 @@ const platformLead: Me = {
   teams: [{ id: 4, name: 'Platform', org_id: 1, role: 'lead' }],
 }
 
-/** An admin of the org, on neither team: the other way a person is a manager. */
+/**
+ * An admin of the org, on neither team: the other way a person is a manager.
+ *
+ * Admin of both orgs in the fixture, because the `?team=` cases (#4910) send a
+ * link to a team in the *second* one: a manager who is only an admin of the first
+ * is not a manager of that team, and asserting otherwise would test a fiction.
+ */
 const orgAdmin: Me = {
   ...plainMember, user_id: 12, email: 'admin@simstech.cloud', name: 'Org Admin',
-  orgs: [{ ...ORG, my_role: 'admin' }],
+  orgs: [{ ...ORG, my_role: 'admin' }, { ...NORTHWIND, my_role: 'admin' }],
   teams: [],
 }
 
-const mount = (me: Me, isAdmin = false) => render(
+const mount = (me: Me, isAdmin = false, url = '/admin/orgs') => render(
   <AuthContext.Provider value={{ me, loading: false, error: null, isAdmin }}>
-    <MemoryRouter><Orgs /></MemoryRouter>
+    <MemoryRouter initialEntries={[url]}><Orgs /></MemoryRouter>
   </AuthContext.Provider>,
 )
 
@@ -204,5 +229,100 @@ describe('Teams & orgs > Inbox access (AMP #4877)', () => {
     expect(screen.queryByRole('button', { name: `Inbox access for ${PLATFORM.name}` })).toBeNull()
     expect(screen.queryByRole('region', { name: /Team inbox · submit access/ })).toBeNull()
     expect(grantReads).toEqual([])
+  })
+})
+
+// ─── The `?team=` deep link (AMP #4910) ───────────────────────────────────────
+//
+// The team inbox's "Manage submit access" sends `/admin/orgs?team=<id>` (#4879),
+// and the approved mockup (artifact 112 v1 §4) promises that this lands on "the
+// Teams tab with this team expanded to its access section". These cases are that
+// promise, the same link for somebody who may not manage it, and the page without
+// a link at all.
+//
+describe('Teams & orgs > ?team= deep link (AMP #4910)', () => {
+  /**
+   * A second org, ahead of the page's default in nothing but id order — the point
+   * is that it is **not** the first org, so landing on it proves the team was
+   * resolved rather than the first row taken.
+   */
+  const twoOrgs = () => {
+    server.use(
+      http.get('*/api/orgs', () => HttpResponse.json({ orgs: [ORG, NORTHWIND] })),
+      http.get('*/api/orgs/2/teams', () => HttpResponse.json({ teams: [FIELD] })),
+      http.get('*/api/teams/6', () => HttpResponse.json({ team: FIELD, members: [{ user_id: 1, email: 'local-dev@amp.local', display_name: 'Local Dev', role: 'lead' }] })),
+      http.get('*/api/teams/6/request-grants', () => {
+        grantReads.push(6)
+        return HttpResponse.json({ team_id: 6, grants: [grant(6, { display_name: 'Field service grantee' })] })
+      }),
+      http.get('*/api/teams/6/request-invites', () => HttpResponse.json({ team_id: 6, invites: [] })),
+    )
+  }
+
+  /**
+   * Which org the page has selected, read off the list's own `aria-current` —
+   * the page's own statement of the selection rather than a guess from styling.
+   */
+  const selectedOrgName = () => {
+    const row = screen.getAllByRole('button').find(b => b.getAttribute('aria-current') === 'true')
+    if (!row) throw new Error('no org is selected')
+    return row.textContent ?? ''
+  }
+
+  it('a manager lands on the team\u2019s org, its Teams tab, the expanded row and the open section', async () => {
+    twoOrgs()
+    mount(orgAdmin, false, '/admin/orgs?team=6')
+
+    // The section is open with this team's grants — no click, no tab to pick.
+    const panel = await screen.findByRole('region', { name: /Team inbox · submit access/ })
+    expect(await within(panel).findByText('Field service grantee')).toBeInTheDocument()
+    expect(grantReads).toEqual([6])
+
+    // On the team's own org, not on the page's default (the first org).
+    expect(selectedOrgName()).toContain(NORTHWIND.name)
+    // The Teams tab is the active one: its panel rendered without being clicked.
+    expect(screen.getByRole('button', { name: 'teams' }).className).toContain('border-accent')
+    // The row is expanded, so its members are there too — not just the section.
+    expect(await screen.findByText('local-dev@amp.local', { exact: false })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: `Inbox access for ${FIELD.name}` })).toHaveAttribute('aria-expanded', 'true')
+  })
+
+  it('the same link for a viewer who may not manage it expands the row and opens no section', async () => {
+    twoOrgs()
+    mount(plainMember, false, '/admin/orgs?team=6')
+
+    // Expanded: the row's members are on screen.
+    expect(await screen.findByText('local-dev@amp.local', { exact: false })).toBeInTheDocument()
+    // No section, no action, and nothing read this team's grants.
+    expect(screen.queryByRole('region', { name: /Team inbox · submit access/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: `Inbox access for ${FIELD.name}` })).toBeNull()
+    expect(grantReads).toEqual([])
+    // Still the team's own org and its Teams tab: the arrival is not the manager's.
+    expect(selectedOrgName()).toContain(NORTHWIND.name)
+  })
+
+  it('without ?team the page behaves exactly as before — first org, Members tab, nothing expanded', async () => {
+    twoOrgs()
+    mount(orgAdmin)
+
+    // Members is the landing tab, so the invite form is what renders.
+    expect(await screen.findByRole('form', { name: 'Invite to Default' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'members' }).className).toContain('border-accent')
+    expect(screen.queryByRole('region', { name: /Team inbox · submit access/ })).toBeNull()
+    expect(grantReads).toEqual([])
+    // And the page never selected an org it was not sent to.
+    expect(selectedOrgName()).toContain(ORG.name)
+  })
+
+  it('an unknown or unusable id is the same page as no id at all', async () => {
+    twoOrgs()
+    for (const url of ['/admin/orgs?team=999', '/admin/orgs?team=abc', '/admin/orgs?team=']) {
+      const { unmount } = mount(orgAdmin, false, url)
+      expect(await screen.findByRole('form', { name: 'Invite to Default' })).toBeInTheDocument()
+      expect(screen.queryByRole('region', { name: /Team inbox · submit access/ })).toBeNull()
+      expect(selectedOrgName()).toContain(ORG.name)
+      unmount()
+      grantReads = []
+    }
   })
 })
