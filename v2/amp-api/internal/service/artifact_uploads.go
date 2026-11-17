@@ -5,12 +5,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"strings"
 	"time"
 
+	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/receipts"
@@ -177,7 +179,11 @@ func (s *Service) StoreArtifactUpload(ctx context.Context, token string, body io
 	if err := json.Unmarshal(row.Request, &r); err != nil {
 		return nil, err
 	}
-	a, err := s.PublishArtifact(ctx, c.principal(), PublishArtifactRequest{ArtifactID: r.ArtifactID, ProjectID: r.ProjectID,
+	p, err := s.uploadPrincipal(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	a, err := s.PublishArtifact(ctx, p, PublishArtifactRequest{ArtifactID: r.ArtifactID, ProjectID: r.ProjectID,
 		TaskID: r.TaskID, Title: r.Title, Kind: r.Kind, Note: r.Note, Content: content})
 	if err != nil {
 		return nil, err
@@ -189,6 +195,50 @@ func (s *Service) StoreArtifactUpload(ctx context.Context, token string, body io
 		slog.Warn("artifact upload: mark it used", "id", row.ID, "artifact", a.ID, "claim_held", ok, "err", err)
 	}
 	return a, nil
+}
+
+// uploadPrincipal is who the upload publishes as now. The route skips the
+// auth middleware, so its checks run here: the account must still exist and
+// be active, and the API token the URL was minted with must still be live.
+// Super and the rest of the identity come from the current user row; only
+// the credential's scope and channel are kept from the mint.
+func (s *Service) uploadPrincipal(ctx context.Context, c uploadCaller) (authz.Principal, error) {
+	p := c.principal()
+	if c.UserID == 0 {
+		// Only auth-off local dev mints without a user.
+		if c.AuthMethod == auth.AuthLocalDev {
+			return p, nil
+		}
+		return authz.Principal{}, authz.Forbidden("this upload URL has no AMP user; nothing was published")
+	}
+	u, err := s.Repo.GetUserByID(ctx, c.UserID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return authz.Principal{}, authz.Forbidden("the account that made this upload URL no longer exists; nothing was published")
+	}
+	if err != nil {
+		return authz.Principal{}, err
+	}
+	if u.DisabledAt != nil {
+		return authz.Principal{}, authz.Forbidden("the account that made this upload URL is deactivated; nothing was published")
+	}
+	if c.TokenID != 0 {
+		tok, err := s.Repo.GetAPIToken(ctx, int(c.TokenID))
+		if err != nil && !errors.Is(err, repository.ErrNotFound) {
+			return authz.Principal{}, err
+		}
+		if err != nil || tok.UserID != u.ID || tok.RevokedAt != nil || (tok.ExpiresAt != nil && !time.Now().Before(*tok.ExpiresAt)) {
+			return authz.Principal{}, authz.Forbidden("the API token this upload URL was made with is revoked or expired; nothing was published")
+		}
+	}
+	roles, err := s.Repo.UserRoles(ctx, u.ID)
+	if err != nil {
+		return authz.Principal{}, err
+	}
+	u.Roles = roles
+	p.Email, p.Agent, p.ManagedBy = u.Email, u.IsAgent(), u.ManagedBy
+	// Local dev's Super is the auth-off mode's (authz.FromContext), not a role.
+	p.Super = c.AuthMethod == auth.AuthLocalDev || (u.HasRole(domain.RoleAdmin) && !u.IsAgent())
+	return p, nil
 }
 
 // unclaimableUpload answers a PUT to an upload URL that can't be claimed now,

@@ -330,3 +330,104 @@ func TestArtifactUpload_ReleaseAndFinishActOnlyOnTheirOwnClaim(t *testing.T) {
 		t.Fatalf("a second finish = %v, %v; want false", ok, err)
 	}
 }
+
+// The upload route skips the auth middleware, so StoreArtifactUpload itself
+// must refuse an account deactivated, or a token revoked, after the mint
+// (AMP #4970). A refusal releases the claim: the URL works again once the
+// account is back.
+func TestArtifactUpload_RefusedAfterDeactivation(t *testing.T) {
+	f := newArtUploadFixture(t)
+	html := screenshotHTML("d")
+	_, token := f.begin(f.worker, PublishArtifactRequest{TaskID: &f.task, Title: "Mockup", Kind: "html"}, html)
+
+	f.exec(`UPDATE users SET disabled_at = NOW() WHERE id = $1`, f.worker.UserID)
+	if _, err := f.svc.StoreArtifactUpload(f.ctx, token, bytes.NewReader(html)); authz.StatusOf(err, 0) != 403 {
+		t.Fatalf("deactivated: err = %v, want 403", err)
+	}
+	f.wantArtifacts(0)
+
+	f.exec(`UPDATE users SET disabled_at = NULL WHERE id = $1`, f.worker.UserID)
+	if a, err := f.svc.StoreArtifactUpload(f.ctx, token, bytes.NewReader(html)); err != nil || a.CurrentVersion != 1 {
+		t.Fatalf("reactivated: %+v, %v; want v1 (the refusal released the claim)", a, err)
+	}
+}
+
+func TestArtifactUpload_RefusedAfterTokenRevokedOrExpired(t *testing.T) {
+	f := newArtUploadFixture(t)
+	html := screenshotHTML("t")
+	req := PublishArtifactRequest{TaskID: &f.task, Title: "Mockup", Kind: "html"}
+	for name, kill := range map[string]string{
+		"revoked": `UPDATE api_tokens SET revoked_at = NOW() WHERE id = $1`,
+		"expired": `UPDATE api_tokens SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+	} {
+		p := f.viaToken(f.worker)
+		_, token := f.begin(p, req, html)
+		f.exec(kill, p.TokenID)
+		if _, err := f.svc.StoreArtifactUpload(f.ctx, token, bytes.NewReader(html)); authz.StatusOf(err, 0) != 403 {
+			t.Fatalf("%s token: err = %v, want 403", name, err)
+		}
+	}
+	f.wantArtifacts(0)
+
+	p := f.viaToken(f.worker)
+	_, token := f.begin(p, req, html)
+	if a, err := f.svc.StoreArtifactUpload(f.ctx, token, bytes.NewReader(html)); err != nil || a.CurrentVersion != 1 {
+		t.Fatalf("live token: %+v, %v; want v1", a, err)
+	}
+}
+
+// A global admin's URL to a project they aren't in publishes only while they
+// are still an admin: Super is read from the user row, not the mint.
+func TestArtifactUpload_SuperComesFromTheCurrentUser(t *testing.T) {
+	f := newArtUploadFixture(t)
+	html := screenshotHTML("s")
+	admin := f.stranger
+	admin.Super = true
+	f.exec(`INSERT INTO user_roles (user_id, role) VALUES ($1, 'admin')`, admin.UserID)
+	req := PublishArtifactRequest{TaskID: &f.task, Title: "Mockup", Kind: "html"}
+
+	_, demoted := f.begin(admin, req, html)
+	_, kept := f.begin(admin, req, html)
+	f.exec(`DELETE FROM user_roles WHERE user_id = $1 AND role = 'admin'`, admin.UserID)
+	// A project the caller can't see answers 404, not 403, so it isn't disclosed.
+	if _, err := f.svc.StoreArtifactUpload(f.ctx, demoted, bytes.NewReader(html)); authz.StatusOf(err, 0) != 404 {
+		t.Fatalf("demoted admin: err = %v, want 404", err)
+	}
+	f.wantArtifacts(0)
+
+	f.exec(`INSERT INTO user_roles (user_id, role) VALUES ($1, 'admin')`, admin.UserID)
+	if _, err := f.svc.StoreArtifactUpload(f.ctx, kept, bytes.NewReader(html)); err != nil {
+		t.Fatalf("admin again: %v", err)
+	}
+}
+
+func (f *artUploadFixture) exec(sql string, args ...any) {
+	f.t.Helper()
+	if _, err := f.db.Exec(f.ctx, sql, args...); err != nil {
+		f.t.Fatalf("%s: %v", sql, err)
+	}
+}
+
+// viaToken is p authenticated with a fresh live API token of its own.
+func (f *artUploadFixture) viaToken(p authz.Principal) authz.Principal {
+	f.t.Helper()
+	var id int64
+	hash := fmt.Sprintf("%064x", rand.Uint64())
+	if err := f.db.QueryRow(f.ctx, `INSERT INTO api_tokens (user_id, name, token_hash, prefix) VALUES ($1, 'agent', $2, 'amp_x')
+		RETURNING id`, p.UserID, hash).Scan(&id); err != nil {
+		f.t.Fatal(err)
+	}
+	p.ViaToken, p.TokenID, p.AuthMethod, p.Channel = true, id, auth.AuthAPIToken, auth.ChannelToken
+	return p
+}
+
+func (f *artUploadFixture) wantArtifacts(n int) {
+	f.t.Helper()
+	var got int
+	if err := f.db.QueryRow(f.ctx, `SELECT COUNT(*) FROM artifacts WHERE task_id = $1`, f.task).Scan(&got); err != nil {
+		f.t.Fatal(err)
+	}
+	if got != n {
+		f.t.Fatalf("%d artifacts on the ticket, want %d", got, n)
+	}
+}
