@@ -45,8 +45,9 @@ mockup itself. Keep a copy in the repo only when the ticket asks for one.
   ```
 
   The response holds the artifact's `url` and `version`. Nothing is published until the upload
-  lands. A 422 means the bytes or sha256 didn't match the file: fix them and upload again to the
-  same URL.
+  lands. A 422 means the file you sent doesn't match the bytes or sha256 you declared, and the URL
+  stays bound to those values. Either upload the file that matches them to the same URL, or call
+  `amp_publish_artifact` again with the correct bytes and sha256 to get a new URL.
 - **A small file** can still go inline: `amp_publish_artifact(..., content=...)` (or
   `content_base64` for an image or PDF). Don't re-type a large file this way.
 
