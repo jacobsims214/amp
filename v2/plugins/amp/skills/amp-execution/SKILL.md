@@ -358,7 +358,9 @@ as VERIFIED / COULD NOT VERIFY above, which you still write in the comment. A `v
 counts only with its own uploaded evidence (screenshots, a recording): declare the files with
 `amp_add_evidence` before completing, upload each to its one-time URL, and cite its `key` as the
 check's `evidence_key` (`amp-worker-frontend` describes how). Without that it counts as
-`cant_tell`.
+`cant_tell`. Any worker with a shell can do this, not only frontend: the upload is
+`curl -fsS -T screenshot-1.png "<url>"` with no auth header (`shasum -a 256` on macOS gives the
+`sha256`). A worker without a shell can't upload: record the check as `cant_tell` with a note.
 
 **If the result says `held: true`**, stop: the project requires a receipt and yours is below its
 minimum (no passing check, or a failing one). The ticket is not done; it waits for a person, who
@@ -369,8 +371,9 @@ Then complete it **with the run record** — what you used and where the work is
 capitalizes token spend from these numbers, and traces code back to tickets from the git fields:
 
 ```
-amp_session_usage()          ← if your harness has it (Claude Code with the AMP plugin): your model,
-                               tokens and cost for this session. Pass them straight through.
+python3 <this skill's base directory>/session_usage.py --dispatch-id <your dispatch ID>
+                             ← Bash: your model and tokens for this session, read from your own
+                               transcript. Pass them straight through; on an error, the model only.
 amp_complete_task(task_id=YOUR_TASK_ID, dispatch_id="<your dispatch ID>",
   model="<the model you ran on>",
   input_tokens=…, output_tokens=…, cache_read_tokens=…, cost_usd=…,   ← only numbers your harness gave you
@@ -401,7 +404,7 @@ amp_open_receipt {task_id, dispatch_id, summary?, files_changed?}   ← before c
 amp_add_evidence {receipt_id, dispatch_id, tree_sha, commit?, files: [{name, bytes, sha256, duration_ms?, frames?}]}   ← one-time upload URLs for a visual check's evidence
 amp_complete_task {task_id, dispatch_id, model?, input_tokens?, output_tokens?, cache_read_tokens?, cost_usd?, branch?, commit?, pushed?, pr_url?, base_branch?, receipt_id?, checks?}
 amp_report_run {task_id, outcome, …run fields}  ← a run that ended another way, or a PR opened later
-amp_session_usage {}                  ← Claude Code plugin: your own model/tokens/cost
+session_usage.py --dispatch-id <id>   ← run with Bash from this skill's folder: your own model/tokens
 amp_get_task {task_id, include: ["history","runs"]}   ← what happened before you
 amp_get_plan {project_id, epic_id?}
 amp_create_tasks {project_id, tasks: [{ref, story_id, name, description, acceptance_criteria, assigned_to, depends_on}]}

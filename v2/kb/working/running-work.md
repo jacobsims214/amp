@@ -79,8 +79,10 @@ itself. Reaching an **integration branch** is not a merge to main — only a rec
 the tickets after a ticket, and `pushed` never means "merged". A ticket completed with no git
 fields at all simply holds nothing and asks no one to merge.
 
-Tokens are never estimated: they come from the harness (`amp_session_usage` in opencode, the
-subagent result in Claude Code) or are left out.
+Tokens are never estimated: they come from the harness (`amp_session_usage` in opencode; in
+Claude Code the worker runs the amp-execution skill's `session_usage.py --dispatch-id <id>`,
+which reads its own transcript, or the manager takes them from the subagent's result) or are
+left out.
 
 ## Closeouts — a ticket finished by someone other than its worker
 

@@ -215,6 +215,26 @@ BODY_RULES: list[tuple[str, str]] = [
         r"opencode's\s*\n?\s*`?subagent_depth`? setting structurally prevents nested delegation",
         "Claude Code structurally prevents nested delegation (subagents cannot spawn subagents)",
     ),
+    # amp_session_usage is an opencode plugin tool; Claude Code gets session_usage.py from
+    # overrides/skills/amp-execution instead. Replacements must not say "opencode": the
+    # catch-all below would turn it into "Claude Code".
+    (
+        r"amp_session_usage\(\) +← if your harness has it \(opencode with the AMP plugin\): your model,\n"
+        r" +tokens and cost for this session\. Pass them straight through\.",
+        "python3 <this skill's base directory>/session_usage.py --dispatch-id <your dispatch ID>\n"
+        "                             ← Bash: your model and tokens for this session, read from your own\n"
+        "                               transcript. Pass them straight through; on an error, the model only.",
+    ),
+    (
+        r"amp_session_usage \{\} +← opencode plugin: your own model/tokens/cost",
+        "session_usage.py --dispatch-id <id>   ← run with Bash from this skill's folder: your own model/tokens",
+    ),
+    (
+        r"`amp_session_usage` is not an AMP server tool: the harness plugin provides it \(opencode with the AMP plugin\) to report your own model, tokens and cost",
+        "`amp_session_usage` is not an AMP server tool, and Claude Code has no such tool: run "
+        "`python3 <amp-execution skill folder>/session_usage.py --dispatch-id <your dispatch ID>` "
+        "with Bash to read your own model and tokens from your transcript",
+    ),
     # anything left
     (r"\bopencode\b", "Claude Code"),
 ]

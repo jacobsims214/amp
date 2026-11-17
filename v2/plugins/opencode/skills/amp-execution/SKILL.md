@@ -358,7 +358,9 @@ as VERIFIED / COULD NOT VERIFY above, which you still write in the comment. A `v
 counts only with its own uploaded evidence (screenshots, a recording): declare the files with
 `amp_add_evidence` before completing, upload each to its one-time URL, and cite its `key` as the
 check's `evidence_key` (`amp-worker-frontend` describes how). Without that it counts as
-`cant_tell`.
+`cant_tell`. Any worker with a shell can do this, not only frontend: the upload is
+`curl -fsS -T screenshot-1.png "<url>"` with no auth header (`shasum -a 256` on macOS gives the
+`sha256`). A worker without a shell can't upload: record the check as `cant_tell` with a note.
 
 **If the result says `held: true`**, stop: the project requires a receipt and yours is below its
 minimum (no passing check, or a failing one). The ticket is not done; it waits for a person, who
