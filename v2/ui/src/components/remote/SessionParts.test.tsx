@@ -1,8 +1,8 @@
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
-import { Composer, WorkerChips } from './SessionParts'
-import type { WorkerInfo, WorkerState } from '../../remote/types'
+import { AmpConnectionBadge, Composer, WorkerChips } from './SessionParts'
+import type { AmpConnection, SessionStatus, WorkerInfo, WorkerState } from '../../remote/types'
 
 const NOW = 1_000_000_000_000
 
@@ -216,5 +216,45 @@ describe('Composer: Send and Stop in one row, a fixed box (#4896)', () => {
     // The reason is not repeated below the row.
     expect(within(container).getAllByText(why)).toHaveLength(1)
     expect(screen.getByLabelText('Message')).toBeDisabled()
+  })
+})
+
+describe('AmpConnectionBadge: the phone dot still says what it means (#4960)', () => {
+  const badge = (amp: AmpConnection | null) =>
+    render(<AmpConnectionBadge status={{ amp_connection: amp } as SessionStatus} />)
+
+  it('exposes the connection word as an accessible name, on a role that carries it', () => {
+    badge({ state: 'connected', latency_ms: null })
+    // A bare <span> has no role, and `aria-label` is prohibited on a generic element: it dropped out
+    // of the accessibility tree, so on a phone — where the dot is the entire badge — a screen reader
+    // got nothing. `role="img"` gives the name a role to sit on, at every width.
+    const b = screen.getByRole('img', { name: 'AMP tools connected' })
+    expect(b).toBe(screen.getByTestId('amp-connection'))
+    expect(b).toHaveAccessibleName('AMP tools connected')
+  })
+
+  it('keeps the phone layout exactly as the mockup drew it: the dot alone, the words from `sm` up', () => {
+    badge({ state: 'slow', latency_ms: 812 })
+    const b = screen.getByTestId('amp-connection')
+    expect(within(b).getByText('AMP')).toHaveClass('hidden', 'sm:inline')
+    expect(within(b).getByText('slow 812 ms')).toHaveClass('hidden', 'sm:inline')
+    // The dot is the one thing a phone shows, and it stays decorative: the name above is what speaks.
+    const dot = b.querySelector('[aria-hidden="true"]')!
+    expect(dot).toHaveClass('w-1.5', 'h-1.5', 'rounded-full')
+    expect(b).toHaveClass('inline-flex', 'whitespace-nowrap')
+  })
+
+  it('names a degraded or lost connection too, so colour is never the whole message', () => {
+    const { unmount } = render(<AmpConnectionBadge status={{ amp_connection: { state: 'degraded', latency_ms: null } } as SessionStatus} />)
+    expect(screen.getByRole('img')).toHaveAccessibleName('AMP tools degraded')
+    unmount()
+
+    badge({ state: 'disconnected', latency_ms: null })
+    expect(screen.getByRole('img')).toHaveAccessibleName('AMP tools disconnected · retrying…')
+  })
+
+  it('renders nothing, and announces nothing, when the harness sends no connection', () => {
+    const { container } = badge(null)
+    expect(container).toBeEmptyDOMElement()
   })
 })
