@@ -81,17 +81,9 @@ func artifactContentType(kind string, content []byte) (string, error) {
 // A decision doc changes only in AMP: publishing to one is refused, for any
 // caller.
 func (s *Service) PublishArtifact(ctx context.Context, p authz.Principal, req PublishArtifactRequest) (*domain.Artifact, error) {
-	if req.ArtifactID != 0 {
-		doc, link, err := s.decisionArtifact(ctx, p, req.ArtifactID)
-		if err != nil {
-			return nil, err
-		}
-		if doc != nil {
-			if doc.Claimed() {
-				return nil, &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionRecordedRefusal, link)}
-			}
-			return nil, authz.Forbidden(decisionPublishRefusal, link)
-		}
+	existing, err := s.prepareArtifactPublish(ctx, p, &req)
+	if err != nil {
+		return nil, err
 	}
 	if len(req.Content) == 0 {
 		return nil, authz.BadRequest("content is empty")
@@ -99,54 +91,9 @@ func (s *Service) PublishArtifact(ctx context.Context, p authz.Principal, req Pu
 	if len(req.Content) > domain.MaxArtifactBytes {
 		return nil, authz.BadRequest("content is %d bytes; the limit is %d (10 MB)", len(req.Content), domain.MaxArtifactBytes)
 	}
-	req.Title = strings.TrimSpace(req.Title)
-
-	var existing *domain.Artifact
-	if req.ArtifactID != 0 {
-		a, err := s.Repo.GetArtifact(ctx, req.ArtifactID)
-		if err != nil {
-			return nil, authz.NotFound("artifact %d not found", req.ArtifactID)
-		}
-		existing = a
-		req.ProjectID, req.TaskID = a.ProjectID, a.TaskID
-		if req.Kind == "" {
-			req.Kind = a.Kind
-		}
-		if req.Kind != a.Kind {
-			return nil, authz.BadRequest("artifact %d is %s; a new version must be too (publish a new artifact for a different kind)", a.ID, a.Kind)
-		}
-	} else if req.Title == "" {
-		return nil, authz.BadRequest("title is required")
-	}
 	contentType, err := artifactContentType(req.Kind, req.Content)
 	if err != nil {
 		return nil, err
-	}
-
-	if req.TaskID != nil {
-		t, _, err := s.LoadTask(ctx, p, *req.TaskID, authz.TaskWork)
-		if err != nil {
-			return nil, err
-		}
-		// A design system phase has one artifact; further rounds are versions
-		// of it, so the approval the publish step checks is unambiguous.
-		if phase, _ := t.Metadata["design_system_phase"].(string); phase != "" && existing == nil {
-			if arts, err := s.Repo.ListArtifacts(ctx, t.ProjectID, req.TaskID); err == nil && len(arts) > 0 {
-				return nil, authz.BadRequest("ticket %d (design system phase %q) already has artifact #%d: publish a new version of it with artifact_id=%d", t.ID, phase, arts[0].ID, arts[0].ID)
-			}
-		}
-		if req.ProjectID != 0 && req.ProjectID != t.ProjectID {
-			return nil, authz.BadRequest("ticket %d is in project %d, not %d", t.ID, t.ProjectID, req.ProjectID)
-		}
-		req.ProjectID = t.ProjectID
-	} else if _, err := s.Authz.RequireProject(ctx, p, req.ProjectID, authz.Member); err != nil {
-		return nil, err
-	}
-
-	if existing != nil {
-		if n, err := s.Repo.CountArtifactVersions(ctx, existing.ID); err == nil && n >= domain.MaxArtifactVersions {
-			return nil, authz.BadRequest("artifact %d has %d versions, the most one artifact keeps; publish a new artifact", existing.ID, n)
-		}
 	}
 	var a *domain.Artifact
 	if existing != nil {
@@ -174,8 +121,76 @@ func (s *Service) PublishArtifact(ctx context.Context, p authz.Principal, req Pu
 	return a, nil
 }
 
+// prepareArtifactPublish is every check a publish makes that doesn't need
+// the content, so an upload URL is refused when minted rather than after the
+// file is sent. It fills req's project, ticket and kind from the artifact on
+// a new version, and returns that artifact (nil for a new one).
+func (s *Service) prepareArtifactPublish(ctx context.Context, p authz.Principal, req *PublishArtifactRequest) (*domain.Artifact, error) {
+	if req.ArtifactID != 0 {
+		doc, link, err := s.decisionArtifact(ctx, p, req.ArtifactID)
+		if err != nil {
+			return nil, err
+		}
+		if doc != nil {
+			if doc.Claimed() {
+				return nil, &authz.Error{Status: 409, Msg: fmt.Sprintf(decisionRecordedRefusal, link)}
+			}
+			return nil, authz.Forbidden(decisionPublishRefusal, link)
+		}
+	}
+	req.Title = strings.TrimSpace(req.Title)
+
+	var existing *domain.Artifact
+	if req.ArtifactID != 0 {
+		a, err := s.Repo.GetArtifact(ctx, req.ArtifactID)
+		if err != nil {
+			return nil, authz.NotFound("artifact %d not found", req.ArtifactID)
+		}
+		existing = a
+		req.ProjectID, req.TaskID = a.ProjectID, a.TaskID
+		if req.Kind == "" {
+			req.Kind = a.Kind
+		}
+		if req.Kind != a.Kind {
+			return nil, authz.BadRequest("artifact %d is %s; a new version must be too (publish a new artifact for a different kind)", a.ID, a.Kind)
+		}
+	} else if req.Title == "" {
+		return nil, authz.BadRequest("title is required")
+	}
+
+	if req.TaskID != nil {
+		t, _, err := s.LoadTask(ctx, p, *req.TaskID, authz.TaskWork)
+		if err != nil {
+			return nil, err
+		}
+		// A design system phase has one artifact; further rounds are versions
+		// of it, so the approval the publish step checks is unambiguous.
+		if phase, _ := t.Metadata["design_system_phase"].(string); phase != "" && existing == nil {
+			if arts, err := s.Repo.ListArtifacts(ctx, t.ProjectID, req.TaskID); err == nil && len(arts) > 0 {
+				return nil, authz.BadRequest("ticket %d (design system phase %q) already has artifact #%d: publish a new version of it with artifact_id=%d", t.ID, phase, arts[0].ID, arts[0].ID)
+			}
+		}
+		if req.ProjectID != 0 && req.ProjectID != t.ProjectID {
+			return nil, authz.BadRequest("ticket %d is in project %d, not %d", t.ID, t.ProjectID, req.ProjectID)
+		}
+		req.ProjectID = t.ProjectID
+	} else if _, err := s.Authz.RequireProject(ctx, p, req.ProjectID, authz.Member); err != nil {
+		return nil, err
+	}
+
+	if existing != nil {
+		if n, err := s.Repo.CountArtifactVersions(ctx, existing.ID); err == nil && n >= domain.MaxArtifactVersions {
+			return nil, authz.BadRequest("artifact %d has %d versions, the most one artifact keeps; publish a new artifact", existing.ID, n)
+		}
+	}
+	return existing, nil
+}
+
 // comment posts on a ticket as p; a failure is not the caller's problem.
 func (s *Service) comment(projectID, taskID int, p authz.Principal, body string) {
+	if s.Registry == nil {
+		return
+	}
 	reply := make(chan actor.ReplyAddComment, 1)
 	if err := s.Registry.Send(projectID, &actor.MsgAddComment{Req: domain.AddCommentRequest{
 		TaskID: taskID, Author: p.Email, Body: body, AuthorUserID: p.UserRef(),

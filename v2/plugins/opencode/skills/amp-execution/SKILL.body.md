@@ -355,6 +355,20 @@ counts only with its own uploaded evidence (screenshots, a recording): declare t
 check's `evidence_key` (`amp-worker-frontend` describes how). Without that it counts as
 `cant_tell`.
 
+**Screenshots and visual evidence go on the ticket, never only on disk.** Whatever you
+screenshot to make or check visual work, publish it on your ticket as **one self-contained html
+artifact**: inline CSS and JS, images as `data:` URIs, 10 MB at most, with CSS-driven state,
+width and theme switchers so a reviewer sees every view without running anything. Bundle a
+multi-file prototype into one file first (`vite-plugin-singlefile` or an inline-assets step).
+Don't leave screenshots local and don't commit them. Publish the file, don't paste it:
+
+- **opencode**: the AMP plugin's `amp_publish_artifact_file(path, task_id, title)` tool.
+- **Claude Code, or any harness with a shell**: `amp_publish_artifact(task_id, title,
+  kind="html", bytes, sha256)` with no content, then `curl -fsS -T <file> '<upload.url>'`.
+
+The **amp-design-tools** skill has the exact commands and the switcher pattern. Receipt evidence
+(`amp_add_evidence`, above) is in addition to the artifact, not instead of it.
+
 **If the result says `held: true`**, stop: the project requires a receipt and yours is below its
 minimum (no passing check, or a failing one). The ticket is not done; it waits for a person, who
 accepts it or sends it back. Don't retry the completion. Say why in your closing message, with

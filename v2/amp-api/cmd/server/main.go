@@ -555,13 +555,13 @@ func envOrDefault(key, def string) string {
 // and /ready, which k8s liveness/readiness probes hit unauthenticated, and
 // GitHub's webhook deliveries (api.GitHubHookPrefix), which carry no AMP
 // session and are authenticated by their HMAC signature instead, and
-// receipt evidence uploads (api.ReceiptUploadPrefix), whose one-time token
-// in the path is the credential.
+// receipt evidence and artifact uploads (api.ReceiptUploadPrefix,
+// api.ArtifactUploadPrefix), whose one-time token in the path is the credential.
 func authExceptHealth(v *auth.Verifier, next http.Handler) http.Handler {
 	authed := v.Middleware(next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" || r.URL.Path == "/ready" || strings.HasPrefix(r.URL.Path, api.GitHubHookPrefix) ||
-			strings.HasPrefix(r.URL.Path, api.ReceiptUploadPrefix) {
+			strings.HasPrefix(r.URL.Path, api.ReceiptUploadPrefix) || strings.HasPrefix(r.URL.Path, api.ArtifactUploadPrefix) {
 			next.ServeHTTP(w, r)
 			return
 		}
