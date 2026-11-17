@@ -183,6 +183,11 @@ export interface SessionSummary {
   project: ProjectRef | null
   online: boolean
   viewers: number
+  /**
+   * How many workers the harness's last status counted (#4898). Optional: a relay that predates it,
+   * or a harness that has sent no status, leaves it out, which reads as "not known" rather than 0.
+   */
+  workers_running?: number
   started_at_ms: number
   /** null: the session has no lifetime, the default (#2424); it lasts until someone ends it. */
   expires_at_ms: number | null

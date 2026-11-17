@@ -301,6 +301,7 @@ type Live struct {
 	pending  map[string]pendingPair // device_id -> the forwarded request
 	devices  string                 // the last status.devices set reconciled
 	meta     string                 // the last status model/ticket stored (#2389)
+	workers  int                    // the last status.workers_running, for the sessions list (#4898)
 	prompts  *bucket                // 20/min, burst 5
 	ops      *bucket                // 120/min
 	attaches *bucket                // 20/min
@@ -348,6 +349,27 @@ func (l *Live) Viewers() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return len(l.viewers)
+}
+
+// Workers is the last worker count the harness reported in a status, so the
+// sessions list can show it without opening the session (#4898). Zero for a
+// harness that predates the member, or one that has sent no status yet.
+func (l *Live) Workers() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.workers
+}
+
+// setWorkers records the status's worker count. Call with mu held.
+func (l *Live) setWorkers(status map[string]any) {
+	n, ok := status["workers_running"].(int64)
+	if !ok || n < 0 {
+		n = 0
+	}
+	if n > maxWorkersRunning {
+		n = maxWorkersRunning
+	}
+	l.workers = int(n)
 }
 
 // updatePresence tells viewers when the presence changed. Call with mu held.

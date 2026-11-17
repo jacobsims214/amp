@@ -759,6 +759,19 @@ func TestRelay_BrowserLegAuthz(t *testing.T) {
 		row["harness_fp_display"] != relay.FingerprintDisplay(s.harness.pub) || row["project"].(map[string]any)["id"] != float64(e.w.s.projectID) {
 		t.Fatalf("list row: %v", row)
 	}
+	// #4898: the list carries the worker count from the harness's last status, so the
+	// sessions page can show it without opening the session. This session's hello sent
+	// no worker count, so it starts at zero rather than missing.
+	if v, ok := row["workers_running"]; !ok || v != float64(0) {
+		t.Fatalf("list row workers_running: %v (present: %v)", v, ok)
+	}
+	// A status naming workers updates it on the next list read.
+	s.mustPublish(t, s.event(t, "status", nil, map[string]any{"busy": true, "workers_running": 3, "devices": []any{}}))
+	st, body, _ = e.do(t, "GET", "/api/sessions", nil, as("alice"))
+	list = body["sessions"].([]any)
+	if st != 200 || len(list) != 1 || list[0].(map[string]any)["workers_running"] != float64(3) {
+		t.Fatalf("list after a status with workers: %d %v", st, body)
+	}
 	st, body, _ = e.do(t, "GET", mine, nil, as("alice"))
 	if st != 200 || body["harness_pub"] != s.harness.pub {
 		t.Fatalf("GET own session: %d %v", st, body)

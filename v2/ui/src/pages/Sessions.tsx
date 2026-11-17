@@ -1,15 +1,20 @@
 /**
  * /sessions — every harness session of yours that is open for remote control, across all your
  * projects and orgs: where it runs, its project, whether the laptop is online, when it started,
- * its last activity and when it expires, the model, the current ticket and the paired devices.
- * Open one, disconnect it, or revoke them all. Sessions that ended in the last 7 days are listed
- * below the live ones, with why they ended.
+ * its last activity and when it expires, the model, the current ticket, the paired devices and
+ * how many workers it is running. Open one, disconnect it, or revoke them all.
+ *
+ * This page is where remote control starts on a phone, so the live sessions come first and the
+ * ones that ended in the last 7 days are folded away behind a count (#4898): reaching a live
+ * session never means scrolling past a long history. A row is a phone card — the host and its
+ * actions on one line, the facts in a two-up grid — rather than the six-column desktop strip.
  *
  * The list comes from GET /api/sessions (protocol 8.3). A relay that predates #2389 leaves out
- * state, model, ticket and devices: every session it lists is live, and the facts it lacks show "—".
+ * state, model, ticket and devices: every session it lists is live, and the facts it lacks show
+ * "—". A relay that predates #4898 also leaves out workers_running, which then shows "—" too.
  */
 import { useCallback, useEffect, useState } from 'react'
-import { ExternalLink, History, MonitorSmartphone, RefreshCw, ShieldOff, Unplug } from 'lucide-react'
+import { ChevronDown, ExternalLink, History, MonitorSmartphone, RefreshCw, ShieldOff, Unplug } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { PageHeader, Panel } from '../components/ui/PageHeader'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
@@ -24,6 +29,8 @@ import { projectLink } from '../lib/projectLink'
 const when = (ms: number) => new Date(ms).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 
 const isEnded = (s: SessionSummary) => s.state === 'ended'
+
+const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
 
 function StateBadge({ s }: { s: SessionSummary }) {
   if (isEnded(s)) {
@@ -41,11 +48,13 @@ function StateBadge({ s }: { s: SessionSummary }) {
   )
 }
 
-function Fact({ label, children, title }: { label: string; children: React.ReactNode; title?: string }) {
+function Fact({ label, children, title, wide }: { label: string; children: React.ReactNode; title?: string; wide?: boolean }) {
   return (
-    <div className="min-w-0" title={title}>
+    <div className={`min-w-0 ${wide ? 'col-span-full' : ''}`} title={title}>
       <dt className="amp-label !text-[10px]">{label}</dt>
-      <dd className="m-0 mt-0.5 amp-num text-[12px] text-ink truncate">{children}</dd>
+      {/* A wide fact is the one thing a person must be able to read in full, so it wraps
+          instead of truncating (the "why it ended" copy is the only place they learn it). */}
+      <dd className={`m-0 mt-0.5 amp-num text-[12px] text-ink ${wide ? '' : 'truncate'}`}>{children}</dd>
     </div>
   )
 }
@@ -75,44 +84,95 @@ function DevicesFact({ devices, now }: { devices: SessionDevice[] | undefined; n
   )
 }
 
+/**
+ * "3 workers · 2 watching": what a session is doing right now, in the words a person would use.
+ * This is the line the list is scanned for, so it sits right under the host name. A relay that
+ * predates #4898 sends no worker count, so that half reads "—" instead of a made-up 0.
+ */
+function LiveCounts({ s }: { s: SessionSummary }) {
+  const workers = s.workers_running
+  return (
+    <span className="flex items-center gap-2 flex-wrap text-[12px] text-ink-2 amp-num" data-testid="live-counts">
+      <span className={`inline-flex items-center gap-1 whitespace-nowrap ${workers && workers > 0 ? 'font-semibold text-ink' : ''}`}
+        title="Workers this session is running right now">
+        {workers == null ? '— workers' : plural(workers, 'worker')}
+      </span>
+      <span className="text-ink-3" aria-hidden="true">·</span>
+      <span className="whitespace-nowrap" title="Browsers watching this session right now">
+        {plural(s.viewers, 'watching', 'watching')}
+      </span>
+    </span>
+  )
+}
+
 function SessionRow({ s, now, onDisconnect, busy }: { s: SessionSummary; now: number; onDisconnect: () => void; busy: boolean }) {
   const ended = isEnded(s)
   // A full page load (not client-side routing), so the session page gets its strict CSP header.
   const href = `/sessions/${encodeURIComponent(s.session_id)}`
   return (
-    <li className="px-4 py-3 border-t border-line first:border-t-0 grid gap-2.5" data-testid={ended ? 'ended-session-row' : 'session-row'}>
-      <div className="flex items-center gap-2.5 flex-wrap min-w-0">
+    <li className="px-3 sm:px-4 py-3 border-t border-line first:border-t-0 grid gap-2.5" data-testid={ended ? 'ended-session-row' : 'session-row'}>
+      {/* The host and the actions share one line, so Open and Disconnect are visible targets with
+          no hover and no overflow menu to find. On the narrowest phones the actions drop below the
+          name instead of squeezing it to "jacob…". */}
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 min-w-0">
         <MonitorSmartphone size={18} className={`${ended ? 'text-ink-3' : 'text-ink'} shrink-0`} aria-hidden="true" />
-        {ended
-          ? <span className="text-[14.5px] font-semibold text-ink-2 truncate min-w-0">{s.host}</span>
-          : <a href={href} className="text-[14.5px] font-semibold text-ink hover:underline truncate min-w-0">{s.host}</a>}
-        <StateBadge s={s} />
-        <span className="text-[12px] text-ink-2 truncate min-w-0">{s.project ? `${s.project.name} #${s.project.id}` : 'no project'}</span>
+        <div className="min-w-0 flex-1 grid gap-0.5">
+          {ended
+            ? <span className="text-[14.5px] font-semibold text-ink-2 truncate">{s.host}</span>
+            : <a href={href} className="text-[14.5px] font-semibold text-ink hover:underline truncate">{s.host}</a>}
+          <span className="text-[12px] text-ink-2 truncate">{s.project ? `${s.project.name} #${s.project.id}` : 'no project'}</span>
+        </div>
         {!ended && (
-          <span className="ml-auto flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5 shrink-0 [&_.amp-btn]:min-h-[40px] sm:[&_.amp-btn]:min-h-0 max-[359px]:w-full max-[359px]:order-last">
+            {/* 40px tall on a phone: a thumb target, not a desktop 26px chip. */}
             <a href={href} className="amp-btn amp-btn-sm amp-btn-primary"><ExternalLink size={12} />Open</a>
             <ConfirmButton label="Disconnect" confirmLabel="Disconnect now" icon={<Unplug size={12} />} busy={busy} onConfirm={onDisconnect} />
-          </span>
+          </div>
         )}
       </div>
-      <dl className="m-0 grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-x-4 gap-y-2">
+      <div className="flex items-start gap-2 min-w-0 flex-wrap">
+        <StateBadge s={s} />
+        {!ended && <LiveCounts s={s} />}
+      </div>
+      <dl className="m-0 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-x-4 gap-y-2">
+        {ended && <Fact wide label="Why" title={endReasonText(s.end_reason ?? '')}>{endReasonText(s.end_reason ?? '')}</Fact>}
         <Fact label="Model" title={s.model ?? undefined}>{s.model ?? '—'}</Fact>
         <TicketFact s={s} />
         <DevicesFact devices={s.devices} now={now} />
-        <Fact label="Started" title={when(s.started_at_ms)}>{ago(s.started_at_ms, now)}</Fact>
         {ended
           ? <Fact label="Ended" title={s.ended_at_ms ? when(s.ended_at_ms) : undefined}>{s.ended_at_ms ? ago(s.ended_at_ms, now) : '—'}</Fact>
           : <Fact label="Last activity" title={when(s.last_activity_at_ms)}>{ago(s.last_activity_at_ms, now)}</Fact>}
-        {ended
-          ? <Fact label="Why" title={endReasonText(s.end_reason ?? '')}>{endReasonText(s.end_reason ?? '')}</Fact>
-          : s.expires_at_ms == null
-            ? <Fact label="Expires" title="No time limit: it stays on, reconnecting after sleep, until you disconnect it or turn it off on the laptop">Never</Fact>
-            : <Fact label="Expires" title={when(s.expires_at_ms)}>{inTime(s.expires_at_ms, now)}</Fact>}
-        {!ended && <Fact label="Watching">{s.viewers === 1 ? '1 browser' : `${s.viewers} browsers`}</Fact>}
+        <Fact label="Started" title={when(s.started_at_ms)}>{ago(s.started_at_ms, now)}</Fact>
+        {!ended && (s.expires_at_ms == null
+          ? <Fact label="Expires" title="No time limit: it stays on, reconnecting after sleep, until you disconnect it or turn it off on the laptop">Never</Fact>
+          : <Fact label="Expires" title={when(s.expires_at_ms)}>{inTime(s.expires_at_ms, now)}</Fact>)}
         <Fact label="Laptop">{s.os} · harness {s.harness_version}</Fact>
         <Fact label="Laptop key" title="Check it matches the key the harness prints">{s.harness_fp_display}</Fact>
       </dl>
     </li>
+  )
+}
+
+/**
+ * The ended sessions, folded away. A person who opened this page on a phone came for the live
+ * session, so a week of history stays one row tall until they ask for it (#4898).
+ */
+function EndedSessions({ sessions, now }: { sessions: SessionSummary[]; now: number }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <Panel label="Ended" title={plural(sessions.length, 'session') + ' in the last 7 days'} right={<History size={13} aria-hidden="true" />}>
+      <button type="button" className="w-full flex items-center gap-2 px-4 py-2.5 text-left text-[12.5px] text-ink-2 hover:bg-surface-2"
+        aria-expanded={open} aria-controls="ended-sessions" onClick={() => setOpen(o => !o)} data-testid="ended-toggle">
+        <ChevronDown size={14} className={`shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} aria-hidden="true" />
+        <span>{open ? 'Hide ended sessions' : `Show ${plural(sessions.length, 'ended session')}`}</span>
+        <span className="ml-auto amp-num text-[11px] text-ink-3" aria-hidden="true">{sessions.length}</span>
+      </button>
+      {open && (
+        <ul id="ended-sessions" className="m-0 p-0 list-none border-t border-line" aria-label="Ended sessions">
+          {sessions.map(s => <SessionRow key={s.session_id} s={s} now={now} busy={false} onDisconnect={() => {}} />)}
+        </ul>
+      )}
+    </Panel>
   )
 }
 
@@ -176,7 +236,7 @@ export function Sessions() {
             busy={busy === 'all'} onConfirm={() => { revokeAll() }} />}
         </>} />
 
-      <div className="px-4 sm:px-7 py-5 grid gap-4 max-w-[1100px]">
+      <div className="px-3 sm:px-7 py-4 sm:py-5 grid gap-4 max-w-[1100px]">
         {note && <p className="m-0 border-l-[3px] border-success bg-surface px-3 py-2 text-[13px] text-ink-2" role="status">{note}</p>}
         {error && <p className="m-0 border-l-[3px] border-danger bg-surface px-3 py-2 text-[13px] text-danger-ink" role="alert">{error}</p>}
         <Panel label="Live" title={live == null ? 'Loading…' : live.length ? `${live.length} session${live.length === 1 ? '' : 's'}` : 'No live sessions'}
@@ -191,13 +251,8 @@ export function Sessions() {
             </ul>
           )}
         </Panel>
-        {!!ended.length && (
-          <Panel label="Ended" title={`${ended.length} in the last 7 days`} right={<History size={13} aria-hidden="true" />}>
-            <ul className="m-0 p-0 list-none" aria-label="Ended sessions">
-              {ended.map(s => <SessionRow key={s.session_id} s={s} now={now} busy={false} onDisconnect={() => {}} />)}
-            </ul>
-          </Panel>
-        )}
+        {/* Ended sessions never share the live list: a week of history is one folded row (#4898). */}
+        {!!ended.length && <EndedSessions sessions={ended} now={now} />}
         <p className="m-0 text-[12px] text-ink-3 max-w-[720px]">
           Ended sessions stay listed for 7 days. Disconnecting ends remote control; the session keeps running on the laptop.
         </p>

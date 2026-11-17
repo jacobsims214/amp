@@ -116,9 +116,9 @@ func (rl *Relay) sessionView(ctx context.Context, sess *domain.RemoteSession, na
 		names[sess.ProjectID] = proj.Name
 		project = map[string]any{"id": sess.ProjectID, "name": proj.Name}
 	}
-	online, viewers := false, 0
+	online, viewers, workers := false, 0, 0
 	if sess.Active() {
-		online, viewers = rl.presence(ctx, sess)
+		online, viewers, workers = rl.presence(ctx, sess)
 	}
 	devs, ok := devices[sess.HarnessID]
 	if !ok {
@@ -142,10 +142,12 @@ func (rl *Relay) sessionView(ctx context.Context, sess *domain.RemoteSession, na
 	if sess.EndedAt != nil {
 		endedAt = ms(*sess.EndedAt)
 	}
+	// #4898: workers_running sits beside online/viewers because it is presence (how many
+	// workers the harness's last status counted), not stored metadata like model/ticket.
 	v := map[string]any{
 		"session_id": sess.ID, "harness_id": sess.HarnessID, "harness_fp_display": FingerprintDisplay(sess.HarnessPub),
 		"host": sess.Host, "os": sess.OS, "harness_version": sess.HarnessVersion, "project": project,
-		"online": online, "viewers": viewers,
+		"online": online, "viewers": viewers, "workers_running": workers,
 		"started_at_ms": ms(sess.StartedAt), "expires_at_ms": msOrNull(sess.ExpiresAt),
 		"last_activity_at_ms": ms(sess.LastActivityAt), "protocol_version": sess.ProtocolVersion,
 		// #2389, additive: state, end reason, model, devices and current ticket.

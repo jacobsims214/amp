@@ -3,6 +3,8 @@ package relay
 import (
 	"strings"
 	"testing"
+
+	"github.com/simstech/amp-api/internal/domain"
 )
 
 // statusMeta keeps only the model and the current ticket from a status
@@ -36,6 +38,35 @@ func TestStatusMeta(t *testing.T) {
 			}
 			if got := deref(m.TicketName); (tc.ticketNm == "" && got != nil) || (tc.ticketNm != "" && got != tc.ticketNm) {
 				t.Errorf("ticket_name = %v, want %q", got, tc.ticketNm)
+			}
+		})
+	}
+}
+
+// setWorkers takes the worker count from a status for the sessions list
+// (#4898): a missing or wrong-typed member reads as zero, and a hostile count
+// is bounded.
+func TestSetWorkers(t *testing.T) {
+	tests := []struct {
+		name   string
+		status map[string]any
+		want   int
+	}{
+		{"missing (an older harness)", map[string]any{"model": "m"}, 0},
+		{"counted", map[string]any{"workers_running": int64(3)}, 3},
+		{"none running", map[string]any{"workers_running": int64(0)}, 0},
+		{"wrong type", map[string]any{"workers_running": "3"}, 0},
+		{"negative", map[string]any{"workers_running": int64(-1)}, 0},
+		{"absurd", map[string]any{"workers_running": int64(1) << 40}, maxWorkersRunning},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newLive(&domain.RemoteSession{ID: "rs_x", HarnessPub: "x"})
+			l.mu.Lock()
+			l.setWorkers(tc.status)
+			l.mu.Unlock()
+			if got := l.Workers(); got != tc.want {
+				t.Errorf("Workers() = %d, want %d", got, tc.want)
 			}
 		})
 	}

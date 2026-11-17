@@ -362,10 +362,10 @@ func (rl *Relay) ctlDeviceRevoked(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"delivered": rl.deviceRevokedHere(req.ID)})
 }
 
-// ctlPresence reports a held session's presence and viewer count.
+// ctlPresence reports a held session's presence, viewer count and worker count.
 func (rl *Relay) ctlPresence(w http.ResponseWriter, r *http.Request) {
-	online, viewers := rl.presenceHere(r.URL.Query().Get("id"))
-	writeJSON(w, http.StatusOK, map[string]any{"online": online, "viewers": viewers})
+	online, viewers, workers := rl.presenceHere(r.URL.Query().Get("id"))
+	writeJSON(w, http.StatusOK, map[string]any{"online": online, "viewers": viewers, "workers_running": workers})
 }
 
 // ctl makes a control call to the replica at addr; out, if set, receives the
@@ -410,33 +410,35 @@ func (rl *Relay) deviceRevokedHere(id string) bool {
 	return live.harness != nil && live.harness.send(frame{event: "device_revoked", data: []byte(`{"all":true}`)})
 }
 
-// presence is the session's harness presence and viewer count, from its holder.
-func (rl *Relay) presence(ctx context.Context, sess *domain.RemoteSession) (bool, int) {
+// presence is the session's harness presence, viewer count and worker count,
+// from its holder.
+func (rl *Relay) presence(ctx context.Context, sess *domain.RemoteSession) (bool, int, int) {
 	if rl.cfg.Cluster != nil && !forwarded(ctx) {
 		addr, err := rl.holder(ctx, sess.ID)
 		if err != nil {
-			return false, 0
+			return false, 0, 0
 		}
 		if addr != "" {
 			var out struct {
 				Online  bool `json:"online"`
 				Viewers int  `json:"viewers"`
+				Workers int  `json:"workers_running"`
 			}
 			if err := rl.ctl(ctx, addr, http.MethodGet, "presence?id="+url.QueryEscape(sess.ID), nil, &out); err != nil {
-				return false, 0
+				return false, 0, 0
 			}
-			return out.Online, out.Viewers
+			return out.Online, out.Viewers, out.Workers
 		}
 	}
 	return rl.presenceHere(sess.ID)
 }
 
-func (rl *Relay) presenceHere(id string) (bool, int) {
+func (rl *Relay) presenceHere(id string) (bool, int, int) {
 	live := rl.reg.Get(id)
 	if live == nil {
-		return false, 0
+		return false, 0, 0
 	}
-	return live.Online(rl.cfg.Now(), rl.cfg.OfflineAfter), live.Viewers()
+	return live.Online(rl.cfg.Now(), rl.cfg.OfflineAfter), live.Viewers(), live.Workers()
 }
 
 // reconcile checks the sessions held here against the database: one that
