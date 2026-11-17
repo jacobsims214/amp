@@ -30,9 +30,11 @@ func (s *Server) registerArtifacts(mcp *server.MCPServer) {
 		"Publish something for people to look at in AMP: a UI mockup or clickable prototype (html), a diagram or icon (svg), "+
 			"an image, a document (markdown or pdf), or plain text. AMP stores it, versions it, and shows it sandboxed to everyone on "+
 			"the project, whatever harness they use; the result has its url. Make html a single self-contained file (inline CSS and JS; "+
-			"CDN scripts and fonts are fine, other files aren't reachable). To publish a file on disk without pasting it (any size up to "+
-			"10 MB, e.g. HTML with embedded screenshots), pass bytes and sha256 instead of content: you get a one-time upload URL, and "+
-			"`curl -fsS -T <file> <url>` publishes it. Never substitute a screenshot for the file. Pass artifact_id to publish a new version of one you "+
+			"CDN scripts and fonts are fine, other files aren't reachable). Give the content one of two ways: inline as content (or "+
+			"content_base64), or, for a file on disk when you have a shell, bytes and sha256 instead: you get a one-time upload URL, and "+
+			"`curl -fsS -T <file> <url>` publishes it (up to 10 MB, e.g. HTML with embedded screenshots; no token needed). Use the "+
+			"upload route for local files rather than pasting a large file, and never publish a screenshot in place of the file. "+
+			"Pass artifact_id to publish a new version of one you "+
 			"published before: it goes back into review. Each publish is noted on the ticket. To have a person review it, block the "+
 			"ticket (amp_block_task) asking them to review the artifact at its url; their approval or requested changes answer the "+
 			"question and come back as a comment on the ticket.",
@@ -98,8 +100,12 @@ func (s *Server) publishArtifact(ctx context.Context, args map[string]interface{
 	}
 	size, sum := optInt(args, "bytes", 0), strings.TrimSpace(optStr(args, "sha256", ""))
 	upload := size != 0 || sum != ""
-	if upload && (optStr(args, "content", "") != "" || optStr(args, "content_base64", "") != "") {
+	inline := optStr(args, "content", "") != "" || optStr(args, "content_base64", "") != ""
+	if upload && inline {
 		return nil, fmt.Errorf("pass content (or content_base64), or bytes and sha256 for an upload URL, not both")
+	}
+	if !upload && !inline {
+		return nil, fmt.Errorf("content is empty: pass content (or content_base64) inline, or bytes and sha256 to get an upload URL for a file on disk")
 	}
 	if b64 := optStr(args, "content_base64", ""); b64 != "" {
 		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))

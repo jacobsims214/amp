@@ -82,3 +82,25 @@ func TestArtifactUpload_MCPThenSessionlessPut(t *testing.T) {
 		t.Fatalf("artifact has %d versions, want 2", n)
 	}
 }
+
+// Inline content keeps working for every existing caller; the upload route
+// is an alternative, and mixing or omitting both is refused by name.
+func TestArtifactUpload_InlineContentStillPublishes(t *testing.T) {
+	w := newRBACWorld(t)
+	alice := w.as(w.alice)
+	task := mkIn(t, alice, w.s.storyID, "inline mockup")
+	html := "<!doctype html><p>inline</p>"
+	art, _ := alice.call(t, "amp_publish_artifact", map[string]any{"task_id": float64(task), "title": "Inline", "kind": "html",
+		"content": html})["artifact"].(map[string]any)
+	if art == nil || art["current_version"].(float64) != 1 {
+		t.Fatalf("inline publish = %v, want v1", art)
+	}
+	both := alice.callExpectError(t, "amp_publish_artifact", map[string]any{"task_id": float64(task), "title": "X", "kind": "html",
+		"content": html, "bytes": float64(len(html)), "sha256": sha256hex([]byte(html))})
+	if !strings.Contains(both, "not both") {
+		t.Fatalf("content plus bytes/sha256: %q, want a 'not both' refusal", both)
+	}
+	if neither := alice.callExpectError(t, "amp_publish_artifact", map[string]any{"task_id": float64(task), "title": "X", "kind": "html"}); !strings.Contains(neither, "upload URL") {
+		t.Fatalf("no content at all: %q, want it to name both ways", neither)
+	}
+}
