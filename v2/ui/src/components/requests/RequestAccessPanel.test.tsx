@@ -18,12 +18,20 @@
 //     from the list the panel re-reads, and absent from every storage the page
 //     could reach. The list shows the server's prefix, which is the only trace
 //     of a credential AMP keeps.
+//
+// #4878 adds the requester entry link above the three sections, tested in its own
+// `describe`: the URL comes from `requesterNewRequestPath` (both the team id and
+// the desk name, since a requester's own projection carries neither the id nor a
+// team they can look up), the copy reports success *and* failure, and the copy
+// says that nothing is emailed — the invitation route mails nobody either, so
+// the link is the delivery.
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { RequestAccessPanel } from './RequestAccessPanel'
+import { requesterNewRequestPath } from '../../lib/requestRoutes'
 import type { APIToken, Invite, Me, NewAPIToken, Team, TeamSubmitGrantee } from '../../types'
 
 const TEAM: Team = { id: 4, org_id: 2, name: 'Platform engineering', created_by: 11, created_at: '2026-10-01T09:00:00Z' }
@@ -354,6 +362,64 @@ describe('the secret is shown once and never retained', () => {
     await userEvent.click(within(row).getByRole('button', { name: 'Revoke' }))
     await userEvent.click(within(row).getByRole('button', { name: 'Revoke credential' }))
     await waitFor(() => expect(calls).toEqual([{ method: 'DELETE', path: '/api/tokens/41', body: undefined }]))
+  })
+})
+
+describe('the requester entry link is how a manager hands out the way in', () => {
+  it('builds its own team’s link from requesterNewRequestPath, carrying the team id and the desk name', async () => {
+    mount()
+    const code = await screen.findByTestId('requester-link-url')
+    // Asserted against the builder itself, not against a string spelled here: a
+    // panel that assembled `?team=…&desk=…` by hand would still have to agree
+    // with this, including how the name is encoded.
+    expect(code).toHaveTextContent(`${window.location.origin}${requesterNewRequestPath({ teamId: 4, teamName: TEAM.name })}`)
+    // The two parameters, each for its own reason: the id is what `POST
+    // /api/teams/:id/requests` needs, the name is the only desk fact a
+    // requester's own projection carries (`lib/requestRoutes.ts` §2).
+    const url = new URL(code.textContent ?? '')
+    expect(url.pathname).toBe('/requests/new')
+    expect(url.searchParams.get('team')).toBe('4')
+    expect(url.searchParams.get('desk')).toBe('Platform engineering')
+  })
+
+  it('reports a successful copy, and clears the report so a second copy is possible', async () => {
+    const user = userEvent.setup()
+    mount()
+    const url = `${window.location.origin}${requesterNewRequestPath({ teamId: 4, teamName: TEAM.name })}`
+    await user.click(await screen.findByRole('button', { name: 'Copy the requester link' }))
+    expect(await screen.findByTestId('requester-link-status')).toHaveTextContent(/^Link copied\. Send it to them/)
+    // `userEvent.setup()` installs its own clipboard stub, so read it back rather
+    // than spying on a write the stub would have replaced. The status line only
+    // appears once the write resolved, so this read cannot race it.
+    expect(await navigator.clipboard.readText()).toBe(url)
+  })
+
+  it('says the clipboard refused instead of claiming it copied', async () => {
+    const user = userEvent.setup()
+    mount()
+    const deny = vi.spyOn(navigator.clipboard, 'writeText').mockRejectedValueOnce(new Error('denied'))
+    await user.click(await screen.findByRole('button', { name: 'Copy the requester link' }))
+    expect(await screen.findByTestId('requester-link-status'))
+      .toHaveTextContent(/refused the clipboard — select the link above and copy it/i)
+    // A refusal is not a failed action: the link is still on screen, selectable.
+    expect(screen.getByTestId('requester-link-url')).toBeInTheDocument()
+    deny.mockRestore()
+  })
+
+  it('says nothing is emailed, and that this link is what the requester needs', async () => {
+    mount()
+    const note = await screen.findByTestId('requester-link-note')
+    expect(note).toHaveTextContent(/Nothing is emailed/)
+    expect(note).toHaveTextContent(/this link is what the requester needs/)
+    // And it does not sell the link as an account: an invitation is still needed.
+    expect(note).toHaveTextContent(/still has to be invited below first/)
+  })
+
+  it('offers no link to a viewer who may not manage this inbox', async () => {
+    mount({ me: member })
+    await screen.findByTestId('submit-access-managers-only')
+    expect(screen.queryByTestId('requester-link-url')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Copy the requester link' })).toBeNull()
   })
 })
 

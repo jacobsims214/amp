@@ -56,7 +56,7 @@ from pathlib import Path
 # --------------------------------------------------------------------------
 
 PLUGIN_NAME = "amp"
-PLUGIN_VERSION = "2.1.0"
+PLUGIN_VERSION = "2.2.0"
 MCP_SERVER_NAME = "amp"
 
 # openrouter model -> Claude Code model tier. Empty: every Claude Code agent
@@ -102,6 +102,10 @@ BODY_FALLBACK_SKILLS = {
     "amp-github-reviewer": "github-pr-review",
     "amp-github-researcher": "github-research",
 }
+
+# Tools only opencode's AMP plugin registers. Any left in the output points a Claude Code
+# agent at a tool it doesn't have, so the build fails instead.
+BANNED = [r"\bamp_publish_artifact_file\b", r"\bamp_session_usage\b"]
 
 SKILL_EXCLUDES = {"__pycache__", ".DS_Store"}
 SKILL_EXCLUDE_SUFFIXES = {".bak", ".pyc"}
@@ -185,6 +189,16 @@ def dump_frontmatter(fields: dict) -> str:
 
 # Applied in order — the .opencode path rules must run before the bare-word rule.
 BODY_RULES: list[tuple[str, str]] = [
+    # opencode-only plugin tools. The catch-all below would relabel them as Claude Code's,
+    # and the Claude plugin has no tool layer, so drop or reword them first.
+    (r"(?m)^- \*\*opencode\*\*: the AMP plugin's `amp_publish_artifact_file\(path, task_id, title\)` tool\.\n", ""),
+    (r"(?m)^amp_session_usage\(\) +← if your harness has it \(opencode with the AMP plugin\)[^\n]*\n[^\n]*\n", ""),
+    (r"(?m)^amp_session_usage \{\} +← opencode plugin[^\n]*\n", ""),
+    (
+        r"`amp_session_usage` is not an AMP server tool: the harness plugin provides it \(opencode with the AMP plugin\) "
+        r"to report your own model, tokens and cost, which you pass to",
+        "Claude Code has no tool that reports your own token usage: pass your model, and leave the token fields out, to",
+    ),
     # skill loading
     (r'`?skill\("([a-z0-9-]+)"\)`?', r"the **\1** skill"),
     (r"`skill\(([^)]*)\)`", r"the Skill tool"),
@@ -546,7 +560,17 @@ def main() -> int:
         print(f"  skill:   {src.name}")
 
     apply_overrides(Path(__file__).parent / "overrides", out)
-    return 0
+    return check_banned(out)
+
+
+def check_banned(out: Path) -> int:
+    hits = []
+    for path in sorted(out.rglob("*.md")):
+        for n, line in enumerate(path.read_text().splitlines(), 1):
+            hits += [f"{path.relative_to(out)}:{n}: {p}" for p in BANNED if re.search(p, line)]
+    for hit in hits:
+        print(f"banned in Claude plugin output: {hit}", file=sys.stderr)
+    return 1 if hits else 0
 
 
 if __name__ == "__main__":

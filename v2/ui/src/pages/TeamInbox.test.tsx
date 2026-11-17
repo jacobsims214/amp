@@ -19,14 +19,19 @@
 // Plus the two things the ticket's "mobile/keyboard tests" name: the queue holds
 // at a 390 px viewport (the pill strip scrolls instead of pushing the layout
 // out) and every row action is reachable and operable by keyboard alone.
+//
+// And the header's link to the team's access management (AMP #4879): present for
+// a lead of this team, absent for a plain member who may not manage it.
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { MemoryRouter } from 'react-router-dom'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { TeamInbox } from './TeamInbox'
+import { AuthContext } from '../contexts/auth-context'
 import { request, queue } from '../test/requestFixture'
-import type { Team } from '../types'
+import type { Me, Team } from '../types'
 
 interface Call { method: string; path: string; search: string; ifMatch: string | null }
 let calls: Call[] = []
@@ -112,7 +117,34 @@ function pagedQueue() {
   })
 }
 
-const mount = () => render(<TeamInbox teamId={4} meId={5} />)
+/**
+ * Who is reading. The page reads `useAuth` for one decision — whether the header
+ * may offer the team's access management (#4879) — so these two identities are
+ * the whole of the difference: a lead of team 4, and a plain member of it.
+ */
+const LEAD: Me = {
+  subject: 'dex|lead', email: 'lead@simstech.cloud', name: 'Team Lead', roles: [], user_id: 5, kind: 'human',
+  orgs: [{ id: 2, name: 'simstech', slug: 'simstech', created_by: 5, created_at: '2026-01-01T00:00:00Z', my_role: 'member' }],
+  teams: [{ id: 4, name: 'Platform engineering', org_id: 2, role: 'lead' }],
+}
+const MEMBER: Me = {
+  ...LEAD, subject: 'dex|member', email: 'marco@simstech.cloud', name: 'Marco Testa',
+  teams: [{ id: 4, name: 'Platform engineering', org_id: 2, role: 'member' }],
+}
+
+/**
+ * Mount the page the way the app does: inside a router (it renders one `Link`)
+ * and under `AuthContext` (it reads the viewer for the header's one action).
+ */
+const mountAs = (me: Me | null, isAdmin = false) => render(
+  <AuthContext.Provider value={{ me, loading: false, error: null, isAdmin }}>
+    <MemoryRouter initialEntries={['/teams/4/requests']}>
+      <TeamInbox teamId={4} meId={me?.user_id} />
+    </MemoryRouter>
+  </AuthContext.Provider>,
+)
+
+const mount = () => mountAs(LEAD)
 
 /** Wait for the queue to render its rows. */
 const loaded = async () => {
@@ -438,14 +470,74 @@ describe('loading, empty and error states', () => {
   })
 
   it('does not offer a dead page action the slice cannot serve', async () => {
-    // "New request" (J4), "Submit access" and "Invite a requester" (#3975's
-    // routes) have no page in this slice; a button that does nothing is worse
-    // than its absence, so the header carries none of them.
+    // "New request" (J4) and "Invite a requester" (#3975's grant routes) have no
+    // staff-facing page in this slice; a button that does nothing is worse than
+    // its absence, so the header carries neither. (The mockup's third action,
+    // "Submit access", is rendered — as the manager-only link below, #4879.)
     server.use(teamRoute(), record('get', '*/api/teams/4/requests', crowdedQueue()))
     mount()
     await loaded()
     expect(screen.queryByRole('button', { name: 'New request' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Submit access' })).toBeNull()
     expect(screen.queryByRole('button', { name: /Invite a requester/ })).toBeNull()
+  })
+})
+
+// AMP #4879, approved mockup artifact 112 v1: the queue reaches its own access
+// management instead of dead-ending, and only a viewer who may manage it is
+// offered the way there.
+describe('the header links to the team\'s access management', () => {
+  const link = () => screen.queryByRole('link', { name: /Manage submit access/ })
+
+  it('offers the link to a lead of this team, pointing at its row in Teams & orgs', async () => {
+    server.use(teamRoute(), record('get', '*/api/teams/4/requests', crowdedQueue()))
+    mountAs(LEAD)
+    await loaded()
+
+    const manage = await screen.findByRole('link', { name: 'Manage submit access for Platform engineering' })
+    // The destination is the team's own access section, carrying the id it is for:
+    // access administration lives in Teams & orgs (#4877), never on this page.
+    // Asserted as the literal URL on purpose — this is the contract with the
+    // destination, and a test that called the page's own builder would pass on a
+    // page that built the wrong string consistently.
+    expect(manage).toHaveAttribute('href', '/admin/orgs?team=4')
+    // A link, not a button: it changes location, so it must be followed,
+    // middle-clicked and announced as a link.
+    expect(manage.tagName).toBe('A')
+  })
+
+  it('offers it to an org admin too, and hides it from a plain member of the team', async () => {
+    const admin: Me = { ...MEMBER, orgs: [{ id: 2, name: 'simstech', slug: 'simstech', created_by: 5, created_at: '2026-01-01T00:00:00Z', my_role: 'admin' }] }
+    server.use(teamRoute(), record('get', '*/api/teams/4/requests', crowdedQueue()))
+    const first = mountAs(admin)
+    await loaded()
+    expect(await screen.findByRole('link', { name: /Manage submit access/ })).toBeInTheDocument()
+    first.unmount()
+
+    // A global admin is the third way to be a manager the server accepts — and the
+    // one decided by `isAdmin`, not by a role in `/api/me`. Passing it through and
+    // then ignoring it would hide the link from exactly the people who can fix
+    // any team's access.
+    const second = mountAs(MEMBER, true)
+    await loaded()
+    expect(await screen.findByRole('link', { name: /Manage submit access/ })).toBeInTheDocument()
+    second.unmount()
+
+    // A member of the team, a member of its org: nothing to manage, and no link
+    // to a screen that would refuse them.
+    mountAs(MEMBER)
+    await loaded()
+    expect(link()).toBeNull()
+  })
+
+  it('offers nothing at all to a viewer who may not manage it, not even a disabled control', async () => {
+    server.use(teamRoute(), record('get', '*/api/teams/4/requests', crowdedQueue()))
+    mountAs(MEMBER)
+    await loaded()
+
+    expect(link()).toBeNull()
+    expect(screen.queryByRole('button', { name: /Manage submit access/ })).toBeNull()
+    // The rest of the header is untouched: the queue still names the team.
+    expect(screen.getByRole('heading', { name: 'Requests' })).toBeInTheDocument()
   })
 })

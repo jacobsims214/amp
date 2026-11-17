@@ -360,6 +360,19 @@ counts only with its own uploaded evidence (screenshots, a recording): declare t
 check's `evidence_key` (`amp-worker-frontend` describes how). Without that it counts as
 `cant_tell`.
 
+**Screenshots and visual evidence go on the ticket, never only on disk.** Whatever you
+screenshot to make or check visual work, publish it on your ticket as **one self-contained html
+artifact**: inline CSS and JS, images as `data:` URIs, 10 MB at most, with CSS-driven state,
+width and theme switchers so a reviewer sees every view without running anything. Bundle a
+multi-file prototype into one file first (`vite-plugin-singlefile` or an inline-assets step).
+Don't leave screenshots local and don't commit them. Publish the file, don't paste it:
+
+- **Claude Code, or any harness with a shell**: `amp_publish_artifact(task_id, title,
+  kind="html", bytes, sha256)` with no content, then `curl -fsS -T <file> '<upload.url>'`.
+
+The **amp-design-tools** skill has the exact commands and the switcher pattern. Receipt evidence
+(`amp_add_evidence`, above) is in addition to the artifact, not instead of it.
+
 **If the result says `held: true`**, stop: the project requires a receipt and yours is below its
 minimum (no passing check, or a failing one). The ticket is not done; it waits for a person, who
 accepts it or sends it back. Don't retry the completion. Say why in your closing message, with
@@ -369,8 +382,6 @@ Then complete it **with the run record** — what you used and where the work is
 capitalizes token spend from these numbers, and traces code back to tickets from the git fields:
 
 ```
-amp_session_usage()          ← if your harness has it (Claude Code with the AMP plugin): your model,
-                               tokens and cost for this session. Pass them straight through.
 amp_complete_task(task_id=YOUR_TASK_ID, dispatch_id="<your dispatch ID>",
   model="<the model you ran on>",
   input_tokens=…, output_tokens=…, cache_read_tokens=…, cost_usd=…,   ← only numbers your harness gave you
@@ -401,7 +412,6 @@ amp_open_receipt {task_id, dispatch_id, summary?, files_changed?}   ← before c
 amp_add_evidence {receipt_id, dispatch_id, tree_sha, commit?, files: [{name, bytes, sha256, duration_ms?, frames?}]}   ← one-time upload URLs for a visual check's evidence
 amp_complete_task {task_id, dispatch_id, model?, input_tokens?, output_tokens?, cache_read_tokens?, cost_usd?, branch?, commit?, pushed?, pr_url?, base_branch?, receipt_id?, checks?}
 amp_report_run {task_id, outcome, …run fields}  ← a run that ended another way, or a PR opened later
-amp_session_usage {}                  ← Claude Code plugin: your own model/tokens/cost
 amp_get_task {task_id, include: ["history","runs"]}   ← what happened before you
 amp_get_plan {project_id, epic_id?}
 amp_create_tasks {project_id, tasks: [{ref, story_id, name, description, acceptance_criteria, assigned_to, depends_on}]}

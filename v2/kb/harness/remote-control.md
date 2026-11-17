@@ -37,8 +37,9 @@ The harness registers the chat with AMP and prints:
 - **when it ends:** by default only when you end it (it has no time limit); if your org set an
   idle limit or a maximum length, the time it ends;
 - **a pairing link**, and under it a **QR code** to scan with your phone. The QR code needs a
-  window of about 60 columns by 40 rows; in a smaller one (80x24) you get the link alone, so
-  enlarge the window or copy the link;
+  window about 54 columns wide; at any height it is drawn (the transcript scrolls), and a window
+  shorter than about 37 rows says so: scroll up to see the whole code. A window too narrow for it
+  gets the link alone, so widen the window or copy the link;
 - this laptop's key fingerprint (`29CA-E6B5-…`).
 
 The link is **copied to your clipboard** as it is shown: the chat says "Pairing link copied to the

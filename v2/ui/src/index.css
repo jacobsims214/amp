@@ -235,8 +235,18 @@ body {
 }
 .amp-btn:hover { background: var(--surface-3); }
 .amp-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-.amp-btn-primary { background: var(--primary); color: var(--on-ink); border-color: var(--primary); }
+/* Label is `--bg`, not `--on-ink`: `--on-ink` is #FFFFFF in both themes while
+   `--primary` inverts (near-black in light, near-white under `.dark`), so `--on-ink`
+   painted white-on-white in dark mode (#4911). `--bg` is the ground the page is on,
+   so it always contrasts against `--primary`. `--on-ink` is untouched — avatars and
+   the `text-on-ink` utilities use it. */
+.amp-btn-primary { background: var(--primary); color: var(--bg); border-color: var(--primary); }
 .amp-btn-primary:hover { background: #2C2F33; }
+/* Under `.dark`, `--primary` is near-white, so the light-mode hover above would drop a
+   dark ground behind the dark label. Dark mode hovers to white instead. Both hooks are
+   listed because lib/theme.ts sets the class and `data-theme` together. */
+.dark .amp-btn-primary:hover,
+[data-theme="dark"] .amp-btn-primary:hover { background: #FFFFFF; }
 .amp-btn-accent { background: var(--accent); color: #fff; border-color: var(--accent); }
 .amp-btn-accent:hover { background: var(--danger-ink); }
 .amp-btn-danger { color: var(--danger-ink); border-color: var(--danger); }

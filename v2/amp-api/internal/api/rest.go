@@ -285,6 +285,7 @@ func (h *RestHandler) register(mux *deniedMux) {
 	// is the credential (main leaves this prefix out of the auth
 	// middleware, #126).
 	mux.mux.HandleFunc(ReceiptUploadPrefix, h.receiptUpload)
+	mux.mux.HandleFunc(ArtifactUploadPrefix, h.artifactUpload)
 	// GitHub's deliveries: no AMP session, authenticated by their HMAC
 	// signature only (main leaves this prefix out of the auth middleware).
 	mux.mux.HandleFunc(GitHubHookPrefix, h.githubHook)

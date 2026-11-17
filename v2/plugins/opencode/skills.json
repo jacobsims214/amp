@@ -16,7 +16,7 @@
  {
   "id": "amp-design-tools",
   "name": "amp-design-tools",
-  "description": "Fast tools for design work. Screenshot every state of a mockup in one call (capture.mjs), and publish a file as an AMP artifact without re-typing it (publish_file.py). Use them instead of screenshotting state by state with chrome-devtools, and instead of pasting a whole file into amp_publish_artifact.",
+  "description": "Fast tools for design work, and the rule for where screenshots go. Screenshot every state of a mockup in one call (capture.mjs), publish a file as an AMP artifact without re-typing it (an upload URL, or publish_file.py), and put screenshots and visual evidence on the ticket as one self-contained HTML artifact. Use them instead of screenshotting state by state with chrome-devtools, and instead of pasting a whole file into amp_publish_artifact.",
   "path": "skills/amp-design-tools/SKILL.md",
   "contentFile": "skills/amp-design-tools/SKILL.body.md"
  },

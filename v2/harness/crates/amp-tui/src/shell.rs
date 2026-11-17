@@ -2333,9 +2333,9 @@ impl Shell {
         }
     }
 
-    /// The pairing link, its QR code when the window has room, and how long it works.
+    /// The pairing link, its QR code, and how long it works.
     fn show_pairing_link(&mut self, url: &str, until_ms: i64, now: i64) {
-        use crate::remote_ui::{QrBlock, clock, qr_fits, qr_size, span};
+        use crate::remote_ui::{QrBlock, clock, qr_fits, qr_window, span};
         self.view.add_notice(&format!(
             "Pair a phone or another computer: open this link there, signed in to AMP as you, \
              then check the code and answer y here. It works once, for {} (until {}).",
@@ -2356,15 +2356,25 @@ impl Shell {
              browser, or select it with the mouse."
         });
         let (w, h) = self.screen_size();
-        if qr_fits(url, w, h)
+        // #4901: the code whenever the window is wide enough for it, whatever its height: the
+        // transcript scrolls, so an 80x24 terminal gets a code to scan rather than the link
+        // alone. Only a window too narrow for the code falls back to the link, and it says why.
+        if qr_fits(url, w)
             && let Some(qr) = QrBlock::new(url)
         {
             self.view.add_to_transcript(Arc::new(qr));
-        } else if let Some((cols, rows)) = qr_size(url) {
+            if let Some((need_w, need_h)) = qr_window(url)
+                && need_h > h
+            {
+                self.view.add_notice(&format!(
+                    "(The QR code is taller than this window: scroll up to see all of it, or make \
+                     the window about {need_w}x{need_h}.)"
+                ));
+            }
+        } else if let Some((need_w, _)) = qr_window(url) {
             self.view.add_notice(&format!(
-                "(No QR code: it needs a window of about {}x{}; this one is {w}x{h}. Use the link.)",
-                cols + 4,
-                rows + 12
+                "(No QR code: it needs a window of about {need_w} columns; this one is {w}. Use \
+                 the link.)"
             ));
         }
         self.copy_pairing_link(url, false);

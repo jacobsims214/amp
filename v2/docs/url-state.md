@@ -106,6 +106,7 @@ The server links people to tickets this way (`TaskURL` in amp-api, and the
 | `sort` | Artifacts | `status` (waiting first), `updated` (recently updated first) or `ticket` (group by ticket) | `status` | replace |
 | `v` | Artifact | version number | latest | replace |
 | `org` | Portfolio | org id | last viewed, else your first | replace |
+| `team` | Teams & orgs (`/admin/orgs`) | team id: select its org, activate the Teams tab, expand its row and — for a viewer who may manage it — open its Inbox access section. Read on arrival only, never written | none | link only (set by the team inbox's "Manage submit access") |
 | `launch` | any page (debug) | `full` or `short`: forces the launch animation | by timing | read only |
 
 `owner` and `done` mean the same thing on Board and Graph but have different

@@ -1,16 +1,19 @@
 import { PageHeader } from '../components/ui/PageHeader'
 import { useState, useEffect, useCallback } from 'react'
-import { Link } from 'react-router-dom'
-import { Loader2, Plus, Trash2, Pencil, UserPlus, Users, Mail, ChevronDown, ChevronRight, X, Check, BookOpen, Inbox } from 'lucide-react'
+import { Link, useSearchParams } from 'react-router-dom'
+import { Loader2, Plus, Trash2, Pencil, UserPlus, Users, Mail, ChevronDown, ChevronRight, X, Check, BookOpen, Inbox, ShieldCheck, ArrowUpRight } from 'lucide-react'
 import { api } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal'
 import { AccountBadges } from '../components/admin'
 import { AuditLogPanel } from '../components/AuditLogPanel'
+import { RequestAccessPanel } from '../components/requests/RequestAccessPanel'
 import { WebhooksPanel } from '../components/WebhooksPanel'
 import { OrgRemoteControlSetting } from '../components/remote/OrgRemoteControlSetting'
 import { OrgReceiptsSetting } from '../components/receipt/OrgReceiptsSetting'
+import { idParam } from '../hooks/useSearchParamState'
 import { personName } from '../lib/people'
+import { canManageSubmitAccess } from '../lib/requestAccess'
 import { teamInboxPath } from '../lib/requestRoutes'
 import type { AddMemberResult, Invite, Member, Org, OrgRole, Team, TeamRole } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
@@ -29,11 +32,39 @@ const smallSelectCls =
 const primaryBtnCls = 'amp-btn amp-btn-primary shrink-0 disabled:opacity-50'
 const iconBtnCls = 'text-ink-2 hover:text-danger-ink disabled:opacity-50 cursor-pointer transition-colors'
 
+/**
+ * The query param the team inbox's "Manage submit access" sends (AMP #4879's
+ * `teamAccessPath`; approved mockup artifact 112 v1 §4): `/admin/orgs?team=<id>`
+ * opens that team's row on its org's Teams tab.
+ *
+ * Named here rather than in `lib/requestRoutes.ts` — that module's rule is about
+ * *request* paths and this is the admin surface, not one. It is listed with the
+ * other params in use in `v2/docs/url-state.md`.
+ */
+const TEAM_PARAM = 'team'
+
 
 function addedMessage(email: string, r: AddMemberResult) {
   return r.invited
     ? `Invited ${email} — they'll be added when they first sign in.`
     : `Added ${email}.`
+}
+
+/**
+ * Which org the page should show, first preference first.
+ *
+ * The page's own rule, in one place because two paths settle it: the first load
+ * (which prefers the org a `?team=` link names) and every later reload (which
+ * keeps the reader's selection). Falling back to the first org is what the page
+ * has always done; a preference that is not in the list — an org the viewer
+ * cannot see, a stale link, an org just deleted — is skipped rather than shown
+ * as an empty detail.
+ */
+function settleOrgId(list: Org[], ...preferred: (number | null | undefined)[]): number | null {
+  for (const id of preferred) {
+    if (id != null && list.some(o => o.id === id)) return id
+  }
+  return list[0]?.id ?? null
 }
 
 function RoleBadge({ role }: { role: string }) {
@@ -52,6 +83,21 @@ function Notice({ error, info }: { error?: string | null; info?: string | null }
 
 export function Orgs() {
   const { me, loading: authLoading, isAdmin } = useAuth()
+  const [searchParams] = useSearchParams()
+  /**
+   * The team a `?team=<id>` link names, read once, when the page mounts.
+   *
+   * Once on purpose: the parameter is an arrival, not page state. `idParam`
+   * answers a positive integer or null, so a hand-edited `?team=abc` is a URL
+   * that names no team rather than an error (v2/docs/url-state.md: parse
+   * defensively, never throw, never show an error for it).
+   */
+  const [linkedTeamId] = useState(() => idParam.parse(searchParams.get(TEAM_PARAM) ?? ''))
+  /**
+   * The team the link resolved to, handed to the org detail for the first commit
+   * that shows it and then let go of — see the effect that clears it.
+   */
+  const [linkedTeam, setLinkedTeam] = useState<Team | null>(null)
   const [orgs, setOrgs] = useState<Org[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -68,15 +114,70 @@ export function Orgs() {
       .then(list => {
         setOrgs(list)
         setError(null)
-        setSelectedId(prev => prev !== null && list.some(o => o.id === prev) ? prev : list[0]?.id ?? null)
+        setSelectedId(prev => settleOrgId(list, prev))
       })
       .catch(e => setError(errMsg(e, 'Failed to load orgs')))
       .finally(() => setLoading(false))
   }, [])
 
+  /**
+   * The page's first load: the org list, and — when the URL names a team — that
+   * team's org already selected when anything renders.
+   *
+   * Both reads finish before the first `set*`, so the org detail mounts once, on
+   * the org the link names. Letting `reload()` load the list and then correcting
+   * the selection would mount the default org's detail (its members, its teams,
+   * its requests) and throw it away — a flash of the wrong org on the one journey
+   * this ticket exists to fix.
+   */
   useEffect(() => {
-    if (!authLoading) reload()
-  }, [authLoading, reload])
+    if (authLoading) return
+    let cancelled = false
+    ;(async () => {
+      // The team names the org; the list decides whether that org is this viewer's
+      // to see. Neither needs the other, so they go together.
+      const [team, orgAnswer] = await Promise.all([
+        linkedTeamId == null
+          ? Promise.resolve(null)
+          : api.getTeam(linkedTeamId).then(r => r.team).catch(() => null),
+        api.listOrgs()
+          .then(list => ({ list, failure: null as unknown }))
+          .catch((failure: unknown) => ({ list: [] as Org[], failure })),
+      ])
+      if (cancelled) return
+      // One synchronous block after the last await: React batches these into one
+      // render, which is what keeps the org detail from mounting twice.
+      if (orgAnswer.failure) {
+        setError(errMsg(orgAnswer.failure, 'Failed to load orgs'))
+      } else {
+        const { list } = orgAnswer
+        // An org the viewer cannot see cannot be selected: a link to a team in an
+        // org outside their list falls back to today's page, not an empty one.
+        const target = team && list.some(o => o.id === team.org_id) ? team : null
+        setOrgs(list)
+        setError(null)
+        setLinkedTeam(target)
+        setSelectedId(settleOrgId(list, target?.org_id))
+      }
+      setLoading(false)
+    })()
+    return () => { cancelled = true }
+  }, [authLoading, linkedTeamId])
+
+  /**
+   * Let go of the link's team after the commit that opened it.
+   *
+   * `?team=` says where to land, not where to be. Kept live, it would re-open
+   * that team's row and its Inbox access section every time the Teams tab or
+   * another org remounts `OrgDetail`/`OrgTeams`, yanking a reader back to a row
+   * they had closed. Each level captures what it needs when *it* mounts (the tab,
+   * the expanded row, the open section), so clearing this changes nothing on
+   * screen — and a reload re-reads the URL and lands there again, which is the
+   * point of a link.
+   */
+  useEffect(() => {
+    if (linkedTeam) setLinkedTeam(null)
+  }, [linkedTeam])
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
@@ -196,6 +297,7 @@ export function Orgs() {
                 isGlobalAdmin={isAdmin}
                 meId={me?.user_id}
                 onChanged={reload}
+                openTeamId={linkedTeam?.org_id === selected.id ? linkedTeam.id : undefined}
               />
             )}
           </div>
@@ -209,15 +311,18 @@ export function Orgs() {
 
 type Tab = 'members' | 'teams' | 'invites' | 'webhooks' | 'audit' | 'settings'
 
-function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
+function OrgDetail({ org, isGlobalAdmin, meId, onChanged, openTeamId }: {
   org: Org
   isGlobalAdmin: boolean
   meId?: number
   onChanged: () => Promise<void>
+  /** The team a `?team=` link asked to open, when it belongs to this org (AMP #4910). Read once, on mount. */
+  openTeamId?: number
 }) {
   const canManage = isGlobalAdmin || org.my_role === 'owner' || org.my_role === 'admin'
   const canGrantOwner = isGlobalAdmin || org.my_role === 'owner'
-  const [tab, setTab] = useState<Tab>('members')
+  // A link that names a team lands on the tab its row lives on, not on Members.
+  const [tab, setTab] = useState<Tab>(openTeamId != null ? 'teams' : 'members')
   const [renaming, setRenaming] = useState(false)
   const [name, setName] = useState(org.name)
   const [busy, setBusy] = useState(false)
@@ -292,7 +397,7 @@ function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
 
       <div className="p-5">
       {tab === 'members' && <OrgMembers org={org} canManage={canManage} canGrantOwner={canGrantOwner} meId={meId} />}
-      {tab === 'teams' && <OrgTeams org={org} canManage={canManage} meId={meId} />}
+      {tab === 'teams' && <OrgTeams org={org} canManage={canManage} meId={meId} openTeamId={openTeamId} />}
       {tab === 'invites' && <OrgInvites org={org} canManage={canManage} />}
       {tab === 'webhooks' && (
         <div className="space-y-3">
@@ -460,13 +565,28 @@ function OrgMembers({ org, canManage, canGrantOwner, meId }: { org: Org; canMana
 
 /* ─── Teams ──────────────────────────────────────────────────────────────── */
 
-function OrgTeams({ org, canManage, meId }: { org: Org; canManage: boolean; meId?: number }) {
+function OrgTeams({ org, canManage, meId, openTeamId }: {
+  org: Org
+  canManage: boolean
+  meId?: number
+  /** The team a `?team=` link asked to open (AMP #4910). Read on mount only. */
+  openTeamId?: number
+}) {
   const [teams, setTeams] = useState<Team[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [newName, setNewName] = useState('')
   const [creating, setCreating] = useState(false)
-  const [expanded, setExpanded] = useState<number | null>(null)
+  const [expanded, setExpanded] = useState<number | null>(openTeamId ?? null)
+  /**
+   * The team the link named, held for this panel's lifetime.
+   *
+   * Its row mounts later than the arrival — as soon as this org's teams answer —
+   * so the "open its access section" fact has to outlive the page's own hand-off
+   * of `?team=`. It only decides the *initial* state of that row's section: a
+   * reader who closes it keeps it closed.
+   */
+  const [arrivalTeamId] = useState<number | null>(openTeamId ?? null)
 
   const reload = useCallback(() => {
     return api.listOrgTeams(org.id)
@@ -520,6 +640,7 @@ function OrgTeams({ org, canManage, meId }: { org: Org; canManage: boolean; meId
               expanded={expanded === t.id}
               onToggle={() => setExpanded(expanded === t.id ? null : t.id)}
               onChanged={reload}
+              openAccess={arrivalTeamId === t.id}
             />
           ))}
         </div>
@@ -528,7 +649,7 @@ function OrgTeams({ org, canManage, meId }: { org: Org; canManage: boolean; meId
   )
 }
 
-function TeamRow({ team, first, canManageOrg, meId, expanded, onToggle, onChanged }: {
+function TeamRow({ team, first, canManageOrg, meId, expanded, onToggle, onChanged, openAccess = false }: {
   team: Team
   first: boolean
   canManageOrg: boolean
@@ -536,12 +657,49 @@ function TeamRow({ team, first, canManageOrg, meId, expanded, onToggle, onChange
   expanded: boolean
   onToggle: () => void
   onChanged: () => Promise<void>
+  /** Whether a `?team=` link asked for this row's Inbox access section (AMP #4910). Read on mount only. */
+  openAccess?: boolean
 }) {
+  const { me, isAdmin } = useAuth()
   const [renaming, setRenaming] = useState(false)
   const [name, setName] = useState(team.name)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  /**
+   * Whether to offer the action at all.
+   *
+   * The panel's own hint (`canManageSubmitAccess`), not a second rule: the entry
+   * point and the panel it opens must not be able to disagree about who is a
+   * manager. Deliberately optimistic — the server's `RequireTeamManager` is the
+   * gate on every write (see lib/requestAccess).
+   */
+  const canAdministerAccess = canManageSubmitAccess(me, team, isAdmin)
+  /**
+   * Whether this team's inbox-access section is open (AMP #4877).
+   *
+   * A team's own state, not the org's: two teams can be expanded at different
+   * times, and closing this section is how the panel's `onClose` collapses it —
+   * the page's expanded team, its scroll and its other rows are untouched.
+   *
+   * A `?team=` link (#4910) opens it on arrival, but only for a viewer who may
+   * manage it: the ticket that landed this journey is explicit that anybody else
+   * gets the expanded row and no section, so the section's initial state and the
+   * action's gate are the same fact rather than two that could drift.
+   */
+  const [accessOpen, setAccessOpen] = useState(openAccess && canAdministerAccess)
+  const accessId = `team-access-${team.id}`
+  /**
+   * Open the section, expanding the row first when it is collapsed.
+   *
+   * The section only exists inside an expanded row, so an action that merely
+   * flipped a hidden flag would be a control that visibly does nothing. Expanding
+   * is the row's own `onToggle`; nothing else on the page changes.
+   */
+  const toggleAccess = () => {
+    if (!expanded) { onToggle(); setAccessOpen(true); return }
+    setAccessOpen(open => !open)
+  }
 
   const rename = async () => {
     setBusy(true); setError(null)
@@ -559,8 +717,12 @@ function TeamRow({ team, first, canManageOrg, meId, expanded, onToggle, onChange
 
   return (
     <div className={first ? '' : 'border-t border-line'}>
-      <div className="flex items-center gap-2 px-4 py-2.5">
-        <button onClick={onToggle} className="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer">
+      {/* The row wraps at phone width and the toggle takes the first line
+          (artifact 112 v1's `.teamrow` / `.teamtoggle` rules, which use 720 px):
+          the actions — Inbox, KB, Inbox access, rename, delete — then sit on
+          their own line instead of pushing the last of them off the screen. */}
+      <div className="flex flex-wrap items-center gap-2 px-4 py-2.5">
+        <button onClick={onToggle} className="flex items-center gap-2 flex-1 min-w-0 max-[720px]:basis-full text-left cursor-pointer">
           <span className="text-ink-3">{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</span>
           <Users size={13} className="text-ink-3 flex-shrink-0" />
           {!renaming && <span className="text-sm text-ink truncate">{team.name}</span>}
@@ -578,6 +740,20 @@ function TeamRow({ team, first, canManageOrg, meId, expanded, onToggle, onChange
               className="amp-btn amp-btn-ghost amp-btn-sm">
               <BookOpen size={12} />KB
             </Link>
+            {/* Who may send requests to this team's inbox (AMP #4877, approved
+                mockup artifact 112 v1). An outlined button rather than a ghost
+                one: it opens a section of this row, where Inbox and KB are page
+                links. Managers only — a viewer with neither standing gets no
+                action, and no dead end. */}
+            {canAdministerAccess && (
+              <button type="button" onClick={toggleAccess}
+                aria-expanded={expanded && accessOpen} aria-controls={expanded && accessOpen ? accessId : undefined}
+                aria-label={`Inbox access for ${team.name}`}
+                title="Who may send requests to this team's inbox"
+                className="amp-btn amp-btn-sm">
+                <ShieldCheck size={12} />Inbox access
+              </button>
+            )}
           </>
         )}
         {renaming ? (
@@ -595,6 +771,40 @@ function TeamRow({ team, first, canManageOrg, meId, expanded, onToggle, onChange
       </div>
       {error && !confirmDelete && <p className="text-xs text-danger-ink px-4 pb-2">{error}</p>}
       {expanded && <TeamMembers teamId={team.id} canManageOrg={canManageOrg} meId={meId} />}
+      {/* The inbox-access section: inside the expanded row, beneath the members,
+          on the same surface and at the same left indent (artifact 112 v1). It is
+          the panel itself, unmoved — no field, control or sentence is restated
+          here, and `onClose` collapses the section rather than the row. */}
+      {expanded && accessOpen && canAdministerAccess && (
+        <section id={accessId} aria-labelledby={`${accessId}-h`}
+          className="mr-4 mb-4 ml-4 border border-line sm:ml-10"
+          style={{ background: 'var(--surface)', borderRadius: 'var(--radius)' }}>
+          <div className="flex flex-col gap-2 px-3.5 py-3 border-b border-line sm:flex-row sm:flex-wrap sm:items-center sm:gap-2.5">
+            <ShieldCheck size={14} className="hidden flex-shrink-0 text-ink-3 sm:block" aria-hidden="true" />
+            <div className="min-w-0 flex-1">
+              <span id={`${accessId}-h`} className="amp-label">Team inbox · submit access</span>
+              <p className="m-0 mt-1 text-[12.5px] leading-snug text-ink-2">
+                Who may send requests to {team.name}’s inbox. This is part of the team’s access — nothing here is a
+                separate admin page.
+              </p>
+            </div>
+            <Link to={teamInboxPath(team.id)} className="amp-btn amp-btn-ghost amp-btn-sm self-start"
+              title="Open the inbox queue">
+              Open inbox<ArrowUpRight size={11} />
+            </Link>
+          </div>
+          <div className="grid gap-4 px-3.5 py-3.5">
+            <RequestAccessPanel
+              teamId={team.id}
+              team={team}
+              me={me}
+              isAdmin={isAdmin}
+              meId={meId}
+              onClose={() => setAccessOpen(false)}
+            />
+          </div>
+        </section>
+      )}
       {confirmDelete && (
         <ConfirmDeleteModal
           title={`Delete team "${team.name}"`}

@@ -32,13 +32,20 @@
  * which the panel renders in place rather than translating into a friendlier
  * half-truth. `canManageSubmitAccess` decides only whether the panel *offers* a
  * control, and its note explains why an optimistic hint is the right shape.
+ *
+ * Above those three, the panel hands out the way in (#4878, approved mockup #112
+ * v1): the requester entry link, built by `requesterNewRequestPath` and copyable.
+ * It is not a fourth act on the server — nothing is emailed by the invitation
+ * either — it is how the acts above become useful to somebody who is not in the
+ * room, so its copy says exactly that.
  */
 import { useCallback, useEffect, useState } from 'react'
-import { AlertTriangle, Ban, KeyRound, Loader2, Mail, Plus, ShieldCheck, UserPlus } from 'lucide-react'
+import { AlertTriangle, Ban, Check, Copy, KeyRound, Loader2, Mail, Plus, ShieldCheck, UserPlus } from 'lucide-react'
 import { api, requestApi } from '../../api/client'
 import { SecretReveal } from '../admin'
 import { ConfirmButton } from '../ui/ConfirmButton'
 import { errMsg } from '../../lib/adminStyles'
+import { requesterNewRequestPath } from '../../lib/requestRoutes'
 import {
   activeGrantCount, canManageSubmitAccess, cannotManageReason, credentialExpired, dayLabel, grantRows,
   grantState, granteeName, REQUESTER_INVITE_RULE, SUBMIT_ACCESS_IS_NOT_MEMBERSHIP, SUBMIT_CREDENTIAL_RULE, SUBMIT_TOKEN_DAYS,
@@ -210,6 +217,15 @@ export function RequestAccessPanel({ teamId, team: teamProp, me, isAdmin = false
         <span><b className="text-ink">Sending is not joining.</b> {SUBMIT_ACCESS_IS_NOT_MEMBERSHIP}</span>
       </p>
 
+      {/*
+        The entry link, before the lists: it is the thing a manager came here
+        for, and it is not one of the three acts below — nothing about it is
+        written. Managers only: a viewer who may not change access cannot
+        complete the act it starts, and the approved mockup (#112 v1) draws it
+        as one of the panel's controls, absent from its not-permitted state.
+      */}
+      {canManage && team && <RequesterLink teamId={teamId} teamName={team.name} />}
+
       {lists.loading && lists.grants.length === 0 && lists.invites.length === 0 ? (
         <div className="flex items-center gap-2 py-4 text-[12.5px] text-ink-3" role="status">
           <Loader2 size={14} className="animate-spin" aria-hidden="true" />Loading who can send requests…
@@ -288,6 +304,90 @@ export function RequestAccessPanel({ teamId, team: teamProp, me, isAdmin = false
         </div>
       )}
     </div>
+  )
+}
+
+/* ── the requester's way in ───────────────────────────────────────────────── */
+
+/**
+ * The requester entry link, as something a manager copies and sends.
+ *
+ * This block is the delivery mechanism, and the copy says so. Nothing in AMP
+ * sends mail — `POST /api/teams/{id}/request-invites` writes a pending
+ * invitation row and mails nobody (`internal/api/request_grants.go`) — so a
+ * manager who believed the invitation had been delivered would leave a
+ * requester waiting for a message that never comes. The link is also the only
+ * thing that works for a requester with no AMP account at all, and its two
+ * query parameters exist because their own projection never carries a team id
+ * (`lib/requestRoutes.ts` §2): hence `requesterNewRequestPath` rather than a
+ * template literal here, so those two facts stay in the one file that explains
+ * them.
+ *
+ * The copy reports both outcomes. A refused clipboard is not a failed action —
+ * the link is on screen, selectable — so it says "select it and copy" rather
+ * than claiming a success that did not happen (the same shape as
+ * `pages/RequesterSubmit`'s reference copy, which is the other place in the
+ * product where a person's only route in is a string on the screen).
+ */
+function RequesterLink({ teamId, teamName }: { teamId: number; teamName: string }) {
+  // Built here, never assembled: the builder is what keeps `?team=` and
+  // `?desk=` travelling together, and the absolute form is what a recipient
+  // can paste (the rest of the app copies links the same way).
+  const url = `${window.location.origin}${requesterNewRequestPath({ teamId, teamName })}`
+  const [copied, setCopied] = useState<'idle' | 'copied' | 'failed'>('idle')
+
+  // The outcome clears itself, so a second copy is possible without a stale
+  // "Copied" from a minute ago sitting under a button nobody pressed.
+  useEffect(() => {
+    if (copied === 'idle') return
+    const t = setTimeout(() => setCopied('idle'), 4000)
+    return () => clearTimeout(t)
+  }, [copied])
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(url)
+      setCopied('copied')
+    } catch {
+      setCopied('failed')
+    }
+  }
+
+  return (
+    <section className="grid gap-1.5 min-w-0" aria-labelledby="requester-link-head">
+      <h2 id="requester-link-head" className="amp-label m-0">Requester link</h2>
+      <div className="flex flex-wrap items-center gap-2 min-w-0">
+        <code
+          data-testid="requester-link-url"
+          className="amp-num flex-1 min-w-[200px] px-3 py-2 text-[12px] text-ink border border-line select-all"
+          style={{ background: 'var(--surface-2)', borderRadius: 'var(--radius)', overflowWrap: 'anywhere' }}
+        >
+          {url}
+        </code>
+        <button
+          type="button"
+          onClick={() => void copy()}
+          // A stable name: a button that renames itself to "Copied" loses its
+          // own label for voice and screen-reader navigation, and the outcome is
+          // announced below either way.
+          aria-label="Copy the requester link"
+          className="amp-btn amp-btn-sm flex-shrink-0"
+        >
+          {copied === 'copied'
+            ? <><Check size={12} className="text-success-ink" aria-hidden="true" />Copied</>
+            : <><Copy size={12} aria-hidden="true" />Copy link</>}
+        </button>
+      </div>
+      <p role="status" className="m-0 min-h-[1em] text-[11.5px] leading-snug text-ink-3" data-testid="requester-link-status">
+        {copied === 'copied' && 'Link copied. Send it to them in whatever way you already reach them.'}
+        {copied === 'failed' && 'Your browser refused the clipboard — select the link above and copy it.'}
+      </p>
+      <p className="m-0 text-[11.5px] leading-snug text-ink-3" data-testid="requester-link-note">
+        Nothing is emailed, not by this panel and not by a requester invitation:{' '}
+        <b className="text-ink-2">this link is what the requester needs</b>, so send it to them yourself. Someone with
+        no AMP account still has to be invited below first — the link opens the form, it does not let them in.
+      </p>
+    </section>
   )
 }
 
