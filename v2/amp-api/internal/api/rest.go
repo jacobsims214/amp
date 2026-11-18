@@ -1089,7 +1089,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 	case "activity":
 		since := r.URL.Query().Get("since")
 		until := r.URL.Query().Get("until")
-		activity, err := h.repo.GetProjectActivity(r.Context(), projectID, since, until)
+		activity, err := h.repo.GetProjectActivity(r.Context(), projectID, since, until, 0)
 		if err != nil {
 			jsonErr(w, err, 500)
 			return
