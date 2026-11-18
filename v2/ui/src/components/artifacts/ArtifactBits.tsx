@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { FileCode2, FileImage, FileText, Shapes } from 'lucide-react'
 import { api } from '../../api/client'
 import { useSSE } from '../../hooks/useSSE'
+import { useStreamReconnect } from '../../hooks/useStreamReconnect'
 import { STATUS_LABEL } from '../../lib/artifacts'
 import type { Artifact, ArtifactKind, ArtifactStatus } from '../../types'
 
@@ -29,9 +30,25 @@ export function ArtifactKindIcon({ kind, size = 14 }: { kind: ArtifactKind; size
 /** A ticket's artifacts, for the ticket drawer. Renders nothing when there are none. */
 export function TicketArtifacts({ projectId, taskId }: { projectId: number; taskId: number }) {
   const [list, setList] = useState<Artifact[]>([])
-  const load = useCallback(() => { api.listArtifacts(projectId, taskId).then(setList).catch(() => setList([])) }, [projectId, taskId])
+  // The ticket whose read last settled, answered or failed. Until this ticket's
+  // first read settles, a reconnect is dropped: that read is already fresh (#2539).
+  const [settledFor, setSettledFor] = useState<number | null>(null)
+  // Only the latest read may answer, so a slower earlier one (another ticket's,
+  // or a re-read a newer one superseded) can't put an old list back.
+  const latest = useRef(0)
+  const load = useCallback(() => {
+    const read = ++latest.current
+    const settle = (artifacts: Artifact[]) => {
+      if (read !== latest.current) return
+      setList(artifacts)
+      setSettledFor(taskId)
+    }
+    api.listArtifacts(projectId, taskId).then(settle, () => settle([]))
+  }, [projectId, taskId])
   useEffect(load, [load])
   useSSE(projectId, e => { if (e.type === 'artifact.updated') load() })
+  // An artifact published while the stream was down never arrives as an event.
+  useStreamReconnect(load, settledFor === taskId)
   if (list.length === 0) return null
   return (
     <div className="px-6 py-3 border-b border-line grid gap-1.5">
