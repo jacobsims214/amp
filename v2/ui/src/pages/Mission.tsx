@@ -244,16 +244,26 @@ export function Mission() {
   const selected = selectedId == null ? null : tasks.find(t => t.id === selectedId) ?? null
   const focusMissing = useFocusFallback(pid, 'mission', selectedId, tasks, loading)
 
-  // Latest activity; refreshed shortly after tickets change.
+  // Latest activity; refreshed shortly after tickets change. Only one load is
+  // in flight: starting one aborts the one before, and so do a change of
+  // project and unmount (below). An aborted load never sets state.
+  const activityLoad = useRef<AbortController | null>(null)
   const loadActivity = useCallback(() => {
     held.current.delete('activity')
+    activityLoad.current?.abort()
+    const ctl = new AbortController()
+    activityLoad.current = ctl
+    const { signal } = ctl
     const since = new Date(Date.now() - 3 * 86_400_000).toISOString()
     // Ticket activity plus plan-level changes (deletes, approvals, settings) from
     // the audit log, which only leads can read — others just get ticket activity.
+    // The feed shows 14 rows, so the newest 100 of each is plenty.
     Promise.all([
-      api.getProjectActivity(pid, since),
-      api.audit({ projectId: pid, limit: 200 }).catch(() => [] as AuditEntry[]),
+      api.getProjectActivity(pid, since, undefined, { limit: 100, signal }),
+      api.audit({ projectId: pid, limit: 100 }, { signal }).catch(() => [] as AuditEntry[]),
     ]).then(([a, audit]) => {
+      // Superseded while it finished (e.g. the audit half was the one aborted).
+      if (signal.aborted) return
       const seen = new Map<number, number>()
       for (const e of a) seen.set(e.task_id, Math.max(seen.get(e.task_id) ?? 0, Date.parse(e.created_at)))
       setLastSeen(seen)
@@ -261,8 +271,11 @@ export function Mission() {
       setActivity([...a.map(fromActivity), ...audit.filter(e => e.at >= since).map(fromAudit)]
         .sort((x, y) => y.at.localeCompare(x.at)).reduce(collapseRuns, []).slice(0, 14))
     })
+      // An AbortError is a superseded load; any other failure keeps the feed as it was.
       .catch(() => {})
   }, [pid])
+  // Another project, or leaving the page: the load in flight is for nothing.
+  useEffect(() => () => activityLoad.current?.abort(), [loadActivity])
   useEffect(() => {
     const t = setTimeout(() => {
       if (isHidden()) held.current.add('activity')
