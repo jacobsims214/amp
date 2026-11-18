@@ -348,6 +348,11 @@ export const api = {
       `/projects/${projectId}/activity${qs ? '?' + qs : ''}`, opts.signal,
     ).then(r => r.activity ?? [])
   },
+  // Newest activity time of each running (in_progress) ticket, keyed by ticket
+  // id as a string. A running ticket that has logged nothing is absent.
+  getLastActivity: (projectId: number, opts: ReadOpts = {}) =>
+    get<{ last_activity: Record<string, string> | null }>(`/projects/${projectId}/last-activity`, opts.signal)
+      .then(r => r.last_activity ?? {}),
 
   // KB: every call names one knowledge base (a project's, a team's, or an org's).
   kbInfo: (ref: KBRef) => get<KBInfo>(`/kb/info?${kbQuery(ref)}`),

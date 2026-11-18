@@ -69,9 +69,9 @@ server.events.on('request:start', ({ requestId, request }) => {
 })
 server.events.on('request:end', ({ requestId }) => { inFlight.delete(requestId) })
 // Requests made by Mission's background loads since open() rendered it.
-const calls = { activity: 0, audit: 0, counts: 0, waiting: 0 }
+const calls = { activity: 0, audit: 0, lastActivity: 0, counts: 0, waiting: 0 }
 const CALL_PATHS: Record<string, keyof typeof calls> = {
-  '/api/projects/2/activity': 'activity', '/api/audit': 'audit',
+  '/api/projects/2/activity': 'activity', '/api/audit': 'audit', '/api/projects/2/last-activity': 'lastActivity',
   '/api/my-work/counts': 'counts', '/api/projects/2/waiting-on-people': 'waiting',
 }
 server.events.on('request:start', ({ request }) => {
@@ -254,8 +254,23 @@ describe("Mission's activity feed", () => {
       await answer.wait
       return HttpResponse.json({ activity: answer.rows.map(row), count: answer.rows.length })
     })
+  // Each last-activity request's signal, in order. Request n waits on its gate
+  // (when given), then answers times[n]; later requests repeat the last answer.
+  let lastSignals: AbortSignal[] = []
+  const lastActivityAnswers = (answers: { times: Record<number, string>; wait?: Promise<void> }[]) =>
+    http.get('*/api/projects/2/last-activity', async ({ request }) => {
+      lastSignals.push(request.signal)
+      const answer = answers[Math.min(lastSignals.length, answers.length) - 1]
+      await answer.wait
+      return HttpResponse.json({ last_activity: answer.times })
+    })
+  const minutesAgo = (m: number) => new Date(Date.now() - m * 60_000).toISOString()
+  // Ticket 2491 is a running agent ticket, dispatched on Oct 27, so with no
+  // sign of life since it reads as quiet for weeks.
+  const crewRow = () => screen.getByText('#2491 Ticket 2491').closest('button')!
+  const inProgressTile = () => screen.getByText('In progress', { selector: '.amp-label' }).parentElement!
 
-  beforeEach(() => { fakeTime(); gates = []; signals = [] })
+  beforeEach(() => { fakeTime(); gates = []; signals = []; lastSignals = [] })
   afterEach(() => {
     for (const open of gates) open()
     cleanup()
@@ -359,6 +374,89 @@ describe("Mission's activity feed", () => {
     await quiet()
     expect(feedRow(9001)).toBeNull()
   })
+
+  // Whether a running ticket is quiet comes from its own newest activity
+  // (GET /projects/:id/last-activity), not from the newest 100 feed rows.
+  it('a running ticket active 2 min ago, with no row in the feed, is not quiet', async () => {
+    server.use(lastActivityAnswers([{ times: { 2491: minutesAgo(2) } }]))
+    await open()
+    await advance(2_000)
+    await quiet()
+    expect(lastSignals).toHaveLength(1)
+    expect(feedRow(2491)).toBeNull()
+    expect(crewRow()).not.toHaveTextContent(/quiet/)
+    expect(inProgressTile()).not.toHaveTextContent('may have stalled')
+    expect(inProgressTile()).toHaveTextContent('agents for 1 person')
+  })
+
+  it('a running ticket last active 40 min ago shows quiet 40m', async () => {
+    server.use(lastActivityAnswers([{ times: { 2491: minutesAgo(40) } }]))
+    await open()
+    await advance(2_000)
+    await quiet()
+    // Not the weeks since its dispatch: its last activity is the latest sign of life.
+    await waitFor(() => expect(crewRow()).toHaveTextContent('quiet 40m'))
+    expect(inProgressTile()).toHaveTextContent('1 quiet · may have stalled')
+  })
+
+  it('a feed row newer than the last-activity time still counts', async () => {
+    server.use(
+      lastActivityAnswers([{ times: { 2491: minutesAgo(40) } }]),
+      activityAnswers([{ rows: [2491] }]),
+    )
+    await open()
+    await advance(2_000)
+    await quiet()
+    await waitFor(() => expect(feedRow(2491)).toBeInTheDocument())
+    expect(crewRow()).not.toHaveTextContent(/quiet/)
+    expect(inProgressTile()).not.toHaveTextContent('may have stalled')
+  })
+
+  it('when last-activity fails, the feed rows say who was seen', async () => {
+    server.use(
+      http.get('*/api/projects/2/last-activity', () => HttpResponse.json({ error: 'boom' }, { status: 500 })),
+      activityAnswers([{ rows: [2491] }]),
+    )
+    await open()
+    await advance(2_000)
+    await quiet()
+    await waitFor(() => expect(feedRow(2491)).toBeInTheDocument())
+    expect(crewRow()).not.toHaveTextContent(/quiet/)
+    expect(inProgressTile()).not.toHaveTextContent('may have stalled')
+  })
+
+  it('a load aborted while its last-activity was out sets no last-seen times', async () => {
+    // The first load's activity (a fresh row for 2491) arrives at once; its
+    // last-activity is still out when the minute's poll aborts it. The newer
+    // load's activity is held, so only the aborted load could have set anything.
+    const firstLast = gate()
+    const second = gate()
+    server.use(
+      lastActivityAnswers([{ times: { 2491: minutesAgo(2) }, wait: firstLast.shut }, { times: {} }]),
+      activityAnswers([{ rows: [2491] }, { rows: [], wait: second.shut }]),
+    )
+    await open()
+    await advance(2_000)
+    await waitFor(() => expect(lastSignals).toHaveLength(1))
+    await act(() => new Promise(r => realSetTimeout(r, 50)))
+    expect(crewRow()).toHaveTextContent(/quiet \d+m/)
+
+    await advance(60_000)
+    await waitFor(() => expect(signals).toHaveLength(2))
+    expect(lastSignals[0].aborted).toBe(true)
+    // The aborted load has settled by now: 2491 is still quiet, and its row
+    // is not in the feed.
+    await act(() => new Promise(r => realSetTimeout(r, 50)))
+    expect(crewRow()).toHaveTextContent(/quiet \d+m/)
+    expect(inProgressTile()).toHaveTextContent('1 quiet · may have stalled')
+    expect(feedRow(2491)).toBeNull()
+
+    second.open()
+    firstLast.open()
+    await quiet()
+    expect(crewRow()).toHaveTextContent(/quiet \d+m/)
+    expect(feedRow(2491)).toBeNull()
+  })
 })
 
 // A hidden tab makes no background loads (activity, audit, counts, waiting on
@@ -369,8 +467,10 @@ describe('Mission in a hidden tab', () => {
     visibility = state
     document.dispatchEvent(new Event('visibilitychange'))
   })
-  const none = { activity: 0, audit: 0, counts: 0, waiting: 0 }
-  const oneEach = { activity: 1, audit: 1, counts: 1, waiting: 1 }
+  // Last-activity is part of the activity load, so it is skipped and caught up with it.
+  const none = { activity: 0, audit: 0, lastActivity: 0, counts: 0, waiting: 0 }
+  const oneEach = { activity: 1, audit: 1, lastActivity: 1, counts: 1, waiting: 1 }
+  const oneActivityLoad = { ...none, activity: 1, audit: 1, lastActivity: 1 }
 
   beforeEach(() => {
     fakeTime()
@@ -428,7 +528,7 @@ describe('Mission in a hidden tab', () => {
     expect(calls).toEqual(none)
 
     await advance(60_000)
-    await waitFor(() => expect(calls).toEqual({ ...none, activity: 1, audit: 1 }))
+    await waitFor(() => expect(calls).toEqual(oneActivityLoad))
     resetCalls()
 
     await setVisibility('hidden')
@@ -438,10 +538,10 @@ describe('Mission in a hidden tab', () => {
 
     // Only the activity poll was skipped, so only activity loads, once.
     await setVisibility('visible')
-    await waitFor(() => expect(calls).toEqual({ ...none, activity: 1, audit: 1 }))
+    await waitFor(() => expect(calls).toEqual(oneActivityLoad))
     await advance(5_000)
     await quiet()
-    expect(calls).toEqual({ ...none, activity: 1, audit: 1 })
+    expect(calls).toEqual(oneActivityLoad)
   })
 
   it('after unmount, showing the tab loads nothing', async () => {

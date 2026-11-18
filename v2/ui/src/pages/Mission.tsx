@@ -257,14 +257,25 @@ export function Mission() {
     const since = new Date(Date.now() - 3 * 86_400_000).toISOString()
     // Ticket activity plus plan-level changes (deletes, approvals, settings) from
     // the audit log, which only leads can read — others just get ticket activity.
-    // The feed shows 14 rows, so the newest 100 of each is plenty.
+    // The feed shows 14 rows, so the newest 100 of each is plenty. Each
+    // running ticket's last sign of life comes from its own newest activity
+    // (last-activity), not the feed: on a busy project an agent that is still
+    // commenting can fall out of the newest 100 rows.
     Promise.all([
       api.getProjectActivity(pid, since, undefined, { limit: 100, signal }),
       api.audit({ projectId: pid, limit: 100 }, { signal }).catch(() => [] as AuditEntry[]),
-    ]).then(([a, audit]) => {
-      // Superseded while it finished (e.g. the audit half was the one aborted).
+      // null: an older server or a failure, so the feed rows alone say who was seen.
+      api.getLastActivity(pid, { signal }).catch(() => null),
+    ]).then(([a, audit, last]) => {
+      // Superseded while it finished (e.g. the audit or last-activity half was
+      // the one aborted).
       if (signal.aborted) return
       const seen = new Map<number, number>()
+      for (const [id, iso] of Object.entries(last ?? {})) {
+        const t = Date.parse(iso)
+        if (t) seen.set(Number(id), t)
+      }
+      // A row that landed after last-activity was read still counts.
       for (const e of a) seen.set(e.task_id, Math.max(seen.get(e.task_id) ?? 0, Date.parse(e.created_at)))
       setLastSeen(seen)
       setNow(Date.now())
