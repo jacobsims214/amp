@@ -212,22 +212,34 @@ describe('board store', () => {
   })
 })
 
-// Events sent while the stream was down never arrive, so a reconnect re-reads (#1570).
+// Events sent while the stream was down never arrive, so a reconnect re-reads
+// (#1570). A project is ready once its first load settles; each "connected"
+// while it is ready re-reads it once, and one during the first load is dropped
+// (#2623, the useStreamReconnect rule). There is no "skip the first connected".
 describe('board store on a reconnect', () => {
   const recordLoads = () => {
     const loads: number[] = []
     tasksImpl = pid => { loads.push(pid); return Promise.resolve(serverTasks) }
     return loads
   }
+  // Hold every ticket read until release(): the first load stays in flight.
+  const holdLoads = () => {
+    const gate = deferred<void>()
+    const loads: number[] = []
+    tasksImpl = async pid => { loads.push(pid); await gate.promise; return serverTasks }
+    return { loads, release: () => act(async () => { gate.resolve() }) }
+  }
+  const missed = () => { serverTasks = [t11, { id: 12, project_id: 1, state: 'backlog', name: 'Missed' } as Task] }
 
-  it('the first connected does not re-read; each later one re-reads the board once, with what the gap missed', async () => {
+  it('a connected during the first load is dropped; each one after it settled re-reads the board once, with what the gap missed', async () => {
+    const held = holdLoads()
     const board = renderHook(() => useBoardData(1))
-    await flush()
-    connect()
+    connect() // the new stream's opening frame, while the first load is in flight
+    await held.release()
     await flush()
     expect(calls).toEqual({ epics: 1, tasks: 1, projectStories: 1, epicStories: 0 })
     // Ticket 12 was created while the stream was down: its task.created never arrived.
-    serverTasks = [t11, { id: 12, project_id: 1, state: 'backlog', name: 'Missed' } as Task]
+    missed()
     connect()
     await flush()
     expect(calls).toEqual({ epics: 2, tasks: 2, projectStories: 2, epicStories: 0 })
@@ -237,27 +249,52 @@ describe('board store on a reconnect', () => {
     expect(calls.tasks).toBe(3)
   })
 
+  it('a board first loaded in a background tab with no leader catches up on its first connected after being shown', async () => {
+    // A hidden tab with no leader has no stream (#1582): the first load settles and no "connected" comes.
+    const board = renderHook(() => useBoardData(1))
+    await flush()
+    missed()
+    // Shown: the tab leads, opens its stream, and its opening "connected" follows the gap.
+    connect()
+    await flush()
+    expect(calls.tasks).toBe(2)
+    expect(board.result.current.tasks.map(t => t.id)).toEqual([11, 12])
+  })
+
+  it('a failed first load still makes the project ready, so a connected retries it', async () => {
+    tasksImpl = () => Promise.reject(new Error('down'))
+    const board = renderHook(() => useBoardData(1))
+    await flush()
+    expect(board.result.current.error).toBe('down')
+    tasksImpl = () => Promise.resolve(serverTasks)
+    connect()
+    await flush()
+    expect(calls.tasks).toBe(2)
+    expect(board.result.current).toMatchObject({ error: null, loading: false })
+    expect(board.result.current.tasks.map(t => t.id)).toEqual([11])
+  })
+
   it('re-reads each subscribed project once, however many views show it', async () => {
-    const loads = recordLoads()
+    const held = holdLoads()
     renderHook(() => useBoardData(1))
     renderHook(() => useBoardData(1))
     renderHook(() => useBoardData(2))
-    await flush()
     expect(sse).toHaveLength(2)
-    loads.length = 0
-    connect()
+    connect() // during both first loads: no extra read
+    await held.release()
     await flush()
-    expect(loads).toEqual([])
+    expect(held.loads.sort()).toEqual([1, 2])
+    const loads = recordLoads()
     connect()
     await flush()
     expect(loads.sort()).toEqual([1, 2])
   })
 
-  it('a project opened on a stream that is already up counts its first connected as a reconnect', async () => {
+  it('a project that joins a stream another project already has open catches up on the next connected', async () => {
     renderHook(() => useBoardData(1))
-    await flush()
     connect()
-    // Project 2 joins the stream project 1 is on, after its "connected" was said.
+    await flush()
+    // Project 2 joins the stream project 1 is on, after its "connected" was said: it never hears one.
     renderHook(() => useBoardData(2))
     await flush()
     const loads = recordLoads()
@@ -269,9 +306,8 @@ describe('board store on a reconnect', () => {
   it('a project nobody is viewing is re-read on its next view, not right away', async () => {
     const board = renderHook(() => useBoardData(1))
     await flush()
-    connect()
     board.unmount() // the store still listens (LINGER_MS)
-    serverTasks = [t11, { id: 12, project_id: 1, state: 'backlog', name: 'Missed' } as Task]
+    missed()
     connect()
     await flush()
     expect(calls.tasks).toBe(1)
@@ -282,20 +318,20 @@ describe('board store on a reconnect', () => {
     expect(back.result.current.tasks.map(t => t.id)).toEqual([11, 12])
   })
 
-  it('after the store stops listening, the first connected on its next subscription does not re-read', async () => {
+  it('after the store stops listening and a view comes back, the next connected still catches up', async () => {
     vi.useFakeTimers()
     const board = renderHook(() => useBoardData(1))
     await act(() => vi.advanceTimersByTimeAsync(0))
-    connect()
     board.unmount()
     await act(() => vi.advanceTimersByTimeAsync(LINGER_MS + 1))
     expect(sse).toHaveLength(0)
     renderHook(() => useBoardData(1)) // stale by now: one read on mount
     await act(() => vi.advanceTimersByTimeAsync(0))
     expect(calls.tasks).toBe(2)
+    expect(sse).toHaveLength(1)
     connect()
     await act(() => vi.advanceTimersByTimeAsync(0))
-    expect(calls.tasks).toBe(2)
+    expect(calls.tasks).toBe(3)
   })
 })
 
@@ -360,26 +396,24 @@ describe('board store eviction', () => {
     const loads: number[] = []
     tasksImpl = pid => { loads.push(pid); return Promise.resolve(serverTasks) }
     const board = renderHook(() => useBoardData(1))
-    await settle()
-    connect() // on the stream: its next "connected" would be a reconnect
+    await settle() // first load settled: a "connected" now would be a reconnect
     board.unmount()
     await wait(EVICT_MS)
     expect(sse).toHaveLength(0)
     // A late re-read signal doesn't bring the entry back.
     invalidateBoard(1)
     expect(cached()).toBe(false)
-    // Another project opening now starts a new stream: its first "connected" is not a reconnect.
-    renderHook(() => useBoardData(2))
-    await settle()
-    connect()
-    await settle()
-    expect(loads).toEqual([1, 2])
-    // Project 1 comes back: one fresh read on mount, and the stream is up (project 2 saw it connect).
+    // Project 1 comes back as a new entry that isn't ready: a "connected" during its first load is dropped.
+    const gate = deferred<void>()
+    tasksImpl = async pid => { loads.push(pid); await gate.promise; return serverTasks }
     renderHook(() => useBoardData(1))
+    connect()
+    await act(async () => { gate.resolve() })
     await settle()
-    expect(loads).toEqual([1, 2, 1])
+    expect(loads).toEqual([1, 1])
+    // Settled now: the next one is a reconnect.
     connect()
     await settle()
-    expect(loads.slice(3).sort()).toEqual([1, 2])
+    expect(loads).toEqual([1, 1, 1])
   })
 })
