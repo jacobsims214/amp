@@ -2,11 +2,13 @@ import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api/client'
 import { changedSince, changedSinceNotice } from '../lib/approval'
 import { useSSE } from './useSSE'
+import { useStreamReconnect } from './useStreamReconnect'
 import type { ApproveRequest, Project, SSEEvent } from '../types'
 
 /**
  * The project's approval state, kept live (project.updated arrives when
- * anyone approves), and the person's approve (their own tickets, or others'
+ * anyone approves, and the project is re-read when the live stream
+ * reconnects), and the person's approve (their own tickets, or others'
  * on their behalf). Approving is only accepted from this web UI session;
  * the server refuses agents and MCP.
  */
@@ -16,10 +18,15 @@ export function usePlanApproval(projectId: number) {
   const [error, setError] = useState<string | null>(null)
   // Set when an approval didn't cover everything: tickets arrived after the page loaded.
   const [notice, setNotice] = useState<string | null>(null)
+  // The project id whose first read has settled, whether it succeeded or failed.
+  const [loadedFor, setLoadedFor] = useState<number | null>(null)
 
   useEffect(() => {
     let live = true
-    api.getProject(projectId).then(p => { if (live) setProject(p) }).catch(() => {})
+    api.getProject(projectId)
+      .then(p => { if (live) setProject(p) })
+      .catch(() => {})
+      .finally(() => { if (live) setLoadedFor(projectId) })
     return () => { live = false }
   }, [projectId])
 
@@ -28,6 +35,18 @@ export function usePlanApproval(projectId: number) {
     const p = e.payload as Project | undefined
     if (p && p.id === projectId) setProject(prev => ({ ...prev, ...p }))
   }, [projectId]))
+
+  // An approval made while this tab's stream was down (a dropped connection, or
+  // a tab hidden for 30 s) sent a project.updated it never heard, so re-read the
+  // project when the stream comes back (#2535). Ready once this project's first
+  // read has settled: a reconnect during that read is dropped, since the read is
+  // fresh anyway. The banner keeps what it shows until the answer arrives. An
+  // answer for a project the hook has since moved off is dropped.
+  useStreamReconnect(() => {
+    api.getProject(projectId)
+      .then(p => setProject(prev => (prev && prev.id !== p.id ? prev : p)))
+      .catch(() => {})
+  }, loadedFor === projectId)
 
   /**
    * Approve the tickets the person ticked (#2198): taskIds, asOf = the newest
