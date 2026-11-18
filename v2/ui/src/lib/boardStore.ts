@@ -20,6 +20,10 @@
  *   a handover) remove the ticket or re-read the project. The store listens while
  *   any view of the project is mounted, and for LINGER_MS after the last
  *   leaves, so a tab switch doesn't drop the stream.
+ * - Events sent while the stream was down (cut, or let go by a hidden tab)
+ *   never arrive, so a reconnect re-reads every project the store listens
+ *   for: the server says {"type":"connected"} on each new stream, and every
+ *   one after the first is a reconnect.
  * - Stories come from GET /api/projects/:id/stories in one request, in
  *   parallel with epics and tickets; an older API without it falls back to
  *   one request per epic.
@@ -56,6 +60,8 @@ interface Entry {
   linger: ReturnType<typeof setTimeout> | null
   /** Patches applied while the current load is in flight, replayed on its answer. */
   replay: Patch[]
+  /** The subscription has been on a stream that said "connected": the next "connected" is a reconnect. */
+  live: boolean
 }
 
 type Patch = (s: BoardSnapshot) => Partial<BoardSnapshot>
@@ -67,7 +73,7 @@ const entries = new Map<number, Entry>()
 function entry(pid: number): Entry {
   let e = entries.get(pid)
   if (!e) {
-    e = { snap: EMPTY, loadedAt: 0, seq: 0, inflight: null, listeners: new Set(), views: 0, unsubscribe: null, linger: null, replay: [] }
+    e = { snap: EMPTY, loadedAt: 0, seq: 0, inflight: null, listeners: new Set(), views: 0, unsubscribe: null, linger: null, replay: [], live: false }
     entries.set(pid, e)
   }
   return e
@@ -230,6 +236,24 @@ export function applyEvent(pid: number, event: SSEEvent) {
 }
 
 /**
+ * The stream said "connected". The first time on this subscription, the board
+ * was just read. Any later time is a reconnect: the events sent while the
+ * stream was down are lost, so re-read the project (now if a view shows it,
+ * else on the next view mount). This runs once per project, however many
+ * views show it: the store has one subscription per project.
+ */
+function onConnected(pid: number, e: Entry) {
+  if (!e.live) { e.live = true; return }
+  invalidateBoard(pid)
+}
+
+/** Whether another project's subscription is on the shared stream and has seen it say "connected". */
+function streamIsUp(except: Entry): boolean {
+  for (const x of entries.values()) if (x !== except && x.live) return true
+  return false
+}
+
+/**
  * A view of project `pid` mounted: listen for its live events (once per
  * project, however many views). Returns the matching release; the store
  * keeps listening for LINGER_MS after the last release.
@@ -238,7 +262,14 @@ export function retainBoard(pid: number): () => void {
   const e = entry(pid)
   e.views++
   if (e.linger) { clearTimeout(e.linger); e.linger = null }
-  if (!e.unsubscribe) e.unsubscribe = subscribeSSE('/api/events', ev => applyEvent(pid, ev))
+  if (!e.unsubscribe) {
+    // Every subscriber shares one stream. One that another project already
+    // saw connect has said its "connected", so the next one this project
+    // sees is a reconnect (a switch from project 1 to 2 joins 1's stream).
+    e.live = streamIsUp(e)
+    // "connected" carries no project: handle it before applyEvent's project guard.
+    e.unsubscribe = subscribeSSE('/api/events', ev => (ev.type === 'connected' ? onConnected(pid, e) : applyEvent(pid, ev)))
+  }
   let released = false
   return () => {
     if (released) return
@@ -247,7 +278,7 @@ export function retainBoard(pid: number): () => void {
     if (e.views > 0) return
     e.linger = setTimeout(() => {
       e.linger = null
-      if (e.views === 0 && e.unsubscribe) { e.unsubscribe(); e.unsubscribe = null }
+      if (e.views === 0 && e.unsubscribe) { e.unsubscribe(); e.unsubscribe = null; e.live = false }
     }, LINGER_MS)
   }
 }

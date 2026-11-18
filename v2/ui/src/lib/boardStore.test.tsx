@@ -29,6 +29,8 @@ vi.mock('../api/client', () => ({
 const { useBoardData } = await import('../hooks/useBoardData')
 const { FRESH_MS, LINGER_MS, invalidateBoard } = await import('./boardStore')
 const emit = (e: Partial<SSEEvent>) => act(() => { sse.forEach(l => l({ project_id: 1, ...e } as SSEEvent)) })
+// The server says this on every new stream; it carries no project.
+const connect = () => act(() => { sse.forEach(l => l({ type: 'connected' } as SSEEvent)) })
 const deferred = <T,>() => { let resolve!: (v: T) => void; let reject!: (e: unknown) => void; const promise = new Promise<T>((a, b) => { resolve = a; reject = b }); return { promise, resolve, reject } }
 
 const flush = () => act(async () => { await new Promise(r => setTimeout(r, 0)) })
@@ -207,5 +209,92 @@ describe('board store', () => {
     again.unmount()
     await act(() => vi.advanceTimersByTimeAsync(LINGER_MS + 1))
     expect(sse).toHaveLength(0)
+  })
+})
+
+// Events sent while the stream was down never arrive, so a reconnect re-reads (#1570).
+describe('board store on a reconnect', () => {
+  const recordLoads = () => {
+    const loads: number[] = []
+    tasksImpl = pid => { loads.push(pid); return Promise.resolve(serverTasks) }
+    return loads
+  }
+
+  it('the first connected does not re-read; each later one re-reads the board once, with what the gap missed', async () => {
+    const board = renderHook(() => useBoardData(1))
+    await flush()
+    connect()
+    await flush()
+    expect(calls).toEqual({ epics: 1, tasks: 1, projectStories: 1, epicStories: 0 })
+    // Ticket 12 was created while the stream was down: its task.created never arrived.
+    serverTasks = [t11, { id: 12, project_id: 1, state: 'backlog', name: 'Missed' } as Task]
+    connect()
+    await flush()
+    expect(calls).toEqual({ epics: 2, tasks: 2, projectStories: 2, epicStories: 0 })
+    expect(board.result.current.tasks.map(t => t.id)).toEqual([11, 12])
+    connect()
+    await flush()
+    expect(calls.tasks).toBe(3)
+  })
+
+  it('re-reads each subscribed project once, however many views show it', async () => {
+    const loads = recordLoads()
+    renderHook(() => useBoardData(1))
+    renderHook(() => useBoardData(1))
+    renderHook(() => useBoardData(2))
+    await flush()
+    expect(sse).toHaveLength(2)
+    loads.length = 0
+    connect()
+    await flush()
+    expect(loads).toEqual([])
+    connect()
+    await flush()
+    expect(loads.sort()).toEqual([1, 2])
+  })
+
+  it('a project opened on a stream that is already up counts its first connected as a reconnect', async () => {
+    renderHook(() => useBoardData(1))
+    await flush()
+    connect()
+    // Project 2 joins the stream project 1 is on, after its "connected" was said.
+    renderHook(() => useBoardData(2))
+    await flush()
+    const loads = recordLoads()
+    connect()
+    await flush()
+    expect(loads.sort()).toEqual([1, 2])
+  })
+
+  it('a project nobody is viewing is re-read on its next view, not right away', async () => {
+    const board = renderHook(() => useBoardData(1))
+    await flush()
+    connect()
+    board.unmount() // the store still listens (LINGER_MS)
+    serverTasks = [t11, { id: 12, project_id: 1, state: 'backlog', name: 'Missed' } as Task]
+    connect()
+    await flush()
+    expect(calls.tasks).toBe(1)
+    // Back within FRESH_MS: the cache would count as fresh, but the reconnect marked it stale.
+    const back = renderHook(() => useBoardData(1))
+    await flush()
+    expect(calls.tasks).toBe(2)
+    expect(back.result.current.tasks.map(t => t.id)).toEqual([11, 12])
+  })
+
+  it('after the store stops listening, the first connected on its next subscription does not re-read', async () => {
+    vi.useFakeTimers()
+    const board = renderHook(() => useBoardData(1))
+    await act(() => vi.advanceTimersByTimeAsync(0))
+    connect()
+    board.unmount()
+    await act(() => vi.advanceTimersByTimeAsync(LINGER_MS + 1))
+    expect(sse).toHaveLength(0)
+    renderHook(() => useBoardData(1)) // stale by now: one read on mount
+    await act(() => vi.advanceTimersByTimeAsync(0))
+    expect(calls.tasks).toBe(2)
+    connect()
+    await act(() => vi.advanceTimersByTimeAsync(0))
+    expect(calls.tasks).toBe(2)
   })
 })
