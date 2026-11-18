@@ -1,3 +1,4 @@
+import { StrictMode } from 'react'
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { createMemoryRouter, RouterProvider } from 'react-router-dom'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -22,6 +23,7 @@ const api = vi.hoisted(() => ({
 vi.mock('../api/client', () => ({ api }))
 
 const { ArtifactView } = await import('./ArtifactView')
+const { subscribeSSE } = await import('../hooks/useSSE')
 
 // The real useSSE, over a fake stream: events reach the page as they would live.
 let sources: FakeEventSource[] = []
@@ -47,27 +49,42 @@ afterEach(() => {
   sources = []
 })
 
+/** How many times the panel had loaded its ticket when renderPanel returned. */
+let initialLoads = 1
+
 /** Renders the page, waits for the ticket panel's first load, then switches to fake timers. */
-async function renderPanel() {
+async function renderPanel({ strict = false } = {}) {
   const router = createMemoryRouter([{ path: '/artifacts/:artifactId', element: <ArtifactView /> }], { initialEntries: ['/artifacts/1'] })
-  const view = render(<RouterProvider router={router} />)
+  const page = <RouterProvider router={router} />
+  const view = render(strict ? <StrictMode>{page}</StrictMode> : page)
   await screen.findByRole('link', { name: 'Build login' })
-  expect(api.getTask).toHaveBeenCalledTimes(1)
-  expect(api.getComments).toHaveBeenCalledTimes(1)
+  // StrictMode runs each mount effect twice, so the panel loads twice.
+  initialLoads = strict ? 2 : 1
+  expect(api.getTask).toHaveBeenCalledTimes(initialLoads)
+  expect(api.getComments).toHaveBeenCalledTimes(initialLoads)
   vi.useFakeTimers()
   return view
 }
 
-function emit(type: SSEEvent['type'], payload: unknown) {
+function send(data: unknown) {
   const source = sources.at(-1)!
-  act(() => source.onmessage!({ data: JSON.stringify({ type, project_id: 3, payload }) }))
+  act(() => source.onmessage!({ data: JSON.stringify(data) }))
+}
+
+function emit(type: SSEEvent['type'], payload: unknown) {
+  send({ type, project_id: 3, payload })
+}
+
+/** The server's first frame on every new stream. It carries no project. */
+function connect() {
+  send({ type: 'connected' })
 }
 
 async function advance(ms: number) {
   await act(async () => { vi.advanceTimersByTime(ms) })
 }
 
-const reloads = () => api.getTask.mock.calls.length - 1
+const reloads = () => api.getTask.mock.calls.length - initialLoads
 
 describe('ArtifactView ticket panel live reloads', () => {
   it('ignores events for other tickets', async () => {
@@ -134,6 +151,79 @@ describe('ArtifactView ticket panel live reloads', () => {
     expect(api.addComment).toHaveBeenCalledWith(TASK_ID, 'Looks good')
     expect(reloads()).toBe(1)
     await advance(5000)
+    expect(reloads()).toBe(1)
+  })
+})
+
+describe('ArtifactView ticket panel after a stream reconnect', () => {
+  it('reloads once on each connected after the first, and not on the first', async () => {
+    await renderPanel()
+    // The opening frame of the stream the panel opened: the panel was just read.
+    connect()
+    await advance(5000)
+    expect(reloads()).toBe(0)
+
+    // A reconnect: what was sent while the stream was down is lost.
+    connect()
+    await advance(999)
+    expect(reloads()).toBe(0)
+    await advance(1)
+    expect(reloads()).toBe(1)
+    expect(api.getComments).toHaveBeenCalledTimes(2)
+    await advance(5000)
+    expect(reloads()).toBe(1)
+
+    connect()
+    await advance(1000)
+    expect(reloads()).toBe(2)
+  })
+
+  it('a reconnect during a burst of its own ticket events gives one reload', async () => {
+    await renderPanel()
+    connect()
+    emit('comment.added', { id: 99, task_id: TASK_ID, body: 'Done' })
+    await advance(300)
+    connect()
+    await advance(300)
+    emit('task.completed', { id: TASK_ID, state: 'completed' })
+    await advance(5000)
+    expect(reloads()).toBe(1)
+
+    // The other way round: the reconnect first, then the burst.
+    connect()
+    await advance(200)
+    emit('comment.added', { id: 100, task_id: TASK_ID, body: 'Again' })
+    emit('task.updated', { id: TASK_ID, state: 'in_progress' })
+    await advance(5000)
+    expect(reloads()).toBe(2)
+  })
+
+  it('a panel that joins a stream another view holds reloads on the first connected it sees', async () => {
+    // Another view (the board store lingers for 30 s) opened the stream and
+    // heard its opening frame before this page mounted.
+    const unsubscribe = subscribeSSE('/api/events', () => {})
+    try {
+      connect()
+      await renderPanel()
+      expect(sources).toHaveLength(1)
+      connect()
+      await advance(1000)
+      expect(reloads()).toBe(1)
+      connect()
+      await advance(1000)
+      expect(reloads()).toBe(2)
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  it('StrictMode re-running the subscription does not make the opening frame a reconnect', async () => {
+    await renderPanel({ strict: true })
+    connect()
+    await advance(5000)
+    expect(reloads()).toBe(0)
+    connect()
+    await advance(1000)
     expect(reloads()).toBe(1)
   })
 })

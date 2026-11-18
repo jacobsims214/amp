@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { Check, ExternalLink, Loader2, Monitor, Smartphone, Tablet, Undo2 } from 'lucide-react'
 import { api } from '../api/client'
-import { useSSE } from '../hooks/useSSE'
+import { sseSubscriberCount, useSSE } from '../hooks/useSSE'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Markdown } from '../components/ui/Markdown'
 import { ArtifactKindIcon, ArtifactStatusTag } from '../components/artifacts/ArtifactBits'
@@ -320,7 +320,8 @@ function concernsTask(e: SSEEvent, taskId: number): boolean {
 }
 
 /** Events for the ticket that arrive in a burst (an agent comments, then
- *  completes) cause one reload, at most one per this long. */
+ *  completes) cause one reload, at most one per this long. A stream reconnect
+ *  joins the same reload. */
 const RELOAD_COALESCE_MS = 1000
 
 /** The ticket the artifact belongs to, and its comments: publishes, reviews
@@ -339,9 +340,38 @@ function TicketThread({ projectId, taskId }: { projectId: number; taskId: number
   const cancelPending = useCallback(() => { clearTimeout(pending.current); pending.current = undefined }, [])
   // A scheduled reload is for this ticket: drop it when the ticket changes or the panel goes.
   useEffect(() => cancelPending, [taskId, cancelPending])
-  useSSE(projectId, e => {
-    if (pending.current !== undefined || !concernsTask(e, taskId)) return
+  const scheduleReload = () => {
+    if (pending.current !== undefined) return
     pending.current = setTimeout(() => { pending.current = undefined; load() }, RELOAD_COALESCE_MS)
+  }
+  // The stream says {"type":"connected"} each time it opens, and events sent
+  // while it was down (a hidden tab lets it go after 30 s) never arrive. live
+  // means this panel's subscription is on a stream that has already said
+  // connected, so the next one is a reconnect and the panel re-reads. This is
+  // the board store's rule (KB architecture/board-store-reconnect-catch-up.md).
+  // null until the panel first subscribes.
+  const live = useRef<boolean | null>(null)
+  // Runs just before useSSE below subscribes, because a component's effects
+  // run in order. The stream is shared, so a panel that joins one that other
+  // views hold (the board store keeps it for 30 s after you leave a board)
+  // never sees its opening connected. If it waited for one, it would skip
+  // the real reconnect. Nothing else on this page subscribes earlier in the
+  // commit that mounts the panel: the page's own subscription is replaced
+  // around it when the artifact arrives. So "someone else is subscribed"
+  // means the stream is already up, or at worst still connecting, which
+  // costs one extra reload. A re-subscribe in the same commit (StrictMode's
+  // re-run) keeps a false: the panel is still waiting for the opening frame.
+  useEffect(() => {
+    live.current = sseSubscriberCount() > 0 && live.current !== false
+  }, [projectId])
+  useSSE(projectId, e => {
+    // "connected" names no project or ticket: handle it before the ticket filter.
+    if (e.type === 'connected') {
+      if (live.current) scheduleReload()
+      else live.current = true
+      return
+    }
+    if (concernsTask(e, taskId)) scheduleReload()
   })
   const send = async () => {
     if (!draft.trim()) return
