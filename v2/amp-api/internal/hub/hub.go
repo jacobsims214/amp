@@ -5,12 +5,22 @@ package hub
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/simstech/amp-api/internal/domain"
 )
+
+// DefaultKeepalive is how often an open SSE stream gets a comment line when
+// nothing else is sent. It must stay under the load balancer's idle timeout
+// (60 s on the AWS ALB), or idle streams are cut.
+const DefaultKeepalive = 25 * time.Second
+
+// keepaliveFrame is an SSE comment: EventSource ignores it, but it keeps
+// bytes moving on an idle connection.
+const keepaliveFrame = ": keepalive\n\n"
 
 // Hub manages all live SSE connections and broadcasts events to them.
 // Actors call hub.Publish() after every state change — the hub fans out
@@ -20,6 +30,10 @@ type Hub struct {
 	clients map[string]chan domain.Event
 	sinks   []func(domain.Event)
 	relay   func(domain.Event)
+
+	// keepalive is the interval between keepalive comments on each stream.
+	// New sets it to DefaultKeepalive; tests in this package shorten it.
+	keepalive time.Duration
 }
 
 // SetRelay sends every event published here on to the other replicas
@@ -41,8 +55,18 @@ func (h *Hub) AddSink(fn func(domain.Event)) {
 
 func New() *Hub {
 	return &Hub{
-		clients: make(map[string]chan domain.Event),
+		clients:   make(map[string]chan domain.Event),
+		keepalive: DefaultKeepalive,
 	}
+}
+
+// keepaliveInterval is the configured interval, or DefaultKeepalive when it
+// is unset or not positive (time.NewTicker panics on those).
+func (h *Hub) keepaliveInterval() time.Duration {
+	if h.keepalive <= 0 {
+		return DefaultKeepalive
+	}
+	return h.keepalive
 }
 
 // Publish sends an event to all connected SSE clients, the sinks, and the
@@ -118,8 +142,18 @@ func (h *Hub) ServeFiltered(w http.ResponseWriter, r *http.Request, allow Allow)
 	fmt.Fprintf(w, "data: {\"type\":\"connected\"}\n\n")
 	flusher.Flush()
 
+	// Send a comment on a fixed interval so an idle stream isn't cut by the
+	// load balancer's idle timeout. Stopped when the connection ends.
+	keepalive := time.NewTicker(h.keepaliveInterval())
+	defer keepalive.Stop()
+
 	for {
 		select {
+		case <-keepalive.C:
+			if _, err := io.WriteString(w, keepaliveFrame); err != nil {
+				return // the client is gone
+			}
+			flusher.Flush()
 		case evt, ok := <-ch:
 			if !ok {
 				return
