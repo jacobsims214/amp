@@ -15,14 +15,35 @@
  * ## What the page reads, and what it can never read
  *
  * One call: `GET /api/requests/{public_ref}` (`requestApi.ownDetail`), which the
- * server answers with the requester projection and *only* the projection
- * (`requestReadAnswer.view === 'requester'`; the record is nil on that arm by
- * construction, and the handler fails closed if both were ever set). The type this
- * page renders is `RequesterRequestView`, which has no field for a project, an
- * epic, a ticket, a claim, an assignee, a revision, a metadata key, an agent or an
- * audit row. So "no internal data exposed" is a property of the data the page was
- * given, not of the page's self-restraint — and the test asserts it against the
- * rendered text anyway.
+ * server answers with the requester projection — unless the caller is also
+ * somebody who works the inbox the request was sent to, in which case it answers
+ * the **team** view (`RequestViewFor` ranks team standing first, by contract; see
+ * `## The team arm` below). The type this page renders for a requester is
+ * `RequesterRequestView`, which has no field for a project, an epic, a ticket, a
+ * claim, an assignee, a revision, a metadata key, an agent or an audit row. So
+ * "no internal data exposed" is a property of the data the page was given, not of
+ * the page's self-restraint — and the test asserts it against the rendered text
+ * anyway.
+ *
+ * ## The team arm
+ *
+ * `GET /api/requests/{ref}` loads only the caller's *own* request
+ * (`WHERE public_ref = $1 AND requester_user_id = $2`), so a team answer here is
+ * always the caller's own request. But when that caller is also a member, lead or
+ * org admin of the inbox, the server answers `view: 'team'` with the record —
+ * deliberately, because a triager must see the record they triage. That answer is
+ * not the projection and must never be rendered as one: the projection's
+ * milestones are re-gated server-side (`RequesterMilestoneDoneAllowed`), its
+ * comments are the subset the team chose to share, its files are the ones it chose
+ * to hand over, and its `state_word` is the server's word. None of that exists in
+ * the record, so mapping the record into a projection would *invent* all four.
+ *
+ * So the page takes four fields of that answer (`team_id`, `id`, `public_ref`,
+ * `subject` — the address of a screen the caller can already open) and offers the
+ * inbox's own view, saying why. Everything else on the record — claim, assignee,
+ * requester contact, revision, metadata — is not read, which is what keeps this
+ * page unable to draw a triage screen. Any other `view` this build does not know
+ * still fails closed: the guard is narrowed, not removed.
  *
  * ## The three acts, and why each is where it is
  *
@@ -72,7 +93,7 @@ import { RequesterAccessStates, RequesterLoadFailure } from '../components/reque
 import { RequestDiscussion } from '../components/requests/RequestDiscussion'
 import { RequestHistory } from '../components/requests/RequestHistory'
 import { Markdown } from '../components/ui/Markdown'
-import type { RequesterRequestView } from '../types'
+import type { RequestReadAnswer, RequesterRequestView, TeamRequest } from '../types'
 
 export interface RequesterStatusProps {
   /**
@@ -108,14 +129,50 @@ export interface RequesterStatusProps {
   onSignIn?: () => void
   /** Ask the desk to restore access (revoked), or contact them (not found). */
   onContactDesk?: () => void
+  /**
+   * Open the request in its inbox's own view, when the caller is both its
+   * requester and somebody who works that inbox. The page deliberately owns no
+   * routing (#3988 does), so the destination travels as a prop like every other
+   * link on it; omitted, the arm states why it is not the tracking page and
+   * offers no button rather than a control that goes nowhere.
+   */
+  onOpenTeamView?: (at: { teamId: number; requestId: number }) => void
 }
 
 /** The page's one read, as one variable at a time. */
 type PageState =
   | { kind: 'loading' }
   | { kind: 'ready'; view: RequesterRequestView }
+  | { kind: 'team_standing'; teamId: number; requestId: number; publicRef: string; subject: string }
   | { kind: 'not_found' }
   | { kind: 'failed'; message: string }
+
+/** The one sentence the page says when a read answers a shape it cannot render. */
+const UNKNOWN_SHAPE = 'This request answered in a shape this page does not understand.'
+
+/**
+ * The most this page takes from a `team` answer: where the request is published,
+ * and its own subject/reference. Nothing else on the record is read.
+ *
+ * It returns `null` for a team answer that does not name a team and a request —
+ * which keeps the unknown-shape arm reachable for a payload that is only half a
+ * team answer — and for every view this build has never heard of.
+ */
+function teamStanding(answer: RequestReadAnswer): Extract<PageState, { kind: 'team_standing' }> | null {
+  if (!answer || answer.view !== 'team') return null
+  const record = (answer as { request?: Partial<Pick<TeamRequest, 'team_id' | 'id' | 'public_ref' | 'subject'>> }).request
+  const teamId = record?.team_id
+  const requestId = record?.id
+  if (typeof teamId !== 'number' || !Number.isInteger(teamId) || teamId <= 0) return null
+  if (typeof requestId !== 'number' || !Number.isInteger(requestId) || requestId <= 0) return null
+  return {
+    kind: 'team_standing',
+    teamId,
+    requestId,
+    publicRef: typeof record?.public_ref === 'string' ? record.public_ref : '',
+    subject: typeof record?.subject === 'string' ? record.subject : '',
+  }
+}
 
 /** The five stepper words, in the mockup's order. The projection's keys are the same five. */
 const STEP_WORD: Record<string, string> = {
@@ -128,7 +185,7 @@ const STEP_WORD: Record<string, string> = {
 
 export function RequesterStatus({
   publicRef, me, teamName, nav, onSignOut, onBackToRequests, onNewRequest,
-  accessState, onSignIn, onContactDesk,
+  accessState, onSignIn, onContactDesk, onOpenTeamView,
 }: RequesterStatusProps) {
   const [state, setState] = useState<PageState>({ kind: 'loading' })
   const [attempt, setAttempt] = useState(0)
@@ -144,15 +201,24 @@ export function RequesterStatus({
     withTimeout(requestApi.ownDetail(publicRef), 'Loading your request')
       .then(answer => {
         if (seq !== loadSeq.current) return
-        // The requester surface answers the projection and nothing else. A
-        // `team` answer here would mean the server thought this caller was a
-        // triager, which cannot happen on this route — and rendering a record
-        // would be the leak. Fail closed.
-        if (answer.view !== 'requester') {
-          setState({ kind: 'failed', message: 'This request answered in a shape this page does not understand.' })
+        if (answer.view === 'requester') {
+          setState({ kind: 'ready', view: answer.projection })
           return
         }
-        setState({ kind: 'ready', view: answer.projection })
+        // The team arm: the caller is this request's requester *and* somebody
+        // who works its inbox, so the server answered the record it triages
+        // (RequestViewFor ranks team standing first). Render the projection
+        // from that record? No — the projection is server-built, and a client
+        // map would have to invent its milestones, its shared thread and its
+        // files. The page offers the view that answer really is, and says why.
+        const team = teamStanding(answer)
+        if (team) {
+          setState(team)
+          return
+        }
+        // Anything else — including a half-formed team answer — is a shape this
+        // build cannot render, and it still fails closed.
+        setState({ kind: 'failed', message: UNKNOWN_SHAPE })
       })
       .catch(e => {
         if (seq !== loadSeq.current) return
@@ -211,6 +277,22 @@ export function RequesterStatus({
     )
   }
 
+  if (state.kind === 'team_standing') {
+    return (
+      <Frame teamName={teamName || 'The desk'} me={me} nav={nav} onSignOut={onSignOut}>
+        <TeamStanding
+          desk={(teamName ?? '').trim() || 'the desk'}
+          reference={requestRef(state.publicRef || publicRef)}
+          subject={state.subject}
+          onOpenTeamView={onOpenTeamView
+            ? () => onOpenTeamView({ teamId: state.teamId, requestId: state.requestId })
+            : undefined}
+          onBackToRequests={onBackToRequests}
+        />
+      </Frame>
+    )
+  }
+
   if (state.kind === 'failed') {
     return (
       <Frame teamName={teamName || 'Your request'} me={me} nav={nav} onSignOut={onSignOut}>
@@ -229,6 +311,59 @@ export function RequesterStatus({
         onChanged={retry}
       />
     </Frame>
+  )
+}
+
+/**
+ * The arm for a caller who is both this request's requester and a person who
+ * works the inbox it was sent to.
+ *
+ * It is not an access state and it is not an error: the request is the caller's
+ * own, it loaded, and the answer is simply the team's view. So it says that
+ * plainly, names where the request can be read in full, and offers that screen.
+ * Only the four fields the page kept from the answer are on it — no claim, no
+ * assignee, no contact, no revision, no metadata — because the point of routing
+ * is that the inbox's own screen owns the record, not that this one renders a
+ * narrower copy of it.
+ */
+function TeamStanding({ desk, reference, subject, onOpenTeamView, onBackToRequests }: {
+  desk: string
+  reference: string
+  subject: string
+  onOpenTeamView?: () => void
+  onBackToRequests?: () => void
+}) {
+  return (
+    <div
+      className="mx-auto mt-8 max-w-[600px] border bg-surface px-6 py-7"
+      style={{ borderRadius: 'var(--radius)', borderColor: 'var(--line)' }}
+      data-testid="requester-team-standing"
+    >
+      <span className="amp-label">Your request, in the inbox</span>
+      <h1 className="m-0 mt-1.5 break-words text-[21px] font-semibold tracking-[-0.01em] text-ink">
+        {subject || 'Your request'}
+      </h1>
+      <p className="m-0 mt-1 font-mono text-[11px] text-ink-3">
+        {reference} · {desk}
+      </p>
+      <p className="m-0 mt-3 text-[13px] leading-relaxed text-ink-2">
+        You sent this request, and you also have access to {desk}'s inbox — so it opens in the inbox's own view,
+        the one the team works from, rather than on this tracking page. This page can only show what a requester
+        outside the team sees, and that would leave out what you are entitled to.
+      </p>
+      <div className="mt-5 flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+        {onOpenTeamView && (
+          <button type="button" onClick={onOpenTeamView} className="amp-btn amp-btn-primary w-full sm:w-auto" style={{ minHeight: 44 }}>
+            Open it in the inbox's view
+          </button>
+        )}
+        {onBackToRequests && (
+          <button type="button" onClick={onBackToRequests} className="amp-btn w-full sm:w-auto" style={{ minHeight: 44 }}>
+            ← Your requests
+          </button>
+        )}
+      </div>
+    </div>
   )
 }
 
