@@ -10,7 +10,9 @@
  * DecisionCard (question, options, the doc with its provenance, Decided
  * means, Edit doc, Record decision) in place of the brief's checklist and
  * Mark done…; it reloads when the doc changes (decision.updated, and after
- * the card's own edit or record). Its header says "blocks N · waiting Xd".
+ * the card's own edit or record), and once when the live stream reconnects,
+ * since a decision.updated sent while it was down never arrives (#2532).
+ * Its header says "blocks N · waiting Xd".
  *
  * A ticket the server says has a doc (has_decision_doc) never falls back to
  * Mark done, which the server refuses for it: while the doc loads it says
@@ -22,6 +24,7 @@ import { AlertTriangle, ArrowRight, Pencil, RotateCcw, Square, SquareCheck, User
 import { Link } from 'react-router-dom'
 import { api } from '../../api/client'
 import { useSSE } from '../../hooks/useSSE'
+import { useStreamReconnect } from '../../hooks/useStreamReconnect'
 import { checklistItems } from '../../lib/brief'
 import { isHuman, reasonHint, reasonLabel, reasonVerb } from '../../lib/human'
 import { lookupPerson, type Person } from '../../lib/people'
@@ -95,6 +98,11 @@ export function HumanWork({ task, meId, people, plan, canPlan, onEdit, ticketHre
   useSSE(task.project_id, e => {
     if (e.type === 'decision.updated' && (e.payload as { task_id?: number } | undefined)?.task_id === task.id) loadDoc()
   })
+  // A decision recorded while the stream was down: re-read once it's back.
+  // `loaded` is set however the first read settles (doc, 404 or error), so a
+  // connected during that read adds nothing, and one after it retries a failure.
+  // A ticket with no doc to read (!wantsDoc) never settles and never re-reads.
+  useStreamReconnect(loadDoc, loaded !== null)
 
   return (
     <div className="px-6 py-4 border-b border-line grid gap-3" data-testid="human-work"
