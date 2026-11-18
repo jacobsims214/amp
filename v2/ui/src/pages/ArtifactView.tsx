@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { Check, ExternalLink, Loader2, Monitor, Smartphone, Tablet, Undo2 } from 'lucide-react'
 import { api } from '../api/client'
@@ -7,7 +7,7 @@ import { PageHeader } from '../components/ui/PageHeader'
 import { Markdown } from '../components/ui/Markdown'
 import { ArtifactKindIcon, ArtifactStatusTag } from '../components/artifacts/ArtifactBits'
 import { KIND_LABEL, expiresIn } from '../lib/artifacts'
-import type { Artifact, ArtifactVersion, AuditEntry, Comment, Task } from '../types'
+import type { Artifact, ArtifactVersion, AuditEntry, Comment, SSEEvent, Task } from '../types'
 import { projectLink } from '../lib/projectLink'
 
 const VIEWPORTS = [
@@ -301,6 +301,28 @@ function ReviewPanel({ artifact, version, selected, onReviewed }: {
   )
 }
 
+const TICKET_EVENTS = new Set<SSEEvent['type']>(['comment.added', 'task.updated', 'task.blocked', 'task.unblocked', 'task.completed', 'artifact.updated'])
+
+/** Whether a live event changes what the ticket panel for taskId shows. Every
+ *  tab gets every event in the project, so anything else is ignored. */
+function concernsTask(e: SSEEvent, taskId: number): boolean {
+  if (!TICKET_EVENTS.has(e.type)) return false
+  const p = e.payload as Record<string, unknown> | null | undefined
+  if (p == null || typeof p !== 'object') return false
+  // task.* events carry the ticket itself. In a comment or an artifact, `id`
+  // is the comment's or artifact's own id, so only task_id names the ticket.
+  if (e.type.startsWith('task.') && typeof p.id === 'number') return p.id === taskId
+  // A comment, an artifact, or one of the server's signals about a single
+  // ticket ({task_id, deleted}, {task_id, run}).
+  if (p.task_id === taskId) return true
+  // Several tickets at once: a story or epic deleted ({task_ids}), tickets restored ({restored}).
+  return [p.task_ids, p.restored].some(ids => Array.isArray(ids) && ids.includes(taskId))
+}
+
+/** Events for the ticket that arrive in a burst (an agent comments, then
+ *  completes) cause one reload, at most one per this long. */
+const RELOAD_COALESCE_MS = 1000
+
 /** The ticket the artifact belongs to, and its comments: publishes, reviews
  *  and discussion all land here, so agents read them too. */
 function TicketThread({ projectId, taskId }: { projectId: number; taskId: number }) {
@@ -313,13 +335,19 @@ function TicketThread({ projectId, taskId }: { projectId: number; taskId: number
     api.getComments(taskId).then(setComments).catch(() => setComments([]))
   }, [taskId])
   useEffect(load, [load])
+  const pending = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const cancelPending = useCallback(() => { clearTimeout(pending.current); pending.current = undefined }, [])
+  // A scheduled reload is for this ticket: drop it when the ticket changes or the panel goes.
+  useEffect(() => cancelPending, [taskId, cancelPending])
   useSSE(projectId, e => {
-    if (['comment.added', 'task.updated', 'task.blocked', 'task.unblocked', 'task.completed', 'artifact.updated'].includes(e.type)) load()
+    if (pending.current !== undefined || !concernsTask(e, taskId)) return
+    pending.current = setTimeout(() => { pending.current = undefined; load() }, RELOAD_COALESCE_MS)
   })
   const send = async () => {
     if (!draft.trim()) return
     setBusy(true)
-    try { await api.addComment(taskId, draft.trim()); setDraft(''); load() } finally { setBusy(false) }
+    // Reloading now covers any reload still scheduled.
+    try { await api.addComment(taskId, draft.trim()); setDraft(''); cancelPending(); load() } finally { setBusy(false) }
   }
   return (
     <div className="px-5 py-4 border-t border-line grid gap-3">
