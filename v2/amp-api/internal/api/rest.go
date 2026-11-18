@@ -124,7 +124,7 @@ func (h *RestHandler) events(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	h.hub.ServeFiltered(w, r, h.svc.EventFilter(p))
+	h.hub.ServeFiltered(w, r, p.UserID, h.svc.EventFilter(p))
 }
 
 func (h *RestHandler) Register(mux *http.ServeMux) {
