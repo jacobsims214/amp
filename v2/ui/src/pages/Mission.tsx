@@ -12,7 +12,7 @@
  * Nothing here is an action: clicking a ticket opens it in the drawer, and
  * answering, merging, approving and doing happen in My work.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { useFocusParam } from '../hooks/useFocusParam'
 import { FocusNotFound } from '../components/FocusNotFound'
@@ -43,6 +43,7 @@ import { needsMerge } from '../lib/merge'
 import { countsSummary, kindSummary, panelOrder, personLink, ticketsWaitingOn } from '../lib/waitingPanel'
 import { Skeleton, SkeletonReadouts, SkeletonRegion } from '../components/ui/Skeleton'
 import { useDelayedFlag } from '../hooks/useDelayedFlag'
+import { useVisibleInterval } from '../hooks/useVisibleInterval'
 
 function ago(iso?: string | null): string {
   if (!iso) return ''
@@ -196,9 +197,17 @@ function collapseRuns(out: FeedItem[], it: FeedItem): FeedItem[] {
   return out
 }
 
+/** Mission's background loads, which wait for a visible tab (see `held` below). */
+type BackgroundLoad = 'activity' | 'counts' | 'waiting'
+const isHidden = () => document.visibilityState === 'hidden'
+
 export function Mission() {
   const { projectId } = useParams<{ projectId: string }>()
   const pid = Number(projectId)
+  // A hidden tab makes no background loads. A load that comes due while the
+  // tab is hidden is held here instead, and runs once when the tab is visible
+  // again. Every run of a load clears it, whatever started the run.
+  const held = useRef(new Set<BackgroundLoad>())
   const { epics, stories, tasks, loading, error, refresh, applyTask } = useBoardData(pid)
   const { members, myAccess, openReassign, people } = useProjectPeople(pid)
   const approval = usePlanApproval(pid)
@@ -215,11 +224,15 @@ export function Mission() {
   const [waitingFor, setWaitingFor] = useState<{ pid: number; people: PersonWaiting[] } | null>(null)
   const waiting = useMemo(() => (waitingFor?.pid === pid ? waitingFor.people : []), [waitingFor, pid])
   const loadWaiting = useCallback(() => {
+    held.current.delete('waiting')
     let live = true
     api.waitingOnPeople(pid).then(r => { if (live) setWaitingFor({ pid, people: r.people ?? [] }) }).catch(() => {})
     return () => { live = false }
   }, [pid])
-  useEffect(() => loadWaiting(), [loadWaiting])
+  useEffect(() => {
+    if (!isHidden()) return loadWaiting()
+    held.current.add('waiting')
+  }, [loadWaiting])
   // ?focus=ID (or the old ?ticket=) opens a ticket; it stays in the URL until closed.
   const [selectedId, setSelectedId] = useFocusParam()
   const [showDone, setShowDone] = useState(false)
@@ -233,6 +246,7 @@ export function Mission() {
 
   // Latest activity; refreshed shortly after tickets change.
   const loadActivity = useCallback(() => {
+    held.current.delete('activity')
     const since = new Date(Date.now() - 3 * 86_400_000).toISOString()
     // Ticket activity plus plan-level changes (deletes, approvals, settings) from
     // the audit log, which only leads can read — others just get ticket activity.
@@ -250,24 +264,60 @@ export function Mission() {
       .catch(() => {})
   }, [pid])
   useEffect(() => {
-    const t = setTimeout(loadActivity, 600)
+    const t = setTimeout(() => {
+      if (isHidden()) held.current.add('activity')
+      else loadActivity()
+    }, 600)
     return () => clearTimeout(t)
   }, [tasks, loadActivity])
   // Agents' comments don't change tickets, so poll for them once a minute.
-  useEffect(() => {
-    const t = setInterval(loadActivity, 60_000)
-    return () => clearInterval(t)
-  }, [loadActivity])
+  // The hook skips the poll while the tab is hidden, and catches up once when
+  // the tab is shown.
+  useVisibleInterval(loadActivity, 60_000)
   const quietFor = (t: Task) => silentFor([lastSeen.get(t.id), t.dispatched_at, t.updated_at], now)
 
   const counts = useMemo(() => countStates(tasks), [tasks])
+  const refreshCounts = useCallback(() => {
+    held.current.delete('counts')
+    void refreshWaitCounts()
+  }, [])
   // Keep the strip's numbers in step when tickets change under us (an answer, a merge).
   useEffect(() => {
     if (!tasks.length) return
     let stop: (() => void) | undefined
-    const t = setTimeout(() => { refreshWaitCounts(); stop = loadWaiting() }, 1200)
+    const t = setTimeout(() => {
+      if (isHidden()) {
+        held.current.add('counts')
+        held.current.add('waiting')
+        return
+      }
+      refreshCounts()
+      stop = loadWaiting()
+    }, 1200)
     return () => { clearTimeout(t); stop?.() }
-  }, [tasks, loadWaiting])
+  }, [tasks, loadWaiting, refreshCounts])
+  // Back from hidden: run each held load once. This waits for the next tick so
+  // that the activity poll's own catch-up, which runs during this same event,
+  // has already cleared the activity load it covers.
+  useEffect(() => {
+    let t: ReturnType<typeof setTimeout> | undefined
+    let stop: (() => void) | undefined
+    const onVisibilityChange = () => {
+      clearTimeout(t)
+      if (isHidden()) return
+      t = setTimeout(() => {
+        if (held.current.has('activity')) loadActivity()
+        if (held.current.has('counts')) refreshCounts()
+        if (held.current.has('waiting')) { stop?.(); stop = loadWaiting() }
+      })
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      clearTimeout(t)
+      stop?.()
+    }
+  }, [loadActivity, loadWaiting, refreshCounts])
   const mergeNeeded = useMemo(() => tasks.filter(needsMerge).length, [tasks])
   // Verification receipts (#126): completed agent tickets whose receipt is
   // unverified. Held ones are in "Waiting on you" (the server's verify kind).

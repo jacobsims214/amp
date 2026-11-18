@@ -1,7 +1,7 @@
 // Mission is informational (v2/kb/working/human-work.md, artifact #23):
 // a Waiting-on-you strip into My work, Merge needed and "for you" readouts,
 // outlined squares, and Waiting on people. It has no action buttons.
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { createMemoryRouter, RouterProvider } from 'react-router-dom'
@@ -63,6 +63,17 @@ const server = setupServer(
 )
 server.events.on('request:start', () => { inFlight++ })
 server.events.on('request:end', () => { inFlight-- })
+// Requests made by Mission's background loads since open() rendered it.
+const calls = { activity: 0, audit: 0, counts: 0, waiting: 0 }
+const CALL_PATHS: Record<string, keyof typeof calls> = {
+  '/api/projects/2/activity': 'activity', '/api/audit': 'audit',
+  '/api/my-work/counts': 'counts', '/api/projects/2/waiting-on-people': 'waiting',
+}
+server.events.on('request:start', ({ request }) => {
+  const kind = CALL_PATHS[new URL(request.url).pathname]
+  if (kind) calls[kind]++
+})
+const resetCalls = () => { for (const k of Object.keys(calls) as (keyof typeof calls)[]) calls[k] = 0 }
 class FakeEventSource { onmessage = null; onerror = null; addEventListener() {} removeEventListener() {} close() {} }
 beforeAll(() => { vi.stubGlobal('EventSource', FakeEventSource); server.listen({ onUnhandledFrame: 'error' }) })
 beforeEach(() => { resetWaitCounts(); access = 'lead'; peopleWaiting = PEOPLE; peopleCalls = 0 })
@@ -77,6 +88,7 @@ async function open(me: Me | null = { user_id: ME, email: 'jacob@x.io' } as neve
   // The strip reads the shared counts store, which AppShell fills; do it here.
   const { refreshWaitCounts } = await import('../lib/waitCounts')
   await refreshWaitCounts()
+  resetCalls()
   const router = createMemoryRouter([{ path: '/project/:projectId/mission', element: <Mission /> }], { initialEntries: ['/project/2/mission'] })
   render(
     <AuthContext.Provider value={{ me, loading, error: null, isAdmin: false }}>
@@ -195,5 +207,108 @@ describe('Mission (informational)', () => {
     for (const n of names) expect(n).not.toMatch(/^(Answer|Merged|Mark merged|Approve|Start|Mark done|Send answer)/)
     expect(document.querySelector('textarea')).toBeNull()
     expect(screen.queryByText(/done, not merged/)).toBeNull()
+  })
+})
+
+// A hidden tab makes no background loads (activity, audit, counts, waiting on
+// people). Each one it skipped runs once when the tab is shown again.
+describe('Mission in a hidden tab', () => {
+  const realSetTimeout = globalThis.setTimeout
+  let visibility: DocumentVisibilityState = 'visible'
+  const setVisibility = (state: DocumentVisibilityState) => act(() => {
+    visibility = state
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  const advance = (ms: number) => act(() => vi.advanceTimersByTimeAsync(ms))
+  // Let any request that was started reach the server, then wait for all of them to finish.
+  const quiet = async () => {
+    await act(() => new Promise(r => realSetTimeout(r, 50)))
+    await waitFor(() => expect(inFlight).toBe(0))
+  }
+  const none = { activity: 0, audit: 0, counts: 0, waiting: 0 }
+  const oneEach = { activity: 1, audit: 1, counts: 1, waiting: 1 }
+
+  beforeEach(() => {
+    // Fake time still moves with real time, so findBy and waitFor keep working.
+    vi.useFakeTimers({ shouldAdvanceTime: true, toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
+    visibility = 'visible'
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => visibility })
+  })
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    // Drop the override so jsdom's own getter shows through again.
+    delete (document as { visibilityState?: DocumentVisibilityState }).visibilityState
+  })
+
+  it('a tab opened hidden loads none of them, then one of each once shown', async () => {
+    visibility = 'hidden'
+    await open()
+    // The 600 ms and 1200 ms reloads come due, and two activity polls.
+    await advance(2 * 60_000 + 2_000)
+    await quiet()
+    expect(calls).toEqual(none)
+
+    await setVisibility('visible')
+    // The poll's catch-up and the held activity reload share one load.
+    await waitFor(() => expect(calls).toEqual(oneEach))
+    await advance(5_000)
+    await quiet()
+    expect(calls).toEqual(oneEach)
+  })
+
+  it('hidden for less than a poll: the reloads it skipped run once when shown', async () => {
+    visibility = 'hidden'
+    await open()
+    await advance(2_000)
+    await quiet()
+    expect(calls).toEqual(none)
+
+    await setVisibility('visible')
+    await waitFor(() => expect(calls).toEqual(oneEach))
+    await advance(5_000)
+    await quiet()
+    expect(calls).toEqual(oneEach)
+  })
+
+  it('polls activity each minute while visible, none while hidden, and catches up once', async () => {
+    await open()
+    await advance(2_000)
+    await quiet()
+    resetCalls()
+
+    // Hidden and shown again before anything came due: nothing extra runs.
+    await setVisibility('hidden')
+    await advance(5_000)
+    await setVisibility('visible')
+    await quiet()
+    expect(calls).toEqual(none)
+
+    await advance(60_000)
+    await waitFor(() => expect(calls).toEqual({ ...none, activity: 1, audit: 1 }))
+    resetCalls()
+
+    await setVisibility('hidden')
+    await advance(3 * 60_000)
+    await quiet()
+    expect(calls).toEqual(none)
+
+    // Only the activity poll was skipped, so only activity loads, once.
+    await setVisibility('visible')
+    await waitFor(() => expect(calls).toEqual({ ...none, activity: 1, audit: 1 }))
+    await advance(5_000)
+    await quiet()
+    expect(calls).toEqual({ ...none, activity: 1, audit: 1 })
+  })
+
+  it('after unmount, showing the tab loads nothing', async () => {
+    visibility = 'hidden'
+    await open()
+    await advance(2_000)
+    cleanup()
+    await setVisibility('visible')
+    await advance(2_000)
+    await quiet()
+    expect(calls).toEqual(none)
   })
 })
