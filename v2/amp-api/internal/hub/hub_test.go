@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -47,10 +49,16 @@ func (s *streamRecorder) snapshot() (string, int) {
 	return s.buf.String(), s.writes
 }
 
-// waitFor polls cond until it is true, failing the test after a bound.
+// waitFor polls cond until it is true, failing the test after 2 s.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	waitForWithin(t, 2*time.Second, what, cond)
+}
+
+// waitForWithin polls cond until it is true, failing the test after limit.
+func waitForWithin(t *testing.T, limit time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(limit)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
@@ -70,19 +78,30 @@ func clientCount(h *Hub) int {
 // closed when the handler returns.
 func serve(t *testing.T, h *Hub, allow Allow) (*streamRecorder, context.CancelFunc, <-chan struct{}) {
 	t.Helper()
+	rec := newStreamRecorder()
+	cancel, done := serveWriter(t, h, rec, allow, nil)
+	return rec, cancel, done
+}
+
+// serveWriter is serve against any writer. unblock, if set, runs at cleanup
+// before the handler is awaited, to free a write the test left blocked.
+func serveWriter(t *testing.T, h *Hub, w http.ResponseWriter, allow Allow, unblock func()) (context.CancelFunc, <-chan struct{}) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest(http.MethodGet, "/api/events", nil).WithContext(ctx)
-	rec := newStreamRecorder()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		h.ServeFiltered(rec, req, allow)
+		h.ServeFiltered(w, req, allow)
 	}()
 	t.Cleanup(func() {
+		if unblock != nil {
+			unblock()
+		}
 		cancel()
 		<-done
 	})
-	return rec, cancel, done
+	return cancel, done
 }
 
 func TestServeFiltered_IdleStreamGetsKeepalive(t *testing.T) {
@@ -220,5 +239,296 @@ func TestKeepaliveInterval(t *testing.T) {
 func TestNew_UsesDefaultKeepalive(t *testing.T) {
 	if got := New().keepaliveInterval(); got != 25*time.Second {
 		t.Fatalf("default keepalive = %v, want 25s", got)
+	}
+}
+
+const testWriteTimeout = 50 * time.Millisecond
+
+// Where a stuck deadlineWriter blocks.
+const (
+	stuckInWrite = "write"
+	stuckInFlush = "flush"
+)
+
+// deadlineWriter is a streaming http.ResponseWriter that honours write
+// deadlines the way a net/http connection does: SetWriteDeadline arms the
+// connection, and the armed deadline covers the write and its flush. Once
+// stuck, a write or a flush (per stuckIn) blocks like one to a client that
+// stopped reading, then fails with os.ErrDeadlineExceeded when the deadline
+// passes. It counts every write that had no fresh deadline before it.
+type deadlineWriter struct {
+	header  http.Header
+	stuckIn string
+
+	release     chan struct{} // closed by unblock, so a write with no deadline can't hang the test
+	releaseOnce sync.Once
+
+	mu       sync.Mutex
+	deadline time.Time // armed deadline; zero means none
+	fresh    bool      // a deadline was set since the last write
+	stuck    bool
+	frames   []string
+	ahead    []time.Duration // per write: how far ahead its deadline was
+	unarmed  int             // writes with no fresh deadline before them
+	timedOut int             // stuck writes or flushes that failed on their deadline
+}
+
+func newDeadlineWriter(stuckIn string) *deadlineWriter {
+	return &deadlineWriter{header: make(http.Header), stuckIn: stuckIn, release: make(chan struct{})}
+}
+
+func (d *deadlineWriter) Header() http.Header { return d.header }
+func (d *deadlineWriter) WriteHeader(int)     {}
+
+func (d *deadlineWriter) SetWriteDeadline(t time.Time) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.deadline = t
+	d.fresh = !t.IsZero()
+	return nil
+}
+
+func (d *deadlineWriter) Write(p []byte) (int, error) {
+	d.mu.Lock()
+	if !d.fresh {
+		d.unarmed++
+	}
+	d.fresh = false
+	d.frames = append(d.frames, string(p))
+	d.ahead = append(d.ahead, time.Until(d.deadline))
+	stuck := d.stuck && d.stuckIn == stuckInWrite
+	d.mu.Unlock()
+	if stuck {
+		if err := d.block(); err != nil {
+			return 0, err
+		}
+	}
+	return len(p), nil
+}
+
+// Flush satisfies the http.Flusher check in ServeFiltered;
+// http.ResponseController calls FlushError instead.
+func (d *deadlineWriter) Flush() { _ = d.FlushError() }
+
+func (d *deadlineWriter) FlushError() error {
+	d.mu.Lock()
+	stuck := d.stuck && d.stuckIn == stuckInFlush
+	d.mu.Unlock()
+	if stuck {
+		return d.block()
+	}
+	return nil
+}
+
+// block waits out the armed deadline, as a write to a full socket does.
+func (d *deadlineWriter) block() error {
+	d.mu.Lock()
+	deadline := d.deadline
+	d.mu.Unlock()
+	if deadline.IsZero() {
+		<-d.release
+		return errors.New("blocked write had no deadline; released at cleanup")
+	}
+	select {
+	case <-time.After(time.Until(deadline)):
+	case <-d.release:
+		return errors.New("blocked write released at cleanup")
+	}
+	d.mu.Lock()
+	d.timedOut++
+	d.mu.Unlock()
+	return os.ErrDeadlineExceeded
+}
+
+// stopReading makes the next write or flush block until its deadline.
+func (d *deadlineWriter) stopReading() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.stuck = true
+}
+
+func (d *deadlineWriter) unblock() { d.releaseOnce.Do(func() { close(d.release) }) }
+
+func (d *deadlineWriter) snapshot() (frames []string, ahead []time.Duration, unarmed, timedOut int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.frames...), append([]time.Duration(nil), d.ahead...), d.unarmed, d.timedOut
+}
+
+func countFrames(frames []string, cond func(string) bool) int {
+	n := 0
+	for _, f := range frames {
+		if cond(f) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestServeFiltered_EveryWriteHasAFreshDeadline(t *testing.T) {
+	const timeout = 5 * time.Second // not the default, to show the override is used
+	h := New()
+	h.keepalive = 10 * time.Millisecond
+	h.writeTimeout = timeout
+	dw := newDeadlineWriter("")
+	cancel, done := serveWriter(t, h, dw, nil, dw.unblock)
+
+	waitFor(t, "client to register", func() bool { return clientCount(h) == 1 })
+	waitFor(t, "two keepalives", func() bool {
+		frames, _, _, _ := dw.snapshot()
+		return countFrames(frames, func(f string) bool { return f == keepaliveFrame }) >= 2
+	})
+	h.Publish(domain.Event{Type: domain.EventType("test.one"), ProjectID: 1})
+	h.Publish(domain.Event{Type: domain.EventType("test.two"), ProjectID: 1})
+	waitFor(t, "both events", func() bool {
+		frames, _, _, _ := dw.snapshot()
+		return countFrames(frames, func(f string) bool { return strings.Contains(f, `"type":"test.two"`) }) == 1
+	})
+	cancel()
+	<-done
+
+	frames, ahead, unarmed, _ := dw.snapshot()
+	if frames[0] != "data: {\"type\":\"connected\"}\n\n" {
+		t.Fatalf("first frame = %q, want the connected frame", frames[0])
+	}
+	if unarmed != 0 {
+		t.Fatalf("%d of %d writes had no fresh write deadline before them: %q", unarmed, len(frames), frames)
+	}
+	for i, a := range ahead {
+		if a <= timeout-time.Second || a > timeout {
+			t.Fatalf("write %d (%q) had its deadline %v ahead, want about %v", i, frames[i], a, timeout)
+		}
+	}
+}
+
+func TestServeFiltered_ClientThatStopsReadingEndsTheStream(t *testing.T) {
+	tests := []struct {
+		name    string
+		trigger string // what makes the blocked write: "keepalive" or "event"
+		stuckIn string
+	}{
+		{name: "event write blocks", trigger: "event", stuckIn: stuckInWrite},
+		{name: "event flush blocks", trigger: "event", stuckIn: stuckInFlush},
+		{name: "keepalive write blocks", trigger: "keepalive", stuckIn: stuckInWrite},
+		{name: "keepalive flush blocks", trigger: "keepalive", stuckIn: stuckInFlush},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := New()
+			h.writeTimeout = testWriteTimeout
+			h.keepalive = time.Hour // only the event writes
+			if tt.trigger == "keepalive" {
+				h.keepalive = 10 * time.Millisecond
+			}
+			dw := newDeadlineWriter(tt.stuckIn)
+			_, done := serveWriter(t, h, dw, nil, dw.unblock)
+
+			waitFor(t, "client to register", func() bool { return clientCount(h) == 1 })
+			waitFor(t, "the connected frame", func() bool {
+				frames, _, _, _ := dw.snapshot()
+				return len(frames) >= 1
+			})
+
+			dw.stopReading()
+			stoppedAt := time.Now()
+			if tt.trigger == "event" {
+				h.Publish(domain.Event{Type: domain.EventType("test.stuck"), ProjectID: 1})
+			}
+
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("ServeFiltered still running 2s after the client stopped reading: the write deadline did not end it")
+			}
+			if elapsed := time.Since(stoppedAt); elapsed < testWriteTimeout {
+				t.Fatalf("stream ended %v after the client stopped reading, before the %v deadline could pass", elapsed, testWriteTimeout)
+			}
+			if n := clientCount(h); n != 0 {
+				t.Fatalf("clients after the stuck write = %d, want 0 (subscriber not unregistered)", n)
+			}
+
+			frames, _, unarmed, timedOut := dw.snapshot()
+			if timedOut != 1 {
+				t.Fatalf("writes that hit their deadline = %d, want 1", timedOut)
+			}
+			if unarmed != 0 {
+				t.Fatalf("%d writes had no fresh write deadline before them: %q", unarmed, frames)
+			}
+			last := frames[len(frames)-1]
+			switch tt.trigger {
+			case "event":
+				if !strings.Contains(last, `"type":"test.stuck"`) {
+					t.Fatalf("blocked frame = %q, want the event", last)
+				}
+			case "keepalive":
+				if last != keepaliveFrame {
+					t.Fatalf("blocked frame = %q, want a keepalive", last)
+				}
+			}
+		})
+	}
+}
+
+// TestServeFiltered_RealClientStopsReading runs the hub behind a real
+// net/http server, so the deadline goes through http.ResponseController to
+// the TCP connection. The client reads the connected frame and then nothing,
+// so once the socket buffers fill, a write blocks until its deadline.
+func TestServeFiltered_RealClientStopsReading(t *testing.T) {
+	h := New()
+	h.keepalive = time.Hour
+	h.writeTimeout = 100 * time.Millisecond
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	line, err := bufio.NewReader(resp.Body).ReadString('\n')
+	if err != nil || line != "data: {\"type\":\"connected\"}\n" {
+		t.Fatalf("first line = %q, %v; want the connected frame", line, err)
+	}
+	waitFor(t, "client to register", func() bool { return clientCount(h) == 1 })
+
+	// 60 MiB in 1 MiB events, far more than loopback socket buffers hold
+	// (a few MiB each way), and under the 64-event queue, so none is dropped.
+	big := strings.Repeat("x", 1<<20)
+	for i := 0; i < 60; i++ {
+		h.Publish(domain.Event{Type: domain.EventType("test.big"), ProjectID: 1, Payload: big})
+	}
+
+	waitForWithin(t, 8*time.Second, "the stuck stream to be unregistered", func() bool { return clientCount(h) == 0 })
+}
+
+func TestWriteTimeoutValue(t *testing.T) {
+	tests := []struct {
+		name string
+		set  time.Duration
+		want time.Duration
+	}{
+		{name: "configured", set: 5 * time.Millisecond, want: 5 * time.Millisecond},
+		{name: "zero falls back to default", set: 0, want: DefaultWriteTimeout},
+		{name: "negative falls back to default", set: -time.Second, want: DefaultWriteTimeout},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &Hub{writeTimeout: tt.set}
+			if got := h.writeTimeoutValue(); got != tt.want {
+				t.Fatalf("writeTimeoutValue() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNew_UsesDefaultWriteTimeout(t *testing.T) {
+	if got := New().writeTimeoutValue(); got != 10*time.Second {
+		t.Fatalf("default write timeout = %v, want 10s", got)
 	}
 }
