@@ -62,6 +62,68 @@ const changesSince = (c: Changes) => {
   return d.toISOString()
 }
 
+/** Ticket changes reload "What changed" at most this often (AMP #2511). */
+const CHANGES_RELOAD_MS = 5_000
+const isHidden = () => document.visibilityState === 'hidden'
+
+/**
+ * The "What changed" overlay's activity. It loads straight away when the
+ * overlay is turned on or its window changes, and again as tickets change.
+ * Each load is the project's whole activity feed for the window, and every
+ * live event changes `tasks`, so ticket changes share loads: after a load,
+ * any changes in the next CHANGES_RELOAD_MS make one more load at its end.
+ * A hidden tab loads nothing. A load that comes due while hidden is held,
+ * and runs once when the tab is shown again.
+ */
+function useChangesActivity(pid: number, changes: Changes, tasks: Task[]): ActivityLog[] {
+  const [fetched, setFetched] = useState<ActivityLog[]>([])
+  // What a ticket change does while the overlay is on (set by the effect below).
+  const ticketsChanged = useRef<(() => void) | null>(null)
+
+  // The overlay turned on, or its window or project changed: load now, then
+  // pace the reloads that ticket changes ask for.
+  useEffect(() => {
+    if (changes === 'off') return
+    let cooldown: ReturnType<typeof setTimeout> | undefined // the CHANGES_RELOAD_MS after a load
+    let dirty = false // tickets changed during the cool-down
+    let held = false // a load came due while the tab was hidden
+    let request: AbortController | undefined
+    const load = () => {
+      dirty = false
+      held = isHidden()
+      const since = changesSince(changes) // "Today" moves on at midnight
+      if (held || !since) return
+      request?.abort()
+      const r = request = new AbortController()
+      api.getProjectActivity(pid, since, undefined, { signal: r.signal })
+        .then(setFetched)
+        .catch(() => { if (!r.signal.aborted) setFetched([]) })
+      clearTimeout(cooldown)
+      cooldown = setTimeout(() => {
+        cooldown = undefined
+        if (dirty) load()
+      }, CHANGES_RELOAD_MS)
+    }
+    const onVisibilityChange = () => { if (held && !isHidden()) load() }
+    ticketsChanged.current = () => {
+      if (cooldown) dirty = true
+      else load()
+    }
+    load()
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => {
+      ticketsChanged.current = null
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      clearTimeout(cooldown)
+      request?.abort()
+    }
+  }, [pid, changes])
+  // Every live event replaces `tasks`. With the overlay off this does nothing.
+  useEffect(() => { ticketsChanged.current?.() }, [tasks])
+
+  return useMemo(() => (changes === 'off' ? [] : fetched), [changes, fetched])
+}
+
 // ─── Node components ──────────────────────────────────────────────────────────
 type Mark = 'selected' | 'up' | 'down' | 'dim' | null
 
@@ -225,13 +287,8 @@ function DAGCanvas() {
   }, [tasks.length, stories, arrivalStory])
   const expanded = expandedSet ?? defaultExpanded
 
-  // Recent changes (refetched as tickets change while it's on).
-  const [fetched, setActivity] = useState<ActivityLog[]>([])
-  useEffect(() => {
-    const since = changesSince(changes)
-    if (since) api.getProjectActivity(pid, since).then(setActivity).catch(() => setActivity([]))
-  }, [pid, changes, tasks])
-  const activity = useMemo(() => (changes === 'off' ? [] : fetched), [changes, fetched])
+  // Recent changes (reloaded as tickets change while it's on, at most every 5 s).
+  const activity = useChangesActivity(pid, changes, tasks)
   const changed = useMemo(() => new Set(activity.map(a => a.task_id)), [activity])
 
   const chain = useMemo(() => (selectedId != null ? chainOf(selectedId, tasks) : null), [selectedId, tasks])
