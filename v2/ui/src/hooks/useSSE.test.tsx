@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, render, renderHook } from '@testing-library/react'
-import { sseSubscriberCount, subscribeSSE, useSSE } from './useSSE'
+import { HIDDEN_CLOSE_MS, sseSubscriberCount, subscribeSSE, useSSE } from './useSSE'
 import type { SSEEvent } from '../types'
 import { isSessionEnded, markSessionEnded, resetSession } from '../lib/session'
 
@@ -171,6 +171,112 @@ describe('useSSE', () => {
       expect(fetchMock).not.toHaveBeenCalled()
       expect(isSessionEnded()).toBe(false)
       a.unmount()
+    })
+  })
+
+  describe('while the tab is hidden', () => {
+    let visibility: DocumentVisibilityState = 'visible'
+    const setVisibility = (v: DocumentVisibilityState) => {
+      visibility = v
+      act(() => { document.dispatchEvent(new Event('visibilitychange')) })
+    }
+    const hide = () => setVisibility('hidden')
+    const show = () => setVisibility('visible')
+    const wait = (ms: number) => act(() => { vi.advanceTimersByTime(ms) })
+
+    beforeEach(() => {
+      vi.useFakeTimers()
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => visibility })
+    })
+    afterEach(() => {
+      show() // resets the module's paused state for the next test
+      vi.useRealTimers()
+    })
+
+    it('closes the stream after 30 s, keeping its subscribers and the session', () => {
+      const fetchMock = vi.fn()
+      vi.stubGlobal('fetch', fetchMock)
+      const a = renderHook(() => useSSE(1, () => {}))
+      const [es] = FakeEventSource.instances
+      hide()
+      wait(HIDDEN_CLOSE_MS - 1)
+      expect(es.closed).toBe(false)
+      wait(1)
+      expect(es.closed).toBe(true)
+      expect(sseSubscriberCount()).toBe(1)
+      es.onerror?.() // a late error from the stream we closed asks nothing
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(isSessionEnded()).toBe(false)
+      a.unmount()
+    })
+
+    it('a quick hide and show closes nothing', () => {
+      const a = renderHook(() => useSSE(1, () => {}))
+      const [es] = FakeEventSource.instances
+      hide()
+      wait(HIDDEN_CLOSE_MS / 2)
+      show()
+      wait(HIDDEN_CLOSE_MS * 2)
+      expect(es.closed).toBe(false)
+      expect(FakeEventSource.instances).toHaveLength(1)
+      // and the timer starts over on the next hide
+      hide()
+      wait(HIDDEN_CLOSE_MS - 1)
+      expect(es.closed).toBe(false)
+      a.unmount()
+    })
+
+    it('a subscriber arriving after the close opens nothing', () => {
+      const a = renderHook(() => useSSE(1, () => {}))
+      hide()
+      wait(HIDDEN_CLOSE_MS)
+      const b = renderHook(() => useSSE(2, () => {})) // joins the paused stream
+      expect(open()).toHaveLength(0)
+      expect(sseSubscriberCount()).toBe(2)
+      a.unmount(); b.unmount()
+      const c = renderHook(() => useSSE(1, () => {})) // a fresh stream, still hidden
+      expect(open()).toHaveLength(0)
+      expect(FakeEventSource.instances).toHaveLength(1)
+      c.unmount()
+    })
+
+    it('reopens on show for the subscribers that remain, old and new', () => {
+      const early = vi.fn(), late = vi.fn()
+      const a = renderHook(() => useSSE(1, early))
+      hide()
+      wait(HIDDEN_CLOSE_MS)
+      const b = renderHook(() => useSSE(1, late))
+      show()
+      expect(FakeEventSource.instances).toHaveLength(2)
+      const [live] = open()
+      expect(live).toBe(FakeEventSource.instances[1])
+      act(() => live.emit({ type: 'task.updated', project_id: 1 }))
+      expect(early).toHaveBeenCalledTimes(1)
+      expect(late).toHaveBeenCalledTimes(1)
+      a.unmount(); b.unmount()
+      expect(live.closed).toBe(true)
+    })
+
+    it('opens nothing on show when everyone left while hidden', () => {
+      const a = renderHook(() => useSSE(1, () => {}))
+      hide()
+      wait(HIDDEN_CLOSE_MS)
+      a.unmount()
+      expect(sseSubscriberCount()).toBe(0)
+      show()
+      expect(FakeEventSource.instances).toHaveLength(1)
+    })
+
+    it('does not reopen on show once the session ended', () => {
+      const a = renderHook(() => useSSE(1, () => {}))
+      hide()
+      wait(HIDDEN_CLOSE_MS)
+      act(() => markSessionEnded())
+      show()
+      expect(FakeEventSource.instances).toHaveLength(1)
+      const b = renderHook(() => useSSE(1, () => {}))
+      expect(FakeEventSource.instances).toHaveLength(1)
+      a.unmount(); b.unmount()
     })
   })
 })

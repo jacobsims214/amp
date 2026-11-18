@@ -7,7 +7,8 @@ const EVENTS_URL = '/api/events'
 type Listener = (event: SSEEvent) => void
 
 interface Shared {
-  source: EventSource
+  // null while a hidden tab has let the stream go (see HIDDEN_CLOSE_MS).
+  source: EventSource | null
   listeners: Set<Listener>
 }
 
@@ -44,7 +45,54 @@ function open(url: string, shared: Omit<Shared, 'source'>): EventSource {
 
 // A lost session (#153) closes every stream: reconnecting would only get the
 // proxy's sign-in answer again, over and over.
-onSessionEnded(() => { for (const shared of registry.values()) shared.source.close() })
+onSessionEnded(() => { for (const shared of registry.values()) shared.source?.close() })
+
+// The browser's six connections per host are shared by every tab, so a tab
+// left in the background lets its streams go after HIDDEN_CLOSE_MS, keeping
+// the subscribers, and reopens them when it is shown again. The server says
+// {"type":"connected"} on every new stream, which tells the page to catch up
+// on what it missed. While paused, nothing opens a stream: not a new
+// subscriber, not a retry.
+export const HIDDEN_CLOSE_MS = 30_000
+let hiddenTimer: ReturnType<typeof setTimeout> | undefined
+let paused = false
+
+function pauseStreams() {
+  paused = true
+  for (const shared of registry.values()) {
+    const { source } = shared
+    if (!source) continue
+    // A close we chose says nothing about the session: never ask.
+    source.onerror = null
+    source.close()
+    shared.source = null
+  }
+}
+
+function resumeStreams() {
+  paused = false
+  if (isSessionEnded()) return
+  // Every entry has a subscriber: the last one to leave deletes it.
+  for (const [url, shared] of registry) {
+    if (!shared.source) shared.source = open(url, shared)
+  }
+}
+
+function onVisibilityChange() {
+  clearTimeout(hiddenTimer)
+  hiddenTimer = undefined
+  if (document.visibilityState === 'hidden') {
+    hiddenTimer = setTimeout(pauseStreams, HIDDEN_CLOSE_MS)
+  } else if (paused) {
+    resumeStreams()
+  }
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', onVisibilityChange)
+  // A tab opened in the background starts hidden.
+  if (document.visibilityState === 'hidden') onVisibilityChange()
+}
 
 /**
  * Subscribe to the shared event stream at url. Returns the unsubscribe. The
@@ -56,9 +104,14 @@ export function subscribeSSE(url: string, listener: Listener): () => void {
   let shared = registry.get(url)
   if (!shared) {
     const listeners = new Set<Listener>()
-    shared = { listeners, source: open(url, { listeners }) }
+    // A paused (hidden) tab opens it when it is shown again.
+    shared = { listeners, source: paused ? null : open(url, { listeners }) }
     registry.set(url, shared)
-  } else if (shared.source.readyState === 2 /* CLOSED */ && !isSessionEnded()) {
+  } else if (
+    !paused
+    && (!shared.source || shared.source.readyState === 2 /* CLOSED */)
+    && !isSessionEnded()
+  ) {
     // The browser gave up (e.g. the server answered with an error status);
     // a new subscriber is a good moment to try again.
     shared.source = open(url, shared)
@@ -71,7 +124,7 @@ export function subscribeSSE(url: string, listener: Listener): () => void {
     done = true
     entry.listeners.delete(listener)
     if (entry.listeners.size === 0 && registry.get(url) === entry) {
-      entry.source.close()
+      entry.source?.close()
       registry.delete(url)
     }
   }
