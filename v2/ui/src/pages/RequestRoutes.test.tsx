@@ -303,6 +303,29 @@ describe('requester deep links', () => {
     expect(seen.find(u => u.includes('/api/requests/'))).toContain('8f2Q1x7K4m2P9t5W')
   })
 
+  // The production case (#5161/#5164): a staff member opens the request they
+  // themselves sent. `GET /api/requests/{ref}` answers the *team* view (the
+  // server ranks inbox standing first), so the page states why and offers the
+  // inbox's own screen — and this file is the only one that knows that path.
+  it('routes a member-requester to the inbox view of their own request', async () => {
+    server.use(http.get('*/api/requests/:ref', ({ request: req }) => {
+      record(req)
+      return HttpResponse.json({ view: 'team', request: row({ public_ref: '8f2q1x7k4m2p9t5w' }) })
+    }))
+    at('/request/8f2q1x7k4m2p9t5w')
+    renderAt(staff)
+    expect(await screen.findByTestId('requester-team-standing')).toBeInTheDocument()
+    expect(screen.queryByTestId('requester-load-failure')).toBeNull()
+
+    await userEvent.click(screen.getByRole('button', { name: /Open it in the inbox's view/ }))
+    // The destination is the request's serial in its own inbox, never the
+    // public reference (a team write path refuses one).
+    await waitFor(() => expect(window.location.pathname).toBe('/teams/4/requests/7'))
+    await waitFor(() => expect(seen.some(u => u.includes('/api/teams/4/requests/7'))).toBe(true))
+    // And it lands inside the shell, because that is the inbox's frame.
+    expect(await screen.findByRole('complementary', { name: 'Main' })).toBeInTheDocument()
+  })
+
   it('offers no "New request" control when the URL names no desk', async () => {
     at('/requests')
     renderAt(customer)

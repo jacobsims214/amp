@@ -19,6 +19,12 @@
  * The only third-party origins are the Google Fonts stylesheet and font files that
  * index.html loads. Neither policy allows 'unsafe-inline' or 'unsafe-eval': React
  * sets `style` through the CSSOM, which style-src doesn't govern.
+ *
+ * Cloudflare Web Analytics is not allowed here either, although it injects a beacon
+ * into every response at the edge: the decision was to switch that injection off at
+ * the zone rather than hand a third party script-src on this origin, where any script
+ * can use the device key. See decisions/ui-cloudflare-beacon-csp.md (#5162);
+ * csp.test.ts fails if either policy grows the beacon's origins.
  */
 export const SESSION_CSP = [
   "default-src 'none'",

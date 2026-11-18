@@ -250,6 +250,11 @@ export function RequesterStatusRoute() {
       onSignOut={signOut}
       onBackToRequests={() => navigate(requesterListPath(desk))}
       onNewRequest={desk.teamId != null ? () => navigate(requesterNewRequestPath(desk)) : undefined}
+      // A caller who sent this request *and* works its inbox gets the team
+      // answer, not the projection (the server ranks team standing first).
+      // The page states that and offers the inbox's own screen; the path is
+      // built here because this file is the only one that knows routes.
+      onOpenTeamView={({ teamId, requestId }) => navigate(teamRequestPath(teamId, requestId))}
     />
   )
 }

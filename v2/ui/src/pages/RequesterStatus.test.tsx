@@ -330,6 +330,98 @@ describe('the closed state', () => {
 
 // ---- 2. Indistinguishable refusals ----
 
+// ---- 4. A requester who also holds inbox standing ----
+//
+// The production failure (#5161, fixed by #5164): a team member opens their own
+// submitted request and `GET /api/requests/{ref}` answers the *team* view, because
+// `RequestViewFor` ranks team standing first. The page used to fail closed with
+// "a shape this page does not understand".
+
+describe('a requester who also holds inbox standing', () => {
+  const teamAnswer = () => HttpResponse.json({
+    view: 'team',
+    request: {
+      id: 7, public_ref: PUBLIC_REF, org_id: 2, team_id: 4,
+      subject: "October invoice export totals don't match the ledger",
+      claim_user_id: 12, owner_user_id: 13, requester_contact: 'marta.reyes@bluefjord.example',
+      metadata: { secret: true }, rev: 3,
+    },
+    outcome: {
+      phase: 'in_progress', items: null, total: 0, done: 0, open: 0, blocked: 0, gated: 0, held: 0,
+      deleted: 0, unverified: 0, rework: 0, linked: 0, outcome_brief_set: false, no_artifact: false,
+      delivered_eligible: false,
+    },
+  })
+
+  it('renders the request instead of failing closed, and offers the inbox view with a reason', async () => {
+    // The exact production case: the caller is the request's requester and also a
+    // member of the inbox, so the server's single answer is the record.
+    server.use(route('get', `/api/requests/${PUBLIC_REF}`, teamAnswer))
+    const onOpenTeamView = vi.fn()
+    mount({ teamName: DESK, onOpenTeamView })
+
+    const arm = await screen.findByTestId('requester-team-standing')
+    // Not the old sentence, and not the load-failure card: the request loaded.
+    expect(screen.queryByTestId('requester-load-failure')).toBeNull()
+    expect(document.body.textContent).not.toContain('shape this page does not understand')
+    expect(arm).toHaveTextContent("October invoice export totals don't match the ledger")
+    expect(arm).toHaveTextContent(`REQ-${PUBLIC_REF}`)
+    // It says why this is not the tracking page, in terms of the person's own access.
+    expect(arm).toHaveTextContent(/also have access to Northwind support desk's inbox/)
+
+    // And the one control goes to the request in its inbox, addressed by the
+    // serial a team route needs — never by string-matching a URL here.
+    await userEvent.click(screen.getByRole('button', { name: /Open it in the inbox's view/ }))
+    expect(onOpenTeamView).toHaveBeenCalledWith({ teamId: 4, requestId: 7 })
+  })
+
+  it('never renders the team record, even though it is what the server sent', async () => {
+    server.use(route('get', `/api/requests/${PUBLIC_REF}`, teamAnswer))
+    mount({ teamName: DESK, onOpenTeamView: vi.fn() })
+    const arm = await screen.findByTestId('requester-team-standing')
+    // Scoped to the arm: the frame draws the signed-in caller's own name and
+    // address, which are theirs, not the record's contact snapshot.
+    const text = (arm.textContent ?? '').toLowerCase()
+    for (const internal of [
+      'claim', 'assignee', 'owner', 'metadata', 'secret', 'revision', 'org ', 'project', 'ticket', 'agent', 'branch',
+    ]) {
+      expect(text, `the inbox arm must never render "${internal}"`).not.toContain(internal)
+    }
+    // The frame is still the requester's, not the app shell's.
+    expect(document.querySelector('main#requester-content')).not.toBeNull()
+    expect(screen.queryByRole('complementary', { name: 'Main' })).toBeNull()
+  })
+
+  it('offers no button when the route supplied no destination, rather than a dead control', async () => {
+    server.use(route('get', `/api/requests/${PUBLIC_REF}`, teamAnswer))
+    mount({ teamName: DESK })
+    await screen.findByTestId('requester-team-standing')
+    expect(screen.queryByRole('button', { name: /inbox's view/ })).toBeNull()
+    // The explanation stays: a person still learns where the request lives.
+    expect(screen.getByTestId('requester-team-standing')).toHaveTextContent(/opens in the inbox's own view/)
+  })
+
+  it('still fails closed on a view this build does not know', async () => {
+    // Narrowed guard, not a removed one: a third view must not inherit either arm.
+    server.use(route('get', `/api/requests/${PUBLIC_REF}`, () => HttpResponse.json({
+      view: 'collaborator', request: { id: 7, team_id: 4, subject: 'x' },
+    })))
+    mount({ teamName: DESK, onOpenTeamView: vi.fn() })
+    await screen.findByTestId('requester-load-failure')
+    expect(screen.getByTestId('requester-load-failure')).toHaveTextContent(/shape this page does not understand/)
+    expect(screen.queryByTestId('requester-team-standing')).toBeNull()
+  })
+
+  it('fails closed on a half team answer that names no team or no request', async () => {
+    server.use(route('get', `/api/requests/${PUBLIC_REF}`, () => HttpResponse.json({
+      view: 'team', request: { public_ref: PUBLIC_REF, subject: 'x' },
+    })))
+    mount({ teamName: DESK, onOpenTeamView: vi.fn() })
+    await screen.findByTestId('requester-load-failure')
+    expect(screen.queryByTestId('requester-team-standing')).toBeNull()
+  })
+})
+
 describe('a reference that is not yours and one that never existed', () => {
   it('renders byte-identical text for both', async () => {
     // The server answers the same 404 for another person's reference and for one
@@ -411,18 +503,27 @@ describe('no internal data is exposed', () => {
     expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1)
   })
 
-  it('cannot render a team answer: a `team` view fails closed instead of leaking the record', async () => {
+  it('takes four fields out of a team answer and leaves the rest of the record unread', async () => {
+    // A caller who sent this request *and* works its inbox gets the team view —
+    // by contract (`RequestViewFor` ranks team standing first). The page reads
+    // the address of the request, the subject and the reference; the claim, the
+    // assignee, the contact snapshot, the revision and the metadata are never
+    // touched, so no triage fact can reach this frame.
     server.use(route('get', `/api/requests/${PUBLIC_REF}`, () => HttpResponse.json({
       view: 'team',
       request: {
         id: 7, public_ref: PUBLIC_REF, org_id: 2, team_id: 4, subject: 'x', claim_user_id: 12,
-        owner_user_id: 13, metadata: { secret: true }, rev: 3,
+        owner_user_id: 13, requester_contact: 'marta@acme.example', metadata: { secret: true }, rev: 3,
       },
     })))
     mount()
-    await screen.findByTestId('requester-load-failure')
-    expect(document.body.textContent).not.toContain('claim_user_id')
-    expect(document.body.textContent).not.toContain('secret')
+    expect(await screen.findByTestId('requester-team-standing')).toBeInTheDocument()
+    for (const leaked of ['claim_user_id', 'secret', 'marta@acme.example', 'metadata', 'owner_user_id']) {
+      expect(document.body.textContent).not.toContain(leaked)
+    }
+    // The serial is not shown either: a requester page addresses a request by
+    // its public reference, and the inbox's own screen is where the serial lives.
+    expect(document.body.textContent).toContain(`REQ-${PUBLIC_REF}`)
   })
 
   it('keeps the requester frame: no team frame, no project data layer, and only the requester routes', async () => {
