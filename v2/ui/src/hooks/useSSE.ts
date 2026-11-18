@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useSyncExternalStore } from 'react'
 import type { SSEEvent } from '../types'
-import { checkSession, isSessionEnded, onSessionEnded } from '../lib/session'
+import { checkSession, isSessionEnded, onSessionEnded, onSignedInUserChange, signedInUser } from '../lib/session'
 
 const EVENTS_URL = '/api/events'
 
@@ -29,16 +29,26 @@ interface Shared {
 // allows six connections per host, so page loads queued behind the streams.
 const registry = new Map<string, Shared>()
 
-// Those six connections are shared by every tab, and every AMP tab gets the
-// same per-user /api/events stream. So one visible tab per browser, the one
-// holding the LEADER_LOCK Web Lock, opens it and relays every frame on the
-// TAB_CHANNEL BroadcastChannel, and the other tabs deliver what it relays.
-// A tab queues for the lock only while it is visible and has subscribers.
-// Without Web Locks or BroadcastChannel, each tab opens its own stream.
+// Those six connections are shared by every tab, and every AMP tab of one
+// user gets the same /api/events stream. So one visible tab per user and
+// browser, the one holding that user's LEADER_LOCK Web Lock, opens it and
+// relays every frame on that user's TAB_CHANNEL BroadcastChannel, and the
+// user's other tabs deliver what it relays. A tab queues for the lock only
+// while it is visible and has subscribers. Without Web Locks or
+// BroadcastChannel, each tab opens its own stream.
+//
+// A stream carries the events of whoever was signed in when it opened, so
+// both names end in the user id /api/me gave this tab (#2678): a tab signed
+// in as someone else is on another channel and never hears the frames. Until
+// the tab knows its user it joins nothing (see listen). The names live only
+// in memory, in this browser.
+//
 // Tabs running different builds talk on this channel: change the messages
 // compatibly, or rename the lock and channel together.
 const LEADER_LOCK = 'amp-sse-leader'
 const TAB_CHANNEL = 'amp-sse'
+const lockName = (user: string) => `${LEADER_LOCK}:${user}`
+const channelName = (user: string) => `${TAB_CHANNEL}:${user}`
 
 type TabMessage =
   | { kind: 'event'; event: SSEEvent } // a frame from the leader's stream
@@ -49,6 +59,9 @@ type TabMessage =
   | { kind: 'session-ended' }
 
 interface Tabs {
+  // The user whose lock and channel this tab is in (signedInUser when it
+  // joined). null while it isn't in any.
+  user: string | null
   // null while the tab is paused (hidden for HIDDEN_CLOSE_MS).
   channel: BroadcastChannel | null
   leading: boolean
@@ -142,13 +155,22 @@ function reopenIfDead(url: string, shared: Shared) {
   if (!shared.source || shared.source.readyState === 2 /* CLOSED */) shared.source = open(url, shared)
 }
 
-// Start hearing the other tabs: open the channel, ask whether a stream is
-// already up, and queue for the lock if the tab is visible.
+// Start hearing the user's other tabs: open the channel, ask whether a
+// stream is already up, and queue for the lock if the tab is visible.
 function listen(shared: Shared, tabs: Tabs) {
+  const user = signedInUser()
+  if (user === null) {
+    // Who is signed in isn't known yet (the first subscribe runs before
+    // AuthProvider's /api/me answers). Join nothing until it is: ask
+    // /api/me, and the answer (onSignedInUserChange) calls listen again.
+    learnUser()
+    return
+  }
   if (!tabs.channel) {
-    const channel = new BroadcastChannel(TAB_CHANNEL)
+    const channel = new BroadcastChannel(channelName(user))
     channel.onmessage = (e: MessageEvent) => onTabMessage(shared, tabs, e.data)
     tabs.channel = channel
+    tabs.user = user
   }
   // A tab whose session ended keeps only the channel, to answer hellos.
   if (isSessionEnded()) return
@@ -161,9 +183,11 @@ function queue(shared: Shared, tabs: Tabs) {
   // A tab whose session ended never leads again, and one checking whether
   // its session ended (checkingElsewhere) waits for the answer.
   if (tabs.leading || tabs.queued || isSessionEnded() || checkingElsewhere) return
+  const { user } = tabs
+  if (user === null) return
   const queued = new AbortController()
   tabs.queued = queued
-  navigator.locks.request(LEADER_LOCK, { signal: queued.signal }, () => {
+  navigator.locks.request(lockName(user), { signal: queued.signal }, () => {
     // Withdrawn after the lock was granted: let it go at once.
     if (tabs.queued !== queued) return
     tabs.queued = null
@@ -211,6 +235,7 @@ function leave(shared: Shared, tabs: Tabs) {
   stepDown(shared, tabs)
   tabs.channel?.close()
   tabs.channel = null
+  tabs.user = null
   tabs.joining = false
   setUp(shared, false) // a follower no longer hears the leader's stream
 }
@@ -260,6 +285,37 @@ function onTabMessage(shared: Shared, tabs: Tabs, message: TabMessage) {
   }
 }
 
+// Ask /api/me who is signed in, once at a time. checkSession records the
+// answer, and onSignedInUserChange below starts listening. If it can't tell
+// (offline, an older API without user_id), this tab can't know whose tabs to
+// share with, so it keeps a stream of its own, as without Web Locks.
+let learningUser = false
+function learnUser() {
+  if (learningUser) return
+  learningUser = true
+  void checkSession().finally(() => {
+    learningUser = false
+    if (signedInUser() !== null || isSessionEnded()) return
+    const shared = registry.get(EVENTS_URL)
+    if (shared?.tabs && !shared.tabs.channel && !paused && shared.closing === undefined) goSolo(shared)
+  })
+}
+
+// /api/me named a user: the first answer, or a different user than before
+// (someone signed in as another user in this browser, and this tab asked
+// again). A tab in the old user's election leaves it, closing the stream it
+// led, and joins the new user's. One waiting for its first answer joins now.
+onSignedInUserChange(() => {
+  const shared = registry.get(EVENTS_URL)
+  const tabs = shared?.tabs
+  if (!shared || !tabs || tabs.user === signedInUser()) return
+  if (tabs.channel) leave(shared, tabs)
+  if (paused || isSessionEnded()) return
+  // Nobody subscribes any more: the entry was only waiting to close.
+  if (shared.closing !== undefined) { closeEntry(EVENTS_URL, shared); return }
+  listen(shared, tabs)
+})
+
 // Another tab's session ended. That is news about its cookie when it looked,
 // and this tab may have signed in since (#2630), so ask /api/me rather than
 // believe it. Until the answer, this tab leaves the lock queue, so it doesn't
@@ -303,8 +359,11 @@ function tellTabs(message: TabMessage) {
   if (!canShareTabs()) return
   const tabs = registry.get(EVENTS_URL)?.tabs
   if (tabs?.channel) { post(tabs, message); return }
+  // Only this user's tabs share a stream with this one.
+  const user = signedInUser()
+  if (user === null) return
   try {
-    const channel = new BroadcastChannel(TAB_CHANNEL)
+    const channel = new BroadcastChannel(channelName(user))
     channel.postMessage(message)
     channel.close()
   } catch { /* nobody to tell */ }
@@ -418,7 +477,7 @@ export function subscribeSSE(url: string, listener: Listener): () => void {
   if (!shared) {
     shared = { listeners: new Set(), source: null, up: false, tabs: null, closing: undefined }
     if (url === EVENTS_URL && canShareTabs()) {
-      shared.tabs = { channel: null, leading: false, queued: null, release: null, joining: false }
+      shared.tabs = { user: null, channel: null, leading: false, queued: null, release: null, joining: false }
     }
     registry.set(url, shared)
     // A paused (hidden) tab starts when it is shown again.
@@ -428,7 +487,9 @@ export function subscribeSSE(url: string, listener: Listener): () => void {
     }
   } else if (!paused && !isSessionEnded()) {
     const { tabs } = shared
-    if (tabs && !tabs.leading) post(tabs, { kind: 'retry' })
+    // Still out of the election (it doesn't know its user yet): try again.
+    if (tabs && !tabs.channel) listen(shared, tabs)
+    else if (tabs && !tabs.leading) post(tabs, { kind: 'retry' })
     else reopenIfDead(url, shared)
   }
   shared.listeners.add(listener)

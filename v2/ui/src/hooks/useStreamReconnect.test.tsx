@@ -222,6 +222,11 @@ describe('useStreamReconnect across tabs (Web Locks + BroadcastChannel)', () => 
     Object.defineProperty(navigator, 'locks', { configurable: true, value: locks })
     FakeBroadcastChannel.all = []
     vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
+    // Every tab asks /api/me who is signed in before it joins the others,
+    // since only tabs of one user share a stream (#2678). One user here.
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ user_id: 1 }), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    })))
   })
   afterEach(() => { delete (navigator as { locks?: unknown }).locks })
 

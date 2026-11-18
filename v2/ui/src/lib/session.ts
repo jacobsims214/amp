@@ -79,8 +79,38 @@ export async function checkSession(): Promise<boolean> {
   try {
     const res = await fetch('/api/me', { redirect: 'manual', headers: { Accept: 'application/json' } })
     if (sessionLost(res)) { markSessionEnded(); return false }
+    if (res.ok) {
+      try { noteSignedIn(await res.json()) } catch { /* no identity in it */ }
+    }
   } catch { /* offline or the stream's own blip: not a lost session */ }
   return true
+}
+
+// Who /api/me last said this tab's cookie belongs to: their AMP user id, as a
+// string. null until it has answered with one. In memory only, never stored.
+// useSSE shares the live event stream only among tabs of the same user (#2678).
+let user: string | null = null
+const userListeners = new Set<() => void>()
+
+/** Record who /api/me says is signed in. An answer without a user_id changes nothing. */
+export function noteSignedIn(who: { user_id?: unknown } | null | undefined) {
+  const id = who?.user_id
+  if (typeof id !== 'number' && typeof id !== 'string') return
+  const next = String(id)
+  if (next === user) return
+  user = next
+  for (const l of [...userListeners]) l()
+}
+
+/** The signed-in user's id, as /api/me last gave it; null until it has. */
+export function signedInUser(): string | null {
+  return user
+}
+
+/** Call l whenever /api/me names a different signed-in user. Returns the unsubscribe. */
+export function onSignedInUserChange(l: () => void): () => void {
+  userListeners.add(l)
+  return () => { userListeners.delete(l) }
 }
 
 /** Sign in again, then come back here (oauth2-proxy's start URL). */
@@ -103,5 +133,6 @@ export function useSessionEnded(): boolean {
 export function resetSession() {
   ended = false
   signInOff = false
+  user = null
   emit()
 }

@@ -525,39 +525,48 @@ describe('useSSE', () => {
 
 type Grant = (lock: { name: string }) => unknown
 
-/** Web Locks for one exclusive lock name: FIFO, granted asynchronously. */
+interface FakeLock { holder: object | null; waiting: { run: () => void }[] }
+
+/** Exclusive Web Locks, each name its own FIFO queue, granted asynchronously. */
 class FakeLocks {
-  private holder: object | null = null
-  private waiting: { run: () => void }[] = []
-  /** How many requests are waiting (not counting the holder). */
-  get queued() { return this.waiting.length }
-  get held() { return this.holder !== null }
+  private locks = new Map<string, FakeLock>()
+  /** How many requests are waiting (not counting holders), for every name. */
+  get queued() { return [...this.locks.values()].reduce((n, l) => n + l.waiting.length, 0) }
+  get held() { return [...this.locks.values()].some(l => l.holder !== null) }
+  /** The names with a holder or a waiter. */
+  get names() { return [...this.locks].filter(([, l]) => l.holder || l.waiting.length).map(([n]) => n) }
+  private lock(name: string): FakeLock {
+    let lock = this.locks.get(name)
+    if (!lock) { lock = { holder: null, waiting: [] }; this.locks.set(name, lock) }
+    return lock
+  }
   request(name: string, options: { signal?: AbortSignal }, callback: Grant): Promise<unknown> {
+    const lock = this.lock(name)
     return new Promise((resolve, reject) => {
       const aborted = () => new DOMException('The request was aborted.', 'AbortError')
       if (options.signal?.aborted) { reject(aborted()); return }
       const req = {
         run: () => {
-          this.holder = req
+          lock.holder = req
           // Held until the callback's promise settles.
           Promise.resolve()
             .then(() => callback({ name }))
             .then(resolve, reject)
-            .finally(() => { if (this.holder === req) { this.holder = null; this.next() } })
+            .finally(() => { if (lock.holder === req) { lock.holder = null; this.next(lock) } })
         },
       }
       // Aborting only withdraws a request that is still waiting.
       options.signal?.addEventListener('abort', () => {
-        const i = this.waiting.indexOf(req)
-        if (i >= 0) { this.waiting.splice(i, 1); reject(aborted()) }
+        const i = lock.waiting.indexOf(req)
+        if (i >= 0) { lock.waiting.splice(i, 1); reject(aborted()) }
       })
-      this.waiting.push(req)
-      this.next()
+      lock.waiting.push(req)
+      this.next(lock)
     })
   }
-  /** The browser lets go of a closed tab's lock without its code running. */
-  drop() { this.holder = null; this.next() }
-  private next() { if (!this.holder && this.waiting.length) this.waiting.shift()!.run() }
+  /** The browser lets go of a closed tab's lock (every held one) without its code running. */
+  drop() { for (const lock of this.locks.values()) { lock.holder = null; this.next(lock) } }
+  private next(lock: FakeLock) { if (!lock.holder && lock.waiting.length) lock.waiting.shift()!.run() }
 }
 
 class FakeBroadcastChannel {
@@ -600,7 +609,9 @@ interface Tab {
   pagehide(): void
 }
 
-async function openTab({ hidden = false } = {}): Promise<Tab> {
+// user: who /api/me said is signed in when the tab loaded (AuthProvider has
+// answered); null for a tab whose first subscribe comes before it knows.
+async function openTab({ hidden = false, user = 1 as number | null } = {}): Promise<Tab> {
   let visibility: DocumentVisibilityState = hidden ? 'hidden' : 'visible'
   const doc = new EventTarget()
   const view = new EventTarget() // the tab's window, for pagehide
@@ -616,6 +627,7 @@ async function openTab({ hidden = false } = {}): Promise<Tab> {
   } finally {
     Object.defineProperty(globalThis, 'document', realDocument)
   }
+  if (user !== null) session.noteSignedIn({ user_id: user })
   const events: SSEEvent[] = []
   const channels: FakeBroadcastChannel[] = []
   // Channels opened during a call into this tab are this tab's.
@@ -664,10 +676,11 @@ describe('across tabs (Web Locks + BroadcastChannel)', () => {
   const wait = async (ms: number) => { vi.advanceTimersByTime(ms); await settle() }
   // What /api/me answers every tab from now on (they share the cookie jar):
   // 200 is signed in, 401 is the proxy turning a signed-out request away.
-  // A tab told by another that the session ended asks it (#2630).
-  const stubMe = (status: 200 | 401) => {
+  // A tab told by another that the session ended asks it (#2630). who is the
+  // body of a 200: with a user_id, it names who is signed in (#2678).
+  const stubMe = (status: 200 | 401, who: { user_id?: number } = {}) => {
     const me = vi.fn(async () => status === 200
-      ? new Response('{}', { status, headers: { 'content-type': 'application/json' } })
+      ? new Response(JSON.stringify(who), { status, headers: { 'content-type': 'application/json' } })
       : new Response('Unauthorized', { status }))
     vi.stubGlobal('fetch', me)
     return me
@@ -1209,6 +1222,127 @@ describe('across tabs (Web Locks + BroadcastChannel)', () => {
       open()[0].emit({ type: 'connected' })
       await settle()
       expect(b.sse.isSSEConnected()).toBe(true)
+    })
+  })
+
+  // A stream carries the events of whoever was signed in when it opened.
+  // Tabs share one only with tabs of the same user (#2678).
+  describe('per signed-in user (#2678)', () => {
+    it('a tab signed in as another user never hears the first user\'s stream; it opens its own', async () => {
+      const a = await openTab({ user: 1 }), b = await openTab({ user: 2 })
+      a.subscribe()
+      await settle()
+      b.subscribe()
+      await settle()
+      expect(open()).toHaveLength(2)
+      const [esA, esB] = open()
+      expect(locks.names.sort()).toEqual(['amp-sse-leader:1', 'amp-sse-leader:2'])
+      expect(new Set(FakeBroadcastChannel.all.map(c => c.name))).toEqual(new Set(['amp-sse:1', 'amp-sse:2']))
+      esA.emit({ type: 'connected' })
+      esA.emit({ type: 'task.updated', project_id: 1 })
+      esB.emit({ type: 'connected' })
+      await settle()
+      expect(types(a.events)).toEqual(['connected', 'task.updated'])
+      expect(types(b.events)).toEqual(['connected']) // its own stream's, nothing of a's
+      expect(b.sse.isSSEConnected()).toBe(true)
+    })
+
+    it('tabs of the same user still share one stream while another user has their own', async () => {
+      const a = await openTab({ user: 1 }), b = await openTab({ user: 2 }), c = await openTab({ user: 1 })
+      a.subscribe(); b.subscribe(); c.subscribe()
+      await settle()
+      expect(open()).toHaveLength(2)
+      const [esA, esB] = open()
+      esA.emit({ type: 'connected' })
+      esA.emit({ type: 'task.updated', project_id: 1 })
+      esB.emit({ type: 'connected' })
+      esB.emit({ type: 'comment.added', project_id: 2 })
+      await settle()
+      expect(types(a.events)).toEqual(['connected', 'task.updated'])
+      expect(types(c.events)).toEqual(['connected', 'task.updated'])
+      expect(types(b.events)).toEqual(['connected', 'comment.added'])
+    })
+
+    it('a follower that learns a different user leaves the old stream and joins the new user\'s', async () => {
+      const a = await openTab({ user: 1 }), b = await openTab({ user: 1 })
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      const [esA] = open()
+      esA.emit({ type: 'connected' })
+      await settle()
+      expect(types(b.events)).toEqual(['connected'])
+      // Someone signed in as user 2 in this browser, and b asks /api/me.
+      stubMe(200, { user_id: 2 })
+      await b.session.checkSession()
+      await settle()
+      expect(b.session.signedInUser()).toBe('2')
+      expect(open()).toHaveLength(2) // b leads user 2's tabs with a stream of its own
+      const esB = open()[1]
+      esA.emit({ type: 'task.updated', project_id: 1 })
+      esB.emit({ type: 'connected' })
+      await settle()
+      expect(types(a.events)).toEqual(['connected', 'task.updated'])
+      expect(types(b.events)).toEqual(['connected', 'connected']) // never a's task.updated
+    })
+
+    it('a leader that learns a different user closes the stream it opened for the old one', async () => {
+      const a = await openTab({ user: 1 }), b = await openTab({ user: 2 })
+      a.subscribe()
+      await settle()
+      b.subscribe()
+      await settle()
+      const [esA, esB] = open()
+      esB.emit({ type: 'connected' })
+      await settle()
+      stubMe(200, { user_id: 2 })
+      await a.session.checkSession()
+      await settle()
+      expect(esA.closed).toBe(true)
+      expect(open()).toEqual([esB]) // a now follows user 2's leader
+      expect(locks.names).toEqual(['amp-sse-leader:2'])
+      expect(connectedCount(a)).toBe(1) // b's "up" answer
+      esB.emit({ type: 'task.updated', project_id: 2 })
+      await settle()
+      expect(types(a.events)).toEqual(['connected', 'task.updated'])
+    })
+
+    it('a tab that does not know its user yet joins nothing until /api/me names one', async () => {
+      const me = stubMe(200, { user_id: 1 })
+      const a = await openTab({ user: 1 })
+      a.subscribe()
+      await settle()
+      const [esA] = open()
+      esA.emit({ type: 'connected' })
+      const b = await openTab({ user: null })
+      b.subscribe()
+      expect(b.channels).toHaveLength(0) // not on any channel yet
+      esA.emit({ type: 'task.updated', project_id: 1 }) // before b's answer: not b's
+      expect(me).toHaveBeenCalledTimes(1)
+      await settle()
+      expect(b.session.signedInUser()).toBe('1')
+      expect(open()).toEqual([esA]) // b joined user 1's tabs
+      esA.emit({ type: 'comment.added', project_id: 1 })
+      await settle()
+      expect(types(b.events)).toEqual(['connected', 'comment.added'])
+    })
+
+    it('a tab whose /api/me names nobody keeps a stream of its own and hears no other tab', async () => {
+      stubMe(200) // no user_id (an older API)
+      const a = await openTab({ user: 1 })
+      a.subscribe()
+      await settle()
+      const b = await openTab({ user: null })
+      b.subscribe()
+      await settle()
+      expect(open()).toHaveLength(2)
+      const [esA, esB] = open()
+      esA.emit({ type: 'task.updated', project_id: 1 })
+      esB.emit({ type: 'connected' })
+      await settle()
+      expect(types(b.events)).toEqual(['connected'])
+      expect(b.channels).toHaveLength(0)
+      expect(locks.names).toEqual(['amp-sse-leader:1'])
     })
   })
 })
