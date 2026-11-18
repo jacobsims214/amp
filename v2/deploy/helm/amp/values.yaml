@@ -395,6 +395,22 @@ oauth2Proxy:
   existingSecretClientSecretKey: client-secret   # key inside existingSecret
   existingSecretCookieSecretKey: cookie-secret   # key inside existingSecret
   cookieSecure: true
+  # Where oauth2-proxy keeps login sessions: "cookie" or "redis".
+  #   cookie (default): the whole session, tokens included, lives in the
+  #     browser cookie. There is no refresh lock, so parallel requests that
+  #     cross --cookie-refresh=1h race to redeem the same Dex refresh token
+  #     ("claimed twice", then a logout).
+  #   redis: the session lives in this chart's Valkey (amp-valkey, so it needs
+  #     valkey.enabled) and the cookie only holds a ticket for it. oauth2-proxy
+  #     locks a session in Valkey while it refreshes it (v7.7.1 does this:
+  #     pkg/middleware/stored_session.go), so one request redeems the refresh
+  #     token, the rest wait and reuse the result, and the cookie stays valid
+  #     across refreshes. The Valkey password is read from the amp-valkey-users
+  #     Secret (key "default"); nothing is copied into values.
+  #     CAVEAT: Valkey runs without persistence (valkey.dataStorage.enabled:
+  #     false below), so a Valkey restart or reschedule drops every session and
+  #     logs everyone out. Turn valkey.dataStorage on if that matters.
+  sessionStore: cookie
   resources:
     requests: { cpu: 25m, memory: 32Mi }
     limits: { cpu: 200m, memory: 128Mi }
