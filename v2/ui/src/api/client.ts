@@ -90,6 +90,11 @@ async function failure(res: Response, method: string, path: string): Promise<Htt
  * `headers` carries a call's own transport facts — the inbox submission's
  * `Idempotency-Key` is the only one today. It is never a credential: sign-in is
  * the proxy's cookie, and nothing here stores or sends a token.
+ *
+ * `signal` cancels the request. An aborted call rejects with the signal's
+ * reason (fetch's AbortError for a plain `controller.abort()`), never with an
+ * HttpError, so a caller can tell "I cancelled this" from "the server refused".
+ * That holds even when the abort lands while a refusal's body is being read.
  */
 async function send(
   method: string,
@@ -97,6 +102,7 @@ async function send(
   body?: unknown,
   base = BASE,
   headers?: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<Response> {
   if (isSessionEnded()) throw sessionEndedError()
   const res = await fetch(`${base}${path}`, {
@@ -108,16 +114,26 @@ async function send(
       ...headers,
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal,
   })
   if (sessionLost(res)) {
     markSessionEnded()
     throw sessionEndedError()
   }
-  if (!res.ok) throw await failure(res, method, path)
+  if (!res.ok) {
+    const err = await failure(res, method, path)
+    // failure() swallows a body that won't parse; an abort is not that.
+    signal?.throwIfAborted()
+    throw err
+  }
   return res
 }
 
-const get = <T>(path: string): Promise<T> => send('GET', path).then(r => r.json())
+/** A cancellable read's option: the signal that aborts it. */
+export interface ReadOpts { signal?: AbortSignal }
+
+const get = <T>(path: string, signal?: AbortSignal): Promise<T> =>
+  send('GET', path, undefined, BASE, undefined, signal).then(r => r.json())
 const post = <T>(path: string, body?: unknown, headers?: Record<string, string>): Promise<T> =>
   send('POST', path, body, BASE, headers).then(r => r.json())
 const patch = <T>(path: string, body?: unknown, headers?: Record<string, string>): Promise<T> =>
@@ -320,14 +336,16 @@ export const api = {
   getHistory: (taskId: number) =>
     get<{ history: ActivityLog[]; count: number }>(`/tasks/${taskId}/history`).then(r => r.history ?? []),
 
-  // Project activity log (for report dashboard)
-  getProjectActivity: (projectId: number, since?: string, until?: string) => {
+  // Project activity log (for report dashboard). `limit` caps the rows (the
+  // newest N); `signal` cancels the load. Neither is sent when not given.
+  getProjectActivity: (projectId: number, since?: string, until?: string, opts: ReadOpts & { limit?: number } = {}) => {
     const params = new URLSearchParams()
     if (since) params.set('since', since)
     if (until) params.set('until', until)
+    if (opts.limit != null) params.set('limit', String(opts.limit))
     const qs = params.toString()
     return get<{ activity: ActivityLog[]; count: number }>(
-      `/projects/${projectId}/activity${qs ? '?' + qs : ''}`
+      `/projects/${projectId}/activity${qs ? '?' + qs : ''}`, opts.signal,
     ).then(r => r.activity ?? [])
   },
 
@@ -517,12 +535,13 @@ export const api = {
     }).then(r => r.token),
   revokeToken: (tokenId: number) => del(`/tokens/${tokenId}`),
 
-  // Audit log: global admins any; org admins pass orgId; project owners projectId
-  audit: (q: AuditScope & { filter?: AuditFilter; action?: string; before?: number; limit?: number }) => {
+  // Audit log: global admins any; org admins pass orgId; project owners projectId.
+  // `q.limit` caps the rows; `opts.signal` cancels the load.
+  audit: (q: AuditScope & { filter?: AuditFilter; action?: string; before?: number; limit?: number }, opts: ReadOpts = {}) => {
     const f: AuditFilter = { ...q.filter }
     if (q.action && !f.action) f.action = q.action
     const p = auditQuery(q, f, { before: q.before, limit: q.limit })
-    return get<{ entries: AuditEntry[] | null }>(`/audit?${p}`).then(r => r.entries ?? [])
+    return get<{ entries: AuditEntry[] | null }>(`/audit?${p}`, opts.signal).then(r => r.entries ?? [])
   },
   // The hash chain check: org admins pass orgId; global admins may omit it (every chain)
   auditVerify: (orgId?: number) => get<AuditVerifyReport>(auditVerifyUrl(orgId).slice(BASE.length)),
