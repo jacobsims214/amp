@@ -1104,6 +1104,23 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, map[string]interface{}{"activity": activity, "count": len(activity)})
 		return
 
+	case "last-activity":
+		// Each in_progress ticket's newest activity time (AMP #2545), so
+		// Mission's stall alarm doesn't depend on the bounded feed above.
+		// Same access as "activity": the Member check every project route
+		// passes before this switch.
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET required", 405)
+			return
+		}
+		m, err := h.repo.ProjectRunningLastActivity(r.Context(), projectID)
+		if err != nil {
+			jsonErr(w, fmt.Errorf("last activity: %w", err), 500)
+			return
+		}
+		jsonOK(w, map[string]any{"last_activity": m})
+		return
+
 	case "export":
 		if r.Method != http.MethodGet {
 			http.Error(w, "GET required", 405)

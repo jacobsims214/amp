@@ -140,3 +140,31 @@ func (r *Repo) LastActivity(ctx context.Context, taskIDs []int) (map[int]time.Ti
 	}
 	return out, rows.Err()
 }
+
+// ProjectRunningLastActivity returns, for each in_progress ticket in the
+// project, the time of its newest activity-log entry (state changes,
+// dispatches, comments). A running ticket with no activity is left out, as
+// LastActivity leaves it out. Comments don't touch tasks.updated_at, so this
+// is the sign of life Mission's stall alarm reads (AMP #2545). The result is
+// bounded by the number of running tickets, not by how many rows the whole
+// project logged, and each lookup uses idx_activity_task_id.
+func (r *Repo) ProjectRunningLastActivity(ctx context.Context, projectID int) (map[int]time.Time, error) {
+	rows, err := r.db.Query(ctx, `SELECT t.id, (SELECT MAX(a.created_at) FROM activity_log a WHERE a.task_id = t.id)
+		FROM tasks t WHERE t.project_id = $1 AND t.state = 'in_progress'`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int]time.Time{}
+	for rows.Next() {
+		var id int
+		var at *time.Time
+		if err := rows.Scan(&id, &at); err != nil {
+			return nil, err
+		}
+		if at != nil {
+			out[id] = *at
+		}
+	}
+	return out, rows.Err()
+}
