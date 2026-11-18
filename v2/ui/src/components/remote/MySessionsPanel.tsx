@@ -7,6 +7,7 @@ import { Link } from 'react-router-dom'
 import { MonitorSmartphone } from 'lucide-react'
 import { Panel } from '../ui/PageHeader'
 import { useRemote } from '../../remote/remote-context'
+import { useVisibleInterval } from '../../hooks/useVisibleInterval'
 import type { SessionSummary } from '../../remote/types'
 
 function since(ms: number): string {
@@ -20,15 +21,19 @@ export function MySessionsPanel() {
   const [sessions, setSessions] = useState<SessionSummary[] | null>(null)
   const [error, setError] = useState<string | null>(null)
 
+  // Refresh every 30 s by bumping `refresh`, which reruns the load below. The
+  // hook skips it while the tab is hidden (the home page often sits in a
+  // background tab) and runs it once when the tab is shown.
+  const [refresh, setRefresh] = useState(0)
+  useVisibleInterval(() => setRefresh(n => n + 1), 30_000)
+
   useEffect(() => {
     let live = true
-    const load = () => transport.listSessions()
+    transport.listSessions()
       .then(s => { if (live) { setSessions(s); setError(null) } })
       .catch(e => { if (live) setError(e instanceof Error ? e.message : 'Failed to load sessions') })
-    load()
-    const t = setInterval(load, 30_000)
-    return () => { live = false; clearInterval(t) }
-  }, [transport])
+    return () => { live = false }
+  }, [transport, refresh])
 
   return (
     <Panel label="My sessions" title={sessions?.length ? 'Remote control' : 'No live sessions'} right={<>{sessions && <span>{sessions.length} live</span>}<Link to="/sessions" className="text-link hover:underline font-sans text-[12px]">All sessions</Link></>}>
