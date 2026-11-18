@@ -16,7 +16,7 @@ const createStory = vi.fn((...args: unknown[]) => { void args; return Promise.re
 
 // The board store subscribes to /api/events for live updates (#132), so the double
 // needs subscribeSSE too; it returns an unsubscribe fn like the real one.
-vi.mock('../hooks/useSSE', () => ({ useSSE: () => 'connected', subscribeSSE: () => () => {} }))
+vi.mock('../hooks/useSSE', () => ({ useSSE: () => 'connected', useSSEConnected: () => true, subscribeSSE: () => () => {} }))
 vi.mock('../hooks/usePlanApproval', () => ({
   usePlanApproval: () => ({ project: null, approving: false, error: null, notice: null, approve: vi.fn() }),
 }))

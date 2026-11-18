@@ -176,6 +176,7 @@ describe('Projects after a stream reconnect', () => {
       projects = [project(1, 'Apollo')]
       renderAt('/projects')
       expect(await screen.findByRole('heading', { name: 'Apollo' })).toBeInTheDocument()
+      expect(screen.getByText('live')).toBeInTheDocument() // no connected of its own needed (#2540)
       expect(sources).toHaveLength(1)
       expect(listReads).toBe(1)
 

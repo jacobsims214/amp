@@ -4,7 +4,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { Loader2, Clock, Layers, Archive, RotateCcw, ChevronDown, ChevronUp, Download, Upload, Plus } from 'lucide-react'
 import { api } from '../api/client'
 import { stripMarkdown } from '../lib/stripMarkdown'
-import { useSSE } from '../hooks/useSSE'
+import { useSSE, useSSEConnected } from '../hooks/useSSE'
 import { useStreamReconnect } from '../hooks/useStreamReconnect'
 import { CrudModal, FieldError, inputCls, labelCls } from '../components/CrudModal'
 import { CODE_MAX, cleanCode, suggestCode } from '../lib/projectCode'
@@ -40,7 +40,8 @@ export function Projects() {
   const [archivedProjects, setArchivedProjects] = useState<Project[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [live, setLive] = useState(false)
+  // The shared stream's state: right at once on a stream another view holds.
+  const live = useSSEConnected()
   const [archivedExpanded, setArchivedExpanded] = useState(false)
   const [archivingId, setArchivingId] = useState<number | null>(null)
   const [restoringId, setRestoringId] = useState<number | null>(null)
@@ -141,7 +142,6 @@ export function Projects() {
   useStreamReconnect(() => { void loadProjects() }, !loading)
 
   useSSE(null, useCallback((event: SSEEvent) => {
-    if (event.type === 'connected') { setLive(true); return }
     if (event.type === 'project.created' && event.payload) {
       const p = event.payload as Project
       setProjects(prev => prev.find(x => x.id === p.id) ? prev : [...prev, p])

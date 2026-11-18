@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, render, renderHook } from '@testing-library/react'
-import { HIDDEN_CLOSE_MS, sseSubscriberCount, subscribeSSE, useSSE } from './useSSE'
+import { HIDDEN_CLOSE_MS, isSSEConnected, sseSubscriberCount, subscribeSSE, useSSE, useSSEConnected } from './useSSE'
 import type { SSEEvent } from '../types'
 import { isSessionEnded, markSessionEnded, resetSession } from '../lib/session'
 
@@ -142,7 +142,86 @@ describe('useSSE', () => {
     expect(es.closed).toBe(true)
   })
 
+  // The Live indicators on Board and Projects (#2540).
+  describe('useSSEConnected', () => {
+    it('is false while the stream opens and true once it says connected', () => {
+      const h = renderHook(() => useSSEConnected())
+      expect(h.result.current).toBe(false)
+      const [es] = FakeEventSource.instances
+      act(() => es.emit({ type: 'connected' }))
+      expect(h.result.current).toBe(true)
+      expect(isSSEConnected()).toBe(true)
+      h.unmount()
+      expect(isSSEConnected()).toBe(false) // nobody holds the stream now
+    })
+
+    it('a view that mounts on an open, connected stream reads true on its first render', () => {
+      const frames: string[] = []
+      // Another view holds the stream (the board store lingers for 30 s).
+      const other = renderHook(() => useSSE(null, e => { frames.push(e.type) }))
+      const [es] = FakeEventSource.instances
+      act(() => es.emit({ type: 'connected' }))
+      const renders: boolean[] = []
+      const h = renderHook(() => {
+        const live = useSSEConnected()
+        renders.push(live)
+        return live
+      })
+      expect(renders[0]).toBe(true) // no connected frame of its own needed
+      expect(FakeEventSource.instances).toHaveLength(1) // it joined the open stream
+      expect(frames).toEqual(['connected']) // and no subscriber was sent another
+      h.unmount(); other.unmount()
+    })
+
+    it('goes back to false when the stream drops, and to true on the next connected', () => {
+      const frames: string[] = []
+      const sub = renderHook(() => useSSE(null, e => { frames.push(e.type) }))
+      const h = renderHook(() => useSSEConnected())
+      const [es] = FakeEventSource.instances
+      act(() => es.emit({ type: 'connected' }))
+      expect(h.result.current).toBe(true)
+      act(() => es.onerror?.()) // dropped; the browser retries by itself (CONNECTING)
+      expect(h.result.current).toBe(false)
+      act(() => es.emit({ type: 'connected' })) // the retried stream's opening frame
+      expect(h.result.current).toBe(true)
+      expect(frames).toEqual(['connected', 'connected']) // every subscriber still gets each frame
+      expect(FakeEventSource.instances).toHaveLength(1)
+      h.unmount(); sub.unmount()
+    })
+
+    it('holds the stream like useSSE: indicators share it, and the last one to go closes it', () => {
+      const a = renderHook(() => useSSEConnected())
+      const b = renderHook(() => useSSEConnected())
+      expect(FakeEventSource.instances).toHaveLength(1)
+      expect(sseSubscriberCount()).toBe(2)
+      a.unmount()
+      expect(open()).toHaveLength(1) // b's own listener still holds it
+      b.unmount()
+      expect(open()).toHaveLength(0)
+    })
+
+    it('reads each URL on its own', () => {
+      const events = renderHook(() => useSSEConnected())
+      const other = renderHook(() => useSSEConnected('/api/other'))
+      const [es] = FakeEventSource.instances
+      act(() => es.emit({ type: 'connected' }))
+      expect(events.result.current).toBe(true)
+      expect(other.result.current).toBe(false)
+      events.unmount(); other.unmount()
+    })
+  })
+
   describe('once the session ended (#153)', () => {
+    it('useSSEConnected reads false', () => {
+      const h = renderHook(() => useSSEConnected())
+      const [es] = FakeEventSource.instances
+      act(() => es.emit({ type: 'connected' }))
+      expect(h.result.current).toBe(true)
+      act(() => markSessionEnded())
+      expect(h.result.current).toBe(false)
+      h.unmount()
+    })
+
     it('closes the stream and does not reopen it for new subscribers', () => {
       const a = renderHook(() => useSSE(1, () => {}))
       const [es] = FakeEventSource.instances
@@ -267,6 +346,24 @@ describe('useSSE', () => {
       expect(sseSubscriberCount()).toBe(0)
       show()
       expect(FakeEventSource.instances).toHaveLength(1)
+    })
+
+    it('useSSEConnected reads false while paused, and true once the reopened stream says connected', () => {
+      const h = renderHook(() => useSSEConnected())
+      const [first] = FakeEventSource.instances
+      act(() => first.emit({ type: 'connected' }))
+      hide()
+      wait(HIDDEN_CLOSE_MS - 1)
+      expect(h.result.current).toBe(true) // the grace period keeps the stream
+      wait(1)
+      expect(h.result.current).toBe(false)
+      show()
+      const [second] = open()
+      expect(second).not.toBe(first)
+      expect(h.result.current).toBe(false) // reopened, not connected yet
+      act(() => second.emit({ type: 'connected' }))
+      expect(h.result.current).toBe(true)
+      h.unmount()
     })
 
     it('does not reopen on show once the session ended', () => {
@@ -641,6 +738,119 @@ describe('across tabs (Web Locks + BroadcastChannel)', () => {
     b.subscribe('/api/other')
     await settle()
     expect(open()).toHaveLength(2)
+  })
+
+  // A follower tab is connected when the leader's stream is (#2540).
+  describe('connection state (isSSEConnected)', () => {
+    const connected = (...tabs: Tab[]) => tabs.map(t => t.sse.isSSEConnected())
+    const downs = () => FakeBroadcastChannel.sent.filter(m => m.kind === 'down').length
+
+    it('a follower is connected when the leader\'s stream is, and so is a tab that joins it open', async () => {
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      expect(connected(a, b)).toEqual([false, false]) // opening
+      const [es] = open()
+      es.emit({ type: 'connected' })
+      await settle()
+      expect(connected(a, b)).toEqual([true, true])
+      const c = await openTab()
+      c.subscribe()
+      await settle()
+      expect(c.sse.isSSEConnected()).toBe(true) // from the leader's "up"
+      expect(connectedCount(c)).toBe(1)
+    })
+
+    it('every tab is down while the leader\'s stream reconnects, and up after its next connected', async () => {
+      const a = await openTab(), b = await openTab(), c = await openTab()
+      for (const t of [a, b, c]) t.subscribe()
+      await settle()
+      const [es] = open()
+      es.emit({ type: 'connected' })
+      await settle()
+      const before = downs()
+      es.onerror?.() // dropped; the browser retries by itself (CONNECTING)
+      await settle()
+      expect(connected(a, b, c)).toEqual([false, false, false])
+      expect(downs()).toBe(before + 1)
+      es.onerror?.() // a retry that fails too tells nobody again
+      await settle()
+      expect(downs()).toBe(before + 1)
+      es.emit({ type: 'connected' })
+      await settle()
+      expect(connected(a, b, c)).toEqual([true, true, true])
+      for (const t of [a, b, c]) expect(connectedCount(t)).toBe(2) // the frames are as before: one per connected
+      expect(FakeEventSource.instances).toHaveLength(1)
+    })
+
+    it('followers wait for the new leader\'s connected when the leader hands over', async () => {
+      const a = await openTab(), b = await openTab(), c = await openTab()
+      const offA = a.subscribe()
+      b.subscribe()
+      c.subscribe()
+      await settle()
+      const [first] = open()
+      first.emit({ type: 'connected' })
+      await settle()
+      offA()
+      await settle()
+      expect(first.closed).toBe(true)
+      expect(connected(b, c)).toEqual([false, false])
+      const [second] = open()
+      second.emit({ type: 'connected' })
+      await settle()
+      expect(connected(b, c)).toEqual([true, true])
+    })
+
+    it('when the browser closes the leader tab, the next leader tells the followers to wait', async () => {
+      const a = await openTab(), b = await openTab(), c = await openTab()
+      for (const t of [a, b, c]) t.subscribe()
+      await settle()
+      const [first] = open()
+      first.emit({ type: 'connected' })
+      await settle()
+      expect(connected(b, c)).toEqual([true, true])
+      // The browser ends a's stream, channel and lock; none of a's code runs.
+      first.close()
+      a.channels.forEach(ch => ch.close())
+      locks.drop()
+      await settle()
+      expect(connected(b, c)).toEqual([false, false]) // b leads now, and said so
+      const [second] = open()
+      second.emit({ type: 'connected' })
+      await settle()
+      expect(connected(b, c)).toEqual([true, true])
+    })
+
+    it('a paused follower is down, and up again with the leader\'s "up" when shown', async () => {
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      open()[0].emit({ type: 'connected' })
+      await settle()
+      b.hide()
+      await wait(HIDDEN_CLOSE_MS - 1)
+      expect(b.sse.isSSEConnected()).toBe(true) // still hearing the leader in the grace period
+      await wait(1)
+      expect(connected(a, b)).toEqual([true, false])
+      b.show()
+      await settle()
+      expect(b.sse.isSSEConnected()).toBe(true)
+    })
+
+    it('no tab is connected once the session ended', async () => {
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      open()[0].emit({ type: 'connected' })
+      await settle()
+      a.session.markSessionEnded()
+      await settle()
+      expect(connected(a, b)).toEqual([false, false])
+    })
   })
 
   describe('when the session ends (#153)', () => {

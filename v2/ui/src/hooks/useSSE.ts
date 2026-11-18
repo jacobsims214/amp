@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useSyncExternalStore } from 'react'
 import type { SSEEvent } from '../types'
 import { checkSession, isSessionEnded, markSessionEnded, onSessionEnded } from '../lib/session'
 
@@ -11,7 +11,9 @@ interface Shared {
   // This tab's own stream. null while another tab leads (see LEADER_LOCK),
   // or while a hidden tab has let the stream go (see HIDDEN_CLOSE_MS).
   source: EventSource | null
-  // The current source said {"type":"connected"} and hasn't failed since.
+  // The stream this tab hears said {"type":"connected"} and hasn't failed
+  // since: its own source, or in a follower tab the leader's. What
+  // useSSEConnected reports. Change it only through setUp.
   up: boolean
   // How this tab shares the stream with the other tabs; null when it doesn't.
   tabs: Tabs | null
@@ -39,6 +41,7 @@ type TabMessage =
   | { kind: 'event'; event: SSEEvent } // a frame from the leader's stream
   | { kind: 'hello' } // a tab started listening: is the stream up?
   | { kind: 'up' } // the leader's answer: its stream said connected
+  | { kind: 'down' } // the leader's stream dropped or closed, or a new leader is opening one
   | { kind: 'retry' } // a new subscriber: retry a stream the browser gave up on
   | { kind: 'session-ended' }
 
@@ -65,6 +68,23 @@ function canShareTabs(): boolean {
 const doc = typeof document === 'undefined' ? undefined : document
 const hidden = () => doc?.visibilityState === 'hidden'
 
+// Told whenever an entry's up changes, so useSSEConnected re-reads it.
+const watchers = new Set<() => void>()
+
+function setUp(shared: Shared, up: boolean) {
+  if (shared.up === up) return
+  shared.up = up
+  for (const watcher of [...watchers]) watcher()
+}
+
+// The stream this tab hears is down. A leader tells the other tabs, whose
+// streams are its stream, so their Live indicators go back to Connecting.
+function lost(shared: Shared) {
+  const { tabs } = shared
+  if (tabs?.leading && shared.up) post(tabs, { kind: 'down' })
+  setUp(shared, false)
+}
+
 function deliver(shared: Shared, event: SSEEvent) {
   // Copy so a listener that unsubscribes mid-dispatch doesn't skip another.
   for (const listener of [...shared.listeners]) {
@@ -78,7 +98,7 @@ function post(tabs: Tabs, message: TabMessage) {
 
 function open(url: string, shared: Shared): EventSource {
   const source = new EventSource(url)
-  shared.up = false
+  setUp(shared, false)
   source.onmessage = (e) => {
     let event: SSEEvent
     try {
@@ -86,7 +106,7 @@ function open(url: string, shared: Shared): EventSource {
     } catch {
       return // ignore malformed events
     }
-    if (event.type === 'connected') shared.up = true
+    if (event.type === 'connected') setUp(shared, true)
     // The leader relays every frame, connected included, to the other tabs.
     if (shared.tabs?.leading) post(shared.tabs, { kind: 'event', event })
     deliver(shared, event)
@@ -95,7 +115,7 @@ function open(url: string, shared: Shared): EventSource {
   // it gives up (CLOSED: the answer was an error status or not a stream),
   // ask whether the session ended, since the stream can't show its status.
   source.onerror = () => {
-    shared.up = false
+    lost(shared)
     if (isSessionEnded()) { source.close(); return }
     if (source.readyState === 2 /* CLOSED */) void checkSession()
   }
@@ -110,7 +130,7 @@ function closeSource(shared: Shared) {
     source.close()
   }
   shared.source = null
-  shared.up = false
+  setUp(shared, false)
 }
 
 // The browser gave up on the stream (e.g. the server answered with an error
@@ -157,6 +177,10 @@ function withdraw(tabs: Tabs) {
 function lead(shared: Shared, tabs: Tabs): Promise<void> {
   tabs.leading = true
   tabs.joining = false
+  // Until this tab's own stream says connected there is none: the last
+  // leader may have closed without a word (the browser closed its tab).
+  setUp(shared, false)
+  post(tabs, { kind: 'down' })
   // Once the session ended, the leader opens nothing but keeps the lock, so
   // no other tab takes over and opens a stream either.
   if (!paused && !isSessionEnded()) shared.source = open(EVENTS_URL, shared)
@@ -169,6 +193,7 @@ function lead(shared: Shared, tabs: Tabs): Promise<void> {
 function stepDown(shared: Shared, tabs: Tabs) {
   withdraw(tabs)
   if (!tabs.leading) return
+  lost(shared)
   tabs.leading = false
   closeSource(shared)
   tabs.release?.()
@@ -182,6 +207,7 @@ function leave(shared: Shared, tabs: Tabs) {
   tabs.channel?.close()
   tabs.channel = null
   tabs.joining = false
+  setUp(shared, false) // a follower no longer hears the leader's stream
 }
 
 function goSolo(shared: Shared) {
@@ -195,7 +221,10 @@ function onTabMessage(shared: Shared, tabs: Tabs, message: TabMessage) {
   if (!message || typeof message !== 'object') return
   switch (message.kind) {
     case 'event':
-      if (message.event.type === 'connected') tabs.joining = false
+      if (message.event.type === 'connected' && !tabs.leading) {
+        tabs.joining = false
+        setUp(shared, true)
+      }
       deliver(shared, message.event)
       return
     case 'hello':
@@ -209,7 +238,11 @@ function onTabMessage(shared: Shared, tabs: Tabs, message: TabMessage) {
       // Every listening tab hears the answer; only a joining one needs it.
       if (tabs.leading || !tabs.joining) return
       tabs.joining = false
+      setUp(shared, true)
       deliver(shared, { type: 'connected' })
+      return
+    case 'down':
+      if (!tabs.leading) setUp(shared, false)
       return
     case 'session-ended':
       endedElsewhere = true
@@ -225,7 +258,7 @@ let endedElsewhere = false
 onSessionEnded(() => {
   for (const shared of registry.values()) {
     shared.source?.close()
-    shared.up = false
+    setUp(shared, false)
   }
   if (!endedElsewhere) tellTabs({ kind: 'session-ended' })
 })
@@ -328,7 +361,7 @@ export function subscribeSSE(url: string, listener: Listener): () => void {
     if (entry.listeners.size === 0 && registry.get(url) === entry) {
       registry.delete(url)
       if (entry.tabs) leave(entry, entry.tabs)
-      else entry.source?.close()
+      else { entry.source?.close(); setUp(entry, false) }
     }
   }
 }
@@ -336,6 +369,35 @@ export function subscribeSSE(url: string, listener: Listener): () => void {
 /** Test hook: how many subscribers share url's stream (0 when closed). */
 export function sseSubscriberCount(url = EVENTS_URL): number {
   return registry.get(url)?.listeners.size ?? 0
+}
+
+/**
+ * Whether the stream at url is connected in this tab: it has said
+ * {"type":"connected"} (in a follower tab, the leader's stream has) and
+ * hasn't dropped since. False while it opens or reconnects, while a hidden
+ * tab has let it go, once the session ended, and when nothing subscribes.
+ */
+export function isSSEConnected(url = EVENTS_URL): boolean {
+  return registry.get(url)?.up ?? false
+}
+
+/**
+ * isSSEConnected as React state, for a Live indicator. It holds the stream
+ * open like useSSE does. A view that mounts on a stream another view already
+ * holds gets no connected frame of its own, so it reads the state rather than
+ * waiting for one: it shows Live at once.
+ */
+export function useSSEConnected(url = EVENTS_URL): boolean {
+  const subscribe = useCallback((onChange: () => void) => {
+    watchers.add(onChange)
+    // A listener of its own: the registry's set would merge a shared one.
+    const unsubscribe = subscribeSSE(url, () => {})
+    return () => {
+      watchers.delete(onChange)
+      unsubscribe()
+    }
+  }, [url])
+  return useSyncExternalStore(subscribe, () => isSSEConnected(url), () => false)
 }
 
 /**
