@@ -20,6 +20,7 @@ import { PageHeader, Panel } from '../components/ui/PageHeader'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
 import { BandLoader } from '../components/brand/BandLoader'
 import { useAuth } from '../hooks/useAuth'
+import { useVisibleInterval } from '../hooks/useVisibleInterval'
 import { remoteAvailable, useRemote } from '../remote/remote-context'
 import type { SessionDevice, SessionSummary } from '../remote/types'
 import { ago, inTime } from '../remote/toolText'
@@ -192,11 +193,11 @@ export function Sessions() {
     .catch(e => setError(e instanceof Error ? e.message : 'Failed to load sessions')), [transport])
 
   useEffect(() => {
-    if (!available) return
-    load()
-    const t = setInterval(load, 15_000)
-    return () => clearInterval(t)
+    if (available) load()
   }, [available, load])
+  // Refresh every 15 s while the tab is visible. The hook skips the refresh in a
+  // background tab and runs it once when the tab is shown again.
+  useVisibleInterval(load, available ? 15_000 : null)
 
   const disconnect = async (id: string) => {
     setBusy(id)
