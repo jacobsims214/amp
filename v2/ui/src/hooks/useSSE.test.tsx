@@ -662,6 +662,16 @@ describe('across tabs (Web Locks + BroadcastChannel)', () => {
     vi.useRealTimers()
   })
   const wait = async (ms: number) => { vi.advanceTimersByTime(ms); await settle() }
+  // What /api/me answers every tab from now on (they share the cookie jar):
+  // 200 is signed in, 401 is the proxy turning a signed-out request away.
+  // A tab told by another that the session ended asks it (#2630).
+  const stubMe = (status: 200 | 401) => {
+    const me = vi.fn(async () => status === 200
+      ? new Response('{}', { status, headers: { 'content-type': 'application/json' } })
+      : new Response('Unauthorized', { status }))
+    vi.stubGlobal('fetch', me)
+    return me
+  }
 
   it('opens exactly one EventSource for N visible tabs and relays every frame to the others', async () => {
     const tabs = [await openTab(), await openTab(), await openTab(), await openTab()]
@@ -1042,6 +1052,7 @@ describe('across tabs (Web Locks + BroadcastChannel)', () => {
     })
 
     it('no tab is connected once the session ended', async () => {
+      stubMe(401)
       const a = await openTab(), b = await openTab()
       a.subscribe()
       b.subscribe()
@@ -1056,6 +1067,7 @@ describe('across tabs (Web Locks + BroadcastChannel)', () => {
 
   describe('when the session ends (#153)', () => {
     it('ending in the leader tab ends it in every tab, and no tab opens a stream after', async () => {
+      stubMe(401) // the other tabs ask, and the proxy says signed out
       const a = await openTab(), b = await openTab(), c = await openTab()
       const offA = a.subscribe()
       b.subscribe()
@@ -1067,13 +1079,17 @@ describe('across tabs (Web Locks + BroadcastChannel)', () => {
       expect(es.closed).toBe(true)
       expect(b.session.isSessionEnded()).toBe(true)
       expect(c.session.isSessionEnded()).toBe(true)
-      offA() // the next leader opens nothing either
+      offA()
       await settle()
-      expect(locks.held).toBe(true)
+      // The ended leader lets go of the lock (#2630), so a tab signed in
+      // since could lead. b and c are ended too, so neither takes it.
+      expect(locks.held).toBe(false)
+      expect(locks.queued).toBe(0)
       expect(FakeEventSource.instances).toHaveLength(1)
     })
 
     it('a follower that finds it ended tells the leader, which closes the stream', async () => {
+      stubMe(401) // the leader asks, and the proxy says signed out
       const a = await openTab(), b = await openTab()
       a.subscribe()
       b.subscribe()
@@ -1087,6 +1103,7 @@ describe('across tabs (Web Locks + BroadcastChannel)', () => {
     })
 
     it('a follower paused at the time learns it when shown', async () => {
+      const me = stubMe(401)
       const a = await openTab(), b = await openTab()
       a.subscribe()
       b.subscribe()
@@ -1096,10 +1113,102 @@ describe('across tabs (Web Locks + BroadcastChannel)', () => {
       a.session.markSessionEnded()
       await settle()
       expect(b.session.isSessionEnded()).toBe(false) // its channel was closed
+      expect(me).not.toHaveBeenCalled()
       b.show()
       await settle()
-      expect(b.session.isSessionEnded()).toBe(true) // the leader answered its hello
-      expect(FakeEventSource.instances).toHaveLength(1)
+      // a answered b's hello, and /api/me said b is signed out too. a no
+      // longer holds the lock (#2630), so b may have opened a stream of its
+      // own before the answer; ending closed it.
+      expect(me).toHaveBeenCalledTimes(1)
+      expect(b.session.isSessionEnded()).toBe(true)
+      expect(open()).toHaveLength(0)
+      expect(locks.held).toBe(false)
+    })
+
+    // #2630, found by wave check #1585: the ended leader used to answer a new
+    // tab's hello with session-ended, the new tab believed it, and the ended
+    // leader kept the lock, so a tab signed in again got the gate again.
+    it('a tab opened after another tab\'s session ended, and signed in, is not ended and gets one stream', async () => {
+      stubMe(401)
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      open()[0].emit({ type: 'connected' })
+      await settle()
+      a.session.markSessionEnded()
+      await settle()
+      expect(b.session.isSessionEnded()).toBe(true)
+      expect(open()).toHaveLength(0)
+      const seenA = a.events.length, seenB = b.events.length
+      // The user signs in again in a new tab; a and b still show the gate.
+      const me = stubMe(200)
+      const d = await openTab()
+      d.subscribe()
+      await settle()
+      expect(me).toHaveBeenCalledTimes(1) // a (and b) told d; d asked once
+      expect(d.session.isSessionEnded()).toBe(false)
+      expect(open()).toHaveLength(1) // d's: it leads
+      const [es] = open()
+      es.emit({ type: 'connected' })
+      es.emit({ type: 'task.updated', project_id: 1 })
+      await settle()
+      expect(types(d.events)).toEqual(['connected', 'task.updated'])
+      expect(d.sse.isSSEConnected()).toBe(true)
+      // A second signed-in tab joins d's stream.
+      const e = await openTab()
+      e.subscribe()
+      await settle()
+      expect(e.session.isSessionEnded()).toBe(false)
+      expect(connectedCount(e)).toBe(1)
+      expect(open()).toEqual([es])
+      // The ended tabs hear none of it and still open nothing.
+      expect([a.events.length, b.events.length]).toEqual([seenA, seenB])
+      expect([a.session.isSessionEnded(), b.session.isSessionEnded()]).toEqual([true, true])
+    })
+
+    it('a follower told session-ended whose /api/me says signed out ends, says nothing more, and no tab reopens a stream', async () => {
+      const me = stubMe(401)
+      const a = await openTab(), b = await openTab(), c = await openTab()
+      a.subscribe()
+      b.subscribe()
+      c.subscribe()
+      await settle()
+      const [es] = open()
+      es.emit({ type: 'connected' })
+      await settle()
+      a.session.markSessionEnded()
+      await settle()
+      expect(me).toHaveBeenCalledTimes(2) // b and c each asked for themselves
+      expect([b.session.isSessionEnded(), c.session.isSessionEnded()]).toEqual([true, true])
+      expect(FakeBroadcastChannel.sent.filter(m => m.kind === 'session-ended')).toHaveLength(1) // no echo
+      // Nothing an ended tab does opens a stream or queues for the lock.
+      b.subscribe()
+      c.hide()
+      await wait(HIDDEN_CLOSE_MS)
+      c.show()
+      await settle()
+      expect(FakeEventSource.instances).toEqual([es])
+      expect(es.closed).toBe(true)
+      expect(locks.held).toBe(false)
+      expect(locks.queued).toBe(0)
+    })
+
+    it('a follower told session-ended whose /api/me says signed in takes over the stream', async () => {
+      stubMe(200) // a's cookie had expired; b's was renewed since
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      const [first] = open()
+      a.session.markSessionEnded()
+      await settle()
+      expect(b.session.isSessionEnded()).toBe(false)
+      expect(first.closed).toBe(true)
+      expect(open()).toHaveLength(1) // b's own
+      open()[0].emit({ type: 'connected' })
+      await settle()
+      expect(b.sse.isSSEConnected()).toBe(true)
     })
   })
 })

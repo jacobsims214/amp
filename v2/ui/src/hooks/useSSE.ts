@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useSyncExternalStore } from 'react'
 import type { SSEEvent } from '../types'
-import { checkSession, isSessionEnded, markSessionEnded, onSessionEnded } from '../lib/session'
+import { checkSession, isSessionEnded, onSessionEnded } from '../lib/session'
 
 const EVENTS_URL = '/api/events'
 
@@ -150,13 +150,17 @@ function listen(shared: Shared, tabs: Tabs) {
     channel.onmessage = (e: MessageEvent) => onTabMessage(shared, tabs, e.data)
     tabs.channel = channel
   }
+  // A tab whose session ended keeps only the channel, to answer hellos.
+  if (isSessionEnded()) return
   tabs.joining = true
   post(tabs, { kind: 'hello' })
   if (!hidden()) queue(shared, tabs)
 }
 
 function queue(shared: Shared, tabs: Tabs) {
-  if (tabs.leading || tabs.queued) return
+  // A tab whose session ended never leads again, and one checking whether
+  // its session ended (checkingElsewhere) waits for the answer.
+  if (tabs.leading || tabs.queued || isSessionEnded() || checkingElsewhere) return
   const queued = new AbortController()
   tabs.queued = queued
   navigator.locks.request(LEADER_LOCK, { signal: queued.signal }, () => {
@@ -184,8 +188,6 @@ function lead(shared: Shared, tabs: Tabs): Promise<void> {
   // leader may have closed without a word (the browser closed its tab).
   setUp(shared, false)
   post(tabs, { kind: 'down' })
-  // Once the session ended, the leader opens nothing but keeps the lock, so
-  // no other tab takes over and opens a stream either.
   if (!paused && !isSessionEnded()) shared.source = open(EVENTS_URL, shared)
   // Held until stepDown. The browser lets go by itself when the tab closes.
   return new Promise(resolve => { tabs.release = resolve })
@@ -222,6 +224,12 @@ function goSolo(shared: Shared) {
 
 function onTabMessage(shared: Shared, tabs: Tabs, message: TabMessage) {
   if (!message || typeof message !== 'object') return
+  if (isSessionEnded()) {
+    // This tab hears nothing more. It tells a tab that starts listening that
+    // its own session ended, and that tab asks /api/me about its own.
+    if (message.kind === 'hello') post(tabs, { kind: 'session-ended' })
+    return
+  }
   switch (message.kind) {
     case 'event':
       if (message.event.type === 'connected' && !tabs.leading) {
@@ -233,8 +241,7 @@ function onTabMessage(shared: Shared, tabs: Tabs, message: TabMessage) {
     case 'hello':
     case 'retry':
       if (!tabs.leading) return
-      if (isSessionEnded()) post(tabs, { kind: 'session-ended' })
-      else if (shared.up && message.kind === 'hello') post(tabs, { kind: 'up' })
+      if (shared.up && message.kind === 'hello') post(tabs, { kind: 'up' })
       else reopenIfDead(EVENTS_URL, shared)
       return
     case 'up':
@@ -248,22 +255,48 @@ function onTabMessage(shared: Shared, tabs: Tabs, message: TabMessage) {
       if (!tabs.leading) setUp(shared, false)
       return
     case 'session-ended':
-      endedElsewhere = true
-      try { markSessionEnded() } finally { endedElsewhere = false }
+      checkElsewhere()
       return
   }
 }
 
+// Another tab's session ended. That is news about its cookie when it looked,
+// and this tab may have signed in since (#2630), so ask /api/me rather than
+// believe it. Until the answer, this tab leaves the lock queue, so it doesn't
+// take over from an ended leader and open a stream the answer would close. A
+// session that ends meanwhile is not broadcast again: the tab that told us
+// told every listening tab, and each asks for itself.
+let checkingElsewhere = false
+function checkElsewhere() {
+  if (checkingElsewhere) return
+  checkingElsewhere = true
+  for (const shared of registry.values()) if (shared.tabs) withdraw(shared.tabs)
+  void checkSession().finally(() => {
+    checkingElsewhere = false
+    // Still signed in: back in the queue (queue skips an ended session).
+    if (paused || hidden()) return
+    for (const shared of registry.values()) {
+      if (shared.tabs?.channel) queue(shared, shared.tabs)
+    }
+  })
+}
+
 // A lost session (#153) closes every stream: reconnecting would only get the
 // proxy's sign-in answer again, over and over. The other tabs are told too,
-// since a follower has no stream of its own to notice it with.
-let endedElsewhere = false
+// since a follower has no stream of its own to notice it with. The leader
+// steps down and lets go of the lock, so a tab that has signed in since can
+// lead (#2630). It keeps its channel to answer hellos (see onTabMessage).
 onSessionEnded(() => {
+  // Tell them before letting go of the lock, so a follower leaves the queue
+  // to ask /api/me before it could be granted the lock.
+  if (!checkingElsewhere) tellTabs({ kind: 'session-ended' })
   for (const shared of registry.values()) {
-    shared.source?.close()
+    if (shared.tabs) {
+      stepDown(shared, shared.tabs)
+      shared.tabs.joining = false
+    } else shared.source?.close()
     setUp(shared, false)
   }
-  if (!endedElsewhere) tellTabs({ kind: 'session-ended' })
 })
 
 function tellTabs(message: TabMessage) {
