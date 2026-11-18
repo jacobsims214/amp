@@ -46,7 +46,11 @@ export function TicketArtifacts({ projectId, taskId }: { projectId: number; task
     api.listArtifacts(projectId, taskId).then(settle, () => settle([]))
   }, [projectId, taskId])
   useEffect(load, [load])
-  useSSE(projectId, e => { if (e.type === 'artifact.updated') load() })
+  // Only this ticket's artifacts. Every tab gets every artifact event in the
+  // project, and the payload is the artifact, whose task_id may be null (#2548).
+  useSSE(projectId, e => {
+    if (e.type === 'artifact.updated' && (e.payload as Artifact | undefined)?.task_id === taskId) load()
+  })
   // An artifact published while the stream was down never arrives as an event.
   useStreamReconnect(load, settledFor === taskId)
   if (list.length === 0) return null

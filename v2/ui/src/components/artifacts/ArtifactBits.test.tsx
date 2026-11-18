@@ -182,3 +182,63 @@ describe('TicketArtifacts re-reads after a stream reconnect (#2539)', () => {
     expect(reads()).toBe(1)
   })
 })
+
+describe('TicketArtifacts reloads only for its own ticket\'s artifacts (#2548)', () => {
+  /** An artifact.updated as the server sends it: the payload is the whole artifact. */
+  const updated = (payload: Partial<Artifact>) =>
+    send({ type: 'artifact.updated', project_id: PROJECT, payload: artifact(payload) })
+
+  it('an artifact.updated for another ticket adds no request', async () => {
+    mount(1)
+    await screen.findByText('Lead import mockup')
+    updated({ id: 90, task_id: 7, title: 'Someone else\'s mockup' })
+    await flush()
+    expect(reads()).toBe(1)
+  })
+
+  it('an artifact.updated with no ticket (task_id null) adds no request', async () => {
+    mount(1)
+    await screen.findByText('Lead import mockup')
+    updated({ id: 91, task_id: null, title: 'Unattached diagram' })
+    await flush()
+    expect(reads()).toBe(1)
+  })
+
+  it('an artifact.updated with no payload adds no request', async () => {
+    mount(1)
+    await screen.findByText('Lead import mockup')
+    send({ type: 'artifact.updated', project_id: PROJECT })
+    await flush()
+    expect(reads()).toBe(1)
+  })
+
+  it('an artifact.updated for this ticket reloads the list exactly once', async () => {
+    mount(1)
+    await screen.findByText('Lead import mockup')
+    artifactsByTask[1] = [artifact({ status: 'approved', approved_version: 1 })]
+    updated({ status: 'approved', approved_version: 1 })
+    expect(reads()).toBe(2)
+    await screen.findByText('Approved')
+    await flush()
+    expect(reads()).toBe(2)
+    expect(listReads.mock.calls.at(-1)).toEqual([PROJECT, 1])
+  })
+
+  it('after switching tickets, only the new ticket\'s artifacts reload it', async () => {
+    artifactsByTask[2] = [artifact({ id: 80, task_id: 2, title: 'Billing copy' })]
+    const show = mount(1)
+    await screen.findByText('Lead import mockup')
+    show(2)
+    await screen.findByText('Billing copy')
+    expect(reads()).toBe(2)
+
+    updated({ task_id: 1 })
+    await flush()
+    expect(reads()).toBe(2)
+
+    updated({ id: 80, task_id: 2, title: 'Billing copy' })
+    await flush()
+    expect(reads()).toBe(3)
+    expect(listReads.mock.calls.at(-1)).toEqual([PROJECT, 2])
+  })
+})
