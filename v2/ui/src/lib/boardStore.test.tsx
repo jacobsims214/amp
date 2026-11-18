@@ -27,7 +27,7 @@ vi.mock('../api/client', () => ({
   },
 }))
 const { useBoardData } = await import('../hooks/useBoardData')
-const { FRESH_MS, LINGER_MS, invalidateBoard } = await import('./boardStore')
+const { EVICT_MS, FRESH_MS, LINGER_MS, boardSnapshot, invalidateBoard, subscribeBoard } = await import('./boardStore')
 const emit = (e: Partial<SSEEvent>) => act(() => { sse.forEach(l => l({ project_id: 1, ...e } as SSEEvent)) })
 // The server says this on every new stream; it carries no project.
 const connect = () => act(() => { sse.forEach(l => l({ type: 'connected' } as SSEEvent)) })
@@ -296,5 +296,90 @@ describe('board store on a reconnect', () => {
     connect()
     await act(() => vi.advanceTimersByTimeAsync(0))
     expect(calls.tasks).toBe(2)
+  })
+})
+
+// A long-lived tab used to keep the board of every project it had shown (#2507).
+describe('board store eviction', () => {
+  const settle = () => act(() => vi.advanceTimersByTimeAsync(0))
+  const wait = (ms: number) => act(() => vi.advanceTimersByTimeAsync(ms))
+  const cached = () => boardSnapshot(1).loaded
+  beforeEach(() => { vi.useFakeTimers() })
+
+  it('drops a board nothing has used for EVICT_MS; the next view reads it fresh', async () => {
+    const board = renderHook(() => useBoardData(1))
+    await settle()
+    board.unmount()
+    await wait(EVICT_MS - 1)
+    expect(cached()).toBe(true)
+    await wait(1)
+    expect(boardSnapshot(1)).toMatchObject({ loaded: false, tasks: [] })
+    const firstFrames: boolean[] = []
+    const back = renderHook(() => { const d = useBoardData(1); firstFrames.push(d.loading); return d })
+    expect(firstFrames[0]).toBe(true) // nothing cached to show
+    await settle()
+    expect(calls.tasks).toBe(2)
+    expect(back.result.current.tasks.map(t => t.id)).toEqual([11])
+  })
+
+  it('a view back within EVICT_MS keeps the cached board, and the clock starts over when it leaves', async () => {
+    const first = renderHook(() => useBoardData(1))
+    await settle()
+    first.unmount()
+    await wait(EVICT_MS - 1_000)
+    const firstFrames: number[] = []
+    const again = renderHook(() => { const d = useBoardData(1); firstFrames.push(d.tasks.length); return d })
+    expect(firstFrames[0]).toBe(1) // the cached board, on the first frame
+    await settle()
+    again.unmount()
+    // The first view's eviction would have run now: coming back cancelled it.
+    await wait(1_000)
+    expect(cached()).toBe(true)
+    // A full EVICT_MS from the second view leaving.
+    await wait(EVICT_MS - 1_001)
+    expect(cached()).toBe(true)
+    await wait(1)
+    expect(cached()).toBe(false)
+  })
+
+  it('a board in use is never dropped: a mounted view or a snapshot subscriber keeps it', async () => {
+    const board = renderHook(() => useBoardData(1))
+    await settle()
+    await wait(2 * EVICT_MS)
+    expect(cached()).toBe(true)
+    const stop = subscribeBoard(1, () => {})
+    board.unmount()
+    await wait(2 * EVICT_MS)
+    expect(cached()).toBe(true)
+    stop()
+    await wait(EVICT_MS)
+    expect(cached()).toBe(false)
+  })
+
+  it('a dropped project keeps no event subscription and no reconnect state', async () => {
+    const loads: number[] = []
+    tasksImpl = pid => { loads.push(pid); return Promise.resolve(serverTasks) }
+    const board = renderHook(() => useBoardData(1))
+    await settle()
+    connect() // on the stream: its next "connected" would be a reconnect
+    board.unmount()
+    await wait(EVICT_MS)
+    expect(sse).toHaveLength(0)
+    // A late re-read signal doesn't bring the entry back.
+    invalidateBoard(1)
+    expect(cached()).toBe(false)
+    // Another project opening now starts a new stream: its first "connected" is not a reconnect.
+    renderHook(() => useBoardData(2))
+    await settle()
+    connect()
+    await settle()
+    expect(loads).toEqual([1, 2])
+    // Project 1 comes back: one fresh read on mount, and the stream is up (project 2 saw it connect).
+    renderHook(() => useBoardData(1))
+    await settle()
+    expect(loads).toEqual([1, 2, 1])
+    connect()
+    await settle()
+    expect(loads.slice(3).sort()).toEqual([1, 2])
   })
 })
