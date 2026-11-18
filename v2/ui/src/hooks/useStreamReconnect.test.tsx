@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { renderHook } from '@testing-library/react'
-import { HIDDEN_CLOSE_MS, sseSubscriberCount, subscribeSSE } from './useSSE'
+import { HIDDEN_CLOSE_MS, SSE_CLOSE_DELAY_MS, sseSubscriberCount, subscribeSSE } from './useSSE'
 import { useStreamReconnect } from './useStreamReconnect'
 import { resetSession } from '../lib/session'
 import type { SSEEvent } from '../types'
@@ -129,6 +129,7 @@ describe('useStreamReconnect', () => {
   })
 
   it('unsubscribes on unmount', () => {
+    vi.useFakeTimers()
     const other = subscribeSSE('/api/events', () => {})
     const view = renderView(true)
     expect(sseSubscriberCount()).toBe(2)
@@ -138,7 +139,8 @@ describe('useStreamReconnect', () => {
     reconnect(es)
     expect(view.onReconnect).not.toHaveBeenCalled()
     other()
-    expect(es.closed).toBe(true) // the last subscriber closed it
+    vi.advanceTimersByTime(SSE_CLOSE_DELAY_MS)
+    expect(es.closed).toBe(true) // the last subscriber closed it, after the close delay
   })
 })
 
@@ -283,6 +285,7 @@ describe('useStreamReconnect across tabs (Web Locks + BroadcastChannel)', () => 
   })
 
   it('works in the tab that leads', async () => {
+    vi.useFakeTimers()
     const view = renderView(false)
     await settle()
     expect(locks.held).toBe(true) // the only tab, so it took the lock and opened the stream
@@ -293,6 +296,7 @@ describe('useStreamReconnect across tabs (Web Locks + BroadcastChannel)', () => 
     reconnect(es)
     expect(view.onReconnect).toHaveBeenCalledTimes(1)
     view.unmount()
+    vi.advanceTimersByTime(SSE_CLOSE_DELAY_MS)
     await settle()
     expect(locks.held).toBe(false)
   })

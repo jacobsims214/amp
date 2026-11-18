@@ -17,13 +17,16 @@ interface Shared {
   up: boolean
   // How this tab shares the stream with the other tabs; null when it doesn't.
   tabs: Tabs | null
+  // Set while the entry has no subscribers and waits SSE_CLOSE_DELAY_MS to
+  // close; a new subscriber cancels it.
+  closing: ReturnType<typeof setTimeout> | undefined
 }
 
 // One EventSource per URL for the whole app, shared by every useSSE caller
-// and closed when the last one unsubscribes. A board page alone used to open
-// three or four (Board, useBoardData, usePlanApproval, the drawer's
-// artifacts), and over HTTP/1.1 the browser allows six connections per host,
-// so page loads queued behind the streams.
+// and closed soon after the last one unsubscribes (SSE_CLOSE_DELAY_MS). A
+// board page alone used to open three or four (Board, useBoardData,
+// usePlanApproval, the drawer's artifacts), and over HTTP/1.1 the browser
+// allows six connections per host, so page loads queued behind the streams.
 const registry = new Map<string, Shared>()
 
 // Those six connections are shared by every tab, and every AMP tab gets the
@@ -288,8 +291,10 @@ let paused = false
 
 function pauseStreams() {
   paused = true
-  for (const shared of registry.values()) {
-    if (shared.tabs) leave(shared, shared.tabs)
+  for (const [url, shared] of registry) {
+    // Nobody is waiting for it: a closing entry goes now, not on show.
+    if (shared.closing !== undefined) closeEntry(url, shared)
+    else if (shared.tabs) leave(shared, shared.tabs)
     else closeSource(shared)
   }
 }
@@ -297,7 +302,8 @@ function pauseStreams() {
 function resumeStreams() {
   paused = false
   if (isSessionEnded()) return
-  // Every entry has a subscriber: the last one to leave deletes it.
+  // Every entry has a subscriber: the last one to leave deletes it (at once
+  // while paused, and pauseStreams closed the entries that were closing).
   for (const [url, shared] of registry) {
     if (shared.tabs) listen(shared, shared.tabs)
     else if (!shared.source) shared.source = open(url, shared)
@@ -327,16 +333,57 @@ if (doc) {
   if (hidden()) onVisibilityChange()
 }
 
+// When the last subscriber leaves, the stream stays open this long before it
+// closes (#2624). A route change (Projects to a project page, ArtifactView's
+// project switch) unsubscribes one view and subscribes the next in the same
+// commit. Closing at once made the leader close and reopen /api/events, and
+// every tab heard a new connected and re-read its data. In the delay the
+// entry stays exactly as it was (stream, lock, up), so the next subscriber
+// joins it and nothing is sent to anyone. Not used while paused or once the
+// session ended: there is no stream to keep then, so the entry goes at once.
+export const SSE_CLOSE_DELAY_MS = 1_000
+
+// The last subscriber's leaving, carried out: close the stream (and leave the
+// cross-tab election) and drop the entry.
+function closeEntry(url: string, shared: Shared) {
+  clearTimeout(shared.closing)
+  shared.closing = undefined
+  if (registry.get(url) !== shared) return
+  registry.delete(url)
+  if (shared.tabs) leave(shared, shared.tabs)
+  else { shared.source?.close(); setUp(shared, false) }
+}
+
+// Close every entry that is waiting to close, now.
+function closeWaiting() {
+  for (const [url, shared] of registry) if (shared.closing !== undefined) closeEntry(url, shared)
+}
+
+// A page going away (unload, or into the back-forward cache) has no next
+// subscriber to wait for.
+doc?.defaultView?.addEventListener('pagehide', closeWaiting)
+
+// Test setup runs this after each test, after the stores' resets let go of
+// their streams (src/test/setup.ts), so a stream left waiting by one test
+// isn't joined by the next.
+;((globalThis as { __ampStreamResets?: Set<() => void> }).__ampStreamResets ??= new Set()).add(closeWaiting)
+
 /**
  * Subscribe to the shared event stream at url. Returns the unsubscribe. The
- * stream opens with the first subscriber and closes with the last.
+ * stream opens with the first subscriber and closes SSE_CLOSE_DELAY_MS after
+ * the last one leaves, unless another subscribes first.
  */
 export function subscribeSSE(url: string, listener: Listener): () => void {
   // No EventSource (a test environment without one): nothing to listen to.
   if (typeof EventSource === 'undefined') return () => {}
   let shared = registry.get(url)
+  if (shared?.closing !== undefined) {
+    // It was waiting to close: keep it, as if the last one had never left.
+    clearTimeout(shared.closing)
+    shared.closing = undefined
+  }
   if (!shared) {
-    shared = { listeners: new Set(), source: null, up: false, tabs: null }
+    shared = { listeners: new Set(), source: null, up: false, tabs: null, closing: undefined }
     if (url === EVENTS_URL && canShareTabs()) {
       shared.tabs = { channel: null, leading: false, queued: null, release: null, joining: false }
     }
@@ -358,10 +405,9 @@ export function subscribeSSE(url: string, listener: Listener): () => void {
     if (done) return
     done = true
     entry.listeners.delete(listener)
-    if (entry.listeners.size === 0 && registry.get(url) === entry) {
-      registry.delete(url)
-      if (entry.tabs) leave(entry, entry.tabs)
-      else { entry.source?.close(); setUp(entry, false) }
+    if (entry.listeners.size === 0 && registry.get(url) === entry && entry.closing === undefined) {
+      if (paused || isSessionEnded()) closeEntry(url, entry)
+      else entry.closing = setTimeout(() => closeEntry(url, entry), SSE_CLOSE_DELAY_MS)
     }
   }
 }
