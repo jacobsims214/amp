@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { Check, ExternalLink, Loader2, Monitor, Smartphone, Tablet, Undo2 } from 'lucide-react'
 import { api } from '../api/client'
-import { sseSubscriberCount, useSSE } from '../hooks/useSSE'
+import { useSSE } from '../hooks/useSSE'
+import { useStreamReconnect } from '../hooks/useStreamReconnect'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Markdown } from '../components/ui/Markdown'
 import { ArtifactKindIcon, ArtifactStatusTag } from '../components/artifacts/ArtifactBits'
@@ -34,15 +35,27 @@ export function ArtifactView() {
   const [versions, setVersions] = useState<ArtifactVersion[]>([])
   const [error, setError] = useState<string | null>(null)
   const [viewport, setViewport] = useState<Viewport>('desktop')
+  // The artifact id whose read last settled, whether it worked or failed.
+  const [settledFor, setSettledFor] = useState<number | null>(null)
+  // Only the newest read applies, so a slow read of another artifact (the id
+  // in the URL changed) can't overwrite this one or its settledFor.
+  const reads = useRef(0)
 
   const load = useCallback(() => {
-    api.getArtifact(id).then(r => { setArtifact(r.artifact); setVersions(r.versions); setError(null) })
-      .catch(e => setError(e instanceof Error ? e.message : 'Could not load the artifact'))
+    const read = ++reads.current
+    const current = () => read === reads.current
+    api.getArtifact(id).then(r => { if (current()) { setArtifact(r.artifact); setVersions(r.versions); setError(null) } })
+      .catch(e => { if (current()) setError(e instanceof Error ? e.message : 'Could not load the artifact') })
+      .finally(() => { if (current()) setSettledFor(id) })
   }, [id])
   useEffect(load, [load])
   useSSE(artifact?.project_id ?? null, e => {
     if (e.type === 'artifact.updated' && (e.payload as Artifact | undefined)?.id === id) load()
   })
+  // A new version published while the stream was down never arrives as an
+  // event: re-read once the stream is back. A failed first read counts as
+  // settled, so a reconnect retries it.
+  useStreamReconnect(load, settledFor === id)
 
   const latest = artifact?.current_version ?? 0
   const version = Number(params.get('v')) || latest
@@ -331,9 +344,18 @@ function TicketThread({ projectId, taskId }: { projectId: number; taskId: number
   const [comments, setComments] = useState<Comment[]>([])
   const [draft, setDraft] = useState('')
   const [busy, setBusy] = useState(false)
+  // The ticket whose ticket and comments reads last settled (worked or failed).
+  const [settledFor, setSettledFor] = useState<number | null>(null)
+  // Only the newest load applies: the panel isn't keyed per ticket, so an
+  // older ticket's slow read could otherwise answer last.
+  const reads = useRef(0)
   const load = useCallback(() => {
-    api.getTask(taskId).then(setTask).catch(() => setTask(null))
-    api.getComments(taskId).then(setComments).catch(() => setComments([]))
+    const read = ++reads.current
+    const current = () => read === reads.current
+    void Promise.allSettled([
+      api.getTask(taskId).then(t => { if (current()) setTask(t) }, () => { if (current()) setTask(null) }),
+      api.getComments(taskId).then(c => { if (current()) setComments(c) }, () => { if (current()) setComments([]) }),
+    ]).then(() => { if (current()) setSettledFor(taskId) })
   }, [taskId])
   useEffect(load, [load])
   const pending = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
@@ -344,35 +366,14 @@ function TicketThread({ projectId, taskId }: { projectId: number; taskId: number
     if (pending.current !== undefined) return
     pending.current = setTimeout(() => { pending.current = undefined; load() }, RELOAD_COALESCE_MS)
   }
-  // The stream says {"type":"connected"} each time it opens, and events sent
-  // while it was down (a hidden tab lets it go after 30 s) never arrive. live
-  // means this panel's subscription is on a stream that has already said
-  // connected, so the next one is a reconnect and the panel re-reads. This is
-  // the board store's rule (KB architecture/board-store-reconnect-catch-up.md).
-  // null until the panel first subscribes.
-  const live = useRef<boolean | null>(null)
-  // Runs just before useSSE below subscribes, because a component's effects
-  // run in order. The stream is shared, so a panel that joins one that other
-  // views hold (the board store keeps it for 30 s after you leave a board)
-  // never sees its opening connected. If it waited for one, it would skip
-  // the real reconnect. Nothing else on this page subscribes earlier in the
-  // commit that mounts the panel: the page's own subscription is replaced
-  // around it when the artifact arrives. So "someone else is subscribed"
-  // means the stream is already up, or at worst still connecting, which
-  // costs one extra reload. A re-subscribe in the same commit (StrictMode's
-  // re-run) keeps a false: the panel is still waiting for the opening frame.
-  useEffect(() => {
-    live.current = sseSubscriberCount() > 0 && live.current !== false
-  }, [projectId])
   useSSE(projectId, e => {
-    // "connected" names no project or ticket: handle it before the ticket filter.
-    if (e.type === 'connected') {
-      if (live.current) scheduleReload()
-      else live.current = true
-      return
-    }
     if (concernsTask(e, taskId)) scheduleReload()
   })
+  // Comments posted while the stream was down (a hidden tab lets it go after
+  // 30 s) never arrive: reload once it is back, through the same 1 s window,
+  // so a reconnect during a burst of this ticket's events gives one reload.
+  // A connected during the first load is dropped (that load is fresh).
+  useStreamReconnect(scheduleReload, settledFor === taskId)
   const send = async () => {
     if (!draft.trim()) return
     setBusy(true)

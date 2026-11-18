@@ -23,7 +23,15 @@ const api = vi.hoisted(() => ({
 vi.mock('../api/client', () => ({ api }))
 
 const { ArtifactView } = await import('./ArtifactView')
-const { subscribeSSE } = await import('../hooks/useSSE')
+const { HIDDEN_CLOSE_MS, subscribeSSE } = await import('../hooks/useSSE')
+const { resetSession } = await import('../lib/session')
+
+// This tab's visibility. useSSE lets a tab's streams go HIDDEN_CLOSE_MS after it is hidden.
+let visibility: DocumentVisibilityState = 'visible'
+function setVisibility(state: DocumentVisibilityState) {
+  visibility = state
+  document.dispatchEvent(new Event('visibilitychange'))
+}
 
 // The real useSSE, over a fake stream: events reach the page as they would live.
 let sources: FakeEventSource[] = []
@@ -37,6 +45,8 @@ class FakeEventSource {
 beforeAll(() => { vi.stubGlobal('EventSource', FakeEventSource) })
 
 beforeEach(() => {
+  visibility = 'visible'
+  Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => visibility })
   api.getArtifact.mockResolvedValue({ artifact, versions: [] })
   api.artifactActivity.mockResolvedValue([])
   api.getTask.mockResolvedValue({ id: TASK_ID, name: 'Build login', state: 'in_progress' } as Task)
@@ -44,20 +54,41 @@ beforeEach(() => {
   api.addComment.mockResolvedValue({})
 })
 afterEach(() => {
+  // A paused tab resumes, so the next test starts on a visible one.
+  if (visibility !== 'visible') setVisibility('visible')
+  delete (document as { visibilityState?: DocumentVisibilityState }).visibilityState
   vi.useRealTimers()
   vi.clearAllMocks()
+  resetSession()
   sources = []
 })
 
 /** How many times the panel had loaded its ticket when renderPanel returned. */
 let initialLoads = 1
 
-/** Renders the page, waits for the ticket panel's first load, then switches to fake timers. */
-async function renderPanel({ strict = false } = {}) {
+/** Lets pending promise callbacks run, such as the .finally that marks a read settled. */
+async function settle() {
+  await act(async () => { for (let i = 0; i < 50; i++) await Promise.resolve() })
+}
+
+function renderPage({ strict = false } = {}) {
   const router = createMemoryRouter([{ path: '/artifacts/:artifactId', element: <ArtifactView /> }], { initialEntries: ['/artifacts/1'] })
   const page = <RouterProvider router={router} />
-  const view = render(strict ? <StrictMode>{page}</StrictMode> : page)
+  return render(strict ? <StrictMode>{page}</StrictMode> : page)
+}
+
+/** A promise the test resolves or rejects later, to hold a read in flight. */
+function held<T>() {
+  let resolve!: (v: T) => void, reject!: (e: unknown) => void
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej })
+  return { promise, resolve, reject }
+}
+
+/** Renders the page, waits for the ticket panel's first load to settle, then switches to fake timers. */
+async function renderPanel({ strict = false } = {}) {
+  const view = renderPage({ strict })
   await screen.findByRole('link', { name: 'Build login' })
+  await settle()
   // StrictMode runs each mount effect twice, so the panel loads twice.
   initialLoads = strict ? 2 : 1
   expect(api.getTask).toHaveBeenCalledTimes(initialLoads)
@@ -155,14 +186,33 @@ describe('ArtifactView ticket panel live reloads', () => {
   })
 })
 
-describe('ArtifactView ticket panel after a stream reconnect', () => {
-  it('reloads once on each connected after the first, and not on the first', async () => {
-    await renderPanel()
-    // The opening frame of the stream the panel opened: the panel was just read.
-    connect()
-    await advance(5000)
-    expect(reloads()).toBe(0)
 
+// Both handlers on this page use useStreamReconnect: a connected while the
+// view's first load is in flight is dropped, and each one after it re-reads.
+describe('ArtifactView ticket panel after a stream reconnect', () => {
+  it('drops a connected that arrives during its first load', async () => {
+    const task = held<Task>()
+    api.getTask.mockReturnValueOnce(task.promise)
+    renderPage()
+    // The panel is mounted and its ticket read is in flight.
+    await screen.findByRole('textbox', { name: 'Comment' })
+    // Fake timers before the frame, so a reload it wrongly scheduled would run below.
+    vi.useFakeTimers()
+    connect()
+    task.resolve({ id: TASK_ID, name: 'Build login', state: 'in_progress' } as Task)
+    await settle()
+    expect(screen.getByRole('link', { name: 'Build login' })).toBeInTheDocument()
+    await advance(5000)
+    expect(api.getTask).toHaveBeenCalledTimes(1)
+    expect(api.getComments).toHaveBeenCalledTimes(1)
+    // The first load has settled now: the next connected is a reconnect.
+    connect()
+    await advance(1000)
+    expect(api.getTask).toHaveBeenCalledTimes(2)
+  })
+
+  it('reloads once on each connected after its first load', async () => {
+    await renderPanel()
     // A reconnect: what was sent while the stream was down is lost.
     connect()
     await advance(999)
@@ -176,6 +226,19 @@ describe('ArtifactView ticket panel after a stream reconnect', () => {
     connect()
     await advance(1000)
     expect(reloads()).toBe(2)
+  })
+
+  it('a failed first load still counts as settled, so a reconnect retries it', async () => {
+    api.getTask.mockRejectedValueOnce(new Error('offline'))
+    renderPage()
+    await screen.findByRole('textbox', { name: 'Comment' })
+    await settle()
+    expect(screen.queryByRole('link', { name: 'Build login' })).toBeNull()
+    vi.useFakeTimers()
+    connect()
+    await advance(1000)
+    expect(api.getTask).toHaveBeenCalledTimes(2)
+    expect(screen.getByRole('link', { name: 'Build login' })).toBeInTheDocument()
   })
 
   it('a reconnect during a burst of its own ticket events gives one reload', async () => {
@@ -217,13 +280,107 @@ describe('ArtifactView ticket panel after a stream reconnect', () => {
     }
   })
 
-  it('StrictMode re-running the subscription does not make the opening frame a reconnect', async () => {
-    await renderPanel({ strict: true })
-    connect()
-    await advance(5000)
-    expect(reloads()).toBe(0)
+  it('a panel opened in a background tab with no leader catches up on its first connected after being shown', async () => {
+    // The tab has been hidden long enough to let its stream go. No tab holds
+    // one (jsdom has no Web Locks, so this tab would open its own), and
+    // nothing opens one while it is paused.
+    vi.useFakeTimers()
+    setVisibility('hidden')
+    vi.advanceTimersByTime(HIDDEN_CLOSE_MS)
+    vi.useRealTimers()
+    await renderPanel()
+    expect(sources).toHaveLength(0)
+    // Shown: a new stream opens, and its connected is the panel's first.
+    setVisibility('visible')
+    expect(sources).toHaveLength(1)
     connect()
     await advance(1000)
     expect(reloads()).toBe(1)
+    expect(api.getComments).toHaveBeenCalledTimes(2)
+    // The page's artifact catches up too.
+    expect(api.getArtifact).toHaveBeenCalledTimes(2)
+  })
+
+  it('StrictMode re-running the subscription still gives one reload per reconnect', async () => {
+    await renderPanel({ strict: true })
+    connect()
+    await advance(5000)
+    expect(reloads()).toBe(1)
+    connect()
+    await advance(1000)
+    expect(reloads()).toBe(2)
+  })
+})
+
+/** Renders the page and waits for the artifact's first read to settle. */
+async function renderArtifact() {
+  const view = renderPage()
+  await screen.findByText('Login mockup')
+  await settle()
+  return view
+}
+
+describe('ArtifactView re-reads the artifact after a stream reconnect', () => {
+  it('a connected during the first read causes no extra request', async () => {
+    const read = held<{ artifact: Artifact; versions: [] }>()
+    api.getArtifact.mockReturnValueOnce(read.promise)
+    renderPage()
+    expect(sources).toHaveLength(1)
+    // The opening frame of the page's new stream, while its read is in flight.
+    connect()
+    read.resolve({ artifact, versions: [] })
+    await screen.findByText('Login mockup')
+    await settle()
+    expect(api.getArtifact).toHaveBeenCalledTimes(1)
+  })
+
+  it('a connected after the first read settles re-reads the artifact exactly once', async () => {
+    await renderArtifact()
+    expect(api.getArtifact).toHaveBeenCalledTimes(1)
+    connect()
+    expect(api.getArtifact).toHaveBeenCalledTimes(2)
+    await settle()
+    expect(api.getArtifact).toHaveBeenCalledTimes(2)
+    connect()
+    expect(api.getArtifact).toHaveBeenCalledTimes(3)
+  })
+
+  it('shows a version published while the stream was down', async () => {
+    await renderArtifact()
+    api.getArtifact.mockResolvedValue({ artifact: { ...artifact, title: 'Login mockup v2', current_version: 2 }, versions: [] })
+    connect()
+    expect(await screen.findByText('Login mockup v2')).toBeInTheDocument()
+  })
+
+  it('a page that mounts on an already-open stream re-reads on the next connected', async () => {
+    const unsubscribe = subscribeSSE('/api/events', () => {})
+    try {
+      connect() // the opening frame, heard before this page mounted
+      await renderArtifact()
+      expect(sources).toHaveLength(1)
+      expect(api.getArtifact).toHaveBeenCalledTimes(1)
+      connect()
+      expect(api.getArtifact).toHaveBeenCalledTimes(2)
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  it('a failed first read still counts as settled, so a reconnect retries it', async () => {
+    api.getArtifact.mockRejectedValueOnce(new Error('Could not reach AMP'))
+    renderPage()
+    await screen.findByText('Could not reach AMP')
+    await settle()
+    connect()
+    expect(await screen.findByText('Login mockup')).toBeInTheDocument()
+    expect(api.getArtifact).toHaveBeenCalledTimes(2)
+  })
+
+  it('ordinary events are not treated as a reconnect', async () => {
+    await renderArtifact()
+    emit('task.updated', { id: TASK_ID, state: 'in_progress' })
+    emit('artifact.updated', { id: 2, task_id: 12 })
+    await settle()
+    expect(api.getArtifact).toHaveBeenCalledTimes(1)
   })
 })
