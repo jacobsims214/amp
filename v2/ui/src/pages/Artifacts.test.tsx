@@ -1,7 +1,9 @@
-import { render, screen, within } from '@testing-library/react'
+import { act, cleanup, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { createMemoryRouter, RouterProvider, useLocation } from 'react-router-dom'
-import { describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import { subscribeSSE } from '../hooks/useSSE'
+import { resetSession } from '../lib/session'
 import type { Artifact } from '../types'
 
 const day = 86_400_000
@@ -16,16 +18,57 @@ const items = [
   art(3, { title: 'Spec', kind: 'markdown', keep: true, expires_at: null }),
 ]
 
+// The list read: counts calls, and a test can hold it in flight (listGate) or fail it (listFails).
+let listed = items
+let listReads = 0
+let listGate: Promise<void> | null = null
+let listFails = 0
+async function listArtifacts(): Promise<Artifact[]> {
+  listReads++
+  const gate = listGate
+  if (gate) await gate
+  if (listFails > 0) { listFails--; throw new Error('amp-api is down') }
+  return listed
+}
 const keepSpy = vi.fn<(id: number, keep: boolean) => Promise<unknown>>(() => Promise.resolve({}))
 vi.mock('../api/client', () => ({
-  api: { listArtifacts: () => Promise.resolve(items), artifactContentUrl: () => '/x', keepArtifact: (id: number, keep: boolean) => keepSpy(id, keep) },
+  api: { listArtifacts: () => listArtifacts(), artifactContentUrl: () => '/x', keepArtifact: (id: number, keep: boolean) => keepSpy(id, keep) },
 }))
-vi.mock('../hooks/useSSE', () => ({ useSSE: () => {} }))
 vi.mock('../components/ProjectNav', () => ({
   ProjectNav: ({ rightSlot }: { rightSlot?: React.ReactNode }) => <div>{rightSlot}</div>,
 }))
 
 const { Artifacts } = await import('./Artifacts')
+
+// The real useSSE, over a fake stream: frames reach the page as they would live.
+// jsdom has no navigator.locks, so useSSE opens one stream per tab.
+let sources: FakeEventSource[] = []
+class FakeEventSource {
+  constructor() { sources.push(this) }
+  onmessage: ((e: { data: string }) => void) | null = null
+  onerror: (() => void) | null = null
+  readyState = 1
+  close() {}
+}
+beforeAll(() => { vi.stubGlobal('EventSource', FakeEventSource) })
+afterEach(() => { listed = items; listReads = 0; listGate = null; listFails = 0; sources = []; resetSession() })
+afterAll(() => { vi.unstubAllGlobals() })
+
+function send(data: unknown) {
+  const source = sources.at(-1)!
+  act(() => source.onmessage!({ data: JSON.stringify(data) }))
+}
+/** The server's first frame on every new stream. It carries no project. */
+const connect = () => send({ type: 'connected' })
+/** Let pending reads and their state updates (the settled flag included) finish. */
+const settle = () => act(async () => { for (let i = 0; i < 50; i++) await Promise.resolve() })
+/** Hold the next list read in flight until the returned function is called. */
+function holdReads(): () => void {
+  let release!: () => void
+  listGate = new Promise(r => { release = r })
+  return () => { listGate = null; release() }
+}
+const published = art(4, { title: 'Published while away' })
 
 function Where() {
   const loc = useLocation()
@@ -109,5 +152,87 @@ describe('Artifacts filters', () => {
     await userEvent.click(screen.getByText('Clear filters'))
     expect(url()).toBe('/project/3/artifacts')
     expect(screen.getByText('3 of 3')).toBeInTheDocument()
+  })
+})
+
+describe('Artifacts after a stream reconnect', () => {
+  it('drops a connected that arrives while the first read is in flight', async () => {
+    const release = holdReads()
+    renderAt('/project/3/artifacts')
+    expect(listReads).toBe(1)
+    connect() // the new stream's opening frame: the read in flight is already fresh
+    expect(listReads).toBe(1)
+    release()
+    expect(await screen.findByText('Login mockup')).toBeInTheDocument()
+    await settle()
+    expect(listReads).toBe(1) // dropped, not saved for later
+  })
+
+  it('re-reads the list exactly once on each connected after the first read settles', async () => {
+    renderAt('/project/3/artifacts')
+    expect(await screen.findByText('Login mockup')).toBeInTheDocument()
+    await settle()
+    expect(listReads).toBe(1)
+
+    // Published while the stream was down: no artifact.updated ever arrives.
+    listed = [...items, published]
+    const release = holdReads()
+    connect()
+    expect(listReads).toBe(2)
+    // A quiet re-read: the list stays on screen while it is in flight.
+    expect(screen.getByText('Login mockup')).toBeInTheDocument()
+    release()
+    expect(await screen.findByText('Published while away')).toBeInTheDocument()
+    await settle()
+    expect(listReads).toBe(2)
+
+    connect()
+    expect(listReads).toBe(3)
+    await settle()
+    expect(listReads).toBe(3)
+  })
+
+  it('a page that mounts on a stream another view holds re-reads on the first connected it sees', async () => {
+    // Another view opened the stream and heard its opening frame before this page mounted.
+    const unsubscribe = subscribeSSE('/api/events', () => {})
+    try {
+      connect()
+      renderAt('/project/3/artifacts')
+      expect(await screen.findByText('Login mockup')).toBeInTheDocument()
+      await settle()
+      expect(sources).toHaveLength(1)
+      expect(listReads).toBe(1)
+
+      listed = [...items, published]
+      connect()
+      expect(listReads).toBe(2)
+      expect(await screen.findByText('Published while away')).toBeInTheDocument()
+      await settle()
+      expect(listReads).toBe(2)
+    } finally {
+      cleanup()
+      unsubscribe()
+    }
+  })
+
+  it('retries a failed first read on the next connected', async () => {
+    listFails = 1
+    renderAt('/project/3/artifacts')
+    expect(await screen.findByText('No artifacts yet')).toBeInTheDocument()
+    await settle()
+    connect()
+    expect(listReads).toBe(2)
+    expect(await screen.findByText('Login mockup')).toBeInTheDocument()
+  })
+
+  it('re-reads on artifact.updated, and not on other events', async () => {
+    renderAt('/project/3/artifacts')
+    expect(await screen.findByText('Login mockup')).toBeInTheDocument()
+    await settle()
+    send({ type: 'task.updated', project_id: 3 })
+    send({ type: 'artifact.updated', project_id: 9 })
+    expect(listReads).toBe(1)
+    send({ type: 'artifact.updated', project_id: 3 })
+    expect(listReads).toBe(2)
   })
 })

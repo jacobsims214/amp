@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router-dom'
 import { Loader2 } from 'lucide-react'
 import { api } from '../api/client'
 import { useSSE } from '../hooks/useSSE'
+import { useStreamReconnect } from '../hooks/useStreamReconnect'
 import { ProjectNav } from '../components/ProjectNav'
 import { ArtifactKindIcon, ArtifactStatusTag } from '../components/artifacts/ArtifactBits'
 import { useSearchParamState, usePatchSearchParams, type ParamCodec } from '../hooks/useSearchParamState'
@@ -48,9 +49,16 @@ export function Artifacts() {
   const [q, setQ] = useSearchParamState('q', qParam)
   const patch = usePatchSearchParams()
   const filtered = filter !== 'all' || kind !== 'all' || expiry !== 'all' || sort !== 'status' || q.trim() !== ''
-  const load = useCallback(() => { api.listArtifacts(pid).then(setList).catch(() => setList([])) }, [pid])
+  // The project whose list read last settled, success or failure: a reconnect
+  // before that is the new stream's opening frame, and the read in flight is fresh.
+  const [loadedFor, setLoadedFor] = useState<number | null>(null)
+  const load = useCallback(() => {
+    api.listArtifacts(pid).then(setList).catch(() => setList([])).finally(() => setLoadedFor(pid))
+  }, [pid])
   useEffect(load, [load])
   useSSE(pid, e => { if (e.type === 'artifact.updated') load() })
+  // Artifacts published while the stream was down (a hidden tab, a dropped network) send no event: re-read.
+  useStreamReconnect(load, loadedFor === pid)
 
   const shown = useMemo(() => {
     const rank: Record<ArtifactStatus, number> = { in_review: 0, changes_requested: 1, approved: 2 }
