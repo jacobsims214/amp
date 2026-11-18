@@ -1089,7 +1089,14 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 	case "activity":
 		since := r.URL.Query().Get("since")
 		until := r.URL.Query().Get("until")
-		activity, err := h.repo.GetProjectActivity(r.Context(), projectID, since, until, 0)
+		// ?limit=N returns at most the newest N rows (the repository caps N
+		// at 500). A missing or unparsable limit, an overflowing one
+		// included, is 0: every row, as before the param existed.
+		limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+		if err != nil {
+			limit = 0
+		}
+		activity, err := h.repo.GetProjectActivity(r.Context(), projectID, since, until, limit)
 		if err != nil {
 			jsonErr(w, err, 500)
 			return
