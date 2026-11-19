@@ -6,6 +6,7 @@ import { Notice, Pill, SecretReveal, When } from './admin'
 import { dangerBtnCls, errMsg, fieldCls, primaryBtnCls, quietBtnCls, smallSelectCls } from '../lib/adminStyles'
 import { labelCls } from './CrudModal'
 import { stoppedAuditStreams } from '../lib/audit'
+import { useVisibleInterval } from '../hooks/useVisibleInterval'
 
 // Webhooks for a project (project owners), an org (org admins), or the
 // whole instance (global admins: audit entries only, all of them, the SIEM
@@ -175,13 +176,14 @@ export function WebhookForm({ initial, instance, submitLabel, onSubmit, onCancel
 function Deliveries({ webhookId }: { webhookId: number }) {
   const [list, setList] = useState<WebhookDelivery[] | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // Each bump reloads; the hook skips bumps while the tab is hidden.
+  const [refresh, setRefresh] = useState(0)
+  useVisibleInterval(() => setRefresh(n => n + 1), 4000)
   useEffect(() => {
     let live = true
-    const load = () => api.listDeliveries(webhookId, 20).then(d => { if (live) setList(d) }).catch(e => { if (live) setError(errMsg(e, 'Failed to load')) })
-    load()
-    const t = setInterval(load, 4000)
-    return () => { live = false; clearInterval(t) }
-  }, [webhookId])
+    api.listDeliveries(webhookId, 20).then(d => { if (live) setList(d) }).catch(e => { if (live) setError(errMsg(e, 'Failed to load')) })
+    return () => { live = false }
+  }, [webhookId, refresh])
   if (error) return <p className="text-xs text-danger-ink">{error}</p>
   if (!list) return <Loader2 size={13} className="text-primary animate-spin" />
   if (list.length === 0) return <p className="text-xs text-ink-3">No deliveries yet. Send a test to try it.</p>

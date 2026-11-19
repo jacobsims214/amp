@@ -1,7 +1,7 @@
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Session } from './Session'
 import { AuthContext } from '../contexts/auth-context'
 import { RemoteProvider } from '../remote/RemoteProvider'
@@ -699,6 +699,83 @@ describe('Session page while amp-relay is down', () => {
     expect(screen.queryByRole('button', { name: 'Try now' })).toBeNull()
     await new Promise(r => setTimeout(r, 1_500))
     expect(calls.n).toBe(1)
+  })
+
+  // A hidden tab sends no retries during an outage (#2549). Each getSession is one
+  // GET /api/sessions/:id on the real transport.
+  describe('in a hidden tab', () => {
+    const realSetTimeout = globalThis.setTimeout
+    let visibility: DocumentVisibilityState = 'visible'
+    const setVisibility = (state: DocumentVisibilityState) => act(() => {
+      visibility = state
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
+    const advance = (ms: number) => act(() => vi.advanceTimersByTimeAsync(ms))
+    // Give any load that was started time to finish.
+    const settle = () => act(() => new Promise(r => realSetTimeout(r, 50)))
+
+    beforeEach(() => {
+      // Fake time still moves with real time, so findBy and waitFor keep working.
+      vi.useFakeTimers({ shouldAdvanceTime: true, toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
+      visibility = 'visible'
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => visibility })
+    })
+    afterEach(() => {
+      cleanup()
+      vi.useRealTimers()
+      // Drop the override so jsdom's own getter shows through again.
+      delete (document as { visibilityState?: DocumentVisibilityState }).visibilityState
+    })
+
+    it('holds the retry while hidden and tries exactly once, straight away, when shown', async () => {
+      const { deps, calls } = outage(2, () => new RelayError(503, 'relay_down', RELAY_DOWN_MESSAGE))
+      renderSession(deps)
+      await screen.findByText('Waiting to open the session')
+      expect(calls.n).toBe(1)
+      await setVisibility('hidden')
+      // Two minutes hidden would be about seven retries on the 1 s → 30 s backoff: none is sent.
+      await advance(120_000)
+      await settle()
+      expect(calls.n).toBe(1)
+      expect(screen.getByText('Waiting to open the session')).toBeInTheDocument()
+
+      await setVisibility('visible')
+      expect(calls.n).toBe(2) // at once, not after a backoff
+      await settle()
+      expect(calls.n).toBe(2)
+      // Hiding and showing again while the next retry is pending adds nothing.
+      await setVisibility('hidden')
+      await setVisibility('visible')
+      expect(calls.n).toBe(2)
+      // The backoff started over: the next retry comes after about 1 s (0.8–1.2 s), not 2 s or more.
+      await advance(1_300)
+      expect(await screen.findByText('Laptop online')).toBeInTheDocument()
+      expect(calls.n).toBe(3)
+    })
+
+    it('coming back online while hidden waits for the tab to be shown', async () => {
+      const { deps, calls } = outage(1, () => new TypeError('Failed to fetch'))
+      renderSession(deps)
+      await screen.findByText('Waiting to open the session')
+      await setVisibility('hidden')
+      await act(() => { window.dispatchEvent(new Event('online')) })
+      await advance(60_000)
+      await settle()
+      expect(calls.n).toBe(1)
+      await setVisibility('visible')
+      expect(calls.n).toBe(2)
+      expect(await screen.findByText('Laptop online')).toBeInTheDocument()
+    })
+
+    it('a visible tab keeps retrying on the backoff', async () => {
+      const { deps, calls } = outage(3, () => new RelayError(503, 'relay_down', RELAY_DOWN_MESSAGE))
+      renderSession(deps)
+      await screen.findByText('Waiting to open the session')
+      // About 1 s, then about 2 s, then about 4 s: three tries after the first are due within 9 s.
+      await advance(9_000)
+      expect(await screen.findByText('Laptop online')).toBeInTheDocument()
+      expect(calls.n).toBe(4)
+    })
   })
 
   it('says remote control is unavailable instead of a raw 503', async () => {

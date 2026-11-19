@@ -1,13 +1,14 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { Check, ExternalLink, Loader2, Monitor, Smartphone, Tablet, Undo2 } from 'lucide-react'
 import { api } from '../api/client'
 import { useSSE } from '../hooks/useSSE'
+import { useStreamReconnect } from '../hooks/useStreamReconnect'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Markdown } from '../components/ui/Markdown'
 import { ArtifactKindIcon, ArtifactStatusTag } from '../components/artifacts/ArtifactBits'
 import { KIND_LABEL, expiresIn } from '../lib/artifacts'
-import type { Artifact, ArtifactVersion, AuditEntry, Comment, Task } from '../types'
+import type { Artifact, ArtifactVersion, AuditEntry, Comment, SSEEvent, Task } from '../types'
 import { projectLink } from '../lib/projectLink'
 
 const VIEWPORTS = [
@@ -34,15 +35,27 @@ export function ArtifactView() {
   const [versions, setVersions] = useState<ArtifactVersion[]>([])
   const [error, setError] = useState<string | null>(null)
   const [viewport, setViewport] = useState<Viewport>('desktop')
+  // The artifact id whose read last settled, whether it worked or failed.
+  const [settledFor, setSettledFor] = useState<number | null>(null)
+  // Only the newest read applies, so a slow read of another artifact (the id
+  // in the URL changed) can't overwrite this one or its settledFor.
+  const reads = useRef(0)
 
   const load = useCallback(() => {
-    api.getArtifact(id).then(r => { setArtifact(r.artifact); setVersions(r.versions); setError(null) })
-      .catch(e => setError(e instanceof Error ? e.message : 'Could not load the artifact'))
+    const read = ++reads.current
+    const current = () => read === reads.current
+    api.getArtifact(id).then(r => { if (current()) { setArtifact(r.artifact); setVersions(r.versions); setError(null) } })
+      .catch(e => { if (current()) setError(e instanceof Error ? e.message : 'Could not load the artifact') })
+      .finally(() => { if (current()) setSettledFor(id) })
   }, [id])
   useEffect(load, [load])
   useSSE(artifact?.project_id ?? null, e => {
     if (e.type === 'artifact.updated' && (e.payload as Artifact | undefined)?.id === id) load()
   })
+  // A new version published while the stream was down never arrives as an
+  // event: re-read once the stream is back. A failed first read counts as
+  // settled, so a reconnect retries it.
+  useStreamReconnect(load, settledFor === id)
 
   const latest = artifact?.current_version ?? 0
   const version = Number(params.get('v')) || latest
@@ -301,6 +314,29 @@ function ReviewPanel({ artifact, version, selected, onReviewed }: {
   )
 }
 
+const TICKET_EVENTS = new Set<SSEEvent['type']>(['comment.added', 'task.updated', 'task.blocked', 'task.unblocked', 'task.completed', 'artifact.updated'])
+
+/** Whether a live event changes what the ticket panel for taskId shows. Every
+ *  tab gets every event in the project, so anything else is ignored. */
+function concernsTask(e: SSEEvent, taskId: number): boolean {
+  if (!TICKET_EVENTS.has(e.type)) return false
+  const p = e.payload as Record<string, unknown> | null | undefined
+  if (p == null || typeof p !== 'object') return false
+  // task.* events carry the ticket itself. In a comment or an artifact, `id`
+  // is the comment's or artifact's own id, so only task_id names the ticket.
+  if (e.type.startsWith('task.') && typeof p.id === 'number') return p.id === taskId
+  // A comment, an artifact, or one of the server's signals about a single
+  // ticket ({task_id, deleted}, {task_id, run}).
+  if (p.task_id === taskId) return true
+  // Several tickets at once: a story or epic deleted ({task_ids}), tickets restored ({restored}).
+  return [p.task_ids, p.restored].some(ids => Array.isArray(ids) && ids.includes(taskId))
+}
+
+/** Events for the ticket that arrive in a burst (an agent comments, then
+ *  completes) cause one reload, at most one per this long. A stream reconnect
+ *  joins the same reload. */
+const RELOAD_COALESCE_MS = 1000
+
 /** The ticket the artifact belongs to, and its comments: publishes, reviews
  *  and discussion all land here, so agents read them too. */
 function TicketThread({ projectId, taskId }: { projectId: number; taskId: number }) {
@@ -308,18 +344,41 @@ function TicketThread({ projectId, taskId }: { projectId: number; taskId: number
   const [comments, setComments] = useState<Comment[]>([])
   const [draft, setDraft] = useState('')
   const [busy, setBusy] = useState(false)
+  // The ticket whose ticket and comments reads last settled (worked or failed).
+  const [settledFor, setSettledFor] = useState<number | null>(null)
+  // Only the newest load applies: the panel isn't keyed per ticket, so an
+  // older ticket's slow read could otherwise answer last.
+  const reads = useRef(0)
   const load = useCallback(() => {
-    api.getTask(taskId).then(setTask).catch(() => setTask(null))
-    api.getComments(taskId).then(setComments).catch(() => setComments([]))
+    const read = ++reads.current
+    const current = () => read === reads.current
+    void Promise.allSettled([
+      api.getTask(taskId).then(t => { if (current()) setTask(t) }, () => { if (current()) setTask(null) }),
+      api.getComments(taskId).then(c => { if (current()) setComments(c) }, () => { if (current()) setComments([]) }),
+    ]).then(() => { if (current()) setSettledFor(taskId) })
   }, [taskId])
   useEffect(load, [load])
+  const pending = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const cancelPending = useCallback(() => { clearTimeout(pending.current); pending.current = undefined }, [])
+  // A scheduled reload is for this ticket: drop it when the ticket changes or the panel goes.
+  useEffect(() => cancelPending, [taskId, cancelPending])
+  const scheduleReload = () => {
+    if (pending.current !== undefined) return
+    pending.current = setTimeout(() => { pending.current = undefined; load() }, RELOAD_COALESCE_MS)
+  }
   useSSE(projectId, e => {
-    if (['comment.added', 'task.updated', 'task.blocked', 'task.unblocked', 'task.completed', 'artifact.updated'].includes(e.type)) load()
+    if (concernsTask(e, taskId)) scheduleReload()
   })
+  // Comments posted while the stream was down (a hidden tab lets it go after
+  // 30 s) never arrive: reload once it is back, through the same 1 s window,
+  // so a reconnect during a burst of this ticket's events gives one reload.
+  // A connected during the first load is dropped (that load is fresh).
+  useStreamReconnect(scheduleReload, settledFor === taskId)
   const send = async () => {
     if (!draft.trim()) return
     setBusy(true)
-    try { await api.addComment(taskId, draft.trim()); setDraft(''); load() } finally { setBusy(false) }
+    // Reloading now covers any reload still scheduled.
+    try { await api.addComment(taskId, draft.trim()); setDraft(''); cancelPending(); load() } finally { setBusy(false) }
   }
   return (
     <div className="px-5 py-4 border-t border-line grid gap-3">

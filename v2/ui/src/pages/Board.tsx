@@ -3,7 +3,7 @@ import { useParams } from 'react-router-dom'
 import { useFocusParam } from '../hooks/useFocusParam'
 import { RefreshCw, RotateCw, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users, ListChecks } from 'lucide-react'
 import { useBoardData } from '../hooks/useBoardData'
-import { useSSE } from '../hooks/useSSE'
+import { useSSEConnected } from '../hooks/useSSE'
 import { useReceiptSummary } from '../hooks/useReceiptSummary'
 import { useAuth } from '../hooks/useAuth'
 import { TaskCard } from '../components/TaskCard'
@@ -92,7 +92,9 @@ export function Board() {
   const [collapsedEpics, setCollapsedEpics] = useState<Set<number>>(new Set())
   const [collapsedStories, setCollapsedStories] = useState<Set<number>>(new Set())
   const [hideCompleted, setHideCompleted] = useSearchParamState('done', HIDE_DONE)
-  const [liveStatus, setLiveStatus] = useState<'connected' | 'disconnected'>('disconnected')
+  // The shared stream's state, so a board opened on a stream another view
+  // holds (Mission's board store lingers for 30 s) shows Live at once.
+  const live = useSSEConnected()
 
   // Project members: names for owners/creators, the owner filter, and assignment.
   const [members, setMembers] = useState<ProjectMember[]>([])
@@ -164,10 +166,6 @@ export function Board() {
       }).map(e => e.id)
     )
   }, [epics, tasks])
-
-  useSSE(pid, (event) => {
-    if (event.type === 'connected') setLiveStatus('connected')
-  })
 
   useEffect(() => {
     if (openEpicMenu === null) return
@@ -390,12 +388,12 @@ export function Board() {
             )}
 
             {/* Live status */}
-            <div className={`flex items-center gap-1.5 amp-num text-[11px] ${liveStatus === 'connected' ? 'text-success-ink' : 'text-ink-3'}`}>
-              {liveStatus === 'connected'
+            <div className={`flex items-center gap-1.5 amp-num text-[11px] ${live ? 'text-success-ink' : 'text-ink-3'}`}>
+              {live
                 ? <span className="w-1.5 h-1.5 bg-success" />
                 : <WifiOff size={11} />
               }
-              <span className="hidden sm:inline">{liveStatus === 'connected' ? 'Live' : 'Connecting…'}</span>
+              <span className="hidden sm:inline">{live ? 'Live' : 'Connecting…'}</span>
             </div>
 
             <button

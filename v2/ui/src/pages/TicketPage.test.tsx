@@ -7,6 +7,8 @@ import { createMemoryRouter, RouterProvider, useLocation } from 'react-router-do
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { TicketPage } from './TicketPage'
 import { TaskDrawer } from '../components/TaskDrawer'
+import { subscribeSSE } from '../hooks/useSSE'
+import { resetSession } from '../lib/session'
 import { ticketLanding } from '../lib/ticketRef'
 import type { Task } from '../types'
 
@@ -32,7 +34,8 @@ const server = setupServer(
 let sources: FakeEventSource[] = []
 class FakeEventSource { constructor() { sources.push(this) } onmessage: ((e: { data: string }) => void) | null = null; onerror = null; addEventListener() {} removeEventListener() {} close() {} }
 beforeAll(() => { vi.stubGlobal('EventSource', FakeEventSource); server.listen() })
-afterEach(() => { cleanup(); sources = []; server.resetHandlers(); status = 200 })
+// resetSession: the 401 test ends the session, which would refuse every later test's reads.
+afterEach(() => { cleanup(); sources = []; server.resetHandlers(); status = 200; resetSession() })
 afterAll(() => server.close())
 import { cleanup } from '@testing-library/react'
 
@@ -116,6 +119,83 @@ describe('live ticket page', () => {
     server.use(http.get('*/api/tasks/34', () => HttpResponse.error()))
     renderAt('/project/2/ticket/34')
     expect(await screen.findByText(/didn't load/)).toBeInTheDocument()
+  })
+})
+
+// #2530: a tab hidden for 30 s lets its /api/events stream go (#1569), and the
+// server sends {"type":"connected"} on every new stream. The page re-reads the
+// ticket on a connected that arrives after its read has settled.
+describe('catching up after the live stream reconnects', () => {
+  // Counts this ticket's reads. The first read waits for `gate` if one is given.
+  function countReads(gate?: Promise<void>) {
+    const c = { reads: 0, name: 'Confirm targets' }
+    server.use(http.get('*/api/tasks/34', async () => {
+      c.reads++
+      if (gate) await gate
+      return HttpResponse.json({ task: task({ name: c.name }) })
+    }))
+    return c
+  }
+  const send = (event: object) => act(() => { sources[sources.length - 1].onmessage?.({ data: JSON.stringify(event) }) })
+  const idle = () => act(async () => { await new Promise(r => setTimeout(r, 30)) })
+
+  it('re-reads the ticket once for a connected after the first read has settled, keeping it on screen', async () => {
+    const c = countReads()
+    renderAt('/project/2/ticket/34')
+    await screen.findByRole('heading', { name: 'Confirm targets' })
+    await idle()
+    expect(c.reads).toBe(1)
+    send({ type: 'task.updated', project_id: 2, payload: task({ id: 99 }) }) // another ticket's event is not a reconnect
+    await idle()
+    expect(c.reads).toBe(1)
+
+    c.name = 'Renamed while the tab was hidden'
+    send({ type: 'connected' })
+    expect(screen.queryByTestId('ticket-page-loading')).toBeNull()
+    expect(await screen.findByRole('heading', { name: 'Renamed while the tab was hidden' })).toBeInTheDocument()
+    await idle()
+    expect(c.reads).toBe(2)
+
+    send({ type: 'connected' }) // each reconnect catches up once
+    await idle()
+    expect(c.reads).toBe(3)
+  })
+
+  it('a connected while the first read is in flight causes no extra read', async () => {
+    let release: () => void = () => {}
+    const c = countReads(new Promise<void>(r => { release = r }))
+    renderAt('/project/2/ticket/34')
+    await idle()
+    expect(c.reads).toBe(1)
+    send({ type: 'connected' }) // the new stream's opening frame, during the first read
+    await act(async () => { release() })
+    expect(await screen.findByRole('heading', { name: 'Confirm targets' })).toBeInTheDocument()
+    await idle()
+    expect(c.reads).toBe(1)
+  })
+
+  it('a page that mounts on an already-open stream re-reads on its first connected', async () => {
+    // Another view (or the board store's 30 s linger) already holds the stream,
+    // and its opening frame came before this page mounted.
+    const other = subscribeSSE('/api/events', () => {})
+    try {
+      send({ type: 'connected' })
+      const c = countReads()
+      renderAt('/project/2/ticket/34')
+      await screen.findByRole('heading', { name: 'Confirm targets' })
+      await idle()
+      expect(sources).toHaveLength(1) // joined the open stream
+      expect(c.reads).toBe(1)
+
+      c.name = 'Renamed while the tab was hidden'
+      send({ type: 'connected' }) // the first connected this page sees is a real reconnect
+      expect(await screen.findByRole('heading', { name: 'Renamed while the tab was hidden' })).toBeInTheDocument()
+      await idle()
+      expect(c.reads).toBe(2)
+    } finally {
+      cleanup()
+      other()
+    }
   })
 })
 

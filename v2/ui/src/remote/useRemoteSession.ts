@@ -63,14 +63,18 @@ export function useRemoteSession(sessionId: string) {
   // A failure that can pass (the relay down or restarting, a network blip, a 5xx) is retried with
   // backoff until it works, so a page opened during a relay outage opens the session by itself once
   // the relay is back (#2455), as a page that was already open does. 404, 410 and other refusals are
-  // final.
+  // final. A retry that comes due while the tab is hidden is held, not sent, and runs once as soon as
+  // the tab is shown again (#2549): background tabs make no loads, even during a relay outage.
   useEffect(() => {
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | undefined
+    /** A retry came due while the tab was hidden: it runs when the tab is shown. */
+    let held = false
     let backoff = LOAD_RETRY_FIRST_MS
     const load = async () => {
       clearTimeout(timer)
       timer = undefined // set again only while a retry is pending
+      held = false
       try {
         const detail = await transport.getSession(sessionId)
         const [pin, deviceId] = await Promise.all([crypto.harnessPin(detail.harness_id), crypto.deviceId()])
@@ -93,21 +97,41 @@ export function useRemoteSession(sessionId: string) {
           const retrying = isTransientLoadError(e)
           setPhase({ kind: 'error', message, retrying })
           if (retrying) {
-            timer = setTimeout(load, backoff * (0.8 + Math.random() * 0.4))
+            timer = setTimeout(retry, backoff * (0.8 + Math.random() * 0.4))
             backoff = Math.min(backoff * 2, LOAD_RETRY_MAX_MS)
           }
         }
       }
     }
-    // Back online while a retry is pending: try at once instead of waiting out the backoff.
+    // A retry is due: load now if the tab is visible, otherwise hold it for when it is shown.
+    const retry = () => {
+      clearTimeout(timer)
+      timer = undefined
+      if (document.visibilityState === 'hidden') held = true
+      else void load()
+    }
+    // Back online while a retry is pending: try at once instead of waiting out the backoff (held
+    // instead, while the tab is hidden).
     const onOnline = () => {
       if (cancelled || timer === undefined) return
+      backoff = LOAD_RETRY_FIRST_MS
+      retry()
+    }
+    // Shown again with a retry held: try once, straight away, with the backoff starting over.
+    const onVisibility = () => {
+      if (cancelled || !held || document.visibilityState === 'hidden') return
       backoff = LOAD_RETRY_FIRST_MS
       void load()
     }
     window.addEventListener('online', onOnline)
+    document.addEventListener('visibilitychange', onVisibility)
     void load()
-    return () => { cancelled = true; clearTimeout(timer); window.removeEventListener('online', onOnline) }
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+      window.removeEventListener('online', onOnline)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
   }, [sessionId, transport, crypto, loads])
 
   const paired = useCallback(() => setLoads(n => n + 1), [])

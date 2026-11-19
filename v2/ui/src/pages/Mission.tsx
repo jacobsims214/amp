@@ -12,7 +12,7 @@
  * Nothing here is an action: clicking a ticket opens it in the drawer, and
  * answering, merging, approving and doing happen in My work.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { useFocusParam } from '../hooks/useFocusParam'
 import { FocusNotFound } from '../components/FocusNotFound'
@@ -43,6 +43,7 @@ import { needsMerge } from '../lib/merge'
 import { countsSummary, kindSummary, panelOrder, personLink, ticketsWaitingOn } from '../lib/waitingPanel'
 import { Skeleton, SkeletonReadouts, SkeletonRegion } from '../components/ui/Skeleton'
 import { useDelayedFlag } from '../hooks/useDelayedFlag'
+import { useVisibleInterval } from '../hooks/useVisibleInterval'
 
 function ago(iso?: string | null): string {
   if (!iso) return ''
@@ -196,9 +197,17 @@ function collapseRuns(out: FeedItem[], it: FeedItem): FeedItem[] {
   return out
 }
 
+/** Mission's background loads, which wait for a visible tab (see `held` below). */
+type BackgroundLoad = 'activity' | 'counts' | 'waiting'
+const isHidden = () => document.visibilityState === 'hidden'
+
 export function Mission() {
   const { projectId } = useParams<{ projectId: string }>()
   const pid = Number(projectId)
+  // A hidden tab makes no background loads. A load that comes due while the
+  // tab is hidden is held here instead, and runs once when the tab is visible
+  // again. Every run of a load clears it, whatever started the run.
+  const held = useRef(new Set<BackgroundLoad>())
   const { epics, stories, tasks, loading, error, refresh, applyTask } = useBoardData(pid)
   const { members, myAccess, openReassign, people } = useProjectPeople(pid)
   const approval = usePlanApproval(pid)
@@ -215,11 +224,15 @@ export function Mission() {
   const [waitingFor, setWaitingFor] = useState<{ pid: number; people: PersonWaiting[] } | null>(null)
   const waiting = useMemo(() => (waitingFor?.pid === pid ? waitingFor.people : []), [waitingFor, pid])
   const loadWaiting = useCallback(() => {
+    held.current.delete('waiting')
     let live = true
     api.waitingOnPeople(pid).then(r => { if (live) setWaitingFor({ pid, people: r.people ?? [] }) }).catch(() => {})
     return () => { live = false }
   }, [pid])
-  useEffect(() => loadWaiting(), [loadWaiting])
+  useEffect(() => {
+    if (!isHidden()) return loadWaiting()
+    held.current.add('waiting')
+  }, [loadWaiting])
   // ?focus=ID (or the old ?ticket=) opens a ticket; it stays in the URL until closed.
   const [selectedId, setSelectedId] = useFocusParam()
   const [showDone, setShowDone] = useState(false)
@@ -231,43 +244,104 @@ export function Mission() {
   const selected = selectedId == null ? null : tasks.find(t => t.id === selectedId) ?? null
   const focusMissing = useFocusFallback(pid, 'mission', selectedId, tasks, loading)
 
-  // Latest activity; refreshed shortly after tickets change.
+  // Latest activity; refreshed shortly after tickets change. Only one load is
+  // in flight: starting one aborts the one before, and so do a change of
+  // project and unmount (below). An aborted load never sets state.
+  const activityLoad = useRef<AbortController | null>(null)
   const loadActivity = useCallback(() => {
+    held.current.delete('activity')
+    activityLoad.current?.abort()
+    const ctl = new AbortController()
+    activityLoad.current = ctl
+    const { signal } = ctl
     const since = new Date(Date.now() - 3 * 86_400_000).toISOString()
     // Ticket activity plus plan-level changes (deletes, approvals, settings) from
     // the audit log, which only leads can read — others just get ticket activity.
+    // The feed shows 14 rows, so the newest 100 of each is plenty. Each
+    // running ticket's last sign of life comes from its own newest activity
+    // (last-activity), not the feed: on a busy project an agent that is still
+    // commenting can fall out of the newest 100 rows.
     Promise.all([
-      api.getProjectActivity(pid, since),
-      api.audit({ projectId: pid, limit: 200 }).catch(() => [] as AuditEntry[]),
-    ]).then(([a, audit]) => {
+      api.getProjectActivity(pid, since, undefined, { limit: 100, signal }),
+      api.audit({ projectId: pid, limit: 100 }, { signal }).catch(() => [] as AuditEntry[]),
+      // null: an older server or a failure, so the feed rows alone say who was seen.
+      api.getLastActivity(pid, { signal }).catch(() => null),
+    ]).then(([a, audit, last]) => {
+      // Superseded while it finished (e.g. the audit or last-activity half was
+      // the one aborted).
+      if (signal.aborted) return
       const seen = new Map<number, number>()
+      for (const [id, iso] of Object.entries(last ?? {})) {
+        const t = Date.parse(iso)
+        if (t) seen.set(Number(id), t)
+      }
+      // A row that landed after last-activity was read still counts.
       for (const e of a) seen.set(e.task_id, Math.max(seen.get(e.task_id) ?? 0, Date.parse(e.created_at)))
       setLastSeen(seen)
       setNow(Date.now())
       setActivity([...a.map(fromActivity), ...audit.filter(e => e.at >= since).map(fromAudit)]
         .sort((x, y) => y.at.localeCompare(x.at)).reduce(collapseRuns, []).slice(0, 14))
     })
+      // An AbortError is a superseded load; any other failure keeps the feed as it was.
       .catch(() => {})
   }, [pid])
+  // Another project, or leaving the page: the load in flight is for nothing.
+  useEffect(() => () => activityLoad.current?.abort(), [loadActivity])
   useEffect(() => {
-    const t = setTimeout(loadActivity, 600)
+    const t = setTimeout(() => {
+      if (isHidden()) held.current.add('activity')
+      else loadActivity()
+    }, 600)
     return () => clearTimeout(t)
   }, [tasks, loadActivity])
   // Agents' comments don't change tickets, so poll for them once a minute.
-  useEffect(() => {
-    const t = setInterval(loadActivity, 60_000)
-    return () => clearInterval(t)
-  }, [loadActivity])
+  // The hook skips the poll while the tab is hidden, and catches up once when
+  // the tab is shown.
+  useVisibleInterval(loadActivity, 60_000)
   const quietFor = (t: Task) => silentFor([lastSeen.get(t.id), t.dispatched_at, t.updated_at], now)
 
   const counts = useMemo(() => countStates(tasks), [tasks])
+  const refreshCounts = useCallback(() => {
+    held.current.delete('counts')
+    void refreshWaitCounts()
+  }, [])
   // Keep the strip's numbers in step when tickets change under us (an answer, a merge).
   useEffect(() => {
     if (!tasks.length) return
     let stop: (() => void) | undefined
-    const t = setTimeout(() => { refreshWaitCounts(); stop = loadWaiting() }, 1200)
+    const t = setTimeout(() => {
+      if (isHidden()) {
+        held.current.add('counts')
+        held.current.add('waiting')
+        return
+      }
+      refreshCounts()
+      stop = loadWaiting()
+    }, 1200)
     return () => { clearTimeout(t); stop?.() }
-  }, [tasks, loadWaiting])
+  }, [tasks, loadWaiting, refreshCounts])
+  // Back from hidden: run each held load once. This waits for the next tick so
+  // that the activity poll's own catch-up, which runs during this same event,
+  // has already cleared the activity load it covers.
+  useEffect(() => {
+    let t: ReturnType<typeof setTimeout> | undefined
+    let stop: (() => void) | undefined
+    const onVisibilityChange = () => {
+      clearTimeout(t)
+      if (isHidden()) return
+      t = setTimeout(() => {
+        if (held.current.has('activity')) loadActivity()
+        if (held.current.has('counts')) refreshCounts()
+        if (held.current.has('waiting')) { stop?.(); stop = loadWaiting() }
+      })
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      clearTimeout(t)
+      stop?.()
+    }
+  }, [loadActivity, loadWaiting, refreshCounts])
   const mergeNeeded = useMemo(() => tasks.filter(needsMerge).length, [tasks])
   // Verification receipts (#126): completed agent tickets whose receipt is
   // unverified. Held ones are in "Waiting on you" (the server's verify kind).

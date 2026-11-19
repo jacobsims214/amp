@@ -1,9 +1,10 @@
-import { render, screen } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { MemoryRouter } from 'react-router-dom'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MyWork } from '../../pages/MyWork'
+import { MySessionsPanel } from './MySessionsPanel'
 import { AuthContext } from '../../contexts/auth-context'
 import { RemoteProvider } from '../../remote/RemoteProvider'
 import { httpTransport } from '../../remote/transport'
@@ -54,5 +55,81 @@ describe('My Work → My sessions', () => {
       expect(screen.queryByText('My sessions')).toBeNull()
       unmount()
     }
+  })
+})
+
+// The home page often sits in a background tab: the 30 s refresh makes no
+// fetch while the tab is hidden, and one when it is shown again.
+describe('My sessions polling', () => {
+  const realSetTimeout = globalThis.setTimeout
+  let visibility: DocumentVisibilityState = 'visible'
+  let fetches = 0
+  const countSessionFetches = ({ request }: { request: Request }) => {
+    if (new URL(request.url).pathname === '/api/sessions') fetches++
+  }
+  const setVisibility = (state: DocumentVisibilityState) => act(() => {
+    visibility = state
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  const advance = (ms: number) => act(() => vi.advanceTimersByTimeAsync(ms))
+  // Give any fetch that was started time to reach the server.
+  const settle = () => act(() => new Promise(r => realSetTimeout(r, 50)))
+
+  const renderPanel = () => render(
+    <RemoteProvider deps={{ transport: httpTransport, crypto: unpairedCrypto, mock: false }}>
+      <MemoryRouter><MySessionsPanel /></MemoryRouter>
+    </RemoteProvider>,
+  )
+
+  beforeEach(() => {
+    // Fake time still moves with real time, so findBy and waitFor keep working.
+    vi.useFakeTimers({ shouldAdvanceTime: true, toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
+    visibility = 'visible'
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => visibility })
+    fetches = 0
+    server.events.on('request:start', countSessionFetches)
+  })
+  afterEach(() => {
+    cleanup()
+    server.events.removeListener('request:start', countSessionFetches)
+    vi.useRealTimers()
+    // Drop the override so jsdom's own getter shows through again.
+    delete (document as { visibilityState?: DocumentVisibilityState }).visibilityState
+  })
+
+  it('loads on mount, refreshes every 30 s while visible, and stops on unmount', async () => {
+    const { unmount } = renderPanel()
+    await screen.findByRole('link', { name: /jacobs-mbp/ })
+    expect(fetches).toBe(1)
+
+    await advance(30_000)
+    await waitFor(() => expect(fetches).toBe(2))
+    await advance(30_000)
+    await waitFor(() => expect(fetches).toBe(3))
+
+    unmount()
+    await advance(90_000)
+    await settle()
+    expect(fetches).toBe(3)
+  })
+
+  it('makes no fetch while the tab is hidden, then one when it is shown', async () => {
+    renderPanel()
+    await screen.findByRole('link', { name: /jacobs-mbp/ })
+    expect(fetches).toBe(1)
+
+    await setVisibility('hidden')
+    await advance(3 * 30_000)
+    await settle()
+    expect(fetches).toBe(1)
+
+    // One catch-up fetch, and the next refresh is a full 30 s after it.
+    await setVisibility('visible')
+    await waitFor(() => expect(fetches).toBe(2))
+    await advance(29_000)
+    await settle()
+    expect(fetches).toBe(2)
+    await advance(1_000)
+    await waitFor(() => expect(fetches).toBe(3))
   })
 })

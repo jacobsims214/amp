@@ -195,6 +195,12 @@ data:
                                   - exact: authorization
                                   - exact: x-auth-request-user
                                   - exact: x-auth-request-email
+                              # Hand oauth2-proxy's refreshed session cookie (--cookie-refresh)
+                              # back to the browser. Without it the browser keeps replaying a
+                              # spent refresh token (Dex: "claimed twice") until it is logged out.
+                              allowed_client_headers_on_success:
+                                patterns:
+                                  - exact: set-cookie
                           failure_mode_allow: false
                       - name: envoy.filters.http.router
                         typed_config:
@@ -397,6 +403,12 @@ data:
                                   - exact: authorization
                                   - exact: x-auth-request-user
                                   - exact: x-auth-request-email
+                              # Hand oauth2-proxy's refreshed session cookie (--cookie-refresh)
+                              # back to the browser. Without it the browser keeps replaying a
+                              # spent refresh token (Dex: "claimed twice") until it is logged out.
+                              allowed_client_headers_on_success:
+                                patterns:
+                                  - exact: set-cookie
                           failure_mode_allow: false
                       - name: envoy.filters.http.router
                         typed_config:

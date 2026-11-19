@@ -1,3 +1,11 @@
+{{- /* Where sessions live: "cookie" (default) or "redis" (the chart's Valkey). See oauth2Proxy.sessionStore in values.yaml. */ -}}
+{{- $sessionStore := .Values.oauth2Proxy.sessionStore | default "cookie" -}}
+{{- if not (has $sessionStore (list "cookie" "redis")) -}}
+{{- fail (printf "oauth2Proxy.sessionStore must be \"cookie\" or \"redis\", got %q" $sessionStore) -}}
+{{- end -}}
+{{- if and (eq $sessionStore "redis") (not .Values.valkey.enabled) -}}
+{{- fail "oauth2Proxy.sessionStore=redis keeps sessions in the chart's Valkey: set valkey.enabled=true, or use sessionStore=cookie" -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -28,6 +36,17 @@ spec:
             - -c
             - |
               until nc -z dex {{ .Values.dex.httpPort }}; do echo waiting for dex; sleep 3; done
+        {{- if eq $sessionStore "redis" }}
+        - name: wait-for-valkey
+          image: busybox:1.36
+          securityContext:
+            {{- include "amp.containerSecurityContext" (dict "runAsUser" 65534) | nindent 12 }}
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z amp-valkey 6379; do echo waiting for valkey; sleep 3; done
+        {{- end }}
       containers:
         - name: oauth2-proxy
           image: {{ .Values.oauth2Proxy.image }}:{{ .Values.oauth2Proxy.tag }}
@@ -76,6 +95,15 @@ spec:
             # sign-in (AMP #2440). Checked against Dex v2.42.0 and
             # oauth2-proxy v7.7.1: refreshes keep working and keep the nonce.
             - --insecure-oidc-skip-nonce=false
+            {{- if eq $sessionStore "redis" }}
+            # Keep sessions in Valkey; the cookie only carries a ticket for
+            # them. oauth2-proxy (v7.7.1) then locks a session while it
+            # refreshes it, so parallel requests past cookie-refresh redeem
+            # the refresh token once instead of racing, and the cookie stays
+            # valid across refreshes. The password is OAUTH2_PROXY_REDIS_PASSWORD below.
+            - --session-store-type=redis
+            - --redis-connection-url=redis://amp-valkey.{{ .Values.global.namespace }}.svc.cluster.local:6379
+            {{- end }}
           env:
             - name: OAUTH2_PROXY_CLIENT_ID
               valueFrom: { secretKeyRef: { name: amp-oauth2-proxy, key: client-id } }
@@ -89,6 +117,10 @@ spec:
               valueFrom: { secretKeyRef: { name: amp-oauth2-proxy, key: client-secret } }
             - name: OAUTH2_PROXY_COOKIE_SECRET
               valueFrom: { secretKeyRef: { name: amp-oauth2-proxy, key: cookie-secret } }
+            {{- end }}
+            {{- if eq $sessionStore "redis" }}
+            - name: OAUTH2_PROXY_REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: amp-valkey-users, key: default } }
             {{- end }}
           ports:
             - name: http

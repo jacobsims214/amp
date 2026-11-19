@@ -985,9 +985,25 @@ func (r *Repo) GetTicketHistory(ctx context.Context, taskID int) ([]domain.Activ
 	return out, rows.Err()
 }
 
-// GetProjectActivity returns the full activity log for a project, newest first.
-// Supports optional date range filtering for the report dashboard.
-func (r *Repo) GetProjectActivity(ctx context.Context, projectID int, since, until string) ([]domain.ActivityLog, error) {
+// maxProjectActivity is the most rows one GetProjectActivity call returns when
+// the caller asks for a limit.
+const maxProjectActivity = 500
+
+// projectActivityLimit is the LIMIT GetProjectActivity applies for a requested
+// limit: 0 (no LIMIT) for limit <= 0, otherwise limit clamped to
+// maxProjectActivity.
+func projectActivityLimit(limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	return min(limit, maxProjectActivity)
+}
+
+// GetProjectActivity returns a project's activity log, newest first
+// (created_at DESC, id DESC). since and until optionally bound created_at for
+// the report dashboard. limit <= 0 returns every matching row; limit > 0
+// returns at most the newest min(limit, 500).
+func (r *Repo) GetProjectActivity(ctx context.Context, projectID int, since, until string, limit int) ([]domain.ActivityLog, error) {
 	q := `SELECT id, task_id, project_id, actor, action, from_state, to_state, detail, actor_user_id, created_at
 	      FROM activity_log WHERE project_id = $1`
 	args := []interface{}{projectID}
@@ -1000,6 +1016,10 @@ func (r *Repo) GetProjectActivity(ctx context.Context, projectID int, since, unt
 		q += fmt.Sprintf(` AND created_at <= $%d`, len(args))
 	}
 	q += ` ORDER BY created_at DESC, id DESC`
+	if n := projectActivityLimit(limit); n > 0 {
+		args = append(args, n)
+		q += fmt.Sprintf(` LIMIT $%d`, len(args))
+	}
 
 	rows, err := r.db.Query(ctx, q, args...)
 	if err != nil {

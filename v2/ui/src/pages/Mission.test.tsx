@@ -1,7 +1,7 @@
 // Mission is informational (v2/kb/working/human-work.md, artifact #23):
 // a Waiting-on-you strip into My work, Merge needed and "for you" readouts,
 // outlined squares, and Waiting on people. It has no action buttons.
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { createMemoryRouter, RouterProvider } from 'react-router-dom'
@@ -43,7 +43,8 @@ const PEOPLE: PeopleWaiting = { project_id: 2, people: [
 let peopleWaiting: PeopleWaiting = PEOPLE
 let peopleCalls = 0
 let access: ProjectAccess = 'lead'
-let inFlight = 0
+// Requests the server has started and not yet finished.
+const inFlight = new Set<string>()
 
 const server = setupServer(
   http.get('*/api/projects/2/epics', () => HttpResponse.json({ epics: [{ id: 172, project_id: 2, name: 'Human work UX', description: '', priority: '1', created_at: at, updated_at: at }] })),
@@ -61,23 +62,41 @@ const server = setupServer(
   http.get('*/api/projects/2', () => HttpResponse.json({ project: { id: 2, name: 'AMP v2', code: 'AMPV2', require_plan_approval: true } })),
   http.get('*/api/*', () => HttpResponse.json({})),
 )
-server.events.on('request:start', () => { inFlight++ })
-server.events.on('request:end', () => { inFlight-- })
+// An aborted request never reaches request:end, so its abort counts as its end.
+server.events.on('request:start', ({ requestId, request }) => {
+  inFlight.add(requestId)
+  request.signal.addEventListener('abort', () => inFlight.delete(requestId), { once: true })
+})
+server.events.on('request:end', ({ requestId }) => { inFlight.delete(requestId) })
+// Requests made by Mission's background loads since open() rendered it.
+const calls = { activity: 0, audit: 0, lastActivity: 0, counts: 0, waiting: 0 }
+const CALL_PATHS: Record<string, keyof typeof calls> = {
+  '/api/projects/2/activity': 'activity', '/api/audit': 'audit', '/api/projects/2/last-activity': 'lastActivity',
+  '/api/my-work/counts': 'counts', '/api/projects/2/waiting-on-people': 'waiting',
+}
+server.events.on('request:start', ({ request }) => {
+  const kind = CALL_PATHS[new URL(request.url).pathname]
+  if (kind) calls[kind]++
+})
+const resetCalls = () => { for (const k of Object.keys(calls) as (keyof typeof calls)[]) calls[k] = 0 }
 class FakeEventSource { onmessage = null; onerror = null; addEventListener() {} removeEventListener() {} close() {} }
 beforeAll(() => { vi.stubGlobal('EventSource', FakeEventSource); server.listen({ onUnhandledFrame: 'error' }) })
 beforeEach(() => { resetWaitCounts(); access = 'lead'; peopleWaiting = PEOPLE; peopleCalls = 0 })
 afterEach(async () => {
-  await waitFor(() => expect(inFlight).toBe(0))
+  await waitFor(() => expect(inFlight.size).toBe(0))
   server.resetHandlers()
   counts = { counts: { waiting: 3, approve: 0, answer: 1, merge: 1, start: 0, do: 1, coming_up: 0 }, projects: { 2: { waiting: 3, approve: 0, answer: 1, merge: 1, start: 0, do: 1, coming_up: 0 } } }
 })
 afterAll(() => { server.close(); vi.unstubAllGlobals() })
 
+// The router open() rendered last, so a test can move to another project.
+let router: ReturnType<typeof createMemoryRouter>
 async function open(me: Me | null = { user_id: ME, email: 'jacob@x.io' } as never, loading = false) {
   // The strip reads the shared counts store, which AppShell fills; do it here.
   const { refreshWaitCounts } = await import('../lib/waitCounts')
   await refreshWaitCounts()
-  const router = createMemoryRouter([{ path: '/project/:projectId/mission', element: <Mission /> }], { initialEntries: ['/project/2/mission'] })
+  resetCalls()
+  router = createMemoryRouter([{ path: '/project/:projectId/mission', element: <Mission /> }], { initialEntries: ['/project/2/mission'] })
   render(
     <AuthContext.Provider value={{ me, loading, error: null, isAdmin: false }}>
       <RouterProvider router={router} />
@@ -195,5 +214,344 @@ describe('Mission (informational)', () => {
     for (const n of names) expect(n).not.toMatch(/^(Answer|Merged|Mark merged|Approve|Start|Mark done|Send answer)/)
     expect(document.querySelector('textarea')).toBeNull()
     expect(screen.queryByText(/done, not merged/)).toBeNull()
+  })
+})
+
+// Fake timers for Mission's debounced reloads and its one-minute poll. Fake
+// time still moves with real time, so findBy and waitFor keep working.
+const realSetTimeout = globalThis.setTimeout
+const fakeTime = () => vi.useFakeTimers({ shouldAdvanceTime: true, toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
+const advance = (ms: number) => act(() => vi.advanceTimersByTimeAsync(ms))
+// Let any request that was started reach the server, then wait for all of them to finish.
+const quiet = async () => {
+  await act(() => new Promise(r => realSetTimeout(r, 50)))
+  await waitFor(() => expect(inFlight.size).toBe(0))
+}
+
+// The activity feed asks for the newest 100 rows, and keeps one load in flight:
+// a newer load, another project or leaving the page aborts it, and an aborted
+// load never reaches the feed.
+describe("Mission's activity feed", () => {
+  const recent = () => new Date().toISOString()
+  const row = (taskId: number) => ({ id: taskId, task_id: taskId, project_id: 2, actor: 'amp-worker-frontend', action: 'commented', created_at: recent() })
+  const feedRow = (taskId: number) => screen.queryByRole('button', { name: `#${taskId}` })
+  // A handler waits on a gate until the test opens it. Every gate opens after
+  // the test, and after 5 s at most, so a missed abort fails instead of hanging.
+  let gates: (() => void)[] = []
+  const gate = () => {
+    let open!: () => void
+    const shut = new Promise<void>(r => { open = r; realSetTimeout(r, 5_000) })
+    gates.push(open)
+    return { shut, open }
+  }
+  // Each activity request's signal, in the order the requests were made.
+  let signals: AbortSignal[] = []
+  // Activity request n waits on gates[n] (when given), then answers rows[n].
+  const activityAnswers = (answers: { rows: number[]; wait?: Promise<void> }[]) =>
+    http.get('*/api/projects/2/activity', async ({ request }) => {
+      signals.push(request.signal)
+      const answer = answers[signals.length - 1] ?? { rows: [] }
+      await answer.wait
+      return HttpResponse.json({ activity: answer.rows.map(row), count: answer.rows.length })
+    })
+  // Each last-activity request's signal, in order. Request n waits on its gate
+  // (when given), then answers times[n]; later requests repeat the last answer.
+  let lastSignals: AbortSignal[] = []
+  const lastActivityAnswers = (answers: { times: Record<number, string>; wait?: Promise<void> }[]) =>
+    http.get('*/api/projects/2/last-activity', async ({ request }) => {
+      lastSignals.push(request.signal)
+      const answer = answers[Math.min(lastSignals.length, answers.length) - 1]
+      await answer.wait
+      return HttpResponse.json({ last_activity: answer.times })
+    })
+  const minutesAgo = (m: number) => new Date(Date.now() - m * 60_000).toISOString()
+  // Ticket 2491 is a running agent ticket, dispatched on Oct 27, so with no
+  // sign of life since it reads as quiet for weeks.
+  const crewRow = () => screen.getByText('#2491 Ticket 2491').closest('button')!
+  const inProgressTile = () => screen.getByText('In progress', { selector: '.amp-label' }).parentElement!
+
+  beforeEach(() => { fakeTime(); gates = []; signals = []; lastSignals = [] })
+  afterEach(() => {
+    for (const open of gates) open()
+    cleanup()
+    vi.useRealTimers()
+  })
+
+  it('asks for the newest 100 of the activity and of the audit log', async () => {
+    const urls: URL[] = []
+    server.use(
+      http.get('*/api/projects/2/activity', ({ request }) => { urls.push(new URL(request.url)); return HttpResponse.json({ activity: [], count: 0 }) }),
+      http.get('*/api/audit', ({ request }) => { urls.push(new URL(request.url)); return HttpResponse.json({ entries: [] }) }),
+    )
+    await open()
+    await advance(2_000)
+    await quiet()
+    expect(urls.map(u => [u.pathname, u.searchParams.get('limit')])).toEqual([
+      ['/api/projects/2/activity', '100'],
+      ['/api/audit', '100'],
+    ])
+    expect(urls[0].searchParams.get('since')).not.toBeNull()
+  })
+
+  it('a newer load aborts the one in flight, whose late answer never shows', async () => {
+    const first = gate()
+    server.use(activityAnswers([{ rows: [9001], wait: first.shut }, { rows: [9002] }]))
+    await open()
+    // The 600 ms reload after the tickets load starts the first load.
+    await advance(2_000)
+    await waitFor(() => expect(signals).toHaveLength(1))
+    expect(signals[0].aborted).toBe(false)
+
+    // The minute's poll starts a newer load while the first is still out.
+    await advance(60_000)
+    await waitFor(() => expect(signals).toHaveLength(2))
+    expect(signals[0].aborted).toBe(true)
+    expect(signals[1].aborted).toBe(false)
+    await waitFor(() => expect(feedRow(9002)).toBeInTheDocument())
+
+    // The first one's answer arrives after all: the feed keeps the newer rows.
+    first.open()
+    await quiet()
+    expect(feedRow(9001)).toBeNull()
+    expect(feedRow(9002)).toBeInTheDocument()
+  })
+
+  it('a load aborted after its activity arrived drops that activity too', async () => {
+    // The first load's activity answers at once; its audit half is still out
+    // when the newer load aborts it, so it settles with no audit entries.
+    const audit = gate()
+    const second = gate()
+    const audits: AbortSignal[] = []
+    server.use(
+      activityAnswers([{ rows: [9001] }, { rows: [9002], wait: second.shut }]),
+      http.get('*/api/audit', async ({ request }) => {
+        audits.push(request.signal)
+        if (audits.length === 1) await audit.shut
+        return HttpResponse.json({ entries: [] })
+      }),
+    )
+    await open()
+    await advance(2_000)
+    await waitFor(() => expect(audits).toHaveLength(1))
+    await act(() => new Promise(r => realSetTimeout(r, 50)))
+    expect(feedRow(9001)).toBeNull()
+
+    await advance(60_000)
+    await waitFor(() => expect(signals).toHaveLength(2))
+    expect(audits[0].aborted).toBe(true)
+    // The aborted load has settled by now; it put nothing in the feed.
+    await act(() => new Promise(r => realSetTimeout(r, 50)))
+    expect(feedRow(9001)).toBeNull()
+
+    second.open()
+    await waitFor(() => expect(feedRow(9002)).toBeInTheDocument())
+    audit.open()
+    await quiet()
+    expect(feedRow(9001)).toBeNull()
+  })
+
+  it('leaving the page aborts the load in flight', async () => {
+    const first = gate()
+    server.use(activityAnswers([{ rows: [9001], wait: first.shut }]))
+    await open()
+    await advance(2_000)
+    await waitFor(() => expect(signals).toHaveLength(1))
+    cleanup()
+    expect(signals[0].aborted).toBe(true)
+    first.open()
+    await quiet()
+  })
+
+  it('moving to another project aborts the load in flight for the old one', async () => {
+    const first = gate()
+    server.use(activityAnswers([{ rows: [9001], wait: first.shut }]))
+    await open()
+    await advance(2_000)
+    await waitFor(() => expect(signals).toHaveLength(1))
+    await act(() => router.navigate('/project/3/mission'))
+    expect(signals[0].aborted).toBe(true)
+    first.open()
+    await quiet()
+    expect(feedRow(9001)).toBeNull()
+  })
+
+  // Whether a running ticket is quiet comes from its own newest activity
+  // (GET /projects/:id/last-activity), not from the newest 100 feed rows.
+  it('a running ticket active 2 min ago, with no row in the feed, is not quiet', async () => {
+    server.use(lastActivityAnswers([{ times: { 2491: minutesAgo(2) } }]))
+    await open()
+    await advance(2_000)
+    await quiet()
+    expect(lastSignals).toHaveLength(1)
+    expect(feedRow(2491)).toBeNull()
+    expect(crewRow()).not.toHaveTextContent(/quiet/)
+    expect(inProgressTile()).not.toHaveTextContent('may have stalled')
+    expect(inProgressTile()).toHaveTextContent('agents for 1 person')
+  })
+
+  it('a running ticket last active 40 min ago shows quiet 40m', async () => {
+    server.use(lastActivityAnswers([{ times: { 2491: minutesAgo(40) } }]))
+    await open()
+    await advance(2_000)
+    await quiet()
+    // Not the weeks since its dispatch: its last activity is the latest sign of life.
+    await waitFor(() => expect(crewRow()).toHaveTextContent('quiet 40m'))
+    expect(inProgressTile()).toHaveTextContent('1 quiet · may have stalled')
+  })
+
+  it('a feed row newer than the last-activity time still counts', async () => {
+    server.use(
+      lastActivityAnswers([{ times: { 2491: minutesAgo(40) } }]),
+      activityAnswers([{ rows: [2491] }]),
+    )
+    await open()
+    await advance(2_000)
+    await quiet()
+    await waitFor(() => expect(feedRow(2491)).toBeInTheDocument())
+    expect(crewRow()).not.toHaveTextContent(/quiet/)
+    expect(inProgressTile()).not.toHaveTextContent('may have stalled')
+  })
+
+  it('when last-activity fails, the feed rows say who was seen', async () => {
+    server.use(
+      http.get('*/api/projects/2/last-activity', () => HttpResponse.json({ error: 'boom' }, { status: 500 })),
+      activityAnswers([{ rows: [2491] }]),
+    )
+    await open()
+    await advance(2_000)
+    await quiet()
+    await waitFor(() => expect(feedRow(2491)).toBeInTheDocument())
+    expect(crewRow()).not.toHaveTextContent(/quiet/)
+    expect(inProgressTile()).not.toHaveTextContent('may have stalled')
+  })
+
+  it('a load aborted while its last-activity was out sets no last-seen times', async () => {
+    // The first load's activity (a fresh row for 2491) arrives at once; its
+    // last-activity is still out when the minute's poll aborts it. The newer
+    // load's activity is held, so only the aborted load could have set anything.
+    const firstLast = gate()
+    const second = gate()
+    server.use(
+      lastActivityAnswers([{ times: { 2491: minutesAgo(2) }, wait: firstLast.shut }, { times: {} }]),
+      activityAnswers([{ rows: [2491] }, { rows: [], wait: second.shut }]),
+    )
+    await open()
+    await advance(2_000)
+    await waitFor(() => expect(lastSignals).toHaveLength(1))
+    await act(() => new Promise(r => realSetTimeout(r, 50)))
+    expect(crewRow()).toHaveTextContent(/quiet \d+m/)
+
+    await advance(60_000)
+    await waitFor(() => expect(signals).toHaveLength(2))
+    expect(lastSignals[0].aborted).toBe(true)
+    // The aborted load has settled by now: 2491 is still quiet, and its row
+    // is not in the feed.
+    await act(() => new Promise(r => realSetTimeout(r, 50)))
+    expect(crewRow()).toHaveTextContent(/quiet \d+m/)
+    expect(inProgressTile()).toHaveTextContent('1 quiet · may have stalled')
+    expect(feedRow(2491)).toBeNull()
+
+    second.open()
+    firstLast.open()
+    await quiet()
+    expect(crewRow()).toHaveTextContent(/quiet \d+m/)
+    expect(feedRow(2491)).toBeNull()
+  })
+})
+
+// A hidden tab makes no background loads (activity, audit, counts, waiting on
+// people). Each one it skipped runs once when the tab is shown again.
+describe('Mission in a hidden tab', () => {
+  let visibility: DocumentVisibilityState = 'visible'
+  const setVisibility = (state: DocumentVisibilityState) => act(() => {
+    visibility = state
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  // Last-activity is part of the activity load, so it is skipped and caught up with it.
+  const none = { activity: 0, audit: 0, lastActivity: 0, counts: 0, waiting: 0 }
+  const oneEach = { activity: 1, audit: 1, lastActivity: 1, counts: 1, waiting: 1 }
+  const oneActivityLoad = { ...none, activity: 1, audit: 1, lastActivity: 1 }
+
+  beforeEach(() => {
+    fakeTime()
+    visibility = 'visible'
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => visibility })
+  })
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    // Drop the override so jsdom's own getter shows through again.
+    delete (document as { visibilityState?: DocumentVisibilityState }).visibilityState
+  })
+
+  it('a tab opened hidden loads none of them, then one of each once shown', async () => {
+    visibility = 'hidden'
+    await open()
+    // The 600 ms and 1200 ms reloads come due, and two activity polls.
+    await advance(2 * 60_000 + 2_000)
+    await quiet()
+    expect(calls).toEqual(none)
+
+    await setVisibility('visible')
+    // The poll's catch-up and the held activity reload share one load.
+    await waitFor(() => expect(calls).toEqual(oneEach))
+    await advance(5_000)
+    await quiet()
+    expect(calls).toEqual(oneEach)
+  })
+
+  it('hidden for less than a poll: the reloads it skipped run once when shown', async () => {
+    visibility = 'hidden'
+    await open()
+    await advance(2_000)
+    await quiet()
+    expect(calls).toEqual(none)
+
+    await setVisibility('visible')
+    await waitFor(() => expect(calls).toEqual(oneEach))
+    await advance(5_000)
+    await quiet()
+    expect(calls).toEqual(oneEach)
+  })
+
+  it('polls activity each minute while visible, none while hidden, and catches up once', async () => {
+    await open()
+    await advance(2_000)
+    await quiet()
+    resetCalls()
+
+    // Hidden and shown again before anything came due: nothing extra runs.
+    await setVisibility('hidden')
+    await advance(5_000)
+    await setVisibility('visible')
+    await quiet()
+    expect(calls).toEqual(none)
+
+    await advance(60_000)
+    await waitFor(() => expect(calls).toEqual(oneActivityLoad))
+    resetCalls()
+
+    await setVisibility('hidden')
+    await advance(3 * 60_000)
+    await quiet()
+    expect(calls).toEqual(none)
+
+    // Only the activity poll was skipped, so only activity loads, once.
+    await setVisibility('visible')
+    await waitFor(() => expect(calls).toEqual(oneActivityLoad))
+    await advance(5_000)
+    await quiet()
+    expect(calls).toEqual(oneActivityLoad)
+  })
+
+  it('after unmount, showing the tab loads nothing', async () => {
+    visibility = 'hidden'
+    await open()
+    await advance(2_000)
+    cleanup()
+    await setVisibility('visible')
+    await advance(2_000)
+    await quiet()
+    expect(calls).toEqual(none)
   })
 })

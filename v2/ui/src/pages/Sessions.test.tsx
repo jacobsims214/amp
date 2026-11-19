@@ -1,9 +1,9 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Sessions } from './Sessions'
 import { ago, inTime } from '../remote/toolText'
 import { AppShell } from '../components/shell/AppShell'
@@ -11,6 +11,7 @@ import { AuthContext } from '../contexts/auth-context'
 import { RemoteProvider } from '../remote/RemoteProvider'
 import type { RemoteDeps } from '../remote/remote-context'
 import { MOCK_SESSION_ID, MockRelay, mockCrypto, mockTransport } from '../remote/mock/mockRelay'
+import { relayHandlers } from '../remote/mock/handlers'
 import { httpTransport } from '../remote/transport'
 import type { SessionSummary } from '../remote/types'
 import type { Me } from '../types'
@@ -254,5 +255,94 @@ describe('Sessions page while amp-relay is down', () => {
     expect(alert).toHaveTextContent("Remote control is unavailable right now (the relay service isn't running).")
     expect(screen.queryByText(/Request failed/)).toBeNull()
     server.resetHandlers()
+  })
+})
+
+// The sessions page often sits in a background tab: its 15 s refresh makes no
+// fetch while the tab is hidden, and one when it is shown again.
+describe('Sessions page polling', () => {
+  const realSetTimeout = globalThis.setTimeout
+  let visibility: DocumentVisibilityState = 'visible'
+  let fetches = 0
+  const countSessionFetches = ({ request }: { request: Request }) => {
+    if (new URL(request.url).pathname === '/api/sessions') fetches++
+  }
+  const setVisibility = (state: DocumentVisibilityState) => act(() => {
+    visibility = state
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  const advance = (ms: number) => act(() => vi.advanceTimersByTimeAsync(ms))
+  // Give any fetch that was started time to reach the server.
+  const settle = () => act(() => new Promise(r => realSetTimeout(r, 50)))
+
+  const renderPage = (available = true) => render(
+    <AuthContext.Provider value={{ me: me(available), loading: false, error: null, isAdmin: false }}>
+      <RemoteProvider deps={{ transport: httpTransport, crypto: mockCrypto(), mock: false }}>
+        <MemoryRouter initialEntries={['/sessions']}><Sessions /></MemoryRouter>
+      </RemoteProvider>
+    </AuthContext.Provider>,
+  )
+
+  beforeEach(() => {
+    server.use(...relayHandlers(new MockRelay({ stepMs: 0 })))
+    // Fake time still moves with real time, so findBy and waitFor keep working.
+    vi.useFakeTimers({ shouldAdvanceTime: true, toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
+    visibility = 'visible'
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => visibility })
+    fetches = 0
+    server.events.on('request:start', countSessionFetches)
+  })
+  afterEach(() => {
+    cleanup()
+    server.events.removeListener('request:start', countSessionFetches)
+    server.resetHandlers()
+    vi.useRealTimers()
+    // Drop the override so jsdom's own getter shows through again.
+    delete (document as { visibilityState?: DocumentVisibilityState }).visibilityState
+  })
+
+  it('loads on mount, refreshes every 15 s while visible, and stops on unmount', async () => {
+    const { unmount } = renderPage()
+    await screen.findAllByTestId('session-row')
+    expect(fetches).toBe(1)
+
+    await advance(15_000)
+    await waitFor(() => expect(fetches).toBe(2))
+    await advance(15_000)
+    await waitFor(() => expect(fetches).toBe(3))
+
+    unmount()
+    await advance(45_000)
+    await settle()
+    expect(fetches).toBe(3)
+  })
+
+  it('makes no fetch while the tab is hidden, then one when it is shown', async () => {
+    renderPage()
+    await screen.findAllByTestId('session-row')
+    expect(fetches).toBe(1)
+
+    await setVisibility('hidden')
+    await advance(4 * 15_000)
+    await settle()
+    expect(fetches).toBe(1)
+
+    // One catch-up fetch, and the next refresh is a full 15 s after it.
+    await setVisibility('visible')
+    await waitFor(() => expect(fetches).toBe(2))
+    await advance(14_000)
+    await settle()
+    expect(fetches).toBe(2)
+    await advance(1_000)
+    await waitFor(() => expect(fetches).toBe(3))
+  })
+
+  it('never polls when remote control is unavailable', async () => {
+    renderPage(false)
+    expect(screen.getByText(/Remote control of harness sessions is off/)).toBeInTheDocument()
+    await advance(3 * 15_000)
+    await settle()
+    expect(fetches).toBe(0)
+    expect(vi.getTimerCount()).toBe(0)
   })
 })

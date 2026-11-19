@@ -17,6 +17,7 @@ import { Skeleton, SkeletonText } from '../components/ui/Skeleton'
 import { useAuth } from '../hooks/useAuth'
 import { useDelayedFlag } from '../hooks/useDelayedFlag'
 import { useSSE } from '../hooks/useSSE'
+import { useStreamReconnect } from '../hooks/useStreamReconnect'
 import { projectLink, ticketPageLink } from '../lib/projectLink'
 import type { ProjectAccess, ProjectMember, SSEEvent, Task } from '../types'
 
@@ -104,6 +105,11 @@ export function TicketPage() {
     if (!e.type.startsWith('task.') && !e.type.startsWith('run.')) return
     if (p && (p.id === id || p.task_id === id)) refresh()
   }, [id, refresh]))
+  // The live stream came back (a dropped connection, or a tab hidden long
+  // enough to let it go): re-read whatever changed while it was down. Ready is
+  // "this ticket's read has settled", either way, so the opening frame of a new
+  // stream, which arrives during that read, doesn't read the ticket twice.
+  useStreamReconnect(refresh, loaded?.id === id)
 
   useEffect(() => {
     if (pid == null) return

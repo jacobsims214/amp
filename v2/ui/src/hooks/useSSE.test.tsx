@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, render, renderHook } from '@testing-library/react'
-import { sseSubscriberCount, subscribeSSE, useSSE } from './useSSE'
+import { HIDDEN_CLOSE_MS, SSE_CLOSE_DELAY_MS, SSE_REOPEN_FIRST_MS, SSE_REOPEN_MAX_MS, isSSEConnected, sseSubscriberCount, subscribeSSE, useSSE, useSSEConnected } from './useSSE'
 import type { SSEEvent } from '../types'
 import { isSessionEnded, markSessionEnded, resetSession } from '../lib/session'
 
@@ -25,9 +25,18 @@ beforeEach(() => {
   FakeEventSource.instances = []
   vi.stubGlobal('EventSource', FakeEventSource)
 })
+// src/test/setup.ts also closes any stream left waiting out
+// SSE_CLOSE_DELAY_MS after each test, so the next test opens its own.
 afterEach(() => { vi.unstubAllGlobals(); resetSession() })
 
+// jsdom has no Web Locks, so this block runs the per-tab path: each tab its
+// own stream, as before cross-tab sharing (see 'across tabs' below).
 describe('useSSE', () => {
+  // The last subscriber's leaving takes effect SSE_CLOSE_DELAY_MS later.
+  beforeEach(() => { vi.useFakeTimers() })
+  afterEach(() => { vi.useRealTimers() })
+  const waitOutClose = () => act(() => { vi.advanceTimersByTime(SSE_CLOSE_DELAY_MS) })
+
   it('shares one EventSource across every subscriber', () => {
     function Page() {
       useSSE(1, () => {})
@@ -49,6 +58,7 @@ describe('useSSE', () => {
     a.unmount()
     expect(es.closed).toBe(false)
     b.unmount()
+    waitOutClose()
     expect(es.closed).toBe(true)
     expect(sseSubscriberCount()).toBe(0)
 
@@ -121,6 +131,7 @@ describe('useSSE', () => {
     act(() => live.emit({ type: 'task.updated', project_id: 1 }))
     expect(fn).toHaveBeenCalledTimes(1) // the earlier subscriber moved to the new stream
     a.unmount(); b.unmount()
+    waitOutClose()
     expect(live.closed).toBe(true)
   })
 
@@ -137,10 +148,192 @@ describe('useSSE', () => {
     offBad(); offBad() // a second call is a no-op
     expect(sseSubscriberCount()).toBe(1)
     offOk()
+    waitOutClose()
     expect(es.closed).toBe(true)
   })
 
+  // The Live indicators on Board and Projects (#2540).
+  describe('useSSEConnected', () => {
+    it('is false while the stream opens and true once it says connected', () => {
+      const h = renderHook(() => useSSEConnected())
+      expect(h.result.current).toBe(false)
+      const [es] = FakeEventSource.instances
+      act(() => es.emit({ type: 'connected' }))
+      expect(h.result.current).toBe(true)
+      expect(isSSEConnected()).toBe(true)
+      h.unmount()
+      expect(isSSEConnected()).toBe(true) // the stream waits out the close delay
+      waitOutClose()
+      expect(isSSEConnected()).toBe(false) // nobody holds the stream now
+    })
+
+    it('a view that mounts on an open, connected stream reads true on its first render', () => {
+      const frames: string[] = []
+      // Another view holds the stream (the board store lingers for 30 s).
+      const other = renderHook(() => useSSE(null, e => { frames.push(e.type) }))
+      const [es] = FakeEventSource.instances
+      act(() => es.emit({ type: 'connected' }))
+      const renders: boolean[] = []
+      const h = renderHook(() => {
+        const live = useSSEConnected()
+        renders.push(live)
+        return live
+      })
+      expect(renders[0]).toBe(true) // no connected frame of its own needed
+      expect(FakeEventSource.instances).toHaveLength(1) // it joined the open stream
+      expect(frames).toEqual(['connected']) // and no subscriber was sent another
+      h.unmount(); other.unmount()
+    })
+
+    it('goes back to false when the stream drops, and to true on the next connected', () => {
+      const frames: string[] = []
+      const sub = renderHook(() => useSSE(null, e => { frames.push(e.type) }))
+      const h = renderHook(() => useSSEConnected())
+      const [es] = FakeEventSource.instances
+      act(() => es.emit({ type: 'connected' }))
+      expect(h.result.current).toBe(true)
+      act(() => es.onerror?.()) // dropped; the browser retries by itself (CONNECTING)
+      expect(h.result.current).toBe(false)
+      act(() => es.emit({ type: 'connected' })) // the retried stream's opening frame
+      expect(h.result.current).toBe(true)
+      expect(frames).toEqual(['connected', 'connected']) // every subscriber still gets each frame
+      expect(FakeEventSource.instances).toHaveLength(1)
+      h.unmount(); sub.unmount()
+    })
+
+    it('holds the stream like useSSE: indicators share it, and the last one to go closes it', () => {
+      const a = renderHook(() => useSSEConnected())
+      const b = renderHook(() => useSSEConnected())
+      expect(FakeEventSource.instances).toHaveLength(1)
+      expect(sseSubscriberCount()).toBe(2)
+      a.unmount()
+      expect(open()).toHaveLength(1) // b's own listener still holds it
+      b.unmount()
+      waitOutClose()
+      expect(open()).toHaveLength(0)
+    })
+
+    it('reads each URL on its own', () => {
+      const events = renderHook(() => useSSEConnected())
+      const other = renderHook(() => useSSEConnected('/api/other'))
+      const [es] = FakeEventSource.instances
+      act(() => es.emit({ type: 'connected' }))
+      expect(events.result.current).toBe(true)
+      expect(other.result.current).toBe(false)
+      events.unmount(); other.unmount()
+    })
+  })
+
+  // A route change unsubscribes one view and subscribes the next in one
+  // commit; the stream must not close and reopen in between (#2624).
+  describe('when the last subscriber leaves', () => {
+    it('a subscriber arriving within the delay keeps the same stream, and Live never flaps', () => {
+      const frames: string[] = []
+      const live: boolean[] = []
+      function Page({ id }: { id: number }) {
+        useSSE(id, e => { frames.push(e.type) })
+        live.push(useSSEConnected())
+        return null
+      }
+      // Projects -> a project page: a different component, so every
+      // subscription unmounts and a new one mounts in the same commit.
+      function Route({ page }: { page: 'a' | 'b' }) {
+        return page === 'a' ? <Page key="a" id={1} /> : <Page key="b" id={2} />
+      }
+      const r = render(<Route page="a" />)
+      const [es] = FakeEventSource.instances
+      act(() => es.emit({ type: 'connected' }))
+      live.length = 0
+      r.rerender(<Route page="b" />)
+      expect(FakeEventSource.instances).toEqual([es])
+      expect(es.closed).toBe(false)
+      expect(live.length).toBeGreaterThan(0)
+      expect(live.every(Boolean)).toBe(true) // never "Connecting…"
+      waitOutClose()
+      expect(es.closed).toBe(false) // the new page holds it now
+      expect(isSSEConnected()).toBe(true)
+      act(() => es.emit({ type: 'task.updated', project_id: 2 }))
+      expect(frames).toEqual(['connected', 'task.updated']) // no second connected
+      r.unmount()
+    })
+
+    it('with no new subscriber, closes after the delay; the next subscriber opens a fresh stream', () => {
+      const off = subscribeSSE('/api/events', () => {})
+      const [es] = FakeEventSource.instances
+      es.emit({ type: 'connected' })
+      off()
+      expect(sseSubscriberCount()).toBe(0)
+      act(() => { vi.advanceTimersByTime(SSE_CLOSE_DELAY_MS - 1) })
+      expect(es.closed).toBe(false)
+      expect(isSSEConnected()).toBe(true)
+      act(() => { vi.advanceTimersByTime(1) })
+      expect(es.closed).toBe(true)
+      expect(isSSEConnected()).toBe(false)
+      const offNext = subscribeSSE('/api/events', () => {})
+      expect(open()).toHaveLength(1)
+      expect(open()[0]).not.toBe(es)
+      offNext()
+    })
+
+    it('a resubscribe within the delay cancels the close for good', () => {
+      const off = subscribeSSE('/api/events', () => {})
+      const [es] = FakeEventSource.instances
+      off()
+      act(() => { vi.advanceTimersByTime(SSE_CLOSE_DELAY_MS / 2) })
+      const offAgain = subscribeSSE('/api/events', () => {})
+      act(() => { vi.advanceTimersByTime(SSE_CLOSE_DELAY_MS * 5) })
+      expect(es.closed).toBe(false)
+      expect(sseSubscriberCount()).toBe(1)
+      offAgain()
+      waitOutClose()
+      expect(es.closed).toBe(true)
+    })
+
+    it('a stream waiting to close still closes after the delay once the session ended', () => {
+      const off = subscribeSSE('/api/events', () => {})
+      const [es] = FakeEventSource.instances
+      es.emit({ type: 'connected' })
+      off()
+      act(() => markSessionEnded())
+      expect(es.closed).toBe(true) // the session's end closes it at once
+      expect(isSSEConnected()).toBe(false)
+      waitOutClose()
+      expect(sseSubscriberCount()).toBe(0)
+      expect(FakeEventSource.instances).toHaveLength(1)
+    })
+
+    it('a page going away (pagehide) closes a stream waiting to close at once', () => {
+      const off = subscribeSSE('/api/events', () => {})
+      const kept = subscribeSSE('/api/other', () => {})
+      const [es, other] = FakeEventSource.instances
+      off()
+      window.dispatchEvent(new Event('pagehide'))
+      expect(es.closed).toBe(true)
+      expect(other.closed).toBe(false) // one that still has a subscriber stays
+      kept()
+    })
+
+    it('closes a stream for another URL after the delay too', () => {
+      const off = subscribeSSE('/api/other', () => {})
+      const [es] = FakeEventSource.instances
+      off()
+      expect(es.closed).toBe(false)
+      waitOutClose()
+      expect(es.closed).toBe(true)
+    })
+  })
+
   describe('once the session ended (#153)', () => {
+    it('useSSEConnected reads false', () => {
+      const h = renderHook(() => useSSEConnected())
+      const [es] = FakeEventSource.instances
+      act(() => es.emit({ type: 'connected' }))
+      expect(h.result.current).toBe(true)
+      act(() => markSessionEnded())
+      expect(h.result.current).toBe(false)
+      h.unmount()
+    })
+
     it('closes the stream and does not reopen it for new subscribers', () => {
       const a = renderHook(() => useSSE(1, () => {}))
       const [es] = FakeEventSource.instances
@@ -172,5 +365,1318 @@ describe('useSSE', () => {
       expect(isSessionEnded()).toBe(false)
       a.unmount()
     })
+  })
+
+  describe('while the tab is hidden', () => {
+    let visibility: DocumentVisibilityState = 'visible'
+    const setVisibility = (v: DocumentVisibilityState) => {
+      visibility = v
+      act(() => { document.dispatchEvent(new Event('visibilitychange')) })
+    }
+    const hide = () => setVisibility('hidden')
+    const show = () => setVisibility('visible')
+    const wait = (ms: number) => act(() => { vi.advanceTimersByTime(ms) })
+
+    beforeEach(() => {
+      vi.useFakeTimers()
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => visibility })
+    })
+    afterEach(() => {
+      show() // resets the module's paused state for the next test
+      vi.useRealTimers()
+    })
+
+    it('closes the stream after 30 s, keeping its subscribers and the session', () => {
+      const fetchMock = vi.fn()
+      vi.stubGlobal('fetch', fetchMock)
+      const a = renderHook(() => useSSE(1, () => {}))
+      const [es] = FakeEventSource.instances
+      hide()
+      wait(HIDDEN_CLOSE_MS - 1)
+      expect(es.closed).toBe(false)
+      wait(1)
+      expect(es.closed).toBe(true)
+      expect(sseSubscriberCount()).toBe(1)
+      es.onerror?.() // a late error from the stream we closed asks nothing
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(isSessionEnded()).toBe(false)
+      a.unmount()
+    })
+
+    it('a quick hide and show closes nothing', () => {
+      const a = renderHook(() => useSSE(1, () => {}))
+      const [es] = FakeEventSource.instances
+      hide()
+      wait(HIDDEN_CLOSE_MS / 2)
+      show()
+      wait(HIDDEN_CLOSE_MS * 2)
+      expect(es.closed).toBe(false)
+      expect(FakeEventSource.instances).toHaveLength(1)
+      // and the timer starts over on the next hide
+      hide()
+      wait(HIDDEN_CLOSE_MS - 1)
+      expect(es.closed).toBe(false)
+      a.unmount()
+    })
+
+    it('a subscriber arriving after the close opens nothing', () => {
+      const a = renderHook(() => useSSE(1, () => {}))
+      hide()
+      wait(HIDDEN_CLOSE_MS)
+      const b = renderHook(() => useSSE(2, () => {})) // joins the paused stream
+      expect(open()).toHaveLength(0)
+      expect(sseSubscriberCount()).toBe(2)
+      a.unmount(); b.unmount()
+      const c = renderHook(() => useSSE(1, () => {})) // a fresh stream, still hidden
+      expect(open()).toHaveLength(0)
+      expect(FakeEventSource.instances).toHaveLength(1)
+      c.unmount()
+    })
+
+    it('reopens on show for the subscribers that remain, old and new', () => {
+      const early = vi.fn(), late = vi.fn()
+      const a = renderHook(() => useSSE(1, early))
+      hide()
+      wait(HIDDEN_CLOSE_MS)
+      const b = renderHook(() => useSSE(1, late))
+      show()
+      expect(FakeEventSource.instances).toHaveLength(2)
+      const [live] = open()
+      expect(live).toBe(FakeEventSource.instances[1])
+      act(() => live.emit({ type: 'task.updated', project_id: 1 }))
+      expect(early).toHaveBeenCalledTimes(1)
+      expect(late).toHaveBeenCalledTimes(1)
+      a.unmount(); b.unmount()
+      wait(SSE_CLOSE_DELAY_MS)
+      expect(live.closed).toBe(true)
+    })
+
+    it('opens nothing on show when everyone left while hidden', () => {
+      const a = renderHook(() => useSSE(1, () => {}))
+      hide()
+      wait(HIDDEN_CLOSE_MS)
+      a.unmount()
+      expect(sseSubscriberCount()).toBe(0)
+      show()
+      expect(FakeEventSource.instances).toHaveLength(1)
+    })
+
+    it('useSSEConnected reads false while paused, and true once the reopened stream says connected', () => {
+      const h = renderHook(() => useSSEConnected())
+      const [first] = FakeEventSource.instances
+      act(() => first.emit({ type: 'connected' }))
+      hide()
+      wait(HIDDEN_CLOSE_MS - 1)
+      expect(h.result.current).toBe(true) // the grace period keeps the stream
+      wait(1)
+      expect(h.result.current).toBe(false)
+      show()
+      const [second] = open()
+      expect(second).not.toBe(first)
+      expect(h.result.current).toBe(false) // reopened, not connected yet
+      act(() => second.emit({ type: 'connected' }))
+      expect(h.result.current).toBe(true)
+      h.unmount()
+    })
+
+    it('a stream waiting to close still closes after the delay when the tab hides', () => {
+      const a = renderHook(() => useSSE(1, () => {}))
+      const [es] = FakeEventSource.instances
+      a.unmount()
+      hide()
+      wait(SSE_CLOSE_DELAY_MS)
+      expect(es.closed).toBe(true)
+      expect(sseSubscriberCount()).toBe(0)
+    })
+
+    it('the pause closes a stream waiting to close, and nothing reopens on show', () => {
+      const a = renderHook(() => useSSE(1, () => {}))
+      const [es] = FakeEventSource.instances
+      hide()
+      wait(HIDDEN_CLOSE_MS - SSE_CLOSE_DELAY_MS / 2)
+      a.unmount() // the close would land after the pause
+      wait(SSE_CLOSE_DELAY_MS / 2)
+      expect(es.closed).toBe(true)
+      show()
+      expect(FakeEventSource.instances).toHaveLength(1)
+      wait(SSE_CLOSE_DELAY_MS)
+      expect(open()).toHaveLength(0)
+    })
+
+    it('does not reopen on show once the session ended', () => {
+      const a = renderHook(() => useSSE(1, () => {}))
+      hide()
+      wait(HIDDEN_CLOSE_MS)
+      act(() => markSessionEnded())
+      show()
+      expect(FakeEventSource.instances).toHaveLength(1)
+      const b = renderHook(() => useSSE(1, () => {}))
+      expect(FakeEventSource.instances).toHaveLength(1)
+      a.unmount(); b.unmount()
+    })
+  })
+
+  // The browser stops retrying for good (CLOSED) when an answer isn't a 200
+  // event stream, e.g. a 502 while no server is up. If /api/me says the
+  // session is fine, the tab tries again on a jittered backoff (#2702).
+  describe('a stream the browser gave up on, with the session fine', () => {
+    let visibility: DocumentVisibilityState = 'visible'
+    const setVisibility = (v: DocumentVisibilityState) => {
+      visibility = v
+      act(() => { document.dispatchEvent(new Event('visibilitychange')) })
+    }
+    const wait = (ms: number) => act(() => { vi.advanceTimersByTime(ms) })
+    const flush = () => act(async () => { for (let i = 0; i < 100; i++) await Promise.resolve() })
+    const stubMe = (status: 200 | 401) => {
+      const me = vi.fn(async () => status === 200
+        ? new Response(JSON.stringify({ user_id: 1 }), { status, headers: { 'content-type': 'application/json' } })
+        : new Response('Unauthorized', { status }))
+      vi.stubGlobal('fetch', me)
+      return me
+    }
+    // The browser gives up on es, and /api/me answers.
+    const giveUp = async (es: FakeEventSource) => {
+      es.readyState = 2
+      es.onerror?.()
+      await flush()
+    }
+    let random: ReturnType<typeof vi.spyOn>
+    beforeEach(() => {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => visibility })
+      random = vi.spyOn(Math, 'random').mockReturnValue(0.5) // no jitter: waits are exactly the backoff
+    })
+    afterEach(() => {
+      setVisibility('visible')
+      random.mockRestore()
+    })
+
+    it('reopens it after the backoff, and the new stream\'s connected reaches every subscriber once', async () => {
+      const me = stubMe(200)
+      const a: SSEEvent[] = [], b: SSEEvent[] = []
+      const offA = subscribeSSE('/api/events', e => { a.push(e) })
+      const offB = subscribeSSE('/api/events', e => { b.push(e) })
+      const [dead] = FakeEventSource.instances
+      await giveUp(dead)
+      expect(me).toHaveBeenCalledTimes(1)
+      expect(isSessionEnded()).toBe(false)
+      wait(SSE_REOPEN_FIRST_MS - 1)
+      expect(FakeEventSource.instances).toHaveLength(1)
+      wait(1)
+      expect(FakeEventSource.instances).toHaveLength(2)
+      const live = FakeEventSource.instances[1]
+      act(() => live.emit({ type: 'connected' }))
+      expect([a, b].map(types)).toEqual([['connected'], ['connected']])
+      expect(isSSEConnected()).toBe(true)
+      expect(vi.getTimerCount()).toBe(0)
+      offA(); offB()
+      wait(SSE_CLOSE_DELAY_MS)
+    })
+
+    it('waits twice as long after each failure, up to the cap, and starts over once a stream says connected', async () => {
+      stubMe(200)
+      const off = subscribeSSE('/api/events', () => {})
+      const waits: number[] = []
+      for (let i = 0; i < 7; i++) {
+        const n = FakeEventSource.instances.length
+        await giveUp(FakeEventSource.instances[n - 1])
+        let waited = 0
+        while (FakeEventSource.instances.length === n && waited <= SSE_REOPEN_MAX_MS * 2) { wait(100); waited += 100 }
+        waits.push(waited)
+      }
+      expect(waits).toEqual([1_000, 2_000, 4_000, 8_000, 16_000, SSE_REOPEN_MAX_MS, SSE_REOPEN_MAX_MS])
+      const live = FakeEventSource.instances.at(-1)!
+      act(() => live.emit({ type: 'connected' }))
+      await giveUp(live)
+      wait(SSE_REOPEN_FIRST_MS)
+      expect(FakeEventSource.instances).toHaveLength(9)
+      off()
+      wait(SSE_CLOSE_DELAY_MS)
+    })
+
+    it('jitters each wait by up to 20% either way', async () => {
+      stubMe(200)
+      const off = subscribeSSE('/api/events', () => {})
+      random.mockReturnValue(0)
+      await giveUp(FakeEventSource.instances[0])
+      wait(SSE_REOPEN_FIRST_MS * 0.8 - 1)
+      expect(FakeEventSource.instances).toHaveLength(1)
+      wait(1)
+      expect(FakeEventSource.instances).toHaveLength(2)
+      random.mockReturnValue(0.9999)
+      await giveUp(FakeEventSource.instances[1])
+      wait(SSE_REOPEN_FIRST_MS * 2 * 1.2 - 2)
+      expect(FakeEventSource.instances).toHaveLength(2)
+      wait(2)
+      expect(FakeEventSource.instances).toHaveLength(3)
+      off()
+      wait(SSE_CLOSE_DELAY_MS)
+    })
+
+    it('reopens nothing when /api/me says the session ended', async () => {
+      stubMe(401)
+      const off = subscribeSSE('/api/events', () => {})
+      await giveUp(FakeEventSource.instances[0])
+      expect(isSessionEnded()).toBe(true)
+      expect(vi.getTimerCount()).toBe(0)
+      wait(SSE_REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(1)
+      off()
+    })
+
+    it('a session that ends during the wait cancels the reopen', async () => {
+      stubMe(200)
+      const off = subscribeSSE('/api/events', () => {})
+      await giveUp(FakeEventSource.instances[0])
+      expect(vi.getTimerCount()).toBe(1)
+      act(() => markSessionEnded())
+      expect(vi.getTimerCount()).toBe(0)
+      wait(SSE_REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(1)
+      off()
+    })
+
+    it('the last subscriber leaving cancels the reopen, and no timer is left once the entry closed', async () => {
+      stubMe(200)
+      const off = subscribeSSE('/api/events', () => {})
+      await giveUp(FakeEventSource.instances[0])
+      off()
+      wait(SSE_CLOSE_DELAY_MS)
+      expect(sseSubscriberCount()).toBe(0)
+      expect(vi.getTimerCount()).toBe(0)
+      wait(SSE_REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(1)
+    })
+
+    it('a hidden tab waits until it is shown, and a paused one reopens only on show', async () => {
+      stubMe(200)
+      const off = subscribeSSE('/api/events', () => {})
+      await giveUp(FakeEventSource.instances[0])
+      setVisibility('hidden')
+      wait(SSE_REOPEN_MAX_MS - 1) // the grace period, not yet paused
+      expect(FakeEventSource.instances).toHaveLength(1)
+      setVisibility('visible') // shown before the pause: tries again on the backoff
+      wait(SSE_REOPEN_FIRST_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(2)
+
+      await giveUp(FakeEventSource.instances[1])
+      setVisibility('hidden')
+      wait(HIDDEN_CLOSE_MS) // paused: the dead stream is let go
+      expect(vi.getTimerCount()).toBe(0)
+      expect(FakeEventSource.instances).toHaveLength(2)
+      setVisibility('visible') // the usual resume opens one fresh stream
+      expect(FakeEventSource.instances).toHaveLength(3)
+      wait(SSE_REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(3)
+      off()
+      wait(SSE_CLOSE_DELAY_MS)
+    })
+
+    it('another URL gets the same retry', async () => {
+      stubMe(200)
+      const off = subscribeSSE('/api/other', () => {})
+      await giveUp(FakeEventSource.instances[0])
+      wait(SSE_REOPEN_FIRST_MS)
+      expect(FakeEventSource.instances.map(s => s.url)).toEqual(['/api/other', '/api/other'])
+      off()
+      wait(SSE_CLOSE_DELAY_MS)
+    })
+  })
+})
+
+// --- Several tabs of one browser -------------------------------------------
+// Each simulated tab is its own copy of the module, with its own registry,
+// session and document (visibility). They share the browser's Web Locks,
+// BroadcastChannel and EventSource fakes, so `open()` counts every stream
+// the browser holds.
+
+type Grant = (lock: { name: string }) => unknown
+
+interface FakeLock { holder: object | null; waiting: { run: () => void }[] }
+
+/** Exclusive Web Locks, each name its own FIFO queue, granted asynchronously. */
+class FakeLocks {
+  private locks = new Map<string, FakeLock>()
+  /** How many requests are waiting (not counting holders), for every name. */
+  get queued() { return [...this.locks.values()].reduce((n, l) => n + l.waiting.length, 0) }
+  get held() { return [...this.locks.values()].some(l => l.holder !== null) }
+  /** The names with a holder or a waiter. */
+  get names() { return [...this.locks].filter(([, l]) => l.holder || l.waiting.length).map(([n]) => n) }
+  private lock(name: string): FakeLock {
+    let lock = this.locks.get(name)
+    if (!lock) { lock = { holder: null, waiting: [] }; this.locks.set(name, lock) }
+    return lock
+  }
+  request(name: string, options: { signal?: AbortSignal }, callback: Grant): Promise<unknown> {
+    const lock = this.lock(name)
+    return new Promise((resolve, reject) => {
+      const aborted = () => new DOMException('The request was aborted.', 'AbortError')
+      if (options.signal?.aborted) { reject(aborted()); return }
+      const req = {
+        run: () => {
+          lock.holder = req
+          // Held until the callback's promise settles.
+          Promise.resolve()
+            .then(() => callback({ name }))
+            .then(resolve, reject)
+            .finally(() => { if (lock.holder === req) { lock.holder = null; this.next(lock) } })
+        },
+      }
+      // Aborting only withdraws a request that is still waiting.
+      options.signal?.addEventListener('abort', () => {
+        const i = lock.waiting.indexOf(req)
+        if (i >= 0) { lock.waiting.splice(i, 1); reject(aborted()) }
+      })
+      lock.waiting.push(req)
+      this.next(lock)
+    })
+  }
+  /** The browser lets go of a closed tab's lock (every held one) without its code running. */
+  drop() { for (const lock of this.locks.values()) { lock.holder = null; this.next(lock) } }
+  private next(lock: FakeLock) { if (!lock.holder && lock.waiting.length) lock.waiting.shift()!.run() }
+}
+
+class FakeBroadcastChannel {
+  static all: FakeBroadcastChannel[] = []
+  static sent: { kind: string }[] = []
+  onmessage: ((e: { data: unknown }) => void) | null = null
+  closed = false
+  name: string
+  constructor(name: string) {
+    this.name = name
+    FakeBroadcastChannel.all.push(this)
+  }
+  postMessage(data: unknown) {
+    if (this.closed) throw new DOMException('Channel is closed', 'InvalidStateError')
+    FakeBroadcastChannel.sent.push(data as { kind: string })
+    // Every other open channel of that name, never the sender, in order.
+    for (const ch of FakeBroadcastChannel.all) {
+      if (ch === this || ch.closed || ch.name !== this.name) continue
+      const copy = structuredClone(data)
+      void Promise.resolve().then(() => { if (!ch.closed) ch.onmessage?.({ data: copy }) })
+    }
+  }
+  close() { this.closed = true }
+}
+
+type SSEModule = typeof import('./useSSE')
+type SessionModule = typeof import('../lib/session')
+
+interface Tab {
+  sse: SSEModule
+  session: SessionModule
+  /** What this tab's subscribers received. */
+  events: SSEEvent[]
+  /** The channels this tab opened (they close with the tab). */
+  channels: FakeBroadcastChannel[]
+  subscribe(url?: string): () => void
+  hide(): void
+  show(): void
+  /** The page fires pagehide (it is unloading or going into the bfcache). */
+  pagehide(): void
+}
+
+// user: who /api/me said is signed in when the tab loaded (AuthProvider has
+// answered); null for a tab whose first subscribe comes before it knows.
+async function openTab({ hidden = false, user = 1 as number | null } = {}): Promise<Tab> {
+  let visibility: DocumentVisibilityState = hidden ? 'hidden' : 'visible'
+  const doc = new EventTarget()
+  const view = new EventTarget() // the tab's window, for pagehide
+  Object.defineProperty(doc, 'visibilityState', { get: () => visibility })
+  Object.defineProperty(doc, 'defaultView', { value: view })
+  const realDocument = Object.getOwnPropertyDescriptor(globalThis, 'document')!
+  vi.resetModules()
+  Object.defineProperty(globalThis, 'document', { configurable: true, get: () => doc })
+  let sse!: SSEModule, session!: SessionModule
+  try {
+    sse = await import('./useSSE')
+    session = await import('../lib/session')
+  } finally {
+    Object.defineProperty(globalThis, 'document', realDocument)
+  }
+  if (user !== null) session.noteSignedIn({ user_id: user })
+  const events: SSEEvent[] = []
+  const channels: FakeBroadcastChannel[] = []
+  // Channels opened during a call into this tab are this tab's.
+  const track = <T,>(fn: () => T): T => {
+    const before = FakeBroadcastChannel.all.length
+    const result = fn()
+    channels.push(...FakeBroadcastChannel.all.slice(before))
+    return result
+  }
+  const setVisibility = (v: DocumentVisibilityState) => {
+    visibility = v
+    track(() => doc.dispatchEvent(new Event('visibilitychange')))
+  }
+  return {
+    sse, session, events, channels,
+    subscribe: (url = '/api/events') => track(() => sse.subscribeSSE(url, e => { events.push(e) })),
+    hide: () => setVisibility('hidden'),
+    show: () => setVisibility('visible'),
+    pagehide: () => track(() => view.dispatchEvent(new Event('pagehide'))),
+  }
+}
+
+// Let the fakes' promise hops (lock grants, channel messages) run.
+const settle = async () => { for (let i = 0; i < 100; i++) await Promise.resolve() }
+const connectedCount = (t: Tab) => t.events.filter(e => e.type === 'connected').length
+const types = (events: SSEEvent[]) => events.map(e => e.type)
+
+function stubLocks(locks: unknown) {
+  Object.defineProperty(navigator, 'locks', { configurable: true, value: locks })
+}
+
+describe('across tabs (Web Locks + BroadcastChannel)', () => {
+  let locks: FakeLocks
+  beforeEach(() => {
+    vi.useFakeTimers()
+    locks = new FakeLocks()
+    stubLocks(locks)
+    FakeBroadcastChannel.all = []
+    FakeBroadcastChannel.sent = []
+    vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
+  })
+  afterEach(() => {
+    delete (navigator as { locks?: unknown }).locks
+    vi.useRealTimers()
+  })
+  const wait = async (ms: number) => { vi.advanceTimersByTime(ms); await settle() }
+  // What /api/me answers every tab from now on (they share the cookie jar):
+  // 200 is signed in, 401 is the proxy turning a signed-out request away.
+  // A tab told by another that the session ended asks it (#2630). who is the
+  // body of a 200: with a user_id, it names who is signed in (#2678).
+  const stubMe = (status: 200 | 401, who: { user_id?: number } = {}) => {
+    const me = vi.fn(async () => status === 200
+      ? new Response(JSON.stringify(who), { status, headers: { 'content-type': 'application/json' } })
+      : new Response('Unauthorized', { status }))
+    vi.stubGlobal('fetch', me)
+    return me
+  }
+
+  it('opens exactly one EventSource for N visible tabs and relays every frame to the others', async () => {
+    const tabs = [await openTab(), await openTab(), await openTab(), await openTab()]
+    tabs.forEach(t => t.subscribe())
+    await settle()
+    expect(open()).toHaveLength(1)
+    const [es] = open()
+    es.emit({ type: 'connected' })
+    es.emit({ type: 'task.updated', project_id: 1 })
+    await settle()
+    for (const t of tabs) expect(types(t.events)).toEqual(['connected', 'task.updated'])
+    // More subscribers in any tab share it too.
+    tabs[2].subscribe()
+    tabs[0].subscribe()
+    await settle()
+    expect(FakeEventSource.instances).toHaveLength(1)
+    expect(locks.queued).toBe(3) // the other visible tabs wait their turn
+  })
+
+  // A route change in the leader tab unsubscribes and resubscribes (#2624).
+  it('a leader resubscribed within the delay keeps its stream; no tab hears down or connected', async () => {
+    const a = await openTab(), b = await openTab()
+    const offA = a.subscribe()
+    b.subscribe()
+    await settle()
+    const [es] = open()
+    es.emit({ type: 'connected' })
+    await settle()
+    const sent = FakeBroadcastChannel.sent.length
+    offA()
+    await wait(SSE_CLOSE_DELAY_MS / 2)
+    a.subscribe()
+    await wait(SSE_CLOSE_DELAY_MS * 2)
+    expect(open()).toEqual([es])
+    expect(FakeEventSource.instances).toHaveLength(1)
+    expect(FakeBroadcastChannel.sent.slice(sent)).toEqual([]) // no down, no hello
+    expect([connectedCount(a), connectedCount(b)]).toEqual([1, 1])
+    expect([a.sse.isSSEConnected(), b.sse.isSSEConnected()]).toEqual([true, true])
+    es.emit({ type: 'task.updated', project_id: 1 })
+    await settle()
+    expect(b.events.at(-1)?.type).toBe('task.updated') // still relayed
+  })
+
+  it('a follower resubscribed within the delay stays on the leader\'s stream with no new connected', async () => {
+    const a = await openTab(), b = await openTab()
+    a.subscribe()
+    const offB = b.subscribe()
+    await settle()
+    const [es] = open()
+    es.emit({ type: 'connected' })
+    await settle()
+    const sent = FakeBroadcastChannel.sent.length
+    offB()
+    await wait(SSE_CLOSE_DELAY_MS / 2)
+    expect(b.sse.isSSEConnected()).toBe(true) // no flap while it waits
+    b.subscribe()
+    await wait(SSE_CLOSE_DELAY_MS * 2)
+    expect(open()).toEqual([es])
+    expect(connectedCount(b)).toBe(1)
+    expect(b.sse.isSSEConnected()).toBe(true)
+    // Only the usual new-subscriber retry, which an open stream ignores.
+    expect(FakeBroadcastChannel.sent.slice(sent).map(m => m.kind)).toEqual(['retry'])
+  })
+
+  it('a leader that leaves and unloads within the delay hands over at once', async () => {
+    const a = await openTab(), b = await openTab()
+    const offA = a.subscribe()
+    b.subscribe()
+    await settle()
+    const [first] = open()
+    offA()
+    a.pagehide()
+    await settle()
+    expect(first.closed).toBe(true)
+    expect(open()).toHaveLength(1) // b took over without waiting out the delay
+    expect(open()[0]).not.toBe(first)
+  })
+
+  it('a tab that joins a stream that is already up gets one connected, and nobody else does', async () => {
+    const a = await openTab()
+    a.subscribe()
+    await settle()
+    const [es] = open()
+    es.emit({ type: 'connected' })
+    const b = await openTab()
+    b.subscribe()
+    await settle()
+    expect(connectedCount(b)).toBe(1) // the leader's "up", delivered as connected
+    expect(connectedCount(a)).toBe(1)
+    const c = await openTab()
+    c.subscribe()
+    await settle()
+    expect(connectedCount(c)).toBe(1)
+    expect(connectedCount(b)).toBe(1) // c's answer isn't b's
+    expect(FakeEventSource.instances).toHaveLength(1)
+  })
+
+  it('hands the stream to a waiting visible tab when the leader leaves', async () => {
+    const a = await openTab(), b = await openTab(), c = await openTab()
+    const offA = a.subscribe()
+    b.subscribe()
+    c.subscribe()
+    await settle()
+    const [first] = open()
+    first.emit({ type: 'connected' })
+    await settle()
+    offA()
+    await wait(SSE_CLOSE_DELAY_MS)
+    expect(first.closed).toBe(true)
+    expect(open()).toHaveLength(1)
+    const [second] = open()
+    second.emit({ type: 'connected' })
+    second.emit({ type: 'task.updated', project_id: 1 })
+    await settle()
+    // One connected per stream: the second is the catch-up after the gap.
+    for (const t of [b, c]) {
+      expect(connectedCount(t)).toBe(2)
+      expect(t.events.at(-1)?.type).toBe('task.updated')
+    }
+  })
+
+  it('takes over when the browser closes the leader tab', async () => {
+    const a = await openTab(), b = await openTab()
+    a.subscribe()
+    b.subscribe()
+    await settle()
+    const [first] = open()
+    first.emit({ type: 'connected' })
+    await settle()
+    // The browser ends a's stream, channel and lock; none of a's code runs.
+    first.close()
+    a.channels.forEach(ch => ch.close())
+    locks.drop()
+    await settle()
+    expect(open()).toHaveLength(1)
+    const [second] = open()
+    expect(second).not.toBe(first)
+    second.emit({ type: 'connected' })
+    await settle()
+    expect(connectedCount(b)).toBe(2)
+  })
+
+  it('a hidden leader keeps the stream through the grace period, then hands it over', async () => {
+    const a = await openTab(), b = await openTab()
+    a.subscribe()
+    b.subscribe()
+    await settle()
+    const [first] = open()
+    first.emit({ type: 'connected' })
+    a.hide()
+    await wait(HIDDEN_CLOSE_MS - 1)
+    expect(open()).toEqual([first])
+    first.emit({ type: 'task.updated', project_id: 1 })
+    await settle()
+    expect(b.events.at(-1)?.type).toBe('task.updated') // still relayed while hidden
+    await wait(1)
+    expect(first.closed).toBe(true)
+    expect(open()).toHaveLength(1) // b, the visible tab, took over
+    expect(locks.queued).toBe(0) // and hidden a isn't waiting to lead again
+    const [second] = open()
+    second.emit({ type: 'connected' })
+    await settle()
+    expect(connectedCount(b)).toBe(2)
+  })
+
+  it('a quick hide and show of the leader hands nothing over', async () => {
+    const a = await openTab(), b = await openTab()
+    a.subscribe()
+    b.subscribe()
+    await settle()
+    const [first] = open()
+    a.hide()
+    await wait(HIDDEN_CLOSE_MS / 2)
+    a.show()
+    await wait(HIDDEN_CLOSE_MS * 2)
+    expect(open()).toEqual([first])
+    expect(FakeEventSource.instances).toHaveLength(1)
+  })
+
+  it('a hidden follower costs nothing after 30 s and resyncs once when shown', async () => {
+    const a = await openTab(), b = await openTab()
+    a.subscribe()
+    b.subscribe()
+    await settle()
+    const [es] = open()
+    es.emit({ type: 'connected' })
+    await settle()
+    expect(locks.queued).toBe(1)
+    b.hide()
+    await settle()
+    expect(locks.queued).toBe(0) // a hidden tab doesn't queue to lead
+    es.emit({ type: 'task.updated', project_id: 1 })
+    await settle()
+    expect(b.events.at(-1)?.type).toBe('task.updated') // delivered during the grace period
+    await wait(HIDDEN_CLOSE_MS)
+    expect(b.channels.every(ch => ch.closed)).toBe(true) // no channel, no lock, no stream
+    const seen = b.events.length
+    es.emit({ type: 'task.updated', project_id: 1 })
+    await settle()
+    expect(b.events).toHaveLength(seen) // delivers nothing while paused
+    b.show()
+    await settle()
+    expect(types(b.events.slice(seen))).toEqual(['connected']) // exactly one, so its stores resync
+    es.emit({ type: 'task.updated', project_id: 1 })
+    await settle()
+    expect(types(b.events.slice(seen))).toEqual(['connected', 'task.updated'])
+    expect(open()).toEqual([es]) // still the leader's one stream
+    expect(locks.queued).toBe(1) // b waits its turn again
+  })
+
+  it('a returning follower whose leader left opens the stream itself, with one connected', async () => {
+    const a = await openTab(), b = await openTab()
+    const offA = a.subscribe()
+    b.subscribe()
+    await settle()
+    open()[0].emit({ type: 'connected' })
+    b.hide()
+    await wait(HIDDEN_CLOSE_MS)
+    offA()
+    await wait(SSE_CLOSE_DELAY_MS)
+    expect(open()).toHaveLength(0)
+    const seen = b.events.length
+    b.show()
+    await settle()
+    expect(open()).toHaveLength(1)
+    open()[0].emit({ type: 'connected' })
+    await settle()
+    expect(types(b.events.slice(seen))).toEqual(['connected']) // its own stream's, no extra
+  })
+
+  it('a hidden tab never takes over; it opens the stream when shown', async () => {
+    const a = await openTab(), b = await openTab()
+    const offA = a.subscribe()
+    b.subscribe()
+    await settle()
+    b.hide()
+    offA()
+    await wait(SSE_CLOSE_DELAY_MS)
+    expect(open()).toHaveLength(0)
+    b.show()
+    await settle()
+    expect(open()).toHaveLength(1)
+  })
+
+  it('a tab opened in the background waits until it is shown', async () => {
+    const a = await openTab({ hidden: true })
+    a.subscribe()
+    await settle()
+    expect(open()).toHaveLength(0)
+    expect(locks.held).toBe(false)
+    a.show()
+    await settle()
+    expect(open()).toHaveLength(1)
+  })
+
+  it('a new subscriber in a follower tab gets the leader to retry a stream the browser gave up on', async () => {
+    const a = await openTab(), b = await openTab()
+    a.subscribe()
+    b.subscribe()
+    await settle()
+    const [dead] = FakeEventSource.instances
+    dead.readyState = 2 // CLOSED: the server answered with an error status
+    b.subscribe()
+    await settle()
+    expect(FakeEventSource.instances).toHaveLength(2)
+    const live = FakeEventSource.instances[1]
+    live.emit({ type: 'task.updated', project_id: 1 })
+    await settle()
+    expect(b.events.at(-1)?.type).toBe('task.updated')
+  })
+
+  // #2702: the leader retries a stream the browser gave up on by itself, so
+  // a brief outage doesn't leave every tab of the user without live updates.
+  describe('a stream the browser gave up on, with the session fine', () => {
+    let random: ReturnType<typeof vi.spyOn>
+    beforeEach(() => { random = vi.spyOn(Math, 'random').mockReturnValue(0.5) })
+    afterEach(() => { random.mockRestore() })
+    const giveUp = async (es: FakeEventSource) => { es.readyState = 2; es.onerror?.(); await settle() }
+    const downs = () => FakeBroadcastChannel.sent.filter(m => m.kind === 'down').length
+
+    it('the leader reopens it after the backoff, and every tab hears the new stream\'s connected once', async () => {
+      const me = stubMe(200, { user_id: 1 })
+      const a = await openTab(), b = await openTab(), c = await openTab()
+      for (const t of [a, b, c]) t.subscribe()
+      await settle()
+      const [dead] = FakeEventSource.instances
+      dead.emit({ type: 'connected' })
+      await settle()
+      const before = downs()
+      await giveUp(dead)
+      expect(me).toHaveBeenCalledTimes(1) // only the leader, whose stream it was, asks
+      expect(downs()).toBe(before + 1) // the usual down
+      expect([a, b, c].map(t => t.sse.isSSEConnected())).toEqual([false, false, false])
+      await wait(SSE_REOPEN_FIRST_MS - 1)
+      expect(FakeEventSource.instances).toHaveLength(1)
+      await wait(1)
+      expect(FakeEventSource.instances).toHaveLength(2) // one stream, the leader's: followers open none
+      const live = FakeEventSource.instances[1]
+      live.emit({ type: 'connected' })
+      live.emit({ type: 'task.updated', project_id: 1 })
+      await settle()
+      for (const t of [a, b, c]) {
+        expect(types(t.events)).toEqual(['connected', 'connected', 'task.updated'])
+        expect(t.sse.isSSEConnected()).toBe(true)
+      }
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('a second failure waits longer', async () => {
+      stubMe(200, { user_id: 1 })
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      await giveUp(FakeEventSource.instances[0])
+      await wait(SSE_REOPEN_FIRST_MS)
+      expect(FakeEventSource.instances).toHaveLength(2)
+      await giveUp(FakeEventSource.instances[1]) // failed again before saying connected
+      await wait(SSE_REOPEN_FIRST_MS * 2 - 1)
+      expect(FakeEventSource.instances).toHaveLength(2)
+      await wait(1)
+      expect(FakeEventSource.instances).toHaveLength(3)
+    })
+
+    it('a leader whose last subscriber leaves during the wait hands over, and the new leader opens the only stream', async () => {
+      stubMe(200, { user_id: 1 })
+      const a = await openTab(), b = await openTab()
+      const offA = a.subscribe()
+      b.subscribe()
+      await settle()
+      await giveUp(FakeEventSource.instances[0])
+      offA()
+      await wait(SSE_CLOSE_DELAY_MS)
+      expect(FakeEventSource.instances).toHaveLength(2) // b's, as leader
+      await wait(SSE_REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(2)
+      expect(open()).toEqual([FakeEventSource.instances[1]])
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('a session that ends during the wait cancels the reopen in every tab', async () => {
+      const me = stubMe(200, { user_id: 1 })
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      await giveUp(FakeEventSource.instances[0])
+      expect(vi.getTimerCount()).toBe(1)
+      me.mockImplementation(async () => new Response('Unauthorized', { status: 401 }))
+      a.session.markSessionEnded()
+      await settle()
+      expect(b.session.isSessionEnded()).toBe(true)
+      expect(vi.getTimerCount()).toBe(0)
+      await wait(SSE_REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(1)
+      expect(locks.held).toBe(false)
+    })
+
+    it('a leader whose /api/me names another user re-keys instead of reopening the old user\'s stream', async () => {
+      stubMe(200, { user_id: 2 }) // someone else signed in in this browser
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      const [dead] = FakeEventSource.instances
+      await giveUp(dead)
+      // a left user 1's election and leads user 2's; b took over user 1's.
+      expect(FakeEventSource.instances).toHaveLength(3)
+      expect(locks.names.sort()).toEqual(['amp-sse-leader:1', 'amp-sse-leader:2'])
+      await wait(SSE_REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(3)
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('a hidden leader that pauses during the wait reopens nothing; a visible tab takes over', async () => {
+      stubMe(200, { user_id: 1 })
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      await giveUp(FakeEventSource.instances[0])
+      a.hide()
+      await wait(HIDDEN_CLOSE_MS)
+      expect(FakeEventSource.instances).toHaveLength(2) // b's, after a let the lock go
+      b.events.length = 0
+      FakeEventSource.instances[1].emit({ type: 'connected' })
+      await settle()
+      expect(connectedCount(b)).toBe(1)
+      await wait(SSE_REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(2)
+    })
+  })
+
+  it('only /api/events is shared: another URL keeps a stream per tab', async () => {
+    const a = await openTab(), b = await openTab()
+    a.subscribe('/api/other')
+    b.subscribe('/api/other')
+    await settle()
+    expect(open()).toHaveLength(2)
+  })
+
+  // A follower tab is connected when the leader's stream is (#2540).
+  describe('connection state (isSSEConnected)', () => {
+    const connected = (...tabs: Tab[]) => tabs.map(t => t.sse.isSSEConnected())
+    const downs = () => FakeBroadcastChannel.sent.filter(m => m.kind === 'down').length
+
+    it('a follower is connected when the leader\'s stream is, and so is a tab that joins it open', async () => {
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      expect(connected(a, b)).toEqual([false, false]) // opening
+      const [es] = open()
+      es.emit({ type: 'connected' })
+      await settle()
+      expect(connected(a, b)).toEqual([true, true])
+      const c = await openTab()
+      c.subscribe()
+      await settle()
+      expect(c.sse.isSSEConnected()).toBe(true) // from the leader's "up"
+      expect(connectedCount(c)).toBe(1)
+    })
+
+    it('every tab is down while the leader\'s stream reconnects, and up after its next connected', async () => {
+      const a = await openTab(), b = await openTab(), c = await openTab()
+      for (const t of [a, b, c]) t.subscribe()
+      await settle()
+      const [es] = open()
+      es.emit({ type: 'connected' })
+      await settle()
+      const before = downs()
+      es.onerror?.() // dropped; the browser retries by itself (CONNECTING)
+      await settle()
+      expect(connected(a, b, c)).toEqual([false, false, false])
+      expect(downs()).toBe(before + 1)
+      es.onerror?.() // a retry that fails too tells nobody again
+      await settle()
+      expect(downs()).toBe(before + 1)
+      es.emit({ type: 'connected' })
+      await settle()
+      expect(connected(a, b, c)).toEqual([true, true, true])
+      for (const t of [a, b, c]) expect(connectedCount(t)).toBe(2) // the frames are as before: one per connected
+      expect(FakeEventSource.instances).toHaveLength(1)
+    })
+
+    it('followers wait for the new leader\'s connected when the leader hands over', async () => {
+      const a = await openTab(), b = await openTab(), c = await openTab()
+      const offA = a.subscribe()
+      b.subscribe()
+      c.subscribe()
+      await settle()
+      const [first] = open()
+      first.emit({ type: 'connected' })
+      await settle()
+      offA()
+      await wait(SSE_CLOSE_DELAY_MS)
+      expect(first.closed).toBe(true)
+      expect(connected(b, c)).toEqual([false, false])
+      const [second] = open()
+      second.emit({ type: 'connected' })
+      await settle()
+      expect(connected(b, c)).toEqual([true, true])
+    })
+
+    it('when the browser closes the leader tab, the next leader tells the followers to wait', async () => {
+      const a = await openTab(), b = await openTab(), c = await openTab()
+      for (const t of [a, b, c]) t.subscribe()
+      await settle()
+      const [first] = open()
+      first.emit({ type: 'connected' })
+      await settle()
+      expect(connected(b, c)).toEqual([true, true])
+      // The browser ends a's stream, channel and lock; none of a's code runs.
+      first.close()
+      a.channels.forEach(ch => ch.close())
+      locks.drop()
+      await settle()
+      expect(connected(b, c)).toEqual([false, false]) // b leads now, and said so
+      const [second] = open()
+      second.emit({ type: 'connected' })
+      await settle()
+      expect(connected(b, c)).toEqual([true, true])
+    })
+
+    it('a paused follower is down, and up again with the leader\'s "up" when shown', async () => {
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      open()[0].emit({ type: 'connected' })
+      await settle()
+      b.hide()
+      await wait(HIDDEN_CLOSE_MS - 1)
+      expect(b.sse.isSSEConnected()).toBe(true) // still hearing the leader in the grace period
+      await wait(1)
+      expect(connected(a, b)).toEqual([true, false])
+      b.show()
+      await settle()
+      expect(b.sse.isSSEConnected()).toBe(true)
+    })
+
+    it('no tab is connected once the session ended', async () => {
+      stubMe(401)
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      open()[0].emit({ type: 'connected' })
+      await settle()
+      a.session.markSessionEnded()
+      await settle()
+      expect(connected(a, b)).toEqual([false, false])
+    })
+  })
+
+  describe('when the session ends (#153)', () => {
+    it('ending in the leader tab ends it in every tab, and no tab opens a stream after', async () => {
+      stubMe(401) // the other tabs ask, and the proxy says signed out
+      const a = await openTab(), b = await openTab(), c = await openTab()
+      const offA = a.subscribe()
+      b.subscribe()
+      c.subscribe()
+      await settle()
+      const [es] = open()
+      a.session.markSessionEnded() // e.g. a's stream gave up and /api/me said signed out
+      await settle()
+      expect(es.closed).toBe(true)
+      expect(b.session.isSessionEnded()).toBe(true)
+      expect(c.session.isSessionEnded()).toBe(true)
+      offA()
+      await settle()
+      // The ended leader lets go of the lock (#2630), so a tab signed in
+      // since could lead. b and c are ended too, so neither takes it.
+      expect(locks.held).toBe(false)
+      expect(locks.queued).toBe(0)
+      expect(FakeEventSource.instances).toHaveLength(1)
+    })
+
+    it('a follower that finds it ended tells the leader, which closes the stream', async () => {
+      stubMe(401) // the leader asks, and the proxy says signed out
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      const [es] = open()
+      b.session.markSessionEnded() // e.g. an API call came back signed out
+      await settle()
+      expect(a.session.isSessionEnded()).toBe(true)
+      expect(es.closed).toBe(true)
+      expect(FakeBroadcastChannel.sent.filter(m => m.kind === 'session-ended')).toHaveLength(1) // a doesn't echo it
+    })
+
+    it('a follower paused at the time learns it when shown', async () => {
+      const me = stubMe(401)
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      b.hide()
+      await wait(HIDDEN_CLOSE_MS)
+      a.session.markSessionEnded()
+      await settle()
+      expect(b.session.isSessionEnded()).toBe(false) // its channel was closed
+      expect(me).not.toHaveBeenCalled()
+      b.show()
+      await settle()
+      // a answered b's hello, and /api/me said b is signed out too. a no
+      // longer holds the lock (#2630), so b may have opened a stream of its
+      // own before the answer; ending closed it.
+      expect(me).toHaveBeenCalledTimes(1)
+      expect(b.session.isSessionEnded()).toBe(true)
+      expect(open()).toHaveLength(0)
+      expect(locks.held).toBe(false)
+    })
+
+    // #2630, found by wave check #1585: the ended leader used to answer a new
+    // tab's hello with session-ended, the new tab believed it, and the ended
+    // leader kept the lock, so a tab signed in again got the gate again.
+    it('a tab opened after another tab\'s session ended, and signed in, is not ended and gets one stream', async () => {
+      stubMe(401)
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      open()[0].emit({ type: 'connected' })
+      await settle()
+      a.session.markSessionEnded()
+      await settle()
+      expect(b.session.isSessionEnded()).toBe(true)
+      expect(open()).toHaveLength(0)
+      const seenA = a.events.length, seenB = b.events.length
+      // The user signs in again in a new tab; a and b still show the gate.
+      const me = stubMe(200)
+      const d = await openTab()
+      d.subscribe()
+      await settle()
+      expect(me).toHaveBeenCalledTimes(1) // a (and b) told d; d asked once
+      expect(d.session.isSessionEnded()).toBe(false)
+      expect(open()).toHaveLength(1) // d's: it leads
+      const [es] = open()
+      es.emit({ type: 'connected' })
+      es.emit({ type: 'task.updated', project_id: 1 })
+      await settle()
+      expect(types(d.events)).toEqual(['connected', 'task.updated'])
+      expect(d.sse.isSSEConnected()).toBe(true)
+      // A second signed-in tab joins d's stream.
+      const e = await openTab()
+      e.subscribe()
+      await settle()
+      expect(e.session.isSessionEnded()).toBe(false)
+      expect(connectedCount(e)).toBe(1)
+      expect(open()).toEqual([es])
+      // The ended tabs hear none of it and still open nothing.
+      expect([a.events.length, b.events.length]).toEqual([seenA, seenB])
+      expect([a.session.isSessionEnded(), b.session.isSessionEnded()]).toEqual([true, true])
+    })
+
+    it('a follower told session-ended whose /api/me says signed out ends, says nothing more, and no tab reopens a stream', async () => {
+      const me = stubMe(401)
+      const a = await openTab(), b = await openTab(), c = await openTab()
+      a.subscribe()
+      b.subscribe()
+      c.subscribe()
+      await settle()
+      const [es] = open()
+      es.emit({ type: 'connected' })
+      await settle()
+      a.session.markSessionEnded()
+      await settle()
+      expect(me).toHaveBeenCalledTimes(2) // b and c each asked for themselves
+      expect([b.session.isSessionEnded(), c.session.isSessionEnded()]).toEqual([true, true])
+      expect(FakeBroadcastChannel.sent.filter(m => m.kind === 'session-ended')).toHaveLength(1) // no echo
+      // Nothing an ended tab does opens a stream or queues for the lock.
+      b.subscribe()
+      c.hide()
+      await wait(HIDDEN_CLOSE_MS)
+      c.show()
+      await settle()
+      expect(FakeEventSource.instances).toEqual([es])
+      expect(es.closed).toBe(true)
+      expect(locks.held).toBe(false)
+      expect(locks.queued).toBe(0)
+    })
+
+    it('a follower told session-ended whose /api/me says signed in takes over the stream', async () => {
+      stubMe(200) // a's cookie had expired; b's was renewed since
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      const [first] = open()
+      a.session.markSessionEnded()
+      await settle()
+      expect(b.session.isSessionEnded()).toBe(false)
+      expect(first.closed).toBe(true)
+      expect(open()).toHaveLength(1) // b's own
+      open()[0].emit({ type: 'connected' })
+      await settle()
+      expect(b.sse.isSSEConnected()).toBe(true)
+    })
+  })
+
+  // A stream carries the events of whoever was signed in when it opened.
+  // Tabs share one only with tabs of the same user (#2678).
+  describe('per signed-in user (#2678)', () => {
+    it('a tab signed in as another user never hears the first user\'s stream; it opens its own', async () => {
+      const a = await openTab({ user: 1 }), b = await openTab({ user: 2 })
+      a.subscribe()
+      await settle()
+      b.subscribe()
+      await settle()
+      expect(open()).toHaveLength(2)
+      const [esA, esB] = open()
+      expect(locks.names.sort()).toEqual(['amp-sse-leader:1', 'amp-sse-leader:2'])
+      expect(new Set(FakeBroadcastChannel.all.map(c => c.name))).toEqual(new Set(['amp-sse:1', 'amp-sse:2']))
+      esA.emit({ type: 'connected' })
+      esA.emit({ type: 'task.updated', project_id: 1 })
+      esB.emit({ type: 'connected' })
+      await settle()
+      expect(types(a.events)).toEqual(['connected', 'task.updated'])
+      expect(types(b.events)).toEqual(['connected']) // its own stream's, nothing of a's
+      expect(b.sse.isSSEConnected()).toBe(true)
+    })
+
+    it('tabs of the same user still share one stream while another user has their own', async () => {
+      const a = await openTab({ user: 1 }), b = await openTab({ user: 2 }), c = await openTab({ user: 1 })
+      a.subscribe(); b.subscribe(); c.subscribe()
+      await settle()
+      expect(open()).toHaveLength(2)
+      const [esA, esB] = open()
+      esA.emit({ type: 'connected' })
+      esA.emit({ type: 'task.updated', project_id: 1 })
+      esB.emit({ type: 'connected' })
+      esB.emit({ type: 'comment.added', project_id: 2 })
+      await settle()
+      expect(types(a.events)).toEqual(['connected', 'task.updated'])
+      expect(types(c.events)).toEqual(['connected', 'task.updated'])
+      expect(types(b.events)).toEqual(['connected', 'comment.added'])
+    })
+
+    it('a follower that learns a different user leaves the old stream and joins the new user\'s', async () => {
+      const a = await openTab({ user: 1 }), b = await openTab({ user: 1 })
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      const [esA] = open()
+      esA.emit({ type: 'connected' })
+      await settle()
+      expect(types(b.events)).toEqual(['connected'])
+      // Someone signed in as user 2 in this browser, and b asks /api/me.
+      stubMe(200, { user_id: 2 })
+      await b.session.checkSession()
+      await settle()
+      expect(b.session.signedInUser()).toBe('2')
+      expect(open()).toHaveLength(2) // b leads user 2's tabs with a stream of its own
+      const esB = open()[1]
+      esA.emit({ type: 'task.updated', project_id: 1 })
+      esB.emit({ type: 'connected' })
+      await settle()
+      expect(types(a.events)).toEqual(['connected', 'task.updated'])
+      expect(types(b.events)).toEqual(['connected', 'connected']) // never a's task.updated
+    })
+
+    it('a leader that learns a different user closes the stream it opened for the old one', async () => {
+      const a = await openTab({ user: 1 }), b = await openTab({ user: 2 })
+      a.subscribe()
+      await settle()
+      b.subscribe()
+      await settle()
+      const [esA, esB] = open()
+      esB.emit({ type: 'connected' })
+      await settle()
+      stubMe(200, { user_id: 2 })
+      await a.session.checkSession()
+      await settle()
+      expect(esA.closed).toBe(true)
+      expect(open()).toEqual([esB]) // a now follows user 2's leader
+      expect(locks.names).toEqual(['amp-sse-leader:2'])
+      expect(connectedCount(a)).toBe(1) // b's "up" answer
+      esB.emit({ type: 'task.updated', project_id: 2 })
+      await settle()
+      expect(types(a.events)).toEqual(['connected', 'task.updated'])
+    })
+
+    it('a tab that does not know its user yet joins nothing until /api/me names one', async () => {
+      const me = stubMe(200, { user_id: 1 })
+      const a = await openTab({ user: 1 })
+      a.subscribe()
+      await settle()
+      const [esA] = open()
+      esA.emit({ type: 'connected' })
+      const b = await openTab({ user: null })
+      b.subscribe()
+      expect(b.channels).toHaveLength(0) // not on any channel yet
+      esA.emit({ type: 'task.updated', project_id: 1 }) // before b's answer: not b's
+      expect(me).toHaveBeenCalledTimes(1)
+      await settle()
+      expect(b.session.signedInUser()).toBe('1')
+      expect(open()).toEqual([esA]) // b joined user 1's tabs
+      esA.emit({ type: 'comment.added', project_id: 1 })
+      await settle()
+      expect(types(b.events)).toEqual(['connected', 'comment.added'])
+    })
+
+    it('a tab whose /api/me names nobody keeps a stream of its own and hears no other tab', async () => {
+      stubMe(200) // no user_id (an older API)
+      const a = await openTab({ user: 1 })
+      a.subscribe()
+      await settle()
+      const b = await openTab({ user: null })
+      b.subscribe()
+      await settle()
+      expect(open()).toHaveLength(2)
+      const [esA, esB] = open()
+      esA.emit({ type: 'task.updated', project_id: 1 })
+      esB.emit({ type: 'connected' })
+      await settle()
+      expect(types(b.events)).toEqual(['connected'])
+      expect(b.channels).toHaveLength(0)
+      expect(locks.names).toEqual(['amp-sse-leader:1'])
+    })
+  })
+})
+
+describe('without Web Locks or BroadcastChannel (each tab keeps its own stream)', () => {
+  afterEach(() => { delete (navigator as { locks?: unknown }).locks })
+
+  it('without Web Locks, every tab opens its own stream and nothing is broadcast', async () => {
+    FakeBroadcastChannel.all = []
+    FakeBroadcastChannel.sent = []
+    vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
+    const a = await openTab(), b = await openTab()
+    a.subscribe()
+    b.subscribe()
+    expect(open()).toHaveLength(2)
+    const [esA] = open()
+    esA.emit({ type: 'task.updated', project_id: 1 })
+    a.session.markSessionEnded()
+    await settle()
+    expect(a.events).toHaveLength(1)
+    expect(b.events).toHaveLength(0)
+    expect(FakeBroadcastChannel.all).toHaveLength(0)
+    expect(FakeBroadcastChannel.sent).toHaveLength(0)
+  })
+
+  it('without BroadcastChannel, every tab opens its own stream and takes no lock', async () => {
+    const locks = new FakeLocks()
+    stubLocks(locks)
+    vi.stubGlobal('BroadcastChannel', undefined)
+    const a = await openTab(), b = await openTab()
+    a.subscribe()
+    b.subscribe()
+    await settle()
+    expect(open()).toHaveLength(2)
+    expect(locks.held).toBe(false)
+  })
+
+  it('a tab whose lock request is refused keeps its own stream', async () => {
+    stubLocks({ request: () => Promise.reject(new DOMException('The request was denied.', 'SecurityError')) })
+    vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
+    const a = await openTab()
+    a.subscribe()
+    await settle()
+    expect(open()).toHaveLength(1)
+    const [es] = open()
+    es.emit({ type: 'task.updated', project_id: 1 })
+    expect(a.events).toHaveLength(1)
   })
 })

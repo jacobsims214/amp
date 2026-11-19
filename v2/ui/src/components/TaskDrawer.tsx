@@ -37,6 +37,7 @@ import { StoryContext } from './StoryContext'
 import { CompletionReceipt } from './receipt/CompletionReceipt'
 import { latestRunWith } from '../lib/receipt'
 import { useSSE } from '../hooks/useSSE'
+import { useStreamReconnect } from '../hooks/useStreamReconnect'
 
 interface Props {
   task: Task | null
@@ -200,7 +201,9 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   }, [task?.id, task?.state, task?.merge_state]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // The ticket's verification receipt (#126), for the receipt and the
-  // header's "Requires receipt". Reread on its state, and on receipt.updated.
+  // header's "Requires receipt". Reread on its state, on receipt.updated, and
+  // when the live stream reconnects (#2531), since a receipt.updated sent while
+  // the stream was down never arrives.
   const [receiptFor, setReceiptFor] = useState<{ taskId: number; data: TaskReceipt | null } | null>(null)
   const [receiptTick, setReceiptTick] = useState(0)
   const agentTicket = !!task && !isHuman(task)
@@ -215,6 +218,10 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   useSSE(task?.project_id ?? null, e => {
     if (e.type === 'receipt.updated' && (e.payload as { task_id?: number } | undefined)?.task_id === task?.id) setReceiptTick(n => n + 1)
   })
+  // Ready once this ticket's first receipt read has settled (receiptFor is set
+  // on success and on failure), so the opening frame of a new stream, which
+  // arrives during that read, doesn't read the receipt twice.
+  useStreamReconnect(() => setReceiptTick(n => n + 1), agentTicket && receiptFor?.taskId === task?.id)
 
   useEffect(() => {
     if (!task) return

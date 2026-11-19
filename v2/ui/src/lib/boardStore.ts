@@ -20,6 +20,19 @@
  *   a handover) remove the ticket or re-read the project. The store listens while
  *   any view of the project is mounted, and for LINGER_MS after the last
  *   leaves, so a tab switch doesn't drop the stream.
+ * - Events sent while the stream was down (cut, or let go by a hidden tab)
+ *   never arrive, so a reconnect re-reads every project the store listens
+ *   for: the server says {"type":"connected"} on each new stream. A project
+ *   is ready once its first load has settled (succeeded or failed); each
+ *   "connected" while it is ready re-reads it once, and one during its first
+ *   load is dropped (that load reads fresh data). The same rule as
+ *   useStreamReconnect (#2541): there is no "skip the first connected", because a
+ *   shared stream's opening frame can come long after the first load (#2623).
+ * - A project nothing has used for EVICT_MS (no view mounted, no snapshot
+ *   subscriber) is dropped from the store, with its subscription and its
+ *   reconnect state, so a long-lived tab doesn't keep every board it has ever
+ *   shown. A view that comes back inside the window keeps the cache; one that
+ *   comes later reads the project fresh.
  * - Stories come from GET /api/projects/:id/stories in one request, in
  *   parallel with epics and tickets; an older API without it falls back to
  *   one request per epic.
@@ -33,6 +46,8 @@ import type { Epic, Story, Task, SSEEvent } from '../types'
 export const FRESH_MS = 15_000
 /** How long the store keeps listening for live events after the last view of a project leaves. */
 export const LINGER_MS = 30_000
+/** How long the store keeps a project nothing uses (no view, no subscriber) before it forgets it. */
+export const EVICT_MS = 5 * 60_000
 
 export interface BoardSnapshot {
   epics: Epic[]
@@ -56,6 +71,10 @@ interface Entry {
   linger: ReturnType<typeof setTimeout> | null
   /** Patches applied while the current load is in flight, replayed on its answer. */
   replay: Patch[]
+  /** A load of this entry has settled (succeeded or failed): a "connected" from now on is a reconnect. */
+  ready: boolean
+  /** Runs EVICT_MS after the last view and subscriber left; cleared when one comes back. */
+  evict: ReturnType<typeof setTimeout> | null
 }
 
 type Patch = (s: BoardSnapshot) => Partial<BoardSnapshot>
@@ -67,10 +86,43 @@ const entries = new Map<number, Entry>()
 function entry(pid: number): Entry {
   let e = entries.get(pid)
   if (!e) {
-    e = { snap: EMPTY, loadedAt: 0, seq: 0, inflight: null, listeners: new Set(), views: 0, unsubscribe: null, linger: null, replay: [] }
+    e = { snap: EMPTY, loadedAt: 0, seq: 0, inflight: null, listeners: new Set(), views: 0, unsubscribe: null, linger: null, replay: [], ready: false, evict: null }
     entries.set(pid, e)
+    // Nothing uses it yet: a view or subscriber that follows stops the clock.
+    // An entry made any other way (a load or patch with no view) is still dropped.
+    watchUse(pid, e)
   }
   return e
+}
+
+/**
+ * Call after a view or subscriber of project `pid` comes or goes. While
+ * nothing uses the entry, it is dropped after EVICT_MS. Anything that uses it
+ * again before then stops the clock, and the next time nothing uses it the
+ * clock starts again from zero.
+ */
+function watchUse(pid: number, e: Entry) {
+  if (e.views > 0 || e.listeners.size > 0) {
+    if (e.evict) { clearTimeout(e.evict); e.evict = null }
+  } else if (!e.evict && entries.get(pid) === e) {
+    e.evict = setTimeout(() => evict(pid, e), EVICT_MS)
+  }
+}
+
+/**
+ * Nothing has used project `pid` for EVICT_MS: forget its board, stop
+ * listening for it (the linger normally did that long ago) and drop its
+ * reconnect state. The next view gets a new entry and reads the project.
+ * A load still in flight doesn't land: it only lands in the entry that started it.
+ */
+function evict(pid: number, e: Entry) {
+  e.evict = null
+  if (entries.get(pid) !== e || e.views > 0 || e.listeners.size > 0) return
+  if (e.linger) { clearTimeout(e.linger); e.linger = null }
+  e.unsubscribe?.()
+  e.unsubscribe = null
+  e.replay = []
+  entries.delete(pid)
 }
 
 function set(pid: number, patch: Partial<BoardSnapshot>) {
@@ -125,6 +177,8 @@ export function loadBoard(pid: number, { force = false } = {}): Promise<void> {
     .finally(() => {
       if (!current()) return
       e.inflight = null
+      // Settled, either way: a "connected" from now on means events may have been missed.
+      e.ready = true
       set(pid, { inFlight: false })
     })
   e.inflight = run
@@ -146,7 +200,8 @@ export function boardIsStale(pid: number, now = Date.now()): boolean {
 export function subscribeBoard(pid: number, listener: () => void): () => void {
   const e = entry(pid)
   e.listeners.add(listener)
-  return () => { e.listeners.delete(listener) }
+  watchUse(pid, e)
+  return () => { e.listeners.delete(listener); watchUse(pid, e) }
 }
 
 // ─── Patches (from API answers and live events) ──────────────────────────────
@@ -230,6 +285,22 @@ export function applyEvent(pid: number, event: SSEEvent) {
 }
 
 /**
+ * The stream said "connected": it is a new stream, and the events sent while
+ * there was none are lost. Once the project's first load has settled, re-read
+ * it (now if a view shows it, else on the next view mount). During the first
+ * load, do nothing: that load reads what the gap missed. This runs once per
+ * project, however many views show it: the store has one subscription per project.
+ *
+ * Whether this is the stream's opening frame doesn't matter. The stream is
+ * shared, so a project that joins an open stream never sees its opening
+ * frame, and a tab opened in the background with no leader has no stream at
+ * all until it is shown (#1582): its first "connected" then follows a gap.
+ */
+function onConnected(pid: number, e: Entry) {
+  if (e.ready) invalidateBoard(pid)
+}
+
+/**
  * A view of project `pid` mounted: listen for its live events (once per
  * project, however many views). Returns the matching release; the store
  * keeps listening for LINGER_MS after the last release.
@@ -237,14 +308,24 @@ export function applyEvent(pid: number, event: SSEEvent) {
 export function retainBoard(pid: number): () => void {
   const e = entry(pid)
   e.views++
+  watchUse(pid, e)
   if (e.linger) { clearTimeout(e.linger); e.linger = null }
-  if (!e.unsubscribe) e.unsubscribe = subscribeSSE('/api/events', ev => applyEvent(pid, ev))
+  if (!e.unsubscribe) {
+    // "connected" carries no project: handle it before applyEvent's project guard.
+    // A dropped entry ignores whatever the stream was already delivering.
+    e.unsubscribe = subscribeSSE('/api/events', ev => {
+      if (entries.get(pid) !== e) return
+      if (ev.type === 'connected') onConnected(pid, e)
+      else applyEvent(pid, ev)
+    })
+  }
   let released = false
   return () => {
     if (released) return
     released = true
     e.views--
     if (e.views > 0) return
+    watchUse(pid, e)
     e.linger = setTimeout(() => {
       e.linger = null
       if (e.views === 0 && e.unsubscribe) { e.unsubscribe(); e.unsubscribe = null }
@@ -256,6 +337,7 @@ export function retainBoard(pid: number): () => void {
 export function resetBoardStore() {
   for (const e of entries.values()) {
     if (e.linger) clearTimeout(e.linger)
+    if (e.evict) clearTimeout(e.evict)
     e.unsubscribe?.()
   }
   entries.clear()

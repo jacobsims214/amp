@@ -124,7 +124,7 @@ func (h *RestHandler) events(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	h.hub.ServeFiltered(w, r, h.svc.EventFilter(p))
+	h.hub.ServeFiltered(w, r, p.UserID, h.svc.EventFilter(p))
 }
 
 func (h *RestHandler) Register(mux *http.ServeMux) {
@@ -1089,12 +1089,36 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 	case "activity":
 		since := r.URL.Query().Get("since")
 		until := r.URL.Query().Get("until")
-		activity, err := h.repo.GetProjectActivity(r.Context(), projectID, since, until)
+		// ?limit=N returns at most the newest N rows (the repository caps N
+		// at 500). A missing or unparsable limit, an overflowing one
+		// included, is 0: every row, as before the param existed.
+		limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+		if err != nil {
+			limit = 0
+		}
+		activity, err := h.repo.GetProjectActivity(r.Context(), projectID, since, until, limit)
 		if err != nil {
 			jsonErr(w, err, 500)
 			return
 		}
 		jsonOK(w, map[string]interface{}{"activity": activity, "count": len(activity)})
+		return
+
+	case "last-activity":
+		// Each in_progress ticket's newest activity time (AMP #2545), so
+		// Mission's stall alarm doesn't depend on the bounded feed above.
+		// Same access as "activity": the Member check every project route
+		// passes before this switch.
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET required", 405)
+			return
+		}
+		m, err := h.repo.ProjectRunningLastActivity(r.Context(), projectID)
+		if err != nil {
+			jsonErr(w, fmt.Errorf("last activity: %w", err), 500)
+			return
+		}
+		jsonOK(w, map[string]any{"last_activity": m})
 		return
 
 	case "export":

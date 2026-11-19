@@ -1,25 +1,42 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { Projects } from './Projects'
+import { subscribeSSE } from '../hooks/useSSE'
 import type { Project } from '../types'
 
 let projects: Project[] = []
 let created: Record<string, unknown> | null = null
+// How many times the page read the list, and a gate that holds a read until opened.
+let listReads = 0
+let listGate: Promise<void> | null = null
 const server = setupServer(
-  http.get('*/api/projects', () => HttpResponse.json({ projects })),
+  http.get('*/api/projects', async () => {
+    listReads++
+    if (listGate) await listGate
+    return HttpResponse.json({ projects })
+  }),
   http.post('*/api/projects', async ({ request }) => {
     created = await request.json() as Record<string, unknown>
     return HttpResponse.json({ id: 41, ...created })
   }),
   http.get('*/api/orgs', () => HttpResponse.json({ orgs: [] })),
 )
-class FakeEventSource { onmessage = null; onerror = null; addEventListener() {} removeEventListener() {} close() {} }
+// The real useSSE, over a fake stream: frames reach the page as they would live.
+// jsdom has no navigator.locks, so useSSE opens one stream per tab.
+let sources: FakeEventSource[] = []
+class FakeEventSource {
+  constructor() { sources.push(this) }
+  onmessage: ((e: { data: string }) => void) | null = null
+  onerror = null
+  readyState = 1
+  close() {}
+}
 beforeAll(() => { vi.stubGlobal('EventSource', FakeEventSource); server.listen({ onUnhandledFrame: 'bypass' }) })
-afterEach(() => { server.resetHandlers(); projects = []; created = null })
+afterEach(() => { server.resetHandlers(); projects = []; created = null; listReads = 0; listGate = null; sources = [] })
 afterAll(() => { server.close(); vi.unstubAllGlobals() })
 
 function Where() {
@@ -80,5 +97,96 @@ describe('Projects', () => {
     expect(screen.queryByText('Give the project a name.')).toBeNull()
     expect(screen.queryByText('Give it a code: letters A-Z and digits.')).toBeNull() // the suggestion filled it
     expect(screen.getByLabelText('Code *')).toHaveValue('OPS')
+  })
+})
+
+function project(id: number, name: string, state: Project['state'] = 'active'): Project {
+  return { id, name, code: `P${id}`, description: '', state, created_at: '2026-11-01T00:00:00Z', updated_at: '2026-11-01T00:00:00Z' }
+}
+
+function send(data: unknown) {
+  const source = sources.at(-1)!
+  act(() => source.onmessage!({ data: JSON.stringify(data) }))
+}
+
+/** The server's first frame on every new stream. It carries no project. */
+function connect() {
+  send({ type: 'connected' })
+}
+
+/** Lets any request the page just made reach the server and render. */
+async function settle() {
+  await act(async () => { await new Promise(r => setTimeout(r, 50)) })
+}
+
+describe('Projects after a stream reconnect', () => {
+  it('re-reads the list once on each connected after the first load has settled', async () => {
+    projects = [project(1, 'Apollo'), project(2, 'Borealis')]
+    renderAt('/projects')
+    expect(await screen.findByRole('heading', { name: 'Apollo' })).toBeInTheDocument()
+    expect(listReads).toBe(1)
+
+    // An ordinary event is applied as it comes, not taken for a reconnect.
+    send({ type: 'project.created', payload: project(3, 'Cygnus') })
+    expect(await screen.findByRole('heading', { name: 'Cygnus' })).toBeInTheDocument()
+    await settle()
+    expect(listReads).toBe(1)
+
+    // While the stream was down, Delta was created and Borealis archived.
+    projects = [project(1, 'Apollo'), project(2, 'Borealis', 'archived'), project(3, 'Cygnus'), project(4, 'Delta')]
+    connect()
+    expect(await screen.findByRole('heading', { name: 'Delta' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Borealis' })).toBeNull()
+    expect(screen.getByRole('button', { name: /Archived \(1\)/ })).toBeInTheDocument()
+    expect(screen.getByText('live')).toBeInTheDocument()
+    await settle()
+    expect(listReads).toBe(2)
+
+    connect()
+    await waitFor(() => expect(listReads).toBe(3))
+    await settle()
+    expect(listReads).toBe(3)
+  })
+
+  it('a connected during the first load causes no extra request', async () => {
+    projects = [project(1, 'Apollo')]
+    let open!: () => void
+    listGate = new Promise(r => { open = r })
+    renderAt('/projects')
+    await waitFor(() => expect(listReads).toBe(1))
+
+    // The opening frame of the stream the page just opened: the list is being read.
+    connect()
+    open()
+    expect(await screen.findByRole('heading', { name: 'Apollo' })).toBeInTheDocument()
+    await settle()
+    expect(listReads).toBe(1)
+
+    // The next connected is a reconnect.
+    connect()
+    await waitFor(() => expect(listReads).toBe(2))
+  })
+
+  it('a page that mounts on a stream another view holds re-reads on the first connected it sees', async () => {
+    // Another view (the board store lingers for 30 s) opened the stream and
+    // heard its opening frame before this page mounted.
+    const unsubscribe = subscribeSSE('/api/events', () => {})
+    try {
+      connect()
+      projects = [project(1, 'Apollo')]
+      renderAt('/projects')
+      expect(await screen.findByRole('heading', { name: 'Apollo' })).toBeInTheDocument()
+      expect(screen.getByText('live')).toBeInTheDocument() // no connected of its own needed (#2540)
+      expect(sources).toHaveLength(1)
+      expect(listReads).toBe(1)
+
+      projects = [project(1, 'Apollo'), project(2, 'Borealis')]
+      connect()
+      expect(await screen.findByRole('heading', { name: 'Borealis' })).toBeInTheDocument()
+      await settle()
+      expect(listReads).toBe(2)
+    } finally {
+      unsubscribe()
+    }
   })
 })

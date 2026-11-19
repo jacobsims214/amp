@@ -4,12 +4,14 @@
  * GET /tasks/:id/decisions (v2/docs/specs/human-decision-docs.md). Shown on any
  * ticket that has one (the drawer remounts it per ticket); "Done by" for reasons that aren't decisions.
  * It reloads on any decision.updated for one of its dependencies, so an open
- * drawer shows a decision recorded meanwhile.
+ * drawer shows a decision recorded meanwhile, and once more when the live
+ * stream reconnects (#2533), for a decision made while the stream was down.
  */
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api } from '../../api/client'
 import { useSSE } from '../../hooks/useSSE'
+import { useStreamReconnect } from '../../hooks/useStreamReconnect'
 import { decisionAfterOption } from '../../lib/decisions'
 import type { UpstreamDecision } from '../../types'
 
@@ -24,16 +26,24 @@ export function DecidedUpstream({ taskId, projectId, dependencyIds, ticketHref }
   const [items, setItems] = useState<UpstreamDecision[]>([])
   const hasDependencies = dependencyIds.length > 0
   const [reloads, setReloads] = useState(0)
+  // The ticket whose read has settled, whether it succeeded or failed.
+  const [settledFor, setSettledFor] = useState<number | null>(null)
   useEffect(() => {
     if (!hasDependencies) return
     let live = true
-    api.getTaskDecisions(taskId).then(r => { if (live) setItems(r.upstream) }).catch(() => {})
+    api.getTaskDecisions(taskId)
+      .then(r => { if (live) setItems(r.upstream) })
+      .catch(() => {})
+      .finally(() => { if (live) setSettledFor(taskId) })
     return () => { live = false }
   }, [taskId, hasDependencies, reloads])
   useSSE(projectId, e => {
     const id = (e.payload as { task_id?: number } | undefined)?.task_id
     if (e.type === 'decision.updated' && id != null && dependencyIds.includes(id)) setReloads(n => n + 1)
   })
+  // A decision.updated sent while the stream was down never arrives, so re-read
+  // once it is back. The list stays on screen while the re-read runs.
+  useStreamReconnect(() => setReloads(n => n + 1), hasDependencies && settledFor === taskId)
   if (!hasDependencies || items.length === 0) return null
   return (
     <div className="px-6 py-4 border-b border-line grid gap-2" data-testid="decided-upstream">
