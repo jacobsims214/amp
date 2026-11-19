@@ -358,6 +358,13 @@ func (d *deadlineWriter) stopReading() {
 
 func (d *deadlineWriter) unblock() { d.releaseOnce.Do(func() { close(d.release) }) }
 
+// armed is the deadline set on the connection now; zero means none.
+func (d *deadlineWriter) armed() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.deadline
+}
+
 func (d *deadlineWriter) snapshot() (frames []string, ahead []time.Duration, unarmed, timedOut int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -539,6 +546,193 @@ func TestWriteTimeoutValue(t *testing.T) {
 func TestNew_UsesDefaultWriteTimeout(t *testing.T) {
 	if got := New().writeTimeoutValue(); got != 10*time.Second {
 		t.Fatalf("default write timeout = %v, want 10s", got)
+	}
+}
+
+// Idle-stream timings for the real-socket tests below. As in production
+// (DefaultWriteTimeout 10 s, DefaultKeepalive 25 s), the write timeout is
+// shorter than the keepalive interval, so an idle stream spends most of its
+// time past the last write's deadline.
+const (
+	idleWriteTimeout = 50 * time.Millisecond
+	idleKeepalive    = 120 * time.Millisecond
+	idleKeepalives   = 4 // about 480 ms idle: nearly 10 write timeouts
+)
+
+// expectIdleStreamSurvives reads the connected frame and then idleKeepalives
+// keepalives from resp, failing if the stream errors or ends first, and
+// checks the stream is still registered afterwards.
+func expectIdleStreamSurvives(t *testing.T, h *Hub, resp *http.Response) {
+	t.Helper()
+	r := bufio.NewReader(resp.Body)
+	readFrame := func() string {
+		t.Helper()
+		var lines []string
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				t.Fatalf("idle stream ended: %v (frame so far %q)", err, lines)
+			}
+			line = strings.TrimSuffix(line, "\n")
+			if line == "" {
+				return strings.Join(lines, "\n")
+			}
+			lines = append(lines, line)
+		}
+	}
+	if got, want := readFrame(), `data: {"type":"connected"}`; got != want {
+		t.Fatalf("first frame = %q, want %q", got, want)
+	}
+	start := time.Now()
+	for i := 0; i < idleKeepalives; i++ {
+		if got := readFrame(); got != ": keepalive" {
+			t.Fatalf("frame %d = %q, want %q", i+1, got, ": keepalive")
+		}
+	}
+	if idle := time.Since(start); idle < 3*idleWriteTimeout {
+		t.Fatalf("read %d keepalives in %v, want the stream idle past several %v write timeouts", idleKeepalives, idle, idleWriteTimeout)
+	}
+	if n := clientCount(h); n != 1 {
+		t.Fatalf("registered streams after the idle period = %d, want 1", n)
+	}
+}
+
+// openIdleStream GETs the stream from srv with client and returns the
+// response, after checking it used HTTP protoMajor.
+func openIdleStream(t *testing.T, ctx context.Context, client *http.Client, url string, protoMajor int) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	if resp.ProtoMajor != protoMajor {
+		t.Fatalf("response protocol = %s, want HTTP/%d", resp.Proto, protoMajor)
+	}
+	return resp
+}
+
+// TestServeFiltered_IdleStreamOutlivesWriteTimeout_HTTP1 runs an idle stream
+// behind a real HTTP/1.1 server with the write timeout shorter than the
+// keepalive interval, as in production.
+func TestServeFiltered_IdleStreamOutlivesWriteTimeout_HTTP1(t *testing.T) {
+	h := New()
+	h.writeTimeout = idleWriteTimeout
+	h.keepalive = idleKeepalive
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp := openIdleStream(t, ctx, srv.Client(), srv.URL, 1)
+	expectIdleStreamSurvives(t, h, resp)
+
+	cancel()
+	waitFor(t, "client to be deregistered after disconnect", func() bool { return clientCount(h) == 0 })
+}
+
+// TestServeFiltered_IdleStreamOutlivesWriteTimeout_HTTP2 is the same over a
+// real HTTP/2 server. There the write deadline is a timer on the stream that
+// resets it when it fires, even with no write pending, so a deadline left
+// armed after a flush would cut every idle stream one write timeout after its
+// last frame.
+func TestServeFiltered_IdleStreamOutlivesWriteTimeout_HTTP2(t *testing.T) {
+	h := New()
+	h.writeTimeout = idleWriteTimeout
+	h.keepalive = idleKeepalive
+	srv := httptest.NewUnstartedServer(h)
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp := openIdleStream(t, ctx, srv.Client(), srv.URL, 2)
+	expectIdleStreamSurvives(t, h, resp)
+
+	cancel()
+	waitFor(t, "client to be deregistered after disconnect", func() bool { return clientCount(h) == 0 })
+}
+
+// TestServeFiltered_IdleStreamHasNoWriteDeadline checks the deadline is
+// cleared once a frame is flushed, so nothing is armed while the stream
+// waits for the next one.
+func TestServeFiltered_IdleStreamHasNoWriteDeadline(t *testing.T) {
+	h := New()
+	h.writeTimeout = 5 * time.Second
+	h.keepalive = time.Hour
+	dw := newDeadlineWriter("")
+	_, _ = serveWriter(t, h, dw, nil, dw.unblock)
+
+	waitFor(t, "the connected frame", func() bool {
+		frames, _, _, _ := dw.snapshot()
+		return len(frames) == 1
+	})
+	waitFor(t, "the write deadline to be cleared after the connected frame", func() bool { return dw.armed().IsZero() })
+
+	h.Publish(domain.Event{Type: domain.EventType("test.one"), ProjectID: 1})
+	waitFor(t, "the event", func() bool {
+		frames, _, _, _ := dw.snapshot()
+		return len(frames) == 2
+	})
+	waitFor(t, "the write deadline to be cleared after the event", func() bool { return dw.armed().IsZero() })
+
+	if _, _, unarmed, _ := dw.snapshot(); unarmed != 0 {
+		t.Fatalf("%d writes had no fresh write deadline before them", unarmed)
+	}
+}
+
+// TestServeFiltered_StreamEndIsBounded checks a fresh write deadline is armed
+// when ServeFiltered returns, however the stream ends. net/http writes the
+// response's end (the terminating chunk) after the handler returns, so with
+// the idle stream's deadline cleared, that write would otherwise have none.
+func TestServeFiltered_StreamEndIsBounded(t *testing.T) {
+	const timeout = 5 * time.Second
+	tests := []struct {
+		name string
+		end  func(h *Hub, cancel context.CancelFunc)
+	}{
+		{name: "client disconnects", end: func(_ *Hub, cancel context.CancelFunc) { cancel() }},
+		{name: "stream overflows", end: func(h *Hub, _ context.CancelFunc) {
+			h.mu.RLock()
+			defer h.mu.RUnlock()
+			for s := range h.clients {
+				s.overflow()
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := New()
+			h.writeTimeout = timeout
+			h.keepalive = time.Hour
+			dw := newDeadlineWriter("")
+			cancel, done := serveWriter(t, h, dw, nil, dw.unblock)
+
+			waitFor(t, "client to register", func() bool { return clientCount(h) == 1 })
+			waitFor(t, "the idle stream's deadline to be cleared", func() bool {
+				frames, _, _, _ := dw.snapshot()
+				return len(frames) == 1 && dw.armed().IsZero()
+			})
+
+			tt.end(h, cancel)
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("ServeFiltered did not return")
+			}
+			deadline := dw.armed()
+			if deadline.IsZero() {
+				t.Fatal("no write deadline armed when ServeFiltered returned: the response's end is unbounded")
+			}
+			if ahead := time.Until(deadline); ahead <= timeout-time.Second || ahead > timeout {
+				t.Fatalf("deadline at return is %v ahead, want about %v", ahead, timeout)
+			}
+		})
 	}
 }
 

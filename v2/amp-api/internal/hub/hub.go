@@ -23,11 +23,14 @@ const DefaultKeepalive = 25 * time.Second
 // bytes moving on an idle connection.
 const keepaliveFrame = ": keepalive\n\n"
 
-// DefaultWriteTimeout bounds one write to an SSE stream, flush included.
-// The API server sets no WriteTimeout, so without it a client that stops
-// reading (a frozen or sleeping tab) blocks the write, and with it the
-// stream's goroutine and its proxy buffer, until TCP gives up. When the
-// deadline passes, the write fails and the stream ends.
+// DefaultWriteTimeout bounds each write to an SSE stream, flush included,
+// and the end of the response once the stream is over. The API server sets
+// no WriteTimeout, so without it a client that stops reading (a frozen or
+// sleeping tab) blocks the write, and with it the stream's goroutine and its
+// proxy buffer, until TCP gives up. When the deadline passes, the write
+// fails and the stream ends. The deadline is cleared after each successful
+// flush, so an idle stream has none: it may be shorter than
+// DefaultKeepalive.
 const DefaultWriteTimeout = 10 * time.Second
 
 // subscriberBuffer is how many events a stream can fall behind by. One
@@ -194,7 +197,8 @@ type Allow func(projectID int) bool
 // stream in logs; 0 means unknown.
 //
 // Every write to the stream (the connected frame, keepalives and events)
-// runs under a fresh write deadline. A write or flush that fails, whether
+// runs under a fresh write deadline, cleared once the frame is flushed, and
+// the response's end runs under one more. A write or flush that fails, whether
 // the client went away or stopped reading and the deadline passed, ends the
 // stream and unregisters it. So does falling a full buffer of events behind
 // (see deliver): the browser then reconnects and resyncs.
@@ -227,17 +231,33 @@ func (h *Hub) ServeFiltered(w http.ResponseWriter, r *http.Request, userID int, 
 
 	rc := http.NewResponseController(w)
 	timeout := h.writeTimeoutValue()
+	// Bound the end of the response. net/http writes it (the terminating
+	// chunk) after this handler returns and before it resets the
+	// connection's deadline, and send leaves no deadline armed, so without
+	// this a stream ending to a client that stopped reading (an overflow,
+	// say) could block that write for good. Deferred after the unregister
+	// defer, so it runs first.
+	defer func() { _ = rc.SetWriteDeadline(time.Now().Add(timeout)) }()
+
 	// send writes one frame and flushes it under a fresh write deadline. The
 	// deadline is set on the connection, so it bounds the flush too, which
-	// is where a buffered write actually blocks. As in internal/relay, a
-	// writer without deadlines (ErrNotSupported: a test recorder) is written
-	// without one.
+	// is where a buffered write actually blocks. Once the flush succeeds,
+	// send clears the deadline, so none is armed while the stream is idle:
+	// over HTTP/2 a deadline is a timer that resets the stream when it
+	// fires, even with no write pending, and DefaultWriteTimeout is shorter
+	// than DefaultKeepalive, so a deadline left armed would cut every idle
+	// stream. As in internal/relay, a writer without deadlines
+	// (ErrNotSupported: a test recorder) is written without one.
 	send := func(frame string) error {
 		_ = rc.SetWriteDeadline(time.Now().Add(timeout))
 		if _, err := io.WriteString(w, frame); err != nil {
 			return err
 		}
-		return rc.Flush()
+		if err := rc.Flush(); err != nil {
+			return err
+		}
+		_ = rc.SetWriteDeadline(time.Time{})
+		return nil
 	}
 
 	if err := send("data: {\"type\":\"connected\"}\n\n"); err != nil {
