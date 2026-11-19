@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, render, renderHook } from '@testing-library/react'
-import { HIDDEN_CLOSE_MS, SSE_CLOSE_DELAY_MS, isSSEConnected, sseSubscriberCount, subscribeSSE, useSSE, useSSEConnected } from './useSSE'
+import { HIDDEN_CLOSE_MS, SSE_CLOSE_DELAY_MS, SSE_REOPEN_FIRST_MS, SSE_REOPEN_MAX_MS, isSSEConnected, sseSubscriberCount, subscribeSSE, useSSE, useSSEConnected } from './useSSE'
 import type { SSEEvent } from '../types'
 import { isSessionEnded, markSessionEnded, resetSession } from '../lib/session'
 
@@ -515,6 +515,172 @@ describe('useSSE', () => {
       a.unmount(); b.unmount()
     })
   })
+
+  // The browser stops retrying for good (CLOSED) when an answer isn't a 200
+  // event stream, e.g. a 502 while no server is up. If /api/me says the
+  // session is fine, the tab tries again on a jittered backoff (#2702).
+  describe('a stream the browser gave up on, with the session fine', () => {
+    let visibility: DocumentVisibilityState = 'visible'
+    const setVisibility = (v: DocumentVisibilityState) => {
+      visibility = v
+      act(() => { document.dispatchEvent(new Event('visibilitychange')) })
+    }
+    const wait = (ms: number) => act(() => { vi.advanceTimersByTime(ms) })
+    const flush = () => act(async () => { for (let i = 0; i < 100; i++) await Promise.resolve() })
+    const stubMe = (status: 200 | 401) => {
+      const me = vi.fn(async () => status === 200
+        ? new Response(JSON.stringify({ user_id: 1 }), { status, headers: { 'content-type': 'application/json' } })
+        : new Response('Unauthorized', { status }))
+      vi.stubGlobal('fetch', me)
+      return me
+    }
+    // The browser gives up on es, and /api/me answers.
+    const giveUp = async (es: FakeEventSource) => {
+      es.readyState = 2
+      es.onerror?.()
+      await flush()
+    }
+    let random: ReturnType<typeof vi.spyOn>
+    beforeEach(() => {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => visibility })
+      random = vi.spyOn(Math, 'random').mockReturnValue(0.5) // no jitter: waits are exactly the backoff
+    })
+    afterEach(() => {
+      setVisibility('visible')
+      random.mockRestore()
+    })
+
+    it('reopens it after the backoff, and the new stream\'s connected reaches every subscriber once', async () => {
+      const me = stubMe(200)
+      const a: SSEEvent[] = [], b: SSEEvent[] = []
+      const offA = subscribeSSE('/api/events', e => { a.push(e) })
+      const offB = subscribeSSE('/api/events', e => { b.push(e) })
+      const [dead] = FakeEventSource.instances
+      await giveUp(dead)
+      expect(me).toHaveBeenCalledTimes(1)
+      expect(isSessionEnded()).toBe(false)
+      wait(SSE_REOPEN_FIRST_MS - 1)
+      expect(FakeEventSource.instances).toHaveLength(1)
+      wait(1)
+      expect(FakeEventSource.instances).toHaveLength(2)
+      const live = FakeEventSource.instances[1]
+      act(() => live.emit({ type: 'connected' }))
+      expect([a, b].map(types)).toEqual([['connected'], ['connected']])
+      expect(isSSEConnected()).toBe(true)
+      expect(vi.getTimerCount()).toBe(0)
+      offA(); offB()
+      wait(SSE_CLOSE_DELAY_MS)
+    })
+
+    it('waits twice as long after each failure, up to the cap, and starts over once a stream says connected', async () => {
+      stubMe(200)
+      const off = subscribeSSE('/api/events', () => {})
+      const waits: number[] = []
+      for (let i = 0; i < 7; i++) {
+        const n = FakeEventSource.instances.length
+        await giveUp(FakeEventSource.instances[n - 1])
+        let waited = 0
+        while (FakeEventSource.instances.length === n && waited <= SSE_REOPEN_MAX_MS * 2) { wait(100); waited += 100 }
+        waits.push(waited)
+      }
+      expect(waits).toEqual([1_000, 2_000, 4_000, 8_000, 16_000, SSE_REOPEN_MAX_MS, SSE_REOPEN_MAX_MS])
+      const live = FakeEventSource.instances.at(-1)!
+      act(() => live.emit({ type: 'connected' }))
+      await giveUp(live)
+      wait(SSE_REOPEN_FIRST_MS)
+      expect(FakeEventSource.instances).toHaveLength(9)
+      off()
+      wait(SSE_CLOSE_DELAY_MS)
+    })
+
+    it('jitters each wait by up to 20% either way', async () => {
+      stubMe(200)
+      const off = subscribeSSE('/api/events', () => {})
+      random.mockReturnValue(0)
+      await giveUp(FakeEventSource.instances[0])
+      wait(SSE_REOPEN_FIRST_MS * 0.8 - 1)
+      expect(FakeEventSource.instances).toHaveLength(1)
+      wait(1)
+      expect(FakeEventSource.instances).toHaveLength(2)
+      random.mockReturnValue(0.9999)
+      await giveUp(FakeEventSource.instances[1])
+      wait(SSE_REOPEN_FIRST_MS * 2 * 1.2 - 2)
+      expect(FakeEventSource.instances).toHaveLength(2)
+      wait(2)
+      expect(FakeEventSource.instances).toHaveLength(3)
+      off()
+      wait(SSE_CLOSE_DELAY_MS)
+    })
+
+    it('reopens nothing when /api/me says the session ended', async () => {
+      stubMe(401)
+      const off = subscribeSSE('/api/events', () => {})
+      await giveUp(FakeEventSource.instances[0])
+      expect(isSessionEnded()).toBe(true)
+      expect(vi.getTimerCount()).toBe(0)
+      wait(SSE_REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(1)
+      off()
+    })
+
+    it('a session that ends during the wait cancels the reopen', async () => {
+      stubMe(200)
+      const off = subscribeSSE('/api/events', () => {})
+      await giveUp(FakeEventSource.instances[0])
+      expect(vi.getTimerCount()).toBe(1)
+      act(() => markSessionEnded())
+      expect(vi.getTimerCount()).toBe(0)
+      wait(SSE_REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(1)
+      off()
+    })
+
+    it('the last subscriber leaving cancels the reopen, and no timer is left once the entry closed', async () => {
+      stubMe(200)
+      const off = subscribeSSE('/api/events', () => {})
+      await giveUp(FakeEventSource.instances[0])
+      off()
+      wait(SSE_CLOSE_DELAY_MS)
+      expect(sseSubscriberCount()).toBe(0)
+      expect(vi.getTimerCount()).toBe(0)
+      wait(SSE_REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(1)
+    })
+
+    it('a hidden tab waits until it is shown, and a paused one reopens only on show', async () => {
+      stubMe(200)
+      const off = subscribeSSE('/api/events', () => {})
+      await giveUp(FakeEventSource.instances[0])
+      setVisibility('hidden')
+      wait(SSE_REOPEN_MAX_MS - 1) // the grace period, not yet paused
+      expect(FakeEventSource.instances).toHaveLength(1)
+      setVisibility('visible') // shown before the pause: tries again on the backoff
+      wait(SSE_REOPEN_FIRST_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(2)
+
+      await giveUp(FakeEventSource.instances[1])
+      setVisibility('hidden')
+      wait(HIDDEN_CLOSE_MS) // paused: the dead stream is let go
+      expect(vi.getTimerCount()).toBe(0)
+      expect(FakeEventSource.instances).toHaveLength(2)
+      setVisibility('visible') // the usual resume opens one fresh stream
+      expect(FakeEventSource.instances).toHaveLength(3)
+      wait(SSE_REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(3)
+      off()
+      wait(SSE_CLOSE_DELAY_MS)
+    })
+
+    it('another URL gets the same retry', async () => {
+      stubMe(200)
+      const off = subscribeSSE('/api/other', () => {})
+      await giveUp(FakeEventSource.instances[0])
+      wait(SSE_REOPEN_FIRST_MS)
+      expect(FakeEventSource.instances.map(s => s.url)).toEqual(['/api/other', '/api/other'])
+      off()
+      wait(SSE_CLOSE_DELAY_MS)
+    })
+  })
 })
 
 // --- Several tabs of one browser -------------------------------------------
@@ -954,6 +1120,128 @@ describe('across tabs (Web Locks + BroadcastChannel)', () => {
     live.emit({ type: 'task.updated', project_id: 1 })
     await settle()
     expect(b.events.at(-1)?.type).toBe('task.updated')
+  })
+
+  // #2702: the leader retries a stream the browser gave up on by itself, so
+  // a brief outage doesn't leave every tab of the user without live updates.
+  describe('a stream the browser gave up on, with the session fine', () => {
+    let random: ReturnType<typeof vi.spyOn>
+    beforeEach(() => { random = vi.spyOn(Math, 'random').mockReturnValue(0.5) })
+    afterEach(() => { random.mockRestore() })
+    const giveUp = async (es: FakeEventSource) => { es.readyState = 2; es.onerror?.(); await settle() }
+    const downs = () => FakeBroadcastChannel.sent.filter(m => m.kind === 'down').length
+
+    it('the leader reopens it after the backoff, and every tab hears the new stream\'s connected once', async () => {
+      const me = stubMe(200, { user_id: 1 })
+      const a = await openTab(), b = await openTab(), c = await openTab()
+      for (const t of [a, b, c]) t.subscribe()
+      await settle()
+      const [dead] = FakeEventSource.instances
+      dead.emit({ type: 'connected' })
+      await settle()
+      const before = downs()
+      await giveUp(dead)
+      expect(me).toHaveBeenCalledTimes(1) // only the leader, whose stream it was, asks
+      expect(downs()).toBe(before + 1) // the usual down
+      expect([a, b, c].map(t => t.sse.isSSEConnected())).toEqual([false, false, false])
+      await wait(SSE_REOPEN_FIRST_MS - 1)
+      expect(FakeEventSource.instances).toHaveLength(1)
+      await wait(1)
+      expect(FakeEventSource.instances).toHaveLength(2) // one stream, the leader's: followers open none
+      const live = FakeEventSource.instances[1]
+      live.emit({ type: 'connected' })
+      live.emit({ type: 'task.updated', project_id: 1 })
+      await settle()
+      for (const t of [a, b, c]) {
+        expect(types(t.events)).toEqual(['connected', 'connected', 'task.updated'])
+        expect(t.sse.isSSEConnected()).toBe(true)
+      }
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('a second failure waits longer', async () => {
+      stubMe(200, { user_id: 1 })
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      await giveUp(FakeEventSource.instances[0])
+      await wait(SSE_REOPEN_FIRST_MS)
+      expect(FakeEventSource.instances).toHaveLength(2)
+      await giveUp(FakeEventSource.instances[1]) // failed again before saying connected
+      await wait(SSE_REOPEN_FIRST_MS * 2 - 1)
+      expect(FakeEventSource.instances).toHaveLength(2)
+      await wait(1)
+      expect(FakeEventSource.instances).toHaveLength(3)
+    })
+
+    it('a leader whose last subscriber leaves during the wait hands over, and the new leader opens the only stream', async () => {
+      stubMe(200, { user_id: 1 })
+      const a = await openTab(), b = await openTab()
+      const offA = a.subscribe()
+      b.subscribe()
+      await settle()
+      await giveUp(FakeEventSource.instances[0])
+      offA()
+      await wait(SSE_CLOSE_DELAY_MS)
+      expect(FakeEventSource.instances).toHaveLength(2) // b's, as leader
+      await wait(SSE_REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(2)
+      expect(open()).toEqual([FakeEventSource.instances[1]])
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('a session that ends during the wait cancels the reopen in every tab', async () => {
+      const me = stubMe(200, { user_id: 1 })
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      await giveUp(FakeEventSource.instances[0])
+      expect(vi.getTimerCount()).toBe(1)
+      me.mockImplementation(async () => new Response('Unauthorized', { status: 401 }))
+      a.session.markSessionEnded()
+      await settle()
+      expect(b.session.isSessionEnded()).toBe(true)
+      expect(vi.getTimerCount()).toBe(0)
+      await wait(SSE_REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(1)
+      expect(locks.held).toBe(false)
+    })
+
+    it('a leader whose /api/me names another user re-keys instead of reopening the old user\'s stream', async () => {
+      stubMe(200, { user_id: 2 }) // someone else signed in in this browser
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      const [dead] = FakeEventSource.instances
+      await giveUp(dead)
+      // a left user 1's election and leads user 2's; b took over user 1's.
+      expect(FakeEventSource.instances).toHaveLength(3)
+      expect(locks.names.sort()).toEqual(['amp-sse-leader:1', 'amp-sse-leader:2'])
+      await wait(SSE_REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(3)
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('a hidden leader that pauses during the wait reopens nothing; a visible tab takes over', async () => {
+      stubMe(200, { user_id: 1 })
+      const a = await openTab(), b = await openTab()
+      a.subscribe()
+      b.subscribe()
+      await settle()
+      await giveUp(FakeEventSource.instances[0])
+      a.hide()
+      await wait(HIDDEN_CLOSE_MS)
+      expect(FakeEventSource.instances).toHaveLength(2) // b's, after a let the lock go
+      b.events.length = 0
+      FakeEventSource.instances[1].emit({ type: 'connected' })
+      await settle()
+      expect(connectedCount(b)).toBe(1)
+      await wait(SSE_REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.instances).toHaveLength(2)
+    })
   })
 
   it('only /api/events is shared: another URL keeps a stream per tab', async () => {

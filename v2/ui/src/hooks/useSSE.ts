@@ -20,6 +20,10 @@ interface Shared {
   // Set while the entry has no subscribers and waits SSE_CLOSE_DELAY_MS to
   // close; a new subscriber cancels it.
   closing: ReturnType<typeof setTimeout> | undefined
+  // Set while a stream the browser gave up on waits to be reopened (see
+  // scheduleReopen), and how long the next such wait is.
+  reopening: ReturnType<typeof setTimeout> | undefined
+  backoff: number
 }
 
 // One EventSource per URL for the whole app, shared by every useSSE caller
@@ -88,6 +92,8 @@ const hidden = () => doc?.visibilityState === 'hidden'
 const watchers = new Set<() => void>()
 
 function setUp(shared: Shared, up: boolean) {
+  // The stream works again: the next one the browser gives up on is retried soon.
+  if (up) shared.backoff = SSE_REOPEN_FIRST_MS
   if (shared.up === up) return
   shared.up = up
   for (const watcher of [...watchers]) watcher()
@@ -113,6 +119,7 @@ function post(tabs: Tabs, message: TabMessage) {
 }
 
 function open(url: string, shared: Shared): EventSource {
+  cancelReopen(shared)
   const source = new EventSource(url)
   setUp(shared, false)
   source.onmessage = (e) => {
@@ -130,15 +137,57 @@ function open(url: string, shared: Shared): EventSource {
   // EventSource reconnects by itself after a dropped stream; we let it. When
   // it gives up (CLOSED: the answer was an error status or not a stream),
   // ask whether the session ended, since the stream can't show its status.
+  // If it didn't, the outage was elsewhere (a 502 while no server was up), so
+  // try the stream again after a while (scheduleReopen).
   source.onerror = () => {
     lost(shared)
     if (isSessionEnded()) { source.close(); return }
-    if (source.readyState === 2 /* CLOSED */) void checkSession()
+    if (source.readyState === 2 /* CLOSED */) {
+      void checkSession().then(alive => { if (alive) scheduleReopen(url, shared, source) })
+    }
   }
   return source
 }
 
+// A stream the browser gave up on is retried after SSE_REOPEN_FIRST_MS,
+// doubling up to SSE_REOPEN_MAX_MS, each wait jittered by ±20% so tabs and
+// browsers don't all come back at once after an outage (as
+// remote/useRemoteSession does). The wait starts over once a stream says
+// connected (setUp).
+export const SSE_REOPEN_FIRST_MS = 1_000
+export const SSE_REOPEN_MAX_MS = 30_000
+
+// Whether this tab should reopen the dead stream now: the entry is still the
+// live one with subscribers, nothing has replaced the stream, the tab can be
+// seen and isn't paused, the session is alive, and this tab owns the stream
+// (it leads, or keeps a stream of its own). A follower never opens one; it
+// hears the leader's new stream, connected included.
+function mayReopen(url: string, shared: Shared, dead: EventSource): boolean {
+  return registry.get(url) === shared
+    && shared.listeners.size > 0
+    && shared.source === dead
+    && dead.readyState === 2 /* CLOSED */
+    && !hidden() && !paused && !isSessionEnded()
+    && (!shared.tabs || shared.tabs.leading)
+}
+
+function scheduleReopen(url: string, shared: Shared, dead: EventSource) {
+  if (shared.reopening !== undefined || !mayReopen(url, shared, dead)) return
+  const delay = shared.backoff * (0.8 + Math.random() * 0.4)
+  shared.backoff = Math.min(shared.backoff * 2, SSE_REOPEN_MAX_MS)
+  shared.reopening = setTimeout(() => {
+    shared.reopening = undefined
+    if (mayReopen(url, shared, dead)) shared.source = open(url, shared)
+  }, delay)
+}
+
+function cancelReopen(shared: Shared) {
+  clearTimeout(shared.reopening)
+  shared.reopening = undefined
+}
+
 function closeSource(shared: Shared) {
+  cancelReopen(shared)
   const { source } = shared
   if (source) {
     // A close we chose says nothing about the session: never ask.
@@ -220,6 +269,7 @@ function lead(shared: Shared, tabs: Tabs): Promise<void> {
 // Leave the lock queue; a leader also closes its stream and lets go of the
 // lock, so a waiting visible tab takes over.
 function stepDown(shared: Shared, tabs: Tabs) {
+  cancelReopen(shared)
   withdraw(tabs)
   if (!tabs.leading) return
   lost(shared)
@@ -347,6 +397,7 @@ onSessionEnded(() => {
   // to ask /api/me before it could be granted the lock.
   if (!checkingElsewhere) tellTabs({ kind: 'session-ended' })
   for (const shared of registry.values()) {
+    cancelReopen(shared)
     if (shared.tabs) {
       stepDown(shared, shared.tabs)
       shared.tabs.joining = false
@@ -408,13 +459,18 @@ function onVisibilityChange() {
   if (hidden()) {
     hiddenTimer = setTimeout(pauseStreams, HIDDEN_CLOSE_MS)
     // Only visible tabs queue to lead. A leader keeps its stream through the
-    // grace period, so a quick tab switch hands nothing over.
-    for (const shared of registry.values()) if (shared.tabs) withdraw(shared.tabs)
+    // grace period, so a quick tab switch hands nothing over. A hidden tab
+    // doesn't retry a dead stream; it tries again when shown.
+    for (const shared of registry.values()) {
+      cancelReopen(shared)
+      if (shared.tabs) withdraw(shared.tabs)
+    }
   } else if (paused) {
     resumeStreams()
   } else {
-    for (const shared of registry.values()) {
+    for (const [url, shared] of registry) {
       if (shared.tabs?.channel) queue(shared, shared.tabs)
+      if (shared.source) scheduleReopen(url, shared, shared.source)
     }
   }
 }
@@ -440,6 +496,7 @@ export const SSE_CLOSE_DELAY_MS = 1_000
 function closeEntry(url: string, shared: Shared) {
   clearTimeout(shared.closing)
   shared.closing = undefined
+  cancelReopen(shared)
   if (registry.get(url) !== shared) return
   registry.delete(url)
   if (shared.tabs) leave(shared, shared.tabs)
@@ -475,7 +532,10 @@ export function subscribeSSE(url: string, listener: Listener): () => void {
     shared.closing = undefined
   }
   if (!shared) {
-    shared = { listeners: new Set(), source: null, up: false, tabs: null, closing: undefined }
+    shared = {
+      listeners: new Set(), source: null, up: false, tabs: null, closing: undefined,
+      reopening: undefined, backoff: SSE_REOPEN_FIRST_MS,
+    }
     if (url === EVENTS_URL && canShareTabs()) {
       shared.tabs = { user: null, channel: null, leading: false, queued: null, release: null, joining: false }
     }
