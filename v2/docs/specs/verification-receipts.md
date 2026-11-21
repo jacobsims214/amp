@@ -604,8 +604,12 @@ Each phase ends with the Verification commands passing. All three ship in one PR
     When the base was run, some journey that passes on head must also fail on base. Any head
     journey that couldn't be recorded gives CANT_TELL.
   - **The server rule changed with it:** `DowngradeVisualChecks` makes a visual pass `cant_tell`
-    ("not a recording") unless its evidence is a video. Screenshots can still be uploaded as
-    extra evidence, but they don't back a visual check.
+    ("not a recording") unless its evidence is a video with a declared frame count above zero,
+    and an upload named `video.mp4` is refused (422) unless its bytes start as an MP4 file.
+    Screenshots can still be uploaded as extra evidence, but they don't back a visual check.
+  - A journey's `env:NAME` arguments read only `AMP_VERIFY_*` variables, and their values are
+    replaced by the placeholder everywhere in the transcript. The frame count is still the
+    worker's own figure: the server doesn't decode the video.
   - Differences from the plan, still open: head is recorded in place rather than on its own clean
     worktree (D37); a run without `--base-rev` can still PASS, with the note "base not run"; base
     recordings stay on the worker's machine, because evidence has no `side` / `journey` columns

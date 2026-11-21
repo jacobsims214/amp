@@ -108,7 +108,7 @@ use and valid 15 minutes (`curl -fsS -T video.mp4 "<url>"`). It then cites `vide
 each visual check's `evidence_key`. A visual pass is shown as "can't tell" when:
 
 - its evidence is missing, wasn't uploaded, or belongs to another receipt ("evidence missing");
-- its video recorded no frames ("no frames");
+- its video recorded no frames, or the worker didn't declare its frame count ("no frames");
 - it was recorded on another revision than the one completed ("evidence recorded on another
   revision": both `tree_sha`s are known and differ);
 - it cites a screenshot or a log instead of the video ("not a recording");
@@ -117,7 +117,8 @@ each visual check's `evidence_key`. A visual pass is shown as "can't tell" when:
 Allowed names (the server sets the content type from the name): `video.mp4`, `poster.gif`,
 `contact.png`, `screenshot-<n>.png`, `trace.zip`, `har.json`, `receipt.json`, `console.txt`,
 `transcript.txt`. Each file is at most 200 MiB. An upload whose size or sha256 differs from what
-was declared is refused (422) and nothing is stored; calling `amp_add_evidence` again gives a new
+was declared is refused (422) and nothing is stored, and so is a `video.mp4` whose bytes aren't
+an MP4 video; calling `amp_add_evidence` again gives a new
 URL. A used URL is gone (404) and an expired one says so (410). A file already stored with the
 same sha256 needs no upload; the same name with different bytes on the same revision is refused.
 

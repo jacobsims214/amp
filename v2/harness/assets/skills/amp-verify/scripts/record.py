@@ -26,6 +26,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -41,6 +42,10 @@ EXIT = {PASS: 0, FAIL: 1, CANT_TELL: 3}
 MAX_JOURNEYS = 20
 STEP_TIMEOUT_S = 90
 # Commands a journey can't use: the recorder owns the recording and the session.
+# A journey's "env:NAME" arguments can only read variables with this prefix,
+# so a journeys file can't pull the worker's own tokens into a page.
+ENV_PREFIX = "AMP_VERIFY_"
+SECRETS = {}  # resolved value -> the env:NAME it came from, for redact()
 FORBIDDEN = {"record", "close", "connect", "batch", "session", "skills", "auth", "confirm", "deny"}
 
 
@@ -101,8 +106,8 @@ def translate(step, base_url):
 
     A leading "/" on an `open` URL is the served site. `expect` is an
     assertion: text / no-text / visible / hidden / url. An argument "env:NAME"
-    is read from the environment and logged as written, so a secret typed into
-    a form never reaches the transcript."""
+    (NAME starting AMP_VERIFY_) is read from the environment and logged as
+    written, so a secret typed into a form never reaches the transcript."""
     if step[0] == "open" and len(step) > 1 and step[1].startswith("/"):
         step = ["open", base_url.rstrip("/") + step[1], *step[2:]]
     elif step[0] == "expect":
@@ -122,12 +127,24 @@ def translate(step, base_url):
     real = []
     for a in step:
         if a.startswith("env:"):
-            if a[4:] not in os.environ:
-                raise CantTell(f"the environment has no {a[4:]} (a step uses {a})")
-            real.append(os.environ[a[4:]])
+            name = a[4:]
+            if not name.startswith(ENV_PREFIX):
+                raise CantTell(f"a step uses {a}: a journey can only read variables named {ENV_PREFIX}*")
+            if name not in os.environ:
+                raise CantTell(f"the environment has no {name} (a step uses {a})")
+            real.append(os.environ[name])
+            SECRETS[os.environ[name]] = a
         else:
             real.append(a)
     return real, step
+
+
+def redact(text):
+    """text with every secret a step read replaced by its env:NAME."""
+    for value, shown in SECRETS.items():
+        if value:
+            text = text.replace(value, shown)
+    return text
 
 
 class Transcript:
@@ -136,7 +153,7 @@ class Transcript:
         self.t0 = time.time()
 
     def line(self, text=""):
-        self.f.write(text + "\n")
+        self.f.write(redact(text) + "\n")
         self.f.flush()
 
     def cmd(self, side, n, shown, code, out):
@@ -152,6 +169,7 @@ def record_journey(side, n, journey, base_url, viewport, webm, tr):
 
     def ab(real, shown=None, log=True):
         code, out = run(["agent-browser", *real], env=env, timeout=STEP_TIMEOUT_S)
+        out = redact(out)  # nothing a step read from the environment leaves this function
         if log:
             tr.cmd(side, n, shown or real, code, out)
         return code, out
@@ -298,6 +316,8 @@ def main():
     ap.add_argument("--base-rev", help="also run the journeys on this revision, e.g. $(git merge-base HEAD origin/main)")
     ap.add_argument("--out", help="where the evidence goes (default: a temp directory)")
     a = ap.parse_args()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", a.task):
+        usage("--task is a ticket id: letters, digits, - and _ only")
 
     missing = [b for b in ("agent-browser", "ffmpeg", "ffprobe", "git") if not shutil.which(b)]
     if missing:
@@ -325,8 +345,13 @@ def main():
         if run(["git", "-C", root, "ls-files", "--error-unmatch", jpath])[0] != 0:
             raise CantTell(f"{os.path.relpath(jpath, root)} isn't committed")
         commit, tree = git(root, "rev-parse", "HEAD"), git(root, "rev-parse", "HEAD^{tree}")
-        out = os.path.abspath(a.out or os.path.join(tempfile.gettempdir(), "amp-verify", f"{a.task}-{tree[:12]}"))
-        shutil.rmtree(out, ignore_errors=True)
+        if a.out:  # yours: only the recorder's own head/ and base/ are cleared
+            out = os.path.abspath(a.out)
+            os.makedirs(out, exist_ok=True)
+            for sub in ("head", "base"):
+                shutil.rmtree(os.path.join(out, sub), ignore_errors=True)
+        else:  # a fresh private directory (mode 0700)
+            out = tempfile.mkdtemp(prefix=f"amp-verify-{a.task}-")
         os.makedirs(os.path.join(out, "head"))
         tr = Transcript(os.path.join(out, "transcript.txt"))
         tr.line(f"task {a.task}  commit {commit}  tree {tree}")

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -290,6 +291,14 @@ func (s *Service) StoreUpload(ctx context.Context, token string, body io.Reader)
 			slog.Warn("receipt upload: release the claim", "key", row.Key, "err", err)
 		}
 	}()
+	// The bytes must be what the name says: a video.mp4 that isn't a video
+	// would otherwise back a visual check. Nothing is stored or replaced.
+	br := bufio.NewReaderSize(body, 4096)
+	head, _ := br.Peek(receipts.SniffBytes)
+	if !receipts.LooksLike(row.Name, head) {
+		return nil, &authz.Error{Status: 422, Msg: fmt.Sprintf("%s: the upload isn't an MP4 video; nothing was stored", row.Name)}
+	}
+	body = br
 	// A pending row's object is from an earlier attempt that didn't finish
 	// (or a re-mint): it is replaced.
 	if err := store.Delete(ctx, row.Key); err != nil {

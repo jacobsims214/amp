@@ -59,9 +59,11 @@ or verifier re-runs it.
 - **At least one journey is an unhappy path** (`"unhappy": true`): the error, the empty state, the
   refused input. Without one the verdict is `CANT_TELL`.
 - **`criterion_ref`** is the acceptance criterion's number, the same one the check uses.
-- **Secrets**: write `"env:NAME"` as an argument (`["fill", "#password", "env:TEST_PASSWORD"]`). The
-  value is read from the environment and the transcript shows only `env:TEST_PASSWORD`. The video
-  still shows whatever the page shows, so only type secrets into password fields.
+- **Secrets**: write `"env:AMP_VERIFY_NAME"` as an argument
+  (`["fill", "#password", "env:AMP_VERIFY_PASSWORD"]`). The value is read from the environment
+  and the transcript shows only `env:AMP_VERIFY_PASSWORD`, wherever the value appears. Only
+  variables named `AMP_VERIFY_*` can be read. The video still shows whatever the page shows, so
+  only type secrets into password fields.
 - **`serve`** (optional) is how to serve a checkout: `command` must listen on `$PORT`, `cwd` is
   relative to the repo root, `ready` is the path that answers when it is up (`timeout_s`, default
   120), and `setup` runs first in a fresh checkout (installing dependencies).

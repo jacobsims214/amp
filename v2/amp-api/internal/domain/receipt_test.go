@@ -169,7 +169,8 @@ func TestDowngradeVisualChecks(t *testing.T) {
 		{Key: "k/video", Status: EvidenceStored, TreeSHA: "abcdef0123456789", Frames: &five, ContentType: "video/mp4"},
 		{Key: "k/empty", Status: EvidenceStored, TreeSHA: "abcdef0123456789", Frames: &zero, ContentType: "video/mp4"},
 		{Key: "k/pending", Status: EvidencePending, TreeSHA: "abcdef0123456789", ContentType: "video/mp4"},
-		{Key: "k/notree", Status: EvidenceStored, ContentType: "video/mp4"},
+		{Key: "k/notree", Status: EvidenceStored, Frames: &five, ContentType: "video/mp4"},
+		{Key: "k/uncounted", Status: EvidenceStored, TreeSHA: "abcdef0123456789", ContentType: "video/mp4"},
 	}
 	vis := func(key, verdict string) ReceiptCheck {
 		return ReceiptCheck{Role: CheckRoleWorker, Kind: CheckKindVisual, Verdict: verdict, EvidenceKey: key, Note: "looked"}
@@ -187,6 +188,7 @@ func TestDowngradeVisualChecks(t *testing.T) {
 		{"foreign key", "", "", vis("other/receipt/shot", VerdictPass), VerdictCantTell, "evidence missing: looked"},
 		{"pending", "", "", vis("k/pending", VerdictPass), VerdictCantTell, "evidence missing (pending): looked"},
 		{"zero frames", "", "", vis("k/empty", VerdictPass), VerdictCantTell, "no frames: looked"},
+		{"frames not declared", "", "", vis("k/uncounted", VerdictPass), VerdictCantTell, "no frames: the recording's frame count wasn't declared: looked"},
 		{"tree mismatch", "0000000000aa", "", vis("k/video", VerdictPass), VerdictCantTell, "evidence recorded on another revision: looked"},
 		{"receipt has no tree", "", "", vis("k/video", VerdictPass), VerdictPass, "looked"},
 		{"evidence has no tree", "0000000000aa", "", vis("k/notree", VerdictPass), VerdictPass, "looked"},

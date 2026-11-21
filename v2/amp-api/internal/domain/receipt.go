@@ -425,7 +425,7 @@ const (
 // DowngradeVisualChecks makes cant_tell every passing visual check that
 // its evidence doesn't back: a visual pass counts only when its
 // evidence_key names a stored recording of this receipt (evidence, the
-// receipt's own rows; a video, not a screenshot or a log) that has frames,
+// receipt's own rows; a video, not a screenshot or a log) with a frame count above zero,
 // recorded on the receipt's revision (treeSHA) when both name one. A
 // missing tree_sha on either side isn't a mismatch. storeErr, when set, is why there is no evidence store
 // at all: then no visual pass counts. A visual fail stays a fail (turning it
@@ -457,6 +457,8 @@ func DowngradeVisualChecks(checks []ReceiptCheck, evidence []ReceiptEvidence, tr
 			why = "evidence recorded on another revision"
 		case !IsRecording(e):
 			why = NotARecording
+		case e.Frames == nil:
+			why = "no frames: the recording's frame count wasn't declared"
 		}
 		if why == "" {
 			continue
