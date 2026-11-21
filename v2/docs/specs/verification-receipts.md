@@ -31,7 +31,8 @@ badge, and Mission's Done readout counts the unverified ones.
 - Goal: **evidence storage and playback**. The `ReceiptStore` keeps evidence on local disk (or,
   opt-in, in S3: the bundled SeaweedFS or a store you run), amp-api serves it with Range, and the
   drawer plays it.
-- Non-goal (follow-ups, see the end): the recorder, and the gate model and independent verifier.
+- Non-goal (follow-ups, see the end): the recorder (landed since, 2026-11-21), and the gate model
+  and independent verifier.
 - Non-goal: putting evidence in **artifacts** or in the artifact review queue (V3).
 - Non-goal: the live step viewer, `check_suite` ingestion, day-report counts, a harness verifier.
 - Non-goal: **receipts on human tickets.**
@@ -407,9 +408,9 @@ generated and drift-checked in CI).
   today. Otherwise pass `receipt_id` and `checks[]` (one per criterion) to `amp_complete_task`. If
   the result says `held`, stop and say why in the closing comment. The `VERIFIED` comment block
   stays for one release as a display fallback, then the template drops it.
-- `amp-worker-frontend`: the screenshots it already takes for self-comparison are uploaded with
-  `amp_add_evidence` as `screenshot-<n>.png`, and cited by its `visual` checks. This gives v1 real
-  evidence before the recorder exists.
+- `amp-worker-frontend`: in v1, the screenshots it took for self-comparison were uploaded with
+  `amp_add_evidence` as `screenshot-<n>.png` and cited by its `visual` checks. The recorder
+  replaced this (2026-11-21, see Follow-ups): a visual pass now counts only with a recording.
 
 ### UI
 
@@ -587,13 +588,29 @@ Each phase ends with the Verification commands passing. All three ship in one PR
 
 ## Follow-ups (not in this change)
 
-- **Recorder (`amp-verify` skill).** A bash `record.sh` that follows Piquette/SPF exactly (D1):
-  agent-browser recording on clean worktrees of the base and head revisions, loopback-only ttyd
-  for CLI journeys, ffmpeg MP4 / GIF poster / contact sheet, an ffprobe frame check, and a
-  transcript per command. The verdict is PASS only if every head journey passes, at least one is
-  an unhappy path, and some journey fails on base. Journeys live in `.amp/journeys/<task_id>.json`,
-  written by the worker (D19). It adds `side` and `journey` to evidence. Reference:
-  https://github.com/seesharpguy/super-portable-software-factory.
+- **Recorder (`amp-verify` skill): landed** (2026-11-21), for browser journeys. The owner asked
+  for visual checks to be an agent-browser recording, not screenshots or test logs.
+  - `skills/amp-verify/scripts/record.py` (Python standard library, not the bash `record.sh`
+    first planned) reads `.amp/journeys/<task_id>.json`, written and committed by the worker
+    (D19). A journey is a list of agent-browser commands plus `expect` assertions.
+  - It refuses a dirty tree (`CANT_TELL` "uncommitted changes") and binds the evidence to HEAD's
+    tree. Head is the current checkout, served by `--head-url` or by the file's `serve` command.
+    With `--base-rev` the same journeys run on a clean worktree of the base revision.
+  - agent-browser records each journey (WebM, kept local). ffmpeg makes `video.mp4` (every head
+    journey in order), `poster.gif` and `contact.png`; ffprobe counts the frames; `transcript.txt`
+    has every command and its result; `receipt.json` has each journey's `journey_n`, `journey`,
+    head and base verdicts and its offset in the video.
+  - The verdict is PASS only if every head journey passes and at least one is an unhappy path.
+    When the base was run, some journey that passes on head must also fail on base. Any head
+    journey that couldn't be recorded gives CANT_TELL.
+  - **The server rule changed with it:** `DowngradeVisualChecks` makes a visual pass `cant_tell`
+    ("not a recording") unless its evidence is a video. Screenshots can still be uploaded as
+    extra evidence, but they don't back a visual check.
+  - Differences from the plan, still open: head is recorded in place rather than on its own clean
+    worktree (D37); a run without `--base-rev` can still PASS, with the note "base not run"; base
+    recordings stay on the worker's machine, because evidence has no `side` / `journey` columns
+    yet; and there are no ttyd recordings of CLI journeys. Reference for the original design:
+    https://github.com/seesharpguy/super-portable-software-factory.
 - **Gate model and independent verifier.** A heuristic plan (`self|verifier|video`) from the
   changed paths. An optional local model (jev, clef or nimble on Ollama, `VERIFY_GATE_MODEL`) can
   only raise the plan, and falls back to the full check on error (D6). Metadata `verification`

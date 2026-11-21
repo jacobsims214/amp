@@ -1,6 +1,6 @@
 ---
 title: Verification receipts — how a finished ticket was checked
-tags: [receipts, verification, checks, accept, reject, require, inform, self-checked, held, evidence, screenshots, video]
+tags: [receipts, verification, checks, accept, reject, require, inform, self-checked, held, evidence, recording, video, agent-browser, journeys]
 ---
 
 # Verification receipts
@@ -85,19 +85,33 @@ where `verdict` is `pass`, `fail` or `cant_tell`. A completion that comes back `
 done: the worker stops and says why. Older plugins that send no checks keep working in Off and
 Inform projects; under Require their completions are held.
 
-## Evidence: screenshots, video, logs
+## Evidence: a recording of the browser
 
-A `visual` check counts only with evidence: a file the worker uploaded for **this** receipt, on the
-revision it completed. The worker declares its files with
+A `visual` check counts only with a **recording**: a `video.mp4` the worker uploaded for **this**
+receipt, on the revision it completed. A screenshot or a test log is not a visual check.
+
+The worker makes the recording with the `amp-verify` skill. It writes the ticket's journeys in
+`.amp/journeys/<task_id>.json` (each a list of agent-browser steps ending in an assertion, one of
+them an unhappy path) and commits the file. The skill's `record.py` then drives
+[agent-browser](https://github.com/vercel-labs/agent-browser) through every journey while it
+records the browser, on the committed revision, and with `--base-rev` on a clean worktree of the
+base revision too, to show the journeys fail without the change. It writes `video.mp4` (every
+journey on the head revision, in order), `poster.gif`, `contact.png`, `transcript.txt` (every
+command and its result) and `receipt.json` (each journey's verdict on head and base, and where it
+starts in the video). The worker's machine needs `agent-browser`, `ffmpeg`, `ffprobe`, `git` and
+`python3`; without them the visual check is recorded as "can't tell".
+
+The worker declares the files with
 `amp_add_evidence(receipt_id, dispatch_id, tree_sha, commit?, files: [{name, bytes, sha256, duration_ms?, frames?}])`
 and gets a one-time upload URL for each: an HTTP `PUT` of the bytes, with no auth header, single
-use and valid 15 minutes (`curl -fsS -T screenshot-1.png "<url>"`). It then cites each file's
-`key` as a visual check's `evidence_key`. A visual pass is shown as "can't tell" when:
+use and valid 15 minutes (`curl -fsS -T video.mp4 "<url>"`). It then cites `video.mp4`'s `key` as
+each visual check's `evidence_key`. A visual pass is shown as "can't tell" when:
 
 - its evidence is missing, wasn't uploaded, or belongs to another receipt ("evidence missing");
 - its video recorded no frames ("no frames");
 - it was recorded on another revision than the one completed ("evidence recorded on another
   revision": both `tree_sha`s are known and differ);
+- it cites a screenshot or a log instead of the video ("not a recording");
 - the AMP server has no evidence storage ("evidence storage isn't configured").
 
 Allowed names (the server sets the content type from the name): `video.mp4`, `poster.gif`,

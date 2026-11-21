@@ -55,11 +55,13 @@ func (s *Server) registerReceipts(mcp *server.MCPServer) {
 			"files_changed": filesArr("Optional. The files you changed: [{path, added, removed}]."),
 		}), wrap(ctx, s.guard(authz.Member, s.openReceipt)))
 	mcp.AddTool(tool("amp_add_evidence",
-		"Declare the evidence files you recorded for your open receipt (screenshots, a video, logs) and get a one-time upload "+
+		"Declare the evidence files you recorded for your open receipt (the browser recording the amp-verify skill's "+
+			"record.py makes, with its poster, contact sheet and transcript) and get a one-time upload "+
 			"URL for each. Upload each file's bytes with an HTTP PUT to its url (no auth header: the URL is the credential; single "+
-			"use, valid 15 minutes): `curl -fsS -T screenshot-1.png \"$url\"` (prefix a bare /api/... path with $AMP_URL). "+
-			"Then cite the key as a visual check's evidence_key in amp_complete_task. A visual pass without its own stored "+
-			"evidence, on the revision you complete, counts as cant_tell. Names: "+receipts.AllowedNames+". Evidence isn't "+
+			"use, valid 15 minutes): `curl -fsS -T video.mp4 \"$url\"` (prefix a bare /api/... path with $AMP_URL). "+
+			"Then cite video.mp4's key as a visual check's evidence_key in amp_complete_task. A visual pass counts only with "+
+			"its own stored recording (video.mp4, with frames), on the revision you complete: a screenshot or a log isn't a "+
+			"recording, and without one the check counts as cant_tell. Names: "+receipts.AllowedNames+". Evidence isn't "+
 			"an artifact: it is kept with the receipt, and deleted after 90 days unless the ticket merges or a person accepts it. "+
 			"Re-adding a file gives a new URL (a retry), or no url when it is already stored with the same sha256.",
 		props{

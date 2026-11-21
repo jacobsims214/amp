@@ -1,7 +1,7 @@
 {
  "generated_by": "v2/scripts/build-harness-assets.sh — do not edit; edit v2/.opencode or v2/scripts/lib/harness_overrides.yaml",
  "source": "v2/.opencode",
- "source_sha256": "36d97a6cbb9833adca0539e1b26b9204d2cf02bdf84d7dc431bdd327f0c5fbee",
+ "source_sha256": "30405f7083fa54067188fc2eb3b37407294d28ce9b959db20701672e97fb4c27",
  "default_agent": "amp-manager",
  "excluded_skills": [
   "amp-agent-builder"
@@ -142,6 +142,14 @@
    "description": "Reviewer protocol for AMP — wave checks and full code reviews, the fix-task template, and rules for creating fix tasks instead of failing. Use when your task name contains \"check\", \"review\", or \"Code Review:\".",
    "files": [
     "SKILL.md"
+   ]
+  },
+  {
+   "name": "amp-verify",
+   "description": "Record the browser as proof of a visual check. Write the ticket's journeys (.amp/journeys/<task_id>.json), run record.py, which drives agent-browser through each one while it records, and upload the video.mp4 it makes as receipt evidence. Use it for every visual check on a receipt, because a screenshot or a test log is not a visual check.",
+   "files": [
+    "SKILL.md",
+    "scripts/record.py"
    ]
   },
   {
