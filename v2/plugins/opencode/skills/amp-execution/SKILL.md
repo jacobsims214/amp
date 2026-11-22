@@ -355,10 +355,11 @@ checks=[{criterion_ref: "1", kind: "test", verdict: "pass", command: "go test ./
 `test`, `ci`, `visual` or `manual`. `verdict` is what actually happened: `pass` only for a check
 you ran this task, `fail` when it failed, `cant_tell` when you couldn't check it — the same honesty
 as VERIFIED / COULD NOT VERIFY above, which you still write in the comment. A `visual` pass
-counts only with its own uploaded evidence (screenshots, a recording): declare the files with
-`amp_add_evidence` before completing, upload each to its one-time URL, and cite its `key` as the
-check's `evidence_key` (`amp-worker-frontend` describes how). Without that it counts as
-`cant_tell`.
+counts only with a **recording of the browser**: load `skill("amp-verify")`, write the ticket's
+journeys, and run its `record.py`, which drives agent-browser through them while recording.
+Declare the files it made with `amp_add_evidence` before completing, upload each to its one-time
+URL, and cite `video.mp4`'s `key` as the check's `evidence_key`. A screenshot or a test log is not
+a visual check: without a recording it counts as `cant_tell`.
 
 **Screenshots and visual evidence go on the ticket, never only on disk.** Whatever you
 screenshot to make or check visual work, publish it on your ticket as **one self-contained html
@@ -371,8 +372,9 @@ Don't leave screenshots local and don't commit them. Publish the file, don't pas
 - **Claude Code, or any harness with a shell**: `amp_publish_artifact(task_id, title,
   kind="html", bytes, sha256)` with no content, then `curl -fsS -T <file> '<upload.url>'`.
 
-The **amp-design-tools** skill has the exact commands and the switcher pattern. Receipt evidence
-(`amp_add_evidence`, above) is in addition to the artifact, not instead of it.
+The **amp-design-tools** skill has the exact commands and the switcher pattern. The artifact is
+for a reviewer to look at; it is not a visual check. The receipt's recording (`amp_add_evidence`,
+above) is in addition to the artifact, not instead of it.
 
 **If the result says `held: true`**, stop: the project requires a receipt and yours is below its
 minimum (no passing check, or a failing one). The ticket is not done; it waits for a person, who
@@ -412,7 +414,7 @@ amp_get_task {task_id, include: ["comments"]}   ← read before starting; answer
 amp_add_task_comment {task_id, body, author}
 amp_block_task {task_id, dispatch_id?, reason, options?, recommended?, …run fields}   ← only to ask a person a question (Step 5)
 amp_open_receipt {task_id, dispatch_id, summary?, files_changed?}   ← before completing; mode "off" means skip the receipt fields
-amp_add_evidence {receipt_id, dispatch_id, tree_sha, commit?, files: [{name, bytes, sha256, duration_ms?, frames?}]}   ← one-time upload URLs for a visual check's evidence
+amp_add_evidence {receipt_id, dispatch_id, tree_sha, commit?, files: [{name, bytes, sha256, duration_ms?, frames?}]}   ← one-time upload URLs for a visual check's recording (amp-verify's record.py prints these arguments)
 amp_complete_task {task_id, dispatch_id, model?, input_tokens?, output_tokens?, cache_read_tokens?, cost_usd?, branch?, commit?, pushed?, pr_url?, base_branch?, receipt_id?, checks?}
 amp_report_run {task_id, outcome, …run fields}  ← a run that ended another way, or a PR opened later
 amp_session_usage {}                  ← opencode plugin: your own model/tokens/cost

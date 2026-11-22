@@ -98,3 +98,17 @@ const AllowedNames = "video.mp4, poster.gif, contact.png, screenshot-<n>.png, tr
 func Attachment(name string) bool {
 	return name == "trace.zip" || name == "har.json"
 }
+
+// SniffBytes is how much of an upload LooksLike reads.
+const SniffBytes = 12
+
+// LooksLike reports whether an upload's first bytes are what its
+// allowlisted name says it is, for the names a check's verdict rests on: a
+// video.mp4 must be an ISO media file (an "ftyp" box first). The name alone
+// would let any bytes count as a recording. Other names aren't sniffed.
+func LooksLike(name string, head []byte) bool {
+	if name != "video.mp4" {
+		return true
+	}
+	return len(head) >= 8 && string(head[4:8]) == "ftyp"
+}

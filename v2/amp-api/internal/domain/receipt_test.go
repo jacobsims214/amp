@@ -160,16 +160,17 @@ func TestReceiptsOverride(t *testing.T) {
 	}
 }
 
-// A visual pass counts only with its own receipt's stored evidence, on the
-// receipt's revision.
+// A visual pass counts only with its own receipt's stored recording, on the
+// receipt's revision. A screenshot isn't a recording.
 func TestDowngradeVisualChecks(t *testing.T) {
 	zero, five := 0, 5
 	ev := []ReceiptEvidence{
-		{Key: "k/shot", Status: EvidenceStored, TreeSHA: "abcdef0123456789"},
-		{Key: "k/video", Status: EvidenceStored, TreeSHA: "abcdef0123456789", Frames: &five},
-		{Key: "k/empty", Status: EvidenceStored, TreeSHA: "abcdef0123456789", Frames: &zero},
-		{Key: "k/pending", Status: EvidencePending, TreeSHA: "abcdef0123456789"},
-		{Key: "k/notree", Status: EvidenceStored},
+		{Key: "k/shot", Status: EvidenceStored, TreeSHA: "abcdef0123456789", ContentType: "image/png"},
+		{Key: "k/video", Status: EvidenceStored, TreeSHA: "abcdef0123456789", Frames: &five, ContentType: "video/mp4"},
+		{Key: "k/empty", Status: EvidenceStored, TreeSHA: "abcdef0123456789", Frames: &zero, ContentType: "video/mp4"},
+		{Key: "k/pending", Status: EvidencePending, TreeSHA: "abcdef0123456789", ContentType: "video/mp4"},
+		{Key: "k/notree", Status: EvidenceStored, Frames: &five, ContentType: "video/mp4"},
+		{Key: "k/uncounted", Status: EvidenceStored, TreeSHA: "abcdef0123456789", ContentType: "video/mp4"},
 	}
 	vis := func(key, verdict string) ReceiptCheck {
 		return ReceiptCheck{Role: CheckRoleWorker, Kind: CheckKindVisual, Verdict: verdict, EvidenceKey: key, Note: "looked"}
@@ -179,15 +180,17 @@ func TestDowngradeVisualChecks(t *testing.T) {
 		in                   ReceiptCheck
 		want, note           string
 	}{
-		{"stored screenshot", "abcdef0123456789", "", vis("k/shot", VerdictPass), VerdictPass, "looked"},
+		{"stored recording", "abcdef0123456789", "", vis("k/video", VerdictPass), VerdictPass, "looked"},
+		{"a screenshot isn't a recording", "abcdef0123456789", "", vis("k/shot", VerdictPass), VerdictCantTell, NotARecording + ": looked"},
 		{"abbreviated tree", "abcdef012345", "", vis("k/video", VerdictPass), VerdictPass, "looked"},
 		{"too short to compare", "abcdef01", "", vis("k/video", VerdictPass), VerdictCantTell, "evidence recorded on another revision: looked"},
 		{"no key", "", "", vis("", VerdictPass), VerdictCantTell, "evidence missing: looked"},
 		{"foreign key", "", "", vis("other/receipt/shot", VerdictPass), VerdictCantTell, "evidence missing: looked"},
 		{"pending", "", "", vis("k/pending", VerdictPass), VerdictCantTell, "evidence missing (pending): looked"},
 		{"zero frames", "", "", vis("k/empty", VerdictPass), VerdictCantTell, "no frames: looked"},
-		{"tree mismatch", "0000000000aa", "", vis("k/shot", VerdictPass), VerdictCantTell, "evidence recorded on another revision: looked"},
-		{"receipt has no tree", "", "", vis("k/shot", VerdictPass), VerdictPass, "looked"},
+		{"frames not declared", "", "", vis("k/uncounted", VerdictPass), VerdictCantTell, "no frames: the recording's frame count wasn't declared: looked"},
+		{"tree mismatch", "0000000000aa", "", vis("k/video", VerdictPass), VerdictCantTell, "evidence recorded on another revision: looked"},
+		{"receipt has no tree", "", "", vis("k/video", VerdictPass), VerdictPass, "looked"},
 		{"evidence has no tree", "0000000000aa", "", vis("k/notree", VerdictPass), VerdictPass, "looked"},
 		{"no store", "abcdef0123456789", "disk gone", vis("k/shot", VerdictPass), VerdictCantTell, "evidence storage isn't configured: looked"},
 		{"a fail stays a fail", "", "", vis("", VerdictFail), VerdictFail, "looked"},

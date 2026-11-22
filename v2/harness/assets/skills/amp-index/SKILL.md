@@ -46,6 +46,10 @@ Covers: reading a ticket, logging progress, writing to the KB, completing a task
 Use when your task name contains "check", "review", or "Code Review:".
 Covers: wave check vs full code review distinction, the fix-task template, rules for creating fix tasks instead of failing.
 
+**amp-verify**
+Use for every `visual` check on a verification receipt, when `amp_open_receipt` returns a mode other than "off".
+Covers: writing a ticket's journeys (`.amp/journeys/<task_id>.json`), `record.py` (agent-browser drives each journey while recording, on head and optionally on the base revision), and uploading the video as receipt evidence. Screenshots and test logs are not a visual check.
+
 **amp-kb**
 Use when you need to search or write to the project knowledge base.
 Covers: search strategy, create vs update rules, writing content that embeds well.

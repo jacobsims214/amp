@@ -424,10 +424,10 @@ const (
 
 // DowngradeVisualChecks makes cant_tell every passing visual check that
 // its evidence doesn't back: a visual pass counts only when its
-// evidence_key names a stored file of this receipt (evidence, the receipt's
-// own rows) that isn't a zero-frame recording, recorded on the receipt's
-// revision (treeSHA) when both name one. A missing tree_sha on either side
-// isn't a mismatch. storeErr, when set, is why there is no evidence store
+// evidence_key names a stored recording of this receipt (evidence, the
+// receipt's own rows; a video, not a screenshot or a log) with a frame count above zero,
+// recorded on the receipt's revision (treeSHA) when both name one. A
+// missing tree_sha on either side isn't a mismatch. storeErr, when set, is why there is no evidence store
 // at all: then no visual pass counts. A visual fail stays a fail (turning it
 // into cant_tell would raise the status). Each downgraded check's note says
 // why. checks is not modified.
@@ -455,6 +455,10 @@ func DowngradeVisualChecks(checks []ReceiptCheck, evidence []ReceiptEvidence, tr
 			why = "no frames"
 		case treeSHA != "" && e.TreeSHA != "" && !sameTree(treeSHA, e.TreeSHA):
 			why = "evidence recorded on another revision"
+		case !IsRecording(e):
+			why = NotARecording
+		case e.Frames == nil:
+			why = "no frames: the recording's frame count wasn't declared"
 		}
 		if why == "" {
 			continue
@@ -469,6 +473,16 @@ func DowngradeVisualChecks(checks []ReceiptCheck, evidence []ReceiptEvidence, tr
 		out[i].Note = why
 	}
 	return out
+}
+
+// NotARecording is why a visual pass that cites a screenshot or a log is
+// downgraded: a visual check is backed by a recording of the browser
+// (video.mp4, made by the amp-verify skill's recorder), nothing less.
+const NotARecording = "not a recording: a visual check needs the video.mp4 the amp-verify skill records"
+
+// IsRecording reports whether an evidence file is a video.
+func IsRecording(e ReceiptEvidence) bool {
+	return strings.HasPrefix(e.ContentType, "video/")
 }
 
 // MinTreePrefix is the shortest tree id two revisions are compared on: the

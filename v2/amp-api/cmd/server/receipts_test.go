@@ -886,16 +886,21 @@ func TestReceipts_EvidenceUploadAndServe(t *testing.T) {
 	// the receipt lists its evidence with when it expires.
 	out := alice.call(t, "amp_complete_task", map[string]any{"task_id": float64(a), "dispatch_id": da, "receipt_id": float64(ra),
 		"checks": []any{
-			map[string]any{"criterion_ref": "1", "kind": "visual", "verdict": "pass", "evidence_key": shot.key},
-			map[string]any{"criterion_ref": "2", "kind": "visual", "verdict": "pass", "evidence_key": video.key},
+			map[string]any{"criterion_ref": "1", "kind": "visual", "verdict": "pass", "evidence_key": video.key},
+			map[string]any{"criterion_ref": "2", "kind": "visual", "verdict": "pass", "evidence_key": shot.key},
 		}})
 	if out["state"] != "completed" || out["receipt_status"] != "self_checked" {
 		t.Fatalf("complete: %v", out)
 	}
+	// The recording backs its check; a screenshot isn't a recording.
 	got := getReceipt(t, e.ra, "bob", a)
 	for _, c := range got["checks"].([]any) {
-		if c.(map[string]any)["verdict"] != "pass" {
-			t.Fatalf("a backed visual check was downgraded: %v", c)
+		m := c.(map[string]any)
+		if m["criterion_ref"] == "1" && m["verdict"] != "pass" {
+			t.Fatalf("a visual check backed by a recording was downgraded: %v", m)
+		}
+		if m["criterion_ref"] == "2" && (m["verdict"] != "cant_tell" || m["note"] != domain.NotARecording) {
+			t.Fatalf("a visual check backed only by a screenshot counted: %v", m)
 		}
 	}
 	evs := got["evidence"].([]any)
@@ -955,15 +960,44 @@ func TestReceipts_VisualDowngrade(t *testing.T) {
 		t.Fatalf("tree mismatch: %v", c)
 	}
 
-	// The same evidence on its own revision counts.
-	g, dg, rg := opened(t, alice, e.w.s.storyID, "good evidence")
-	gShot := uploadsOf(t, alice.call(t, "amp_add_evidence", map[string]any{"receipt_id": float64(rg), "dispatch_id": dg,
+	// A screenshot on its own revision still isn't a recording.
+	s, ds, rs := opened(t, alice, e.w.s.storyID, "screenshot only")
+	sShot := uploadsOf(t, alice.call(t, "amp_add_evidence", map[string]any{"receipt_id": float64(rs), "dispatch_id": ds,
 		"tree_sha": treeA, "files": []any{file("screenshot-1.png", png)}}))["screenshot-1.png"]
-	if code, _ := e.put(t, gShot.url, png); code != 200 {
+	if code, _ := e.put(t, sShot.url, png); code != 200 {
+		t.Fatalf("upload: %d", code)
+	}
+	out = alice.call(t, "amp_complete_task", map[string]any{"task_id": float64(s), "dispatch_id": ds, "receipt_id": float64(rs),
+		"tree_sha": treeA, "checks": []any{map[string]any{"criterion_ref": "1", "kind": "visual", "verdict": "pass", "evidence_key": sShot.key}}})
+	if out["held"] != true {
+		t.Fatalf("a visual check backed only by a screenshot wasn't held under Require: %v", out)
+	}
+	c = getReceipt(t, e.ra, "alice", s)["checks"].([]any)[0].(map[string]any)
+	if c["verdict"] != "cant_tell" || c["note"] != domain.NotARecording {
+		t.Fatalf("screenshot-only visual check: %v", c)
+	}
+
+	// Bytes that aren't a video can't be stored as video.mp4.
+	_, dn, rn := opened(t, alice, e.w.s.storyID, "not a video")
+	fake := uploadsOf(t, alice.call(t, "amp_add_evidence", map[string]any{"receipt_id": float64(rn), "dispatch_id": dn,
+		"tree_sha": treeA, "files": []any{file("video.mp4", png, "frames", float64(90))}}))["video.mp4"]
+	if code, _ := e.put(t, fake.url, png); code != 422 {
+		t.Fatalf("a PNG uploaded as video.mp4: %d, want 422", code)
+	}
+	if evidenceStatus(t, fake.key) != "pending" {
+		t.Fatalf("a refused upload was stored")
+	}
+
+	// A recording on its own revision counts.
+	mp4 := []byte("....ftypisom a recording")
+	g, dg, rg := opened(t, alice, e.w.s.storyID, "good evidence")
+	gVideo := uploadsOf(t, alice.call(t, "amp_add_evidence", map[string]any{"receipt_id": float64(rg), "dispatch_id": dg,
+		"tree_sha": treeA, "files": []any{file("video.mp4", mp4, "frames", float64(90), "duration_ms", float64(3000))}}))["video.mp4"]
+	if code, _ := e.put(t, gVideo.url, mp4); code != 200 {
 		t.Fatalf("upload: %d", code)
 	}
 	out = alice.call(t, "amp_complete_task", map[string]any{"task_id": float64(g), "dispatch_id": dg, "receipt_id": float64(rg),
-		"tree_sha": treeA, "checks": []any{map[string]any{"criterion_ref": "1", "kind": "visual", "verdict": "pass", "evidence_key": gShot.key}}})
+		"tree_sha": treeA, "checks": []any{map[string]any{"criterion_ref": "1", "kind": "visual", "verdict": "pass", "evidence_key": gVideo.key}}})
 	if out["state"] != "completed" || out["held"] != nil {
 		t.Fatalf("backed visual check under Require: %v", out)
 	}
@@ -1168,7 +1202,7 @@ func TestReceipts_ConcurrentSameTokenUpload(t *testing.T) {
 	e := newEvidenceWorld(t, "inform")
 	alice := e.w.as(e.w.alice)
 	_, d, rid := opened(t, alice, e.w.s.storyID, "concurrent")
-	body := bytes.Repeat([]byte("v"), 64<<10)
+	body := append([]byte("....ftypisom"), bytes.Repeat([]byte("v"), 64<<10)...)
 	up := uploadsOf(t, alice.call(t, "amp_add_evidence", map[string]any{"receipt_id": float64(rid), "dispatch_id": d,
 		"tree_sha": treeA, "files": []any{file("video.mp4", body, "frames", float64(10))}}))["video.mp4"]
 

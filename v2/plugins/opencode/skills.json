@@ -84,6 +84,13 @@
   "contentFile": "skills/amp-review/SKILL.body.md"
  },
  {
+  "id": "amp-verify",
+  "name": "amp-verify",
+  "description": "Record the browser as proof of a visual check. Write the ticket's journeys (.amp/journeys/<task_id>.json), run record.py, which drives agent-browser through each one while it records, and upload the video.mp4 it makes as receipt evidence. Use it for every visual check on a receipt, because a screenshot or a test log is not a visual check.",
+  "path": "skills/amp-verify/SKILL.md",
+  "contentFile": "skills/amp-verify/SKILL.body.md"
+ },
+ {
   "id": "aws-sso-auth",
   "name": "aws-sso-auth",
   "description": "Use when you need to authenticate with AWS via SSO and run AWS CLI commands against AWS accounts and services (EKS, S3, CloudWatch, IAM, etc.). Covers aws-sso exec authentication flow, credential management, common AWS CLI commands, EKS cluster token, and troubleshooting auth issues.",
