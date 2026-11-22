@@ -47,7 +47,8 @@ or verifier re-runs it.
   prefer text, role, label and test-id selectors over `@e` refs, which change between runs.
 - **`expect` is an assertion**: `["expect", "text", "Saved"]`, `["expect", "no-text", "Error"]`,
   `["expect", "visible", "#toast"]`, `["expect", "hidden", "#spinner"]`,
-  `["expect", "url", "**/board"]`. Each waits up to 10 s (`AGENT_BROWSER_DEFAULT_TIMEOUT`, in ms).
+  `["expect", "url", "/board?focus=*"]` (the whole URL; `*` matches anything, and a leading `/` is
+  the served site). Each waits up to 10 s (`AGENT_BROWSER_DEFAULT_TIMEOUT`, in ms).
 - **A journey passes when every step succeeds**, and fails at the first one that doesn't. End
   every journey with an `expect` that shows the criterion is met: a journey that only clicks proves
   nothing.

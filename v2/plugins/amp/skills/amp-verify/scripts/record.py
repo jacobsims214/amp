@@ -121,7 +121,12 @@ def translate(step, base_url):
         elif kind == "hidden":
             step = ["wait", val, "--state", "hidden"]
         elif kind == "url":
-            step = ["wait", "--url", val]
+            # Not `wait --url`: agent-browser 0.27 matches only an exact URL
+            # there, and never a route change made in the page.
+            if val.startswith("/"):
+                val = base_url.rstrip("/") + val
+            rx = "^" + ".*".join(re.escape(p) for p in re.split(r"\*+", val)) + "$"
+            step = ["wait", "--fn", f"new RegExp({json.dumps(rx)}).test(location.href)"]
         else:
             usage(f"expect {kind!r}: use text, no-text, visible, hidden or url")
     real = []
