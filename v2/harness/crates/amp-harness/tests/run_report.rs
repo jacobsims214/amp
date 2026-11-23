@@ -603,8 +603,13 @@ async fn abandoned_runs_are_reported_with_usage_git_and_a_note() {
     );
 }
 
-/// #2225: a worker whose model repeats one call is stopped at the 5th identical call, and its
-/// abandoned run says why.
+/// #2225, #5624: a worker whose model repeats one call is cut off before it burns the run, and
+/// its abandoned run says why.
+///
+/// The escalation matters as much as the stop: calls 1-2 run, 3-4 are **refused** (an error the
+/// run survives, so the model can still act on the result it holds), and only the 5th ends the
+/// run. Before #5624 calls 3-4 ran again and merely carried a postscript, and models read that
+/// as another success — four workers went to the 5th and lost the whole run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_stopped_for_repeating_one_call_records_an_abandoned_run_saying_why() {
     let f = fixture("repeating", false).await;
@@ -627,13 +632,56 @@ async fn a_worker_stopped_for_repeating_one_call_records_an_abandoned_run_saying
     let why = "the model kept repeating `bash ls` (5 identical calls in a row) and was stopped";
     assert_eq!(r.error.as_deref(), Some(why), "{r:?}");
     assert_eq!(r.tool_calls, 5, "nothing ran after the stop: {r:?}");
-    assert_eq!(r.tool_errors, 1, "{r:?}");
+    // Two refusals (3 and 4) plus the stop (5): the model is told at every one of them.
+    assert_eq!(r.tool_errors, 3, "{r:?}");
     let runs = f.calls("amp_report_run");
     assert_eq!(runs.len(), 1, "{runs:?}");
     assert_eq!(runs[0]["task_id"], 2225);
     assert_eq!(runs[0]["outcome"], "abandoned");
     assert_eq!(runs[0]["run_note"], format!("abandoned: stopped: {why}"));
     assert!(f.calls("amp_complete_task").is_empty());
+}
+
+/// #5624: the loop that cost four workers their runs. The model re-requests the same read, is
+/// refused at the 3rd call, and **carries on to finish the ticket** — no stall, no abandoned run.
+///
+/// This is acceptance criterion 3 in the harness: a worker given the same failing call does not
+/// loop, because the refusal is a distinct error rather than one more identical success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_refused_on_a_repeated_read_finishes_instead_of_stalling() {
+    let f = fixture("refused-read", false).await;
+    let sup = f.supervisor(config());
+    let read = || {
+        template(
+            "Reading the ticket again.",
+            json!([{"name": "bash", "arguments": {"command": "ls"}}]),
+        )
+    };
+    // Three identical reads (the 3rd refused), then the model acts on the result it already has.
+    let mut steps: Vec<FauxStep> = (0..3).map(|_| read()).collect();
+    steps.push(template(
+        "Done, from what I have.",
+        json!([{
+            "name": "amp_complete_task",
+            "arguments": {"task_id": 5624, "dispatch_id": "d_test"}
+        }]),
+    ));
+    steps.push(template("Ticket complete.", json!([])));
+    f.script(steps);
+    let r = sup
+        .run_ticket(req(5624, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Completed, "{r:?}");
+    assert_eq!(r.tool_calls, 4, "{r:?}");
+    // The 3rd read and nothing else was refused; it did not run a 4th or 5th time.
+    assert_eq!(r.tool_errors, 1, "{r:?}");
+    assert_eq!(f.calls("amp_complete_task").len(), 1);
+    let runs = f.calls("amp_report_run");
+    assert!(
+        runs.iter().all(|c| c["outcome"] != "abandoned"),
+        "the run was not abandoned: {runs:?}"
+    );
 }
 
 /// A step that cancels `token` (as the manager's abort or Ctrl-C would, mid-turn), then starts a

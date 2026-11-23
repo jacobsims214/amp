@@ -1,10 +1,11 @@
-//! #2225: the repeat guard, end to end on the faux model against the mock AMP. QA pass 2 found a
-//! manager that called `bash ls` about 30 times in a row (every call succeeded the same way) and
-//! then told its user AMP was broken. Now the 3rd and 4th identical call carry a line telling the
-//! model it is repeating itself, the 5th is not run and ends the run, and the person sees one
-//! sentence: a stderr line from `run -p`, a line in the chat transcript. Different calls, or the
-//! same tool with different arguments, are never stopped. (The worker case, an abandoned run with
-//! a note saying why, is in tests/run_report.rs.)
+//! #2225, #5624: the repeat guard, end to end on the faux model against the mock AMP. QA pass 2
+//! found a manager that called `bash ls` about 30 times in a row (every call succeeded the same
+//! way) and then told its user AMP was broken. Now the 2nd identical call carries a line saying
+//! the next one will not run, the 3rd and 4th are **refused** (not run, the run continues), the
+//! 5th is not run and ends the run, and the person sees one sentence: a stderr line from `run -p`,
+//! a line in the chat transcript. Different calls, or the same tool with different arguments, are
+//! never stopped. (The worker case, an abandoned run with a note saying why, is in
+//! tests/run_report.rs.)
 
 mod common;
 
@@ -113,21 +114,50 @@ async fn run_p_stops_a_repeated_call_with_one_stderr_line_and_runs_nothing_more(
     let ends = of_type(&events, "tool_end");
     assert_eq!(ends.len(), 5, "{ends:?}");
     let text = |i: usize| ends[i]["text"].as_str().unwrap().to_owned();
-    for end in &ends[..4] {
+    // 1 and 2 ran. The 2nd warns; the next identical call will not run.
+    for end in &ends[..2] {
         assert_eq!(end["is_error"], false, "{end}");
         assert!(
             end["text"].as_str().unwrap().contains("README.md"),
             "the call ran: {end}"
         );
     }
-    // The 3rd and 4th tell the model; the first two don't.
-    assert!(!text(1).contains("times in a row"), "{}", text(1));
+    assert!(!text(0).contains("times in a row"), "{}", text(0));
     assert!(
-        text(2).contains("this exact call 3 times in a row"),
+        text(1).contains("this exact call 2 times in a row"),
+        "{}",
+        text(1)
+    );
+    assert!(
+        text(1).contains("The next identical call will NOT run"),
+        "{}",
+        text(1)
+    );
+    // #5624: 3 and 4 are refused — an error, so the model has something new to act on — and the
+    // result is NOT repeated to it.
+    for i in [2, 3] {
+        assert_eq!(ends[i]["is_error"], true, "{}", ends[i]);
+        assert!(
+            text(i).starts_with("[amp-harness] Not run: this exact call"),
+            "{}",
+            text(i)
+        );
+        assert!(
+            !text(i).contains("README.md"),
+            "a refused call must not hand back the same success: {}",
+            text(i)
+        );
+    }
+    assert!(
+        text(2).contains("already run 3 times in a row"),
         "{}",
         text(2)
     );
-    assert!(text(3).contains("4 times in a row"), "{}", text(3));
+    assert!(
+        text(3).contains("already run 4 times in a row"),
+        "{}",
+        text(3)
+    );
     assert_eq!(ends[4]["is_error"], true);
     assert!(
         text(4)
@@ -153,7 +183,9 @@ async fn run_p_stops_a_repeated_call_with_one_stderr_line_and_runs_nothing_more(
 async fn different_calls_or_arguments_are_not_stopped() {
     let amp = spawn(MockAmp::new(), None).await;
     // Four `ls` (the most in a row), then `ls -a`, four `ls` again, four `amp_whoami`, a `read`
-    // between two runs of four `ls`: 18 calls, none stopped.
+    // between two runs of four `ls`: 18 calls, none stopped. The 3rd and 4th of each run of four
+    // are refused (#5624) — that costs the model a result it already holds and nothing else — but
+    // the run is never ended, which is what this test is about.
     let mut steps: Vec<Value> = Vec::new();
     steps.extend((0..4).map(|_| bash("ls")));
     steps.push(bash("ls -a"));
@@ -176,8 +208,29 @@ async fn different_calls_or_arguments_are_not_stopped() {
         .collect();
     let ends = of_type(&events, "tool_end");
     assert_eq!(ends.len(), 18);
-    assert!(ends.iter().all(|e| e["is_error"] == false), "{ends:?}");
-    assert_eq!(amp.mock.calls_to("amp_whoami").len(), 4);
+    // Nothing is ever a *stop*, and no call after one is blocked as "after the stop".
+    assert!(
+        ends.iter().all(|e| !e["text"]
+            .as_str()
+            .unwrap()
+            .contains("Stopped a repeating model")),
+        "{ends:?}"
+    );
+    // Each run of four is: run, run (warn), refuse, refuse — so calls 0-3 refuse 2,3; 5-8 refuse
+    // 7,8; 9-12 refuse 11,12; 13-16 refuse 15,16.
+    let refused: Vec<usize> = ends
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e["is_error"] == true)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(refused, vec![2, 3, 7, 8, 11, 12, 15, 16], "{ends:?}");
+    // The 1st and 2nd of each run of four still ran for real, plus `ls -a` and the `read`.
+    for i in [0, 1, 4, 5, 6, 9, 10, 13, 14, 17] {
+        assert_eq!(ends[i]["is_error"], false, "{}", ends[i]);
+    }
+    // `amp_whoami` ran twice, not four times: the refused calls never reached AMP.
+    assert_eq!(amp.mock.calls_to("amp_whoami").len(), 2);
     let result = of_type(&events, "result")[0];
     assert_eq!(result["outcome"], "completed");
     assert_eq!(result["text"], "All done.");
