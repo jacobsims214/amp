@@ -1,23 +1,35 @@
-//! The repeat guard (#2225): a model that keeps making the same tool call is stopped.
+//! The repeat guard (#2225, #5624): a model that keeps making the same tool call is refused, and
+//! then stopped.
 //!
 //! QA pass 2 found a manager (openrouter `xiaomi/mimo-v2.6-pro`) that emitted `bash {"command":
 //! "ls"}` about 30 times over three user turns while its thinking said it was calling `read` and
 //! `amp_*` tools. Every call succeeded with the same `README.md`, so nothing in the loop ever
 //! looked wrong to the harness, and the model finally told its user AMP's tools were broken.
 //!
+//! **#5624 changed the escalation, because the old one lost whole worker runs.** The old guard ran
+//! the 3rd identical call and appended one sentence after an *identical success* — still
+//! `is_error: false`, still the same result the model had already read. Four workers (#5540,
+//! #5557, #5585, #5587) kept going to the 5th call anyway and were killed there; #5587 burned an
+//! hour and 393 K output tokens and produced nothing. A postscript on a repeated success does not
+//! change the next generation, so the old nudge was not a control at all. Now:
+//!
 //! The guard counts identical calls (same tool name, same arguments) in a row since the user's
 //! last message. Any other call in between resets the count, and so does a new user message.
-//! - From the [`NUDGE_AT`]th identical call, the call runs and the model reads a line in its
-//!   result saying it is repeating itself ([`RepeatGuard::after_tool_call_then`]).
-//! - The [`STOP_AT`]th identical call is not run: it is blocked with `terminate`, and the tool
-//!   error starts with [`STOPPED_MARK`]. Every later call in that run is blocked with `terminate`
-//!   too, so a batch that mixed in other calls still ends at the next turn.
+//! - From the [`WARN_AT`]th identical call, the call runs and a line in its result says the next
+//!   identical call will **not** run ([`RepeatGuard::after_tool_call_then`]). This is the last
+//!   chance to change course, and it still costs nothing.
+//! - The [`REFUSE_AT`]th identical call **does not run**: it is blocked as an error that says so,
+//!   with `terminate` **false**, so the run continues. The model's next context is no longer an
+//!   identical success it can rationalise — it is a distinct refusal it has to act on.
+//! - The [`STOP_AT`]th identical call is not run and **ends the run**: blocked with `terminate`,
+//!   the tool error starting with [`STOPPED_MARK`]. Every later call in that run is blocked with
+//!   `terminate` too, so a batch that mixed in other calls still ends at the next turn.
 //! - [`stopped`] recognises the stop in a tool result, so the chat transcript shows one sentence
 //!   ([`RepeatStop::user_line`]), `run -p` one stderr line, and a worker records an abandoned run
 //!   saying why ([`RepeatStop::reason`]).
 //!
 //! It is the first `before_tool_call` hook for every role (before the manager's approval guard and
-//! the role policy), so a call the policy denies over and over is stopped as well. It counts calls
+//! the role policy), so a call the policy denies over and over is refused as well. It counts calls
 //! from the conversation itself, so it keeps no state of its own.
 
 use std::{future::Future, pin::Pin, sync::Arc};
@@ -30,28 +42,35 @@ use rpi_ai::types::{AssistantMessage, Content};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-/// The identical call (counting the first) whose result tells the model it is repeating itself.
-pub const NUDGE_AT: u32 = 3;
+/// The identical call (counting the first) whose result warns that the next one will not run.
+pub const WARN_AT: u32 = 2;
+/// The identical call (counting the first) that is **not run**: the model is told to act on the
+/// result it already has, and the run continues.
+pub const REFUSE_AT: u32 = 3;
 /// The identical call (counting the first) that is not run and ends the run.
 pub const STOP_AT: u32 = 5;
 
 /// Starts the tool error of the call that stopped the run (what [`stopped`] looks for).
 pub const STOPPED_MARK: &str = "[amp-harness] Stopped a repeating model:";
+/// Starts the tool error of a call the guard refused (the run continues).
+pub const REFUSED_MARK: &str = "[amp-harness] Not run: this exact call";
 /// The tool error of every call after the stop, in the same run.
 pub const AFTER_STOP: &str = "Not run: the harness stopped this run because the model kept \
      repeating one tool call. Tell your user what you were trying to do.";
 
-/// How many identical calls in a row are nudged and stopped.
+/// How many identical calls in a row are warned, refused and stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepeatGuard {
-    pub nudge_at: u32,
+    pub warn_at: u32,
+    pub refuse_at: u32,
     pub stop_at: u32,
 }
 
 impl Default for RepeatGuard {
     fn default() -> Self {
         Self {
-            nudge_at: NUDGE_AT,
+            warn_at: WARN_AT,
+            refuse_at: REFUSE_AT,
             stop_at: STOP_AT,
         }
     }
@@ -61,8 +80,12 @@ impl Default for RepeatGuard {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Run,
-    /// Run it, and tell the model it made this call `count` times in a row.
-    Nudge {
+    /// Run it, and warn that the next identical call will not run.
+    Warn {
+        count: u32,
+    },
+    /// Don't run it: the model already has this result and must act on it. The run continues.
+    Refuse {
         count: u32,
     },
     /// Don't run it: the run ends here.
@@ -96,8 +119,10 @@ impl RepeatGuard {
                 count,
                 call: summary(last.0, last.1),
             }
-        } else if count >= self.nudge_at {
-            Verdict::Nudge { count }
+        } else if count >= self.refuse_at {
+            Verdict::Refuse { count }
+        } else if count >= self.warn_at {
+            Verdict::Warn { count }
         } else {
             Verdict::Run
         }
@@ -115,21 +140,26 @@ impl RepeatGuard {
     }
 
     /// The `before_tool_call` hook: the guard, then `next` for calls it lets run.
+    ///
+    /// A refused or stopped call is blocked with `reason` (the model reads it). Only the stop sets
+    /// `terminate`: a refusal leaves the run alive on purpose, so the model still has the whole
+    /// rest of its turn to do the work from the result it already holds.
     pub fn before_tool_call_then(self, next: Option<BeforeToolCall>) -> BeforeToolCall {
         Arc::new(
             move |ctx: BeforeToolCallContext<'_>, signal: CancellationToken| -> BeforeFuture {
                 let blocked =
                     match self.check(ctx.context, ctx.assistant_message, &ctx.tool_call.id) {
-                        Verdict::Stop { count, call } => Some(stop_text(&call, count)),
-                        Verdict::AfterStop => Some(AFTER_STOP.to_owned()),
-                        Verdict::Run | Verdict::Nudge { .. } => None,
+                        Verdict::Stop { count, call } => Some((stop_text(&call, count), true)),
+                        Verdict::Refuse { count } => Some((refused_text(count), false)),
+                        Verdict::AfterStop => Some((AFTER_STOP.to_owned(), true)),
+                        Verdict::Run | Verdict::Warn { .. } => None,
                     };
                 match (blocked, &next) {
-                    (Some(reason), _) => Box::pin(async move {
+                    (Some((reason, terminate)), _) => Box::pin(async move {
                         Some(BeforeToolCallResult {
                             block: true,
                             reason: Some(reason),
-                            terminate: true,
+                            terminate,
                             args: None,
                         })
                     }),
@@ -140,15 +170,15 @@ impl RepeatGuard {
         )
     }
 
-    /// The `after_tool_call` hook: `next`, then the nudge line on a repeated call's result.
+    /// The `after_tool_call` hook: `next`, then the warning line on a repeated call's result.
     pub fn after_tool_call_then(self, next: Option<AfterToolCall>) -> AfterToolCall {
         Arc::new(
             move |ctx: AfterToolCallContext<'_>, signal: CancellationToken| -> AfterFuture {
-                let nudge = match self.check(ctx.context, ctx.assistant_message, &ctx.tool_call.id)
-                {
-                    Verdict::Nudge { count } => Some(nudge_text(count, self.stop_at)),
-                    _ => None,
-                };
+                let warning =
+                    match self.check(ctx.context, ctx.assistant_message, &ctx.tool_call.id) {
+                        Verdict::Warn { count } => Some(warn_text(count, self.refuse_at)),
+                        _ => None,
+                    };
                 let original = ctx.result.content.clone();
                 let inner = next.as_ref().map(|n| n(ctx, signal));
                 Box::pin(async move {
@@ -156,7 +186,7 @@ impl RepeatGuard {
                         Some(f) => f.await,
                         None => None,
                     };
-                    if let Some(line) = nudge {
+                    if let Some(line) = warning {
                         let r = out.get_or_insert_with(AfterToolCallResult::default);
                         let content = r.content.get_or_insert(original);
                         content.push(TextContentOrImage::text(line));
@@ -240,13 +270,31 @@ pub fn stop_text(call: &str, count: u32) -> String {
     )
 }
 
-fn nudge_text(count: u32, stop_at: u32) -> String {
+fn warn_text(count: u32, refuse_at: u32) -> String {
     format!(
         "[amp-harness] You have made this exact call {count} times in a row (same tool, same \
-         arguments). Repeating it won't change the result: use a different tool or different \
-         arguments, or answer your user. At {stop_at} identical calls in a row the harness stops \
-         the run."
+         arguments). The next identical call will NOT run (that would be {refuse_at} in a row): the \
+         result you already have is the answer, and only new arguments or a different tool will \
+         run. Act on what you have."
     )
+}
+
+/// The tool error of a call the guard refused (the model reads it; the run continues).
+///
+/// It names the call and says plainly that nothing was run, so a model cannot read it as another
+/// success to re-request — which is exactly how four workers burned their runs (#5624).
+pub fn refused_text(count: u32) -> String {
+    format!(
+        "{REFUSED_MARK} has already run {count} times in a row with the same arguments, so it was \
+         NOT run again and this is not a new result. The result you already have is the whole \
+         answer to this call: use it and continue the work. Change the arguments or use a \
+         different tool if you need something else; calling it again unchanged ends the run."
+    )
+}
+
+/// Whether a tool result is a refusal (as opposed to a stop): the run is still alive.
+pub fn refused(text: &str) -> bool {
+    text.trim_start().starts_with(REFUSED_MARK)
 }
 
 /// A run the guard stopped, read back from the stopping call's tool error.
@@ -309,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_calls_are_nudged_then_stopped_then_everything_is_blocked() {
+    fn identical_calls_are_warned_then_refused_then_stopped_then_blocked() {
         let ls = ("bash", json!({"command": "ls"}));
         let other = ("read", json!({"path": "README.md"}));
         let v = verdicts(&[
@@ -324,9 +372,10 @@ mod tests {
             v,
             vec![
                 Verdict::Run,
-                Verdict::Run,
-                Verdict::Nudge { count: 3 },
-                Verdict::Nudge { count: 4 },
+                Verdict::Warn { count: 2 },
+                // #5624: the 3rd identical call is not run, but the run continues.
+                Verdict::Refuse { count: 3 },
+                Verdict::Refuse { count: 4 },
                 Verdict::Stop {
                     count: 5,
                     call: "bash ls".into()
@@ -334,6 +383,36 @@ mod tests {
                 Verdict::AfterStop,
             ]
         );
+    }
+
+    #[test]
+    fn a_refusal_is_not_run_but_does_not_end_the_run() {
+        // The whole point of #5624: at 3 and 4 the model gets an error it must act on, and the
+        // run is still alive — so the work can still land. Only 5 ends it.
+        let ls = ("bash", json!({"command": "ls"}));
+        let v = verdicts(&[ls.clone(), ls.clone(), ls.clone(), ls.clone()]);
+        assert_eq!(v[2], Verdict::Refuse { count: 3 });
+        assert_eq!(v[3], Verdict::Refuse { count: 4 });
+        assert!(
+            !v.iter().any(|x| matches!(x, Verdict::Stop { .. })),
+            "nothing below 5 stops the run: {v:?}"
+        );
+        assert!(!v.iter().any(|x| matches!(x, Verdict::AfterStop)), "{v:?}");
+    }
+
+    #[test]
+    fn a_refused_call_reads_as_a_refusal_and_never_as_the_success_it_replaces() {
+        let text = refused_text(3);
+        assert!(refused(&text), "{text}");
+        // It parses as no stop, so the run is not reported as abandoned.
+        assert_eq!(stopped(&text), None);
+        // And it says plainly that nothing was run, which is what stops the retry loop.
+        assert!(text.contains("NOT run"), "{text}");
+        assert!(text.contains("not a new result"), "{text}");
+        assert!(text.contains("already have"), "{text}");
+        assert!(!refused(&stop_text("bash ls", 5)));
+        assert!(!refused(AFTER_STOP));
+        assert!(!refused("README.md"));
     }
 
     #[test]
@@ -352,10 +431,16 @@ mod tests {
             ls.clone(),
             la,
         ];
+        // The most in a row here is four, so a run is never *ended*; the 3rd and 4th identical
+        // call are refused (#5624), which costs the model a result it already has and nothing else.
+        assert!(verdicts(&calls).iter().all(|v| matches!(
+            v,
+            Verdict::Run | Verdict::Warn { .. } | Verdict::Refuse { .. }
+        )));
         assert!(
-            verdicts(&calls)
+            !verdicts(&calls)
                 .iter()
-                .all(|v| matches!(v, Verdict::Run | Verdict::Nudge { .. }))
+                .any(|v| matches!(v, Verdict::Stop { .. } | Verdict::AfterStop))
         );
         // Same arguments in another key order are the same call.
         let a = (
